@@ -1873,12 +1873,12 @@ impl LazyWorld {
     /// Reads T against another thread's read of X; checks both values,
     /// that X ran once, and that T's read retried exactly when a waiter
     /// took the doom over. Returns whether one did.
-    fn race(&self, want: u64) -> bool {
+    fn race(&self, want: u64, user_panics: bool) -> bool {
         let other = {
             let (rt, x) = (Arc::clone(&self.rt), self.x);
             thread::spawn(move || rt.get(x))
         };
-        EXPECTING_UNWIND.with(|e| e.set(true));
+        EXPECTING_UNWIND.with(|e| e.set(user_panics));
         let got = self.rt.get(self.t);
         EXPECTING_UNWIND.with(|e| e.set(false));
         assert_eq!(got, want);
@@ -1916,7 +1916,7 @@ static END_RACE: Reached = Reached::new();
 fn doom_lazy_end_races_take_over() {
     run(|| {
         let world = LazyWorld::new(|rt, x, _| rt.get(x) + 100);
-        END_RACE.note(world.race(114), false);
+        END_RACE.note(world.race(114, false), false);
     });
     END_RACE.assert_both();
 }
@@ -1933,7 +1933,7 @@ static RAISE_RACE: Reached = Reached::new();
 fn doom_lazy_wound_before_raise() {
     run(|| {
         let world = LazyWorld::new(|rt, x, z| rt.get(x) + rt.get(z) + 100);
-        RAISE_RACE.note(world.race(137), false);
+        RAISE_RACE.note(world.race(137, false), false);
     });
     RAISE_RACE.assert_both();
 }
@@ -1982,7 +1982,7 @@ fn doom_lazy_destructor_discard_keeps_flight() {
                 v + 100
             })
         };
-        let took = world.race(114);
+        let took = world.race(114, true);
         DESTRUCTOR_DISCARD.note(took, caught.load(std::sync::atomic::Ordering::Relaxed));
     });
     DESTRUCTOR_DISCARD.assert_both();
