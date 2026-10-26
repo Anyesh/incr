@@ -305,7 +305,11 @@ pub(crate) fn hand_over(cell: usize, claim: Claim, patience: &mut Patience) -> O
             return None;
         }
         h.by_cell.remove(&cell);
-        return h.entries[at].take();
+        let e = h.entries[at].take();
+        if let Some(e) = &e {
+            h.removed(e.rt);
+        }
+        return e;
     }
     None
 }
