@@ -2071,12 +2071,17 @@ fn shared_vframe_reader_waits_for_a_retry_with_a_later_read() {
 }
 
 /// At budget 2 X's virtual frame sits above W's, and W's retry reads X
-/// natively.
+/// natively. Once the driver goes on, the other thread's claim of X can
+/// come first and wait on Y's held landing while W's retry waits on X:
+/// the other thread takes Y over, so either read may get the payload.
 #[test]
-fn shared_vframe_reader_waits_under_a_native_read() {
+fn shared_vframe_reader_under_a_native_read_races_for_the_payload() {
     let (first, other) = read_over_a_delivery(Panics::Out, Some(Panics::Out), false);
-    assert_eq!(first, Err("y boom".to_string()));
-    assert!(failed(&other), "{other:?}");
+    let boom = Err("y boom".to_string());
+    assert!(
+        (first == boom && failed(&other)) || (other == boom && failed(&first)),
+        "{first:?}, {other:?}"
+    );
     let (first, other) = read_over_a_delivery(Panics::Own, Some(Panics::Out), false);
     let own = Err("x own".to_string());
     assert!(
