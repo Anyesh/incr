@@ -3033,18 +3033,26 @@ fn seed_198c2_retry_reads_the_foreign_set() {
     });
 }
 
-/// 0x16a03 at one frame: node 21 is a released entry kept 0 of 1, which
-/// the unbounded walk runs as a leaf with its dep 22 nested. The bounded
-/// walk's run of it dooms on the read of 22, and the retry then runs 4
-/// for real, whose placeholder branch reads 12: the episode records
-/// deps on 12 and 13, which the unbounded run leaves New with none.
+/// 0x16a03 at one frame: doomed 4 reads 12 after a placeholder for 5, so
+/// 12's entry is suspect. The speculative chain above it reaches 14, whose
+/// read of 12 is a virtual hit claiming 12 and 13; the stand-in run of 12
+/// reads a member of the outer episode, and passing that lowlink down
+/// joined 12 and 13 to the episode, which landed them Dirty with deps
+/// where the unbounded 4, reading 5 for real, never reads 12. Only the
+/// operations are compared: the seed's Native run counts differ for
+/// another reason.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn seed_16a03_doomed_leaf_entry_records_only_unbounded_deps() {
+fn seed_16a03_suspect_entry_frame_takes_no_virtual_hit() {
+    fn ops<C: Cells>(case: &Case) {
+        let unbounded = run::<C>(case, None, 0);
+        let bounded = run::<C>(case, Some(1), 0);
+        compare(case, &unbounded, &bounded, "seed 0x16a03, 1 frame");
+    }
     let case = gen_case(0x1_6a03, true, false);
     quiet(|| {
-        differential::<Local>(&case, 0x1_6a03);
-        differential::<Shared>(&case, 0x1_6a03);
+        ops::<Local>(&case);
+        ops::<Shared>(&case);
     });
 }
 

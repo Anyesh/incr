@@ -4148,6 +4148,15 @@ impl<C: Cells> Runtime<C> {
         }
         if low < v.cidx {
             if stand_in.is_some() {
+                // Passed below the chain's lowest speculative frame, its
+                // claims would join an episode a native frame runs, which
+                // a speculative entry never does.
+                if v.spec {
+                    let (boundary, q) = self.spec_chain_base(id, v.cidx);
+                    if low < boundary + q {
+                        return self.drop_spec_chain(id, q);
+                    }
+                }
                 // The run finished the frame, which defers as `cycle_pop`
                 // defers a real one.
                 cycle_state::with_held(|h| {
@@ -4213,27 +4222,11 @@ impl<C: Cells> Runtime<C> {
         } else if !rooted {
             return VPop::Left;
         }
-        let mut bag = Deferred::new();
         if v.spec {
-            let q = replay::with(|c| {
-                let x = c
-                    .iter()
-                    .find(|x| x.id == id)
-                    .expect("incr-core: a running context is open");
-                let mut q = v.cidx - x.boundary;
-                while q > 0 && x.vstack[q as usize - 1].spec {
-                    q -= 1;
-                }
-                q
-            });
-            if q == 0 {
-                self.close_dropped(id);
-                self.drop_unwind();
-            }
-            self.drop_chain(id, q, false, &mut bag);
-            bag.drain(self);
-            return VPop::Restart(false);
+            let (_, q) = self.spec_chain_base(id, v.cidx);
+            return self.drop_spec_chain(id, q);
         }
+        let mut bag = Deferred::new();
         if !cycle_state::holds(rt, v.node) {
             debug_assert!(
                 false,
@@ -4355,17 +4348,7 @@ impl<C: Cells> Runtime<C> {
             self.unwind_out_of(id, boundary, kind, payload);
         }
         if v.spec || kind == Some(UnwindKind::Discard) {
-            let q = replay::with(|c| {
-                let x = c
-                    .iter()
-                    .find(|x| x.id == id)
-                    .expect("incr-core: a running context is open");
-                let mut q = pos;
-                while q > 0 && x.vstack[q as usize - 1].spec {
-                    q -= 1;
-                }
-                q
-            });
+            let (_, q) = self.spec_chain_base(id, v.cidx);
             if q == 0 {
                 bag.drain(self);
                 self.close_dropped(id);
@@ -4922,6 +4905,37 @@ impl<C: Cells> Runtime<C> {
         self.release_claim_list(id, level, kind, &mut bag);
         bag.drain(self);
         None
+    }
+
+    /// Context `id`'s boundary, and the level of the lowest virtual frame
+    /// at or below position `cidx` whose frames between are all
+    /// speculative: where the speculative chain through `cidx` starts.
+    fn spec_chain_base(&self, id: u64, cidx: u32) -> (u32, u32) {
+        replay::with(|c| {
+            let x = c
+                .iter()
+                .find(|x| x.id == id)
+                .expect("incr-core: a running context is open");
+            let mut q = cidx - x.boundary;
+            while q > 0 && x.vstack[q as usize - 1].spec {
+                q -= 1;
+            }
+            (x.boundary, q)
+        })
+    }
+
+    /// A speculative frame's pop that would run or join an episode drops
+    /// its chain from level `q`, the chain's base, and the driver picks its
+    /// next entry again.
+    fn drop_spec_chain(&self, id: u64, q: u32) -> VPop {
+        if q == 0 {
+            self.close_dropped(id);
+            self.drop_unwind();
+        }
+        let mut bag = Deferred::new();
+        self.drop_chain(id, q, false, &mut bag);
+        bag.drain(self);
+        VPop::Restart(false)
     }
 
     /// Drops the chain of context `id` from level `q` up: every entry
