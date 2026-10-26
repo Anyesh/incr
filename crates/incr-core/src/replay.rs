@@ -23,7 +23,7 @@ use crate::deferred::Unbuilt;
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
-use crate::notes::Log;
+use crate::notes::{Landed, Log};
 use crate::state::NodeState;
 use crate::taint_memo;
 use crate::value_code;
@@ -287,7 +287,7 @@ pub(crate) struct Landings {
 
 #[derive(Clone)]
 enum Nodes {
-    Owned(Vec<((u32, u32), u32)>),
+    Owned(Vec<Landed>),
     /// The notes of `log` the copy was taken of: its first `len` entries
     /// but those gone before removal `epoch`, at their depths above
     /// `base`, none deeper than `depth`.
@@ -307,7 +307,7 @@ impl Default for Nodes {
 }
 
 impl Landings {
-    pub(crate) fn owned(source: Option<PayloadKey>, nodes: Vec<((u32, u32), u32)>) -> Self {
+    pub(crate) fn owned(source: Option<PayloadKey>, nodes: Vec<Landed>) -> Self {
         Self {
             source,
             nodes: Nodes::Owned(nodes),
@@ -336,7 +336,7 @@ impl Landings {
         }
     }
 
-    fn owned_nodes(&mut self) -> &mut Vec<((u32, u32), u32)> {
+    fn owned_nodes(&mut self) -> &mut Vec<Landed> {
         if let Nodes::Shared {
             log,
             len,
@@ -357,10 +357,10 @@ impl Landings {
     fn holds(&mut self, node: (u32, u32)) -> bool {
         let nodes = self.owned_nodes();
         note_work(nodes.len());
-        nodes.iter().any(|&(n, _)| n == node)
+        nodes.iter().any(|&(n, _, _)| n == node)
     }
 
-    pub(crate) fn into_nodes(mut self) -> Vec<((u32, u32), u32)> {
+    pub(crate) fn into_nodes(mut self) -> Vec<Landed> {
         std::mem::take(self.owned_nodes())
     }
 
@@ -368,7 +368,7 @@ impl Landings {
         match &self.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
-                nodes.iter().any(|&(_, depth)| depth > 0)
+                nodes.iter().any(|&(_, depth, _)| depth > 0)
             }
             Nodes::Shared {
                 log,
@@ -380,7 +380,7 @@ impl Landings {
                 .borrow()
                 .landings(*len, *epoch, *base)
                 .iter()
-                .any(|&(_, depth)| depth > 0),
+                .any(|&(_, depth, _)| depth > 0),
         }
     }
 
@@ -389,7 +389,7 @@ impl Landings {
         match &self.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
-                nodes.iter().map(|&(_, depth)| depth).max().unwrap_or(0)
+                nodes.iter().map(|&(_, depth, _)| depth).max().unwrap_or(0)
             }
             Nodes::Shared { depth, .. } => *depth,
         }
@@ -418,7 +418,7 @@ impl Landings {
         };
         let nodes = self.owned_nodes();
         note_work(nodes.len());
-        nodes.retain(|&(n, depth)| !gone(n, cidx + 1 + depth));
+        nodes.retain(|&(n, depth, _)| !gone(n, cidx + 1 + depth));
     }
 }
 
@@ -1888,7 +1888,7 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
         match &nodes.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
-                for &(n, _) in nodes {
+                for &(n, _, _) in nodes {
                     mark(n);
                 }
             }
@@ -1999,7 +1999,7 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     if events.log.len() > seen && !events.landed.is_empty() {
         let copy = nodes.owned_nodes();
         note_work(copy.len());
-        for &(n, _) in copy.iter() {
+        for &(n, _, _) in copy.iter() {
             if let Some(at) = events.landed.get(&(rt, n)) {
                 todo.extend(
                     at[at.partition_point(|&i| i < seen)..]

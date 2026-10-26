@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
-use crate::notes::{removal, Members, Notes};
+use crate::notes::{removal, Landed, Members, Notes, Stamped};
 use crate::replay::{note_work, payload_key, Landings, Retire};
 
 /// A Failed read's node left Failed before the read could tell which
@@ -63,6 +63,11 @@ pub(crate) struct Tickets {
     /// By the slot of a dep a set's walk stops at, the Failed landings over
     /// it (slot, generation) that no walk flagged; see `note_past_sets`.
     past: BTreeMap<u32, Vec<(u32, u32)>>,
+    /// By slot, the generation and stamp of the node's latest Failed
+    /// landing under `Shared`. A note names the landing it was made for by
+    /// its stamp, so a containment that comes after the node was flipped
+    /// and landed Failed again, on another thread, holds nothing for it.
+    landed: BTreeMap<u32, (u32, u64)>,
 }
 
 /// `slot`'s bit in `Runtime::failed_past`: a walk takes the tickets' lock
@@ -301,16 +306,16 @@ impl<C: Cells> Runtime<C> {
         // With no frame on the thread, no walk's entry can hold the ticket
         // again, so it goes as its members are noted, rather than lent.
         let alone = (base == 0).then(|| {
-            let live: Vec<(u32, u32)> = c
+            let live: Vec<Stamped> = c
                 .members
                 .lock()
                 .members
                 .iter()
                 .filter(|m| m.gone == u64::MAX)
-                .map(|m| m.node)
+                .map(|m| (m.node, m.at))
                 .collect();
             note_work(live.len());
-            for n in &live {
+            for (n, _) in &live {
                 t.landings.remove(n);
             }
             live
@@ -323,7 +328,9 @@ impl<C: Cells> Runtime<C> {
         drop(t);
         let payload = payload.into_inner().unwrap_or_else(PoisonError::into_inner);
         match alone {
-            Some(nodes) => self.note_above(nodes.into_iter().map(|n| (n, 0)), &*payload, true),
+            Some(nodes) => {
+                self.note_above(nodes.into_iter().map(|(n, at)| (n, 0, at)), &*payload, true)
+            }
             None => {
                 let (rt, at) = (self.runtime_id, payload_key(&*payload));
                 with_notes(|n| n.push_lent(rt, at, base, members));
@@ -351,6 +358,15 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
         self.note_failed_run(id, generation, cidx, regenerable);
+        let stamp = if C::SINGLE_THREADED {
+            0
+        } else {
+            let mut t = self.tickets.write();
+            let stamp = t.next;
+            t.next += 1;
+            t.landed.insert(id.0, (generation, stamp));
+            stamp
+        };
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
@@ -361,7 +377,7 @@ impl<C: Cells> Runtime<C> {
                 // This landing replaces the node's earlier Failed landings,
                 // so no payload noted for them may hold the node again.
                 n.forget_node(rt, landing);
-                n.push(rt, at, cidx, landing, false);
+                n.push(rt, at, cidx, (landing, stamp), false);
             });
         } else if notes_held() {
             with_notes(|n| n.forget_node(rt, landing));
@@ -414,6 +430,7 @@ impl<C: Cells> Runtime<C> {
     /// landings `payload` made there hold it for their first read. Another
     /// payload's notes at `cidx` are the reading frame's, as at a landing.
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
+        self.park(ParkPoint::BeforeContain);
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
         self.retire_copies(&Retire::Contained { cidx, payload: at });
         let (nodes, lent) = if notes_held() {
@@ -432,7 +449,7 @@ impl<C: Cells> Runtime<C> {
     /// read took leaves that ticket.
     fn hold(
         &self,
-        mut nodes: Vec<(u32, u32)>,
+        mut nodes: Vec<Stamped>,
         lent: Vec<Arc<Members>>,
         payload: Box<dyn Any + Send>,
     ) -> Option<Box<dyn Any + Send>> {
@@ -446,9 +463,10 @@ impl<C: Cells> Runtime<C> {
             .filter_map(|m| t.lent.remove(&m.id).map(|c| (m.id, c)))
             .collect();
         note_work(nodes.len() + taken.len());
-        nodes.retain(|&(slot, generation)| {
+        nodes.retain(|&((slot, generation), stamp)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
+                && (C::SINGLE_THREADED || t.landed.get(&slot) == Some(&(generation, stamp)))
                 && self.in_failed_landing(
                     slot,
                     self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
@@ -476,11 +494,11 @@ impl<C: Cells> Runtime<C> {
             for m in members.members.iter().filter(|m| m.gone == u64::MAX) {
                 let j = t.landings[&m.node];
                 debug_assert_eq!(j.ticket, other);
-                nodes.push(m.node);
+                nodes.push((m.node, m.at));
                 t.landings.remove(&m.node);
             }
         }
-        for n in nodes {
+        for (n, stamp) in nodes {
             if let Some((j, _)) = t.of(n) {
                 t.leave(j, at);
             }
@@ -488,6 +506,7 @@ impl<C: Cells> Runtime<C> {
                 let mut joined = ticket.members.lock();
                 joined.members.push(crate::notes::Member {
                     node: n,
+                    at: stamp,
                     gone: u64::MAX,
                 });
                 joined.members.len() as u32 - 1
@@ -566,7 +585,8 @@ impl<C: Cells> Runtime<C> {
 
     /// A set's walk flips `id` from Failed to Dirty, under the tickets'
     /// lock: a `hold` of the landing either precedes the flip, which then
-    /// releases its ticket, or sees the node Dirty and holds nothing. The
+    /// releases its ticket, or sees the node Dirty, or Failed in a later
+    /// landing with another stamp (`Tickets::landed`), and holds nothing. The
     /// payloads it alone kept wait with the buried ones until the walk has
     /// flagged every dependent. False if the state moved first.
     #[cold]
@@ -814,7 +834,7 @@ impl<C: Cells> Runtime<C> {
     /// Notes each of `nodes` at its depth above the reading frame.
     fn note_above(
         &self,
-        nodes: impl IntoIterator<Item = ((u32, u32), u32)>,
+        nodes: impl IntoIterator<Item = Landed>,
         payload: &(dyn Any + Send),
         restorable: bool,
     ) {
@@ -828,8 +848,8 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         with_notes(|n| {
-            for (node, depth) in nodes {
-                n.push(rt, at, base + depth, node, restorable);
+            for (node, depth, stamp) in nodes {
+                n.push(rt, at, base + depth, (node, stamp), restorable);
             }
         });
     }
