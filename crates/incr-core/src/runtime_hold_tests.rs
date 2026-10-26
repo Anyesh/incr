@@ -794,3 +794,45 @@ fn local_reader_of_a_held_landing_holds_nothing_at_its_exit() {
     assert_eq!(got, b_rt.get(a) + b_rt.get(b) + b_rt.get(a) * 10);
     assert_eq!(LOCAL_RT.with(|l| l.get(r)), b_rt.get(a) * 10);
 }
+
+/// An observed node reads a cycle and then panics: under `Shared` its
+/// Failed landing is held to the end of `stabilize`'s entry, and the
+/// observer walk must take it as the node's error, as under `Local`, and
+/// go on to the next observer.
+fn stabilize_records_a_failure_that_read_a_cycle<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (a, _) = two_cycle(&rt);
+    let failing = rt.create_query(move |rt| -> i64 {
+        let v = rt.get(a);
+        assert!(v < 0, "observed after the cycle");
+        v
+    });
+    let input = rt.create_input(1_i64);
+    let after = rt.create_query(move |rt| rt.get(input) + 1);
+    let fired = Arc::new(AtomicUsize::new(0));
+    rt.observe(failing, |_| {});
+    {
+        let fired = fired.clone();
+        rt.observe(after, move |_| {
+            fired.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    let stabilized = catch_unwind(AssertUnwindSafe(|| rt.stabilize()));
+    assert!(
+        stabilized.is_ok(),
+        "stabilize raised the observed node's panic"
+    );
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert_eq!(rt.state_of(failing), NodeState::Failed);
+}
+
+#[test]
+fn local_stabilize_records_a_failure_that_read_a_cycle() {
+    stabilize_records_a_failure_that_read_a_cycle::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stabilize_records_a_failure_that_read_a_cycle() {
+    stabilize_records_a_failure_that_read_a_cycle::<Shared>();
+}
