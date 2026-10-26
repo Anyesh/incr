@@ -180,6 +180,21 @@ impl HoldSet {
         }
     }
 
+    #[cfg(debug_assertions)]
+    fn check_counts(&self) {
+        for r in &self.by_rt {
+            let live = (r.places.iter())
+                .filter(|&&(at, _)| {
+                    (self.entries.get(at)).is_some_and(|e| e.as_ref().is_some_and(|e| e.rt == r.rt))
+                })
+                .count();
+            debug_assert_eq!(
+                r.held, live,
+                "incr-core: a runtime's held count is its live entries"
+            );
+        }
+    }
+
     fn removed(&mut self, rt: RuntimeId) {
         let i = self
             .by_rt
@@ -718,6 +733,8 @@ pub(crate) struct Taken {
 /// retraction, and clears its taint.
 pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
+        #[cfg(debug_assertions)]
+        h.check_counts();
         let mut wounded = h.attempt.as_ref().is_some_and(Attempt::wounded);
         let mut taken: Vec<Held> = Vec::new();
         visited(h.by_rt.len());
