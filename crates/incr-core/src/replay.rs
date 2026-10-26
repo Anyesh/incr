@@ -22,7 +22,7 @@ use crate::deferred::Unbuilt;
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
-use crate::notes::Log;
+use crate::notes::{Cut, Landed, Log};
 use crate::state::NodeState;
 use crate::taint_memo;
 use crate::value_code;
@@ -288,14 +288,15 @@ pub(crate) struct Landings {
 enum Nodes {
     Owned(Vec<((u32, u32), u32)>),
     /// The notes of `log` the copy was taken of: its first `len` entries
-    /// but those gone before removal `epoch`, at their depths above
-    /// `base`, none deeper than `depth`.
+    /// but those gone before removal `epoch` and those `cut` took, at
+    /// their depths above `base`, none deeper than `depth`.
     Shared {
         log: Rc<RefCell<Log>>,
         len: usize,
         epoch: u64,
         base: u32,
         depth: u32,
+        cut: Option<Cut>,
     },
 }
 
@@ -303,6 +304,15 @@ impl Default for Nodes {
     fn default() -> Self {
         Nodes::Owned(Vec::new())
     }
+}
+
+/// The fields of a [`Nodes::Shared`] copy.
+pub(crate) struct SharedCopy<'a> {
+    pub(crate) log: &'a Rc<RefCell<Log>>,
+    pub(crate) len: usize,
+    pub(crate) epoch: u64,
+    pub(crate) base: u32,
+    pub(crate) cut: Option<&'a Cut>,
 }
 
 impl Landings {
@@ -331,6 +341,7 @@ impl Landings {
                 epoch,
                 base,
                 depth: top.saturating_sub(base),
+                cut: None,
             },
         }
     }
@@ -341,10 +352,11 @@ impl Landings {
             len,
             epoch,
             base,
+            cut,
             ..
         } = &self.nodes
         {
-            let nodes = log.borrow().landings(*len, *epoch, *base);
+            let nodes = log.borrow().landings(*len, *epoch, *base, cut.as_ref());
             self.nodes = Nodes::Owned(nodes);
         }
         match &mut self.nodes {
@@ -359,17 +371,23 @@ impl Landings {
         nodes.iter().any(|&(n, _)| n == node)
     }
 
-    /// The log, length, removal epoch and base of a copy that still
-    /// shares its log.
-    pub(crate) fn as_shared(&self) -> Option<(&Rc<RefCell<Log>>, usize, u64, u32)> {
+    /// A copy that still shares its log, as [`Nodes::Shared`] holds it.
+    pub(crate) fn as_shared(&self) -> Option<SharedCopy<'_>> {
         match &self.nodes {
             Nodes::Shared {
                 log,
                 len,
                 epoch,
                 base,
+                cut,
                 ..
-            } => Some((log, *len, *epoch, *base)),
+            } => Some(SharedCopy {
+                log,
+                len: *len,
+                epoch: *epoch,
+                base: *base,
+                cut: cut.as_ref(),
+            }),
             Nodes::Owned(_) => None,
         }
     }
@@ -391,11 +409,12 @@ impl Landings {
                 epoch,
                 base,
                 depth,
+                cut,
             } => {
                 *depth > 0
                     && log
                         .borrow()
-                        .landings(*len, *epoch, *base)
+                        .landings(*len, *epoch, *base, cut.as_ref())
                         .iter()
                         .any(|&(_, depth)| depth > 0)
             }
@@ -1520,16 +1539,15 @@ struct Logged {
 
 /// The events logged while reads are kept, with the indexes of those that
 /// may retire landings by position and of the landings of nodes a kept
-/// copy held, so that a kept read's catch-up skips the landings of nodes
-/// its copy does not hold, and with none since it was kept, looks at no
-/// node of its copy.
+/// copy held, by node and in log order, so that a kept read's catch-up
+/// skips the landings of nodes its copy does not hold, and with none since
+/// it was kept, looks at no node of its copy.
 #[derive(Default)]
 struct Events {
     log: Vec<Logged>,
     wide: Vec<usize>,
     landed: HashMap<(RuntimeId, (u32, u32)), Vec<usize>, FxBuildHasher>,
-    /// The latest event in `landed`.
-    last_kept: Option<usize>,
+    kept: Vec<usize>,
 }
 
 impl Events {
@@ -1540,7 +1558,7 @@ impl Events {
         }
         if let Some(n) = l.ev.node().filter(|_| l.kept) {
             self.landed.entry((l.rt, n)).or_default().push(i);
-            self.last_kept = Some(i);
+            self.kept.push(i);
         }
         self.log.push(l);
     }
@@ -1548,13 +1566,13 @@ impl Events {
     fn clear(&mut self) {
         self.log.clear();
         self.wide.clear();
+        self.kept.clear();
         // As for the copied set, a clear costs the capacity.
         if self.landed.capacity() > COPIED_KEEP {
             self.landed = HashMap::default();
         } else {
             self.landed.clear();
         }
-        self.last_kept = None;
     }
 }
 
@@ -1576,9 +1594,9 @@ fn keep(mut read: KeptRead, fresh: bool, number: bool) {
     if let Delivered::Unwind { nodes, .. } = &read.what {
         let top = read.cidx + 1 + nodes.depth();
         KEPT_TOP.with(|k| k.set(k.get().max(top)));
-        // A copy taken apart already cost its size, which its catch-up may
-        // cost again; a shared one marks only the notes no earlier copy
-        // of its log did.
+        // A shared copy marks only the notes no earlier copy of its log
+        // did; marking one taken apart would cost its size at every keep,
+        // so every landing counts as kept instead.
         if nodes.as_shared().is_some() {
             mark_in(Marks::Kept, read.rt, nodes);
         } else if !matches!(&nodes.nodes, Nodes::Owned(n) if n.is_empty()) {
@@ -1688,6 +1706,20 @@ fn mark_in(marks: Marks, rt: RuntimeId, nodes: &Landings) {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
                 for &(n, _) in nodes {
+                    mark(n);
+                }
+            }
+            // A cut copy holds less than its log up to `len`, so it marks
+            // only what it holds and leaves the watermark to uncut copies.
+            Nodes::Shared {
+                log,
+                len,
+                epoch,
+                base,
+                cut: Some(cut),
+                ..
+            } => {
+                for (n, _) in log.borrow().landings(*len, *epoch, *base, Some(cut)) {
                     mark(n);
                 }
             }
@@ -1819,7 +1851,7 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     let from = events.wide.partition_point(|&i| i < seen);
     // `(index, whether the copy held its node)`
     let mut todo: Vec<(usize, bool)> = events.wide[from..].iter().map(|&i| (i, false)).collect();
-    if events.last_kept.is_some_and(|i| i >= seen) {
+    if events.kept.last().is_some_and(|&i| i >= seen) {
         let copy = nodes.owned_nodes();
         note_work(copy.len());
         for &(n, _) in copy.iter() {
@@ -1850,6 +1882,157 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     }
 }
 
+/// Catches up the kept reads of `rt`'s frame at `cidx`, each `(read,
+/// seen)`, on the events logged since it was kept. Every event only takes
+/// landings away, and the events a copy missed take the same in any order:
+/// the landings deeper than the shallowest position one of them takes, and
+/// the nodes landed since. So a copy that shares its log keeps sharing it,
+/// with those cut ([`Cut`]), and one backward pass over the events gives
+/// every copy its cut. A copy taken apart, or one a held landing below the
+/// frame may empty, takes the events one at a time ([`catch_up`]).
+fn catch_up_frame(rt: RuntimeId, cidx: u32, reads: &mut [(KeptRead, usize)], events: &Events) {
+    let shared = |e: &KeptRead| {
+        matches!(&e.what, Delivered::Unwind { nodes, .. }
+            if matches!(&nodes.nodes, Nodes::Shared { cut: None, .. }))
+    };
+    let Some(first) = reads
+        .iter()
+        .filter(|(e, _)| shared(e))
+        .map(|(_, s)| *s)
+        .min()
+    else {
+        for (e, seen) in reads.iter_mut() {
+            catch_up(e, *seen, events);
+        }
+        return;
+    };
+    let mut landed = Landed::default();
+    // The latest landing of a node at or below the frame: a copy holding
+    // it loses every landing of another payload.
+    let mut below: Option<usize> = None;
+    let kept = &events.kept[events.kept.partition_point(|&i| i < first)..];
+    note_work(kept.len());
+    for &i in kept {
+        let l = &events.log[i];
+        if l.rt != rt {
+            continue;
+        }
+        if let Retire::Landing { cidx: at, node, .. } = l.ev {
+            landed.latest.insert(node, i);
+            landed.order.push(i);
+            if at <= cidx {
+                below = Some(i);
+            }
+        }
+    }
+    let landed = Rc::new(landed);
+    let mut order: Vec<usize> = (0..reads.len()).collect();
+    order.sort_unstable_by_key(|&k| std::cmp::Reverse(reads[k].1));
+    let wide = &events.wide[events.wide.partition_point(|&i| i < first)..];
+    note_work(wide.len());
+    let mut cuts = Cuts::default();
+    let mut next = wide.len();
+    for k in order {
+        let (e, seen) = &mut reads[k];
+        if !shared(e) || below.is_some_and(|b| b >= *seen) {
+            catch_up(e, *seen, events);
+            continue;
+        }
+        while next > 0 && wide[next - 1] >= *seen {
+            next -= 1;
+            let l = &events.log[wide[next]];
+            if l.rt == rt && (cidx < l.ev.cidx() || l.all) {
+                cuts.add(&l.ev);
+            }
+        }
+        let Delivered::Unwind { nodes, .. } = &mut e.what else {
+            unreachable!()
+        };
+        let at = cuts.position(nodes.source);
+        if at <= i64::from(cidx) {
+            nodes.nodes = Nodes::Owned(Vec::new());
+            continue;
+        }
+        let Nodes::Shared { depth, cut, .. } = &mut nodes.nodes else {
+            unreachable!()
+        };
+        let keep = u32::try_from(at - i64::from(cidx) - 1).unwrap_or(u32::MAX);
+        if keep < *depth || landed.order.last().is_some_and(|&i| i >= *seen) {
+            *depth = (*depth).min(keep);
+            *cut = Some(Cut {
+                depth: keep,
+                seen: *seen,
+                landed: Rc::clone(&landed),
+            });
+        }
+    }
+}
+
+/// The positions the events a backward pass has met take landings above,
+/// for a copy of the notes of a payload: an event takes those above its
+/// position, a containment of the copy's own payload also those at it, and
+/// a landing of another payload's those above it.
+#[derive(Default)]
+struct Cuts {
+    any: Option<i64>,
+    /// Per payload, what its events take from a copy of another payload's
+    /// notes and from a copy of its own.
+    keyed: HashMap<PayloadKey, (i64, i64), FxBuildHasher>,
+    /// The two payloads with the lowest positions for others' copies.
+    best: [Option<(i64, PayloadKey)>; 2],
+}
+
+impl Cuts {
+    fn add(&mut self, ev: &Retire) {
+        match *ev {
+            Retire::Above(at) => self.any = Some(self.any.map_or(at.into(), |a| a.min(at.into()))),
+            Retire::Contained { cidx: at, payload } => {
+                self.keyed_add(payload, i64::from(at), i64::from(at) - 1);
+            }
+            Retire::Landing {
+                cidx: at,
+                payload: Some(payload),
+                ..
+            } => self.keyed_add(payload, i64::from(at), i64::MAX),
+            Retire::Landing { payload: None, .. } => {}
+        }
+    }
+
+    fn keyed_add(&mut self, key: PayloadKey, others: i64, own: i64) {
+        let e = self.keyed.entry(key).or_insert((i64::MAX, i64::MAX));
+        e.0 = e.0.min(others);
+        e.1 = e.1.min(own);
+        let v = e.0;
+        if let Some(i) = self
+            .best
+            .iter()
+            .position(|b| b.is_some_and(|(_, k)| k == key))
+        {
+            self.best[i] = Some((v, key));
+        } else if self.best[1].is_none_or(|(b, _)| v < b) {
+            self.best[1] = Some((v, key));
+        }
+        if self.best[1].is_some_and(|(b1, _)| self.best[0].is_none_or(|(b0, _)| b1 < b0)) {
+            self.best.swap(0, 1);
+        }
+    }
+
+    /// The lowest position the events take landings above in a copy of
+    /// `source`'s notes; `i64::MAX` if none.
+    fn position(&self, source: Option<PayloadKey>) -> i64 {
+        let own = source
+            .and_then(|s| self.keyed.get(&s))
+            .map_or(i64::MAX, |e| e.1);
+        let others = self
+            .best
+            .iter()
+            .flatten()
+            .find(|(_, k)| Some(*k) != source)
+            .map_or(i64::MAX, |(v, _)| *v);
+        self.any.unwrap_or(i64::MAX).min(own).min(others)
+    }
+}
+
 /// Marks the kept reads' copies for a context that opens.
 fn mark_kept() {
     KEPT_READS.with(|d| {
@@ -1868,12 +2051,7 @@ pub(crate) fn take_kept_reads(
     ctl: *const crate::cycle::ComputeCtl,
 ) -> Vec<KeptRead> {
     let mut out = extract_kept(cidx, |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl);
-    KEPT_EVENTS.with(|v| {
-        let v = v.borrow();
-        for (e, seen) in &mut out {
-            catch_up(e, *seen, &v);
-        }
-    });
+    KEPT_EVENTS.with(|v| catch_up_frame(rt, cidx, &mut out, &v.borrow()));
     if value_code::thread_word() & value_code::KEPT_BIT == 0 {
         forget_events();
     }
@@ -2372,7 +2550,7 @@ pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + S
 /// which stays put while the box unwinds. A closure can catch a box and
 /// raise a fresh one at the freed address with no engine call between, so
 /// the key also holds the type and the text of a `&str` or `String`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PayloadKey {
     /// Every zero-sized payload's box has its type's dangling address, so
     /// only the type tells two of them apart, the engine's own unwinds

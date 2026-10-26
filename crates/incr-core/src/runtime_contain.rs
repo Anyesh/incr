@@ -649,7 +649,7 @@ impl<C: Cells> Runtime<C> {
     /// the retry's later pops retire the deeper ones as the unbounded
     /// run's do.
     pub(super) fn note_delivered(&self, nodes: Landings, payload: &(dyn Any + Send)) {
-        let Some((log, len, epoch, from_base)) = nodes.as_shared() else {
+        let Some(copy) = nodes.as_shared() else {
             self.note_above(nodes.into_nodes(), payload, false);
             return;
         };
@@ -658,7 +658,7 @@ impl<C: Cells> Runtime<C> {
             self.dep_stack.next_cidx(),
             payload_key(payload),
         );
-        with_notes(|n| n.note_copy(rt, at, base, log, len, epoch, from_base));
+        with_notes(|n| n.note_copy(rt, at, base, copy));
     }
 
     /// A delivery keeps a copy of `payload` for a frame's retry while
