@@ -822,6 +822,7 @@ impl Walk {
     /// [`Self::visit`], returning the index of the visit's own entry: the
     /// switch to exact mode can drop entries below it, so it may sit lower
     /// than the length before the visit.
+    #[inline(always)]
     fn visit_pending(&mut self, id: NodeId, generation: u32, new: bool) -> usize {
         self.visit(id, generation, new);
         self.work.len() - 1
