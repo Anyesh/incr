@@ -690,7 +690,7 @@ impl<C: Cells> Runtime<C> {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let targets = self.publication_targets(rest.as_slice());
             for (e, target) in rest.by_ref().zip(targets) {
-                stopped = Some((e.slot, target));
+                stopped = Some((e.slot, e.target));
                 self.publish_one(e, target, &mut bag, &mut stopped);
             }
         }));
@@ -930,7 +930,7 @@ impl<C: Cells> Runtime<C> {
         }
         node.set_held_mark(false);
         self.park(super::ParkPoint::HeldLanding(id));
-        let failed = (target == NodeState::Failed).then(|| {
+        let failed = (e.target == NodeState::Failed).then(|| {
             (
                 self.failed_run_token(e.slot, e.generation),
                 self.ticket_mark(),
@@ -938,8 +938,9 @@ impl<C: Cells> Runtime<C> {
         });
         let landed = self.land_now(id, node, target, e.flagged, e.unrun);
         *stopped = None;
-        // A set flagged the held Failed landing, or moved a new dep of it,
-        // as `land_failed` handles at an unheld one.
+        // A set flagged the held Failed landing, or moved a new dep of it
+        // so that it publishes lowered, as `land_failed` handles at an
+        // unheld one.
         if let Some((token, mark)) = failed.filter(|_| landed != NodeState::Failed) {
             self.park(super::ParkPoint::FailedLandedOtherwise(id));
             self.leave_failed_target(id, e.generation, token, mark, bag);
