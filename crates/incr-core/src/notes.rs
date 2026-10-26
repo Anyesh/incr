@@ -50,7 +50,40 @@ pub(crate) struct Members {
 pub(crate) struct Joined {
     pub(crate) members: Vec<Member>,
     /// As `Log::marked`.
-    pub(crate) marked: (u64, usize),
+    pub(crate) marked: Marked,
+}
+
+/// How far a set's generation has marked a list of notes: every one
+/// before `upto` still noted at removal `epoch` is in the set.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Marked {
+    generation: u64,
+    upto: usize,
+    epoch: u64,
+}
+
+impl Marked {
+    /// Where a mark of the first `len` notes still noted at removal `epoch`
+    /// for `generation` starts, moving the watermark past them. A copy
+    /// taken before a later one holds notes removed in between, which the
+    /// later one's mark left out, so it marks from the start.
+    pub(crate) fn advance(&mut self, generation: u64, len: usize, epoch: u64) -> usize {
+        if self.generation == generation && epoch >= self.epoch {
+            let from = self.upto.min(len);
+            if len > self.upto {
+                self.upto = len;
+                self.epoch = epoch;
+            }
+            from
+        } else {
+            *self = Marked {
+                generation,
+                upto: len,
+                epoch,
+            };
+            0
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,11 +120,11 @@ impl Members {
 #[derive(Default)]
 pub(crate) struct Log {
     pub(crate) entries: Vec<Noted>,
-    /// The copied set's generation and how far into `entries` it has
-    /// marked the notes copies took (`replay::mark_copied`).
-    pub(crate) marked: (u64, usize),
+    /// How far the copied set has marked the notes copies took
+    /// (`replay::mark_copied`).
+    pub(crate) marked: Marked,
     /// As `marked`, for the kept reads' copies (`replay::keep`).
-    pub(crate) kept_marked: (u64, usize),
+    pub(crate) kept_marked: Marked,
     /// The copy of this log [`Notes::note_copy`] noted last.
     renoted: Option<Renoted>,
 }

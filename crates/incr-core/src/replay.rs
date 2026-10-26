@@ -22,7 +22,7 @@ use crate::deferred::Unbuilt;
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
-use crate::notes::{Cut, Landed, Log};
+use crate::notes::{Cut, Landed, Log, Marked};
 use crate::state::NodeState;
 use crate::taint_memo;
 use crate::value_code;
@@ -1714,7 +1714,7 @@ enum Marks {
     Kept,
 }
 
-fn log_marks(log: &mut Log, marks: Marks) -> &mut (u64, usize) {
+fn log_marks(log: &mut Log, marks: Marks) -> &mut Marked {
     match marks {
         Marks::Copied => &mut log.marked,
         Marks::Kept => &mut log.kept_marked,
@@ -1757,10 +1757,7 @@ fn mark_in(marks: Marks, rt: RuntimeId, nodes: &Landings) {
                 log, len, epoch, ..
             } => {
                 let mut log = log.borrow_mut();
-                let from = match *log_marks(&mut log, marks) {
-                    (g, upto) if g == generation => upto.min(*len),
-                    _ => 0,
-                };
+                let from = log_marks(&mut log, marks).advance(generation, *len, *epoch);
                 note_work(len - from);
                 for e in log.entries[from..*len].iter().filter(|e| e.gone >= *epoch) {
                     match &e.lent {
@@ -1776,10 +1773,7 @@ fn mark_in(marks: Marks, rt: RuntimeId, nodes: &Landings) {
                         // members are new.
                         Some((members, len)) => {
                             let mut joined = members.lock();
-                            let from = match joined.marked {
-                                (g, upto) if g == generation => upto.min(*len),
-                                _ => 0,
-                            };
+                            let from = joined.marked.advance(generation, *len, *epoch);
                             note_work(len - from);
                             for m in joined.members[from..*len]
                                 .iter()
@@ -1787,11 +1781,9 @@ fn mark_in(marks: Marks, rt: RuntimeId, nodes: &Landings) {
                             {
                                 mark(m.node);
                             }
-                            joined.marked = (generation, (*len).max(from));
                         }
                     }
                 }
-                *log_marks(&mut log, marks) = (generation, (*len).max(from));
             }
         }
     });
