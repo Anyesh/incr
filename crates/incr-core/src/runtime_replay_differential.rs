@@ -4221,6 +4221,24 @@ fn two_thread_budget_cycle_group_matches_unbounded_seed() {
     });
 }
 
+/// 0xad crossed: op 16's read of 1 waited on op 15's claim of it, and the
+/// revisit of 1 counted one more walk visit than the unbounded walk makes,
+/// so its walk entered the cycle {4, 5} of recorded deps at the member
+/// the unbounded walk does not.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_entry_after_a_claim_wait_matches_unbounded_seed() {
+    let seed = 0xad;
+    let case = gen_case(seed, true, true);
+    let phases = phases(&case, seed);
+    let label = format!("seed {seed:#x}, two threads {phases:?}");
+    quiet(|| {
+        for _ in 0..20 {
+            Serial::new(&case, &phases).differential(&label, None, 0, &|_| {});
+        }
+    });
+}
+
 /// Two-thread seeds with panics or cycles whose overlapping reads, at most
 /// budgets, come out as the unbounded run of the other order: which read
 /// lands a node both read first decides which gets a closure's payload,
