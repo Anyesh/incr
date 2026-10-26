@@ -513,6 +513,14 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// [`Self::in_failed_landing`] for `slot`'s node of `generation`. The
+    /// write hold excludes a rerun, which moves the node and marks it under a
+    /// read hold.
+    pub(super) fn failed_landing_of(&self, slot: u32, generation: u32) -> bool {
+        let _t = self.tickets.write();
+        self.nodes.get(slot).generation() == generation && self.in_failed_landing(slot)
+    }
+
     /// Every landing a ticket keeps is in its Failed landing and indexed to
     /// it: every change from that landing releases it.
     fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {

@@ -4757,6 +4757,18 @@ impl<C: Cells> Runtime<C> {
         // unwind, or a `try_get` that returns it, has still read a dep that
         // did not land. The native walk computes a Dirty reader's deps
         // before its closure, so that reader never lands Clean over them.
+        // The flag goes by the node this read reads, as `unwound_poison`'s
+        // does: a walk entry's unwind can reach a read of a node above the
+        // entry, which its release landed New. A regenerating run holds a
+        // Failed node Computing, and the unbounded read sees it Failed.
+        let poison = if poison == cycle::HANDLED
+            && !cycle
+            && !self.failed_landing_of(handle.slot(), handle.generation())
+        {
+            cycle::POISONED
+        } else {
+            poison
+        };
         if poison != 0 {
             // SAFETY: the active frame's control block is live.
             unsafe { &*f.ctl }.raise(poison);
