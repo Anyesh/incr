@@ -594,7 +594,9 @@ enum Computed {
     /// planned: the node was left unrun and unclaimed, and the walk prunes
     /// its plan, or plans again if no entry has settled. From a walk, the
     /// release case: its caller reads the root again from its state now.
-    Replan,
+    /// `waited`: the attempt waited on another thread's claim or
+    /// reservation of the node first.
+    Replan { waited: bool },
     /// Another thread landed the node since the walk planned it: a claim
     /// wait ended with it Dirty or New, not released unrun, or the walk
     /// planned it New and claimed it from Dirty. The node was left unrun
@@ -701,6 +703,15 @@ pub(crate) struct Walk {
     failed_from: usize,
     /// What the walk planned under, kept when a doom stashes it.
     planned: Planned,
+    /// Whether the walk met another thread's claim or reservation that a
+    /// release may have ended, leaving states its plan expanded through:
+    /// it waited at an expansion, or before a claim that then replanned,
+    /// or revisited a node a user panic's release landed New, which its
+    /// released mark tells (a release whose union added no dep leaves no
+    /// mark and is missed). A wait that ended in any other landing does not
+    /// count: counting those let restarts on releases the walk never met
+    /// back in (0x14ea7). Carries over a resume.
+    waited: bool,
 }
 
 #[derive(Default, Clone)]
@@ -742,6 +753,7 @@ impl Walk {
             root_failed_here: false,
             failed_from: 0,
             planned: Planned::default(),
+            waited: false,
         }
     }
 
@@ -910,7 +922,8 @@ impl Walk {
     /// it Dirty), as a read that came after that landing would: where the
     /// walk enters a cycle of recorded deps depends on its visit count at
     /// the switch to exact mode, and which queued entries a Failed root
-    /// passes depends on the Failed landings since the walk began.
+    /// passes depends on the Failed landings since the walk began. No state
+    /// the new plan expands predates the releases an earlier wait is about.
     #[cold]
     #[inline(never)]
     fn restart(&mut self) {
@@ -920,6 +933,7 @@ impl Walk {
         self.repushed = None;
         self.root_failed_here = false;
         self.failed_from = cycle_state::failed_here_count();
+        self.waited = false;
     }
 
     /// Visits `id` again as a walk that never met it would, past a first
@@ -2695,7 +2709,7 @@ impl<C: Cells> Runtime<C> {
                 Computed::Doomed | Computed::Discarded => {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
-                Computed::Replan => {
+                Computed::Replan { .. } => {
                     restarts += 1;
                     observed = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
                     continue;
@@ -3501,7 +3515,7 @@ impl<C: Cells> Runtime<C> {
                 return Computed::Done;
             }
             match self.clean_walk::<0>(id, gen, word, observed, restarts) {
-                Computed::Replan => restarts += 1,
+                Computed::Replan { .. } => restarts += 1,
                 computed => return computed,
             }
         }
@@ -3637,13 +3651,15 @@ impl<C: Cells> Runtime<C> {
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
+                    walk.waited |= self.nodes.get(cur.0).released_mark();
                     if is_root {
                         walk.restart();
                     }
                     walk.revisit(cur, generation);
                     continue;
                 }
-                if !C::SINGLE_THREADED && computed == Computed::Replan {
+                if !C::SINGLE_THREADED && matches!(computed, Computed::Replan { .. }) {
+                    walk.waited |= computed == Computed::Replan { waited: true };
                     // A resumed walk does not know whether its part before
                     // the doom left a closure Unsettled, so its plan goes on
                     // past releases. A walk that left a closure Unsettled
@@ -3658,6 +3674,7 @@ impl<C: Cells> Runtime<C> {
                     let released = !resumed
                         && !ran_unsettled
                         && restarts < ROOT_RESTARTS
+                        && walk.waited
                         && self.released_since(planned)
                         && !cycle_state::holds(self.runtime_id, id.0);
                     resumed = false;
@@ -3675,7 +3692,7 @@ impl<C: Cells> Runtime<C> {
                             #[cfg(test)]
                             self.root_replans
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return Computed::Replan;
+                            return Computed::Replan { waited: true };
                         } else {
                             walk.push(Entry {
                                 id: cur,
@@ -3812,6 +3829,7 @@ impl<C: Cells> Runtime<C> {
                     // one of them may be a claim this thread holds, which
                     // only the expansion skips.
                     self.park(ParkPoint::BeforeComputeOne(cur));
+                    walk.waited = true;
                     let mut spins = 0;
                     loop {
                         spins += 1;
@@ -4134,6 +4152,7 @@ impl<C: Cells> Runtime<C> {
     ) -> Computed {
         let (node, flags) = self.nodes.get_with_flags(id.0);
         let mut spins: u32 = 0;
+        let mut waited = false;
         let mut g0 = gen;
 
         'attempt: loop {
@@ -4167,6 +4186,7 @@ impl<C: Cells> Runtime<C> {
                         self.park(ParkPoint::ComputeWaits(id));
                     }
                     spins += 1;
+                    waited = true;
                     self.wait_on_claim(id, spins);
                     continue;
                 }
@@ -4310,6 +4330,7 @@ impl<C: Cells> Runtime<C> {
             self.park(ParkPoint::BeforeReservationCheck(id));
             if self.reserved_elsewhere(id, g) {
                 self.unclaim_unrun(node, claimed_dirty);
+                waited = true;
                 self.wait_out_reservation(id, g, None, &mut spins);
                 continue;
             }
@@ -4346,7 +4367,7 @@ impl<C: Cells> Runtime<C> {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
                     self.unclaim_unrun(node, claimed_dirty);
-                    return Computed::Replan;
+                    return Computed::Replan { waited };
                 }
             }
 

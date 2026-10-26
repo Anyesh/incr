@@ -5358,7 +5358,7 @@ impl<C: Cells> Runtime<C> {
                 return Computed::Done;
             }
             match self.clean_walk::<VIRT>(id, gen, word, observed, restarts) {
-                Computed::Replan => restarts += 1,
+                Computed::Replan { .. } => restarts += 1,
                 computed => return computed,
             }
         }

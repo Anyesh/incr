@@ -5018,6 +5018,94 @@ fn walk_replans_after_an_aborted_episode() {
     });
 }
 
+/// 0x19a69's ops 2 (`Get(15)`, thread 0) and 3 (`Get(1)`, thread 1)
+/// overlap. Op 2's walk claims 7, whose compute reads 15 again, and that
+/// nested walk plans through 6; op 3 then runs the cycle 1 -> 2 -> 1,
+/// which neither walk reaches, and releases its claims before the nested
+/// walk claims 6. The plan holds over those releases: restarted from its
+/// root, the nested read panicked with the cycle where every order gave
+/// op 2 the value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_plan_holds_over_unrelated_releases() {
+    struct Hold {
+        start: AtomicU64,
+        planned: AtomicBool,
+        parked: AtomicBool,
+        released: AtomicBool,
+    }
+    let case = gen_case(0x19a69, false, true);
+    let phases = phases(&case, 0x19a69);
+    let overlap = phases.iter().position(|p| p.ops() == [2, 3]).unwrap();
+    assert_eq!(phases[overlap].of(0), Some(2));
+    let mut shaped = 0;
+    quiet(|| {
+        for _ in 0..10 {
+            let hold = Arc::new(Hold {
+                start: AtomicU64::new(0),
+                planned: AtomicBool::new(false),
+                parked: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+            });
+            // Thread 1 starts once thread 0's nested walk of 15 has
+            // planned, and that walk's claim of 6 waits for a release.
+            let rig = |live: &Live<Shared>| {
+                let (hold, world) = (hold.clone(), live.world.clone());
+                let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                let (n6, n15) = (slot(6), slot(15));
+                let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                    if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                        return;
+                    }
+                    let releases = || world.rt(0).episodes_landed.load(SeqCst) >> 32;
+                    match TWO_THREAD.with(std::cell::Cell::get) {
+                        Some(0)
+                            if p == ParkPoint::BeforeVisit(n15) && !hold.planned.load(SeqCst) =>
+                        {
+                            hold.start.store(releases(), SeqCst);
+                            hold.planned.store(true, SeqCst);
+                        }
+                        Some(0)
+                            if p == ParkPoint::AfterWalkClaim(n6)
+                                && hold.planned.load(SeqCst)
+                                && !hold.parked.swap(true, SeqCst) =>
+                        {
+                            let start = std::time::Instant::now();
+                            while start.elapsed() < std::time::Duration::from_millis(1000) {
+                                if releases() > hold.start.load(SeqCst) {
+                                    hold.released.store(true, SeqCst);
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
+                        Some(1) => until(|| hold.planned.load(SeqCst)),
+                        _ => {}
+                    }
+                });
+                assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+            };
+            let serial = Serial::new(&case, &phases);
+            let verdict = Mutex::new(None);
+            let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+                let v = serial.at_overlap("0x19a69", prefix, live);
+                let stop = p == overlap || v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            if !hold.released.load(SeqCst) {
+                continue;
+            }
+            shaped += 1;
+            serial.check("0x19a69", &got, verdict.into_inner().unwrap());
+        }
+    });
+    assert!(
+        shaped > 0,
+        "no release reached op 2's walk between its plan and a claim"
+    );
+}
+
 /// 0x1006's ops 6 (`Get(12)`) and 7 (`Get(7)`) overlap on the cold cycle
 /// 8 -> 9 -> 10 -> 11 -> 12 -> 8, whose strategy members are 11 and 12.
 /// Op 7 enters it at 8, which has none, so 7's `try_get(4)` gets the
