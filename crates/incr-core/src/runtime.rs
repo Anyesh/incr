@@ -4060,11 +4060,6 @@ impl<C: Cells> Runtime<C> {
             // dirtied our deps yet would let us verify Clean past it (B6).
             let stamp_rev = self.current_revision();
             let mut verify_rev = C::walked(&self.walk, &self.revision);
-            let reshapes = if MODE & VIRT != 0 {
-                C::u64_load_acquire(&self.reshapes)
-            } else {
-                0
-            };
 
             let mut adopted_panic = None;
             if C::u32_load_relaxed(&self.stash_count) != 0 && !matches!(visit, Visit::VerifyOnly(_))
@@ -4168,6 +4163,11 @@ impl<C: Cells> Runtime<C> {
             // A `verified_at` of 0 means never verified, and an empty slot
             // may sit behind it, so it always fails; a memo reads as 0.
             if verifying {
+                let reshapes = if MODE & VIRT != 0 {
+                    C::u64_load_acquire(&self.reshapes)
+                } else {
+                    0
+                };
                 let my_verified = node.verified_at();
                 let mut any_changed = my_verified == 0;
                 node.for_each_dep(|dep| {
@@ -4249,6 +4249,9 @@ impl<C: Cells> Runtime<C> {
                         | if speculative { cycle::SPECULATIVE } else { 0 },
                     self.keep_resolver_ptr(),
                 );
+                if speculative {
+                    ctl.reshapes.set(C::u64_load_acquire(&self.reshapes));
+                }
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
                 if MODE & VIRT != 0 {
@@ -4291,7 +4294,6 @@ impl<C: Cells> Runtime<C> {
                         cidx,
                         stamp_rev,
                         verify_rev,
-                        reshapes,
                     };
                     if let Err(payload) = &result {
                         if word & value_code::UNWIND_MASK != 0 {
@@ -4323,7 +4325,6 @@ impl<C: Cells> Runtime<C> {
                             cidx,
                             stamp_rev,
                             verify_rev,
-                            reshapes,
                         };
                         return self.discard_doomed(id, attempt, &ctl, Some(payload), bag);
                     }
@@ -4337,7 +4338,6 @@ impl<C: Cells> Runtime<C> {
                                 cidx,
                                 stamp_rev,
                                 verify_rev,
-                                reshapes,
                             },
                             &ctl,
                             &deps,
@@ -4354,7 +4354,6 @@ impl<C: Cells> Runtime<C> {
                         cidx,
                         stamp_rev,
                         verify_rev,
-                        reshapes,
                     };
                     if ctl.has(cycle::DOOMED) {
                         return self.discard_doomed(id, attempt, &ctl, None, bag);

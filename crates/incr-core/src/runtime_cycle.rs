@@ -30,9 +30,6 @@ pub(super) struct Attempt {
     pub(super) cidx: u32,
     pub(super) stamp_rev: u64,
     pub(super) verify_rev: u64,
-    /// `Runtime::reshapes` at the claim, which a stash of the run holds at;
-    /// unused by the landings that build an attempt after the run.
-    pub(super) reshapes: u64,
 }
 
 /// What cutting an episode to its root's SCC did.
@@ -1923,7 +1920,6 @@ impl<C: Cells> Runtime<C> {
                 cidx,
                 stamp_rev,
                 verify_rev,
-                reshapes: C::u64_load_acquire(&self.reshapes),
             };
             if discarding {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
@@ -2408,7 +2404,6 @@ impl<C: Cells> Runtime<C> {
                 cidx,
                 stamp_rev,
                 verify_rev,
-                reshapes: C::u64_load_acquire(&self.reshapes),
             };
             if e.failed && !e.wrote {
                 let (node, flags) = self.nodes.get_with_flags(*m);

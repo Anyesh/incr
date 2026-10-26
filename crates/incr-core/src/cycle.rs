@@ -444,6 +444,9 @@ pub struct ComputeCtl {
     /// The frame's runtime's [`KeepResolver`], or null for a frame that
     /// settles its keeping when it is pushed or keeps nothing.
     keep: *const KeepResolver,
+    /// `Runtime::reshapes` as a speculative run of the frame began, which
+    /// its stash holds at.
+    pub(crate) reshapes: Cell<u64>,
 }
 
 /// Lives inside its runtime and answers whether a frame of node `slot` of
@@ -470,6 +473,7 @@ impl ComputeCtl {
             wrote: Cell::new(0),
             children: Cell::new(std::ptr::null()),
             keep,
+            reshapes: Cell::new(0),
         }
     }
 

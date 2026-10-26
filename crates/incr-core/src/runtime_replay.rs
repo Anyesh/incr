@@ -399,7 +399,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 verify_rev: attempt.verify_rev,
                 index,
-                reshapes: attempt.reshapes,
+                reshapes: ctl.reshapes.get(),
             },
             attempt.stamp_rev,
         );
@@ -922,7 +922,7 @@ impl<C: Cells> Runtime<C> {
                 deps: deps.to_vec(),
                 verify_rev: attempt.verify_rev,
                 index,
-                reshapes: attempt.reshapes,
+                reshapes: ctl.reshapes.get(),
             },
             attempt.stamp_rev,
         );
@@ -4331,7 +4331,6 @@ impl<C: Cells> Runtime<C> {
                 cidx,
                 stamp_rev,
                 verify_rev: C::walked(&self.walk, &self.revision),
-                reshapes: C::u64_load_acquire(&self.reshapes),
             };
             self.land_failed(
                 id,
