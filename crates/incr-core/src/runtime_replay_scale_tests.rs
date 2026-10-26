@@ -1078,10 +1078,10 @@ fn shared_caught_fan_over_deep_chain_stays_linear() {
 /// read. `through` puts a query between the frame and each panicking
 /// one, so every copy also holds landings a level deeper, which each
 /// later caught panic's landings take from it.
-fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool) -> u64 {
+fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool, frames: u32, len: usize) -> u64 {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
-    rt.set_max_frames(256);
+    rt.set_max_frames(frames);
     let failing: Vec<Incr<u64>> = (0..n)
         .map(|_| {
             let f = rt.create_query_with(|_| -> u64 { panic!("fan") }, replayable());
@@ -1092,7 +1092,7 @@ fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool) -> u64 {
             }
         })
         .collect();
-    let top = chain(&rt, 600).nodes[0];
+    let top = chain(&rt, len).nodes[0];
     let reader = rt.create_query_with(
         move |rt| {
             let caught = failing
@@ -1104,19 +1104,21 @@ fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool) -> u64 {
         replayable(),
     );
     crate::replay::take_note_work();
-    assert_eq!(rt.get(reader), n + 600);
+    assert_eq!(rt.get(reader), n + len as u64);
     assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
     crate::replay::take_note_work()
 }
 
 fn same_text_fan_over_chain_stays_linear<C: Cells>(through: bool) {
-    let sizes: &[u64] = if cfg!(miri) {
-        &[8]
+    // Below about 1000 panics the chain's own notes take a share of the
+    // bound that only a shorter chain under a smaller budget leaves room for.
+    let (frames, len, sizes): (u32, usize, &[u64]) = if cfg!(miri) {
+        (8, 24, &[128])
     } else {
-        &[1000, 4000, 16000]
+        (256, 600, &[1000, 4000, 16000])
     };
     for &n in sizes {
-        let work = same_text_fan_over_chain::<C>(n, through);
+        let work = same_text_fan_over_chain::<C>(n, through, frames, len);
         assert!(
             work <= 24 * n,
             "{work} units of note work for {n} caught panics of one text, through={through}"
