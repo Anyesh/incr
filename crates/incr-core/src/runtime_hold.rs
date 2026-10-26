@@ -798,11 +798,14 @@ impl<C: Cells> Runtime<C> {
     /// Dirty, as does a Failed one over a new dep moved since its run, and
     /// so does every Clean landing that reads one lowered so,
     /// transitively, while a Dirty one's memo is dropped, as the set's
-    /// flag would have done: the set's walk reached none of them.
+    /// flag would have done: the set's walk reached none of them. A Failed
+    /// landing that reads one lowered because a dep moved lands Dirty too,
+    /// as the walk would have flipped it.
     fn publication_targets(&self, entries: &[Held]) -> Vec<NodeState> {
         let mut targets: Vec<NodeState> = entries.iter().map(|e| e.target).collect();
         let mut held: Option<Targets> = None;
         let mut lowered: Vec<usize> = Vec::new();
+        let mut moved: Vec<bool> = vec![false; entries.len()];
         for (i, e) in entries.iter().enumerate() {
             if e.read.is_empty() {
                 continue;
@@ -823,6 +826,10 @@ impl<C: Cells> Runtime<C> {
                     !self.settled_at_publication(d, held, rev)
                 }
             }) {
+                moved[i] = failed
+                    || e.read
+                        .iter()
+                        .any(|&(d, _)| self.moved_since_read(d, held, rev));
                 lowered.push(i);
             }
         }
@@ -848,13 +855,23 @@ impl<C: Cells> Runtime<C> {
         while let Some(j) = lowered.pop() {
             for &i in &readers[j] {
                 let node = self.nodes.get(entries[i].slot);
+                let flips = moved[j] && !moved[i];
                 match targets[i] {
                     NodeState::Clean => {
                         targets[i] = NodeState::Dirty;
+                        moved[i] = moved[j];
                         lowered.push(i);
                     }
-                    NodeState::Dirty if node.keeps_memo() => {
-                        node.set_verified_at(0);
+                    NodeState::Failed if moved[j] => {
+                        targets[i] = NodeState::Dirty;
+                        moved[i] = true;
+                        lowered.push(i);
+                    }
+                    NodeState::Dirty if node.keeps_memo() || flips => {
+                        if node.keeps_memo() {
+                            node.set_verified_at(0);
+                        }
+                        moved[i] |= moved[j];
                         lowered.push(i);
                     }
                     _ => {}
