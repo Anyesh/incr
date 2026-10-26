@@ -887,10 +887,8 @@ fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
     };
     for &n in sizes {
         let (first, work) = contained_chain::<C>(frames, n);
-        // At a budget of 1 the first read's note work is still quadratic,
-        // a known limitation this bound leaves out.
         assert!(
-            frames.is_some() || first <= 16 * n as u64,
+            first <= 16 * n as u64,
             "{frames:?}: {first} units of note work for a {n}-chain's first read"
         );
         assert!(
@@ -918,6 +916,26 @@ fn local_contained_chain_stays_linear_at_budget_1() {
 #[test]
 fn shared_contained_chain_stays_linear_at_budget_1() {
     on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
+}
+
+#[test]
+fn local_contained_chain_stays_linear_at_budget_2() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(2)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_2() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(2)));
+}
+
+#[test]
+fn local_contained_chain_stays_linear_at_budget_16() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(16)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_16() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(16)));
 }
 
 /// A chain of `n` replayable queries at budget `frames`, where each level
