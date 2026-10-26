@@ -2756,7 +2756,7 @@ impl<C: Cells> Runtime<C> {
                     self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
                 self.release_group_claims(
                     &claimed,
-                    !took && !virtual_member && !is_computing(seen),
+                    !took && !virtual_member && seen != NodeState::Dirty && !is_computing(seen),
                 );
                 return GroupEnd::Ordinary;
             }
