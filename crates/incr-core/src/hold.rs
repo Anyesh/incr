@@ -858,7 +858,7 @@ pub(crate) fn take_visits() -> usize {
 }
 
 /// How many nodes this thread holds now.
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 pub(crate) fn held_count() -> usize {
     with(|h| h.by_cell.len())
 }
