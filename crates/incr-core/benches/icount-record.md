@@ -2336,8 +2336,11 @@ data at 4).
 `w/T10-queued-scan` (tip `90bb837e`, on `c87e7bd4`) stops counting every
 entry a replay context queues: the count map is built when a `Shared`
 reservation's end first asks `Context::queues`, and kept in step only from
-then on, by cold out-of-line updates. Local contexts never build it. Scale
-icount by `gh-scale-icount.sh c87e7bd4b 90bb837e6` (gh-cmd
+then on, by cold out-of-line updates. Local contexts never build it. Hard
+gates by `icount.sh` on this box, `65ce8fa5` against `c87e7bd4`:
+`get_clean_local` 100, `get_clean_shared` 193, `table_hit_local` 155.14,
+`table_hit_shared` 218.14 and `value_slot_read_shared` 87 on both, exact.
+Scale icount by `gh-scale-icount.sh c87e7bd4b 90bb837e6` (gh-cmd
 `90bb837e-d51efe`, all 58 rows ran), ratios tip over base:
 
 | workload | ratio |
@@ -2354,11 +2357,22 @@ icount by `gh-scale-icount.sh c87e7bd4b 90bb837e6` (gh-cmd
 - The two `Local` rows above base are glibc heap state, not engine work
   (callgrind, gh-cmds `90bb837e-0f9bfa`, `90bb837e-07cd0c`,
   `90bb837e-3b644f`): `incr_core` self cost falls on both
-  (`panicking_chain` 10,084.2M against 10,085.0M), and the rise sits in
-  `_int_malloc` and `malloc_consolidate` under `Context::take_unwind`
-  (+113M over the same 4000 calls) while frees fall 101M. With
+  (`panicking_chain` 10,084.2M against 10,085.0M). `Context::take_unwind`
+  rises 113M net inclusive over the same 4000 calls: its malloc callees
+  rise about 183M (`_int_malloc` +168M, `malloc_consolidate` +15M) against
+  falling frees (`_int_free_maybe_consolidate` -101M, all of `free` -106M).
+  With
   `GLIBC_TUNABLES=glibc.malloc.tcache_count=0` the tip is below base on
   both rows; with fastbins off as well it is 0.06% and 0.03% above.
-- The other `Local` rows above 1.0 are within 0.03%.
+- The other `Local` rows above 1.0 are not the change either (callgrind,
+  gh-cmds `65ce8fa5-8a39ee` and `65ce8fa5-c6a900`, against `c87e7bd4`).
+  `local_contained_chain_stays_linear_at_budget_1` runs below base under
+  callgrind in every allocator setting (default 36,301.6M against
+  36,360.6M), with `incr_core` self cost 1.4M lower. The three foreign-read
+  rows have identical `incr_core` self cost, so the `Local` push, drop and
+  truncate `Option` checks cost them nothing; each is a constant ~1.1k
+  instructions up in every allocator setting, all of it in the dynamic
+  loader's relocations and libtest's handling of a test list four tests
+  longer (`TestDesc::clone`, `filter_tests`, the list's collect and drop).
 - `Shared` rows that end reservations pay for the built map's cold
   updates, up to 0.4%.
