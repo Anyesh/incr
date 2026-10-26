@@ -1157,6 +1157,44 @@ fn shared_unwind_landings_are_held_until_a_wound_retracts_them() {
     assert_eq!(crate::hold::held_count(), 0);
 }
 
+/// `d` catches `f`'s panic, so its attempt holds `f`'s Failed landing, and
+/// then joins a thread that reads `f`. The reader waits on the held landing
+/// while `d`'s thread waits on the reader in user code, where no claim wait
+/// shows: the reader takes the landing over, wounding `d`'s attempt, and
+/// both finish with what a single thread reads.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_holder_joining_a_reader_of_its_held_panic_landing_finishes() {
+    let rt = Runtime::<Shared>::new();
+    let x = rt.create_input(0_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        assert!(v % 2 == 1, "even");
+        v
+    });
+    let joined = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let d = {
+        let joined = joined.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10);
+            let failed = std::thread::scope(|s| {
+                s.spawn(|| catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err())
+                    .join()
+                    .unwrap()
+            });
+            joined.lock().unwrap().push(failed);
+            v
+        })
+    };
+    assert_eq!(rt.get(d), 7);
+    assert!(joined.lock().unwrap().iter().all(|&failed| failed));
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(crate::waits::registered(), 0);
+    rt.set(x, 1);
+    assert_eq!(rt.get(d), 10);
+}
+
 /// The thread's state after a caught wound: whether it held, and what
 /// the read after it raised.
 type AfterWound = Arc<std::sync::Mutex<Option<(bool, Option<String>)>>>;
