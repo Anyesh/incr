@@ -1842,6 +1842,14 @@ fn stashed_clean_read_after_set<A: Cells, B: Cells>(budget: bool) -> (u64, u32) 
     (r1.get(leaf), runs.load(Ordering::Relaxed))
 }
 
+/// The stash tests' values and leaf runs for Local and Shared readers: the
+/// budget's extra run is the speculative one off the placeholder, which a
+/// Shared doomed frame does not make, as it unwinds there.
+fn stashed_leaf_runs(budget: bool) -> [(u64, u32); 4] {
+    let local = if budget { 2 } else { 1 };
+    [(2000, local), (2000, local), (2000, 1), (2000, 1)]
+}
+
 #[test]
 fn stashed_clean_read_is_not_adopted_after_a_set() {
     for budget in [false, true] {
@@ -1851,11 +1859,7 @@ fn stashed_clean_read_is_not_adopted_after_a_set() {
             stashed_clean_read_after_set::<Shared, Local>(budget),
             stashed_clean_read_after_set::<Shared, Shared>(budget),
         ];
-        // The budget's extra run is the speculative one off the placeholder,
-        // which a Shared doomed frame does not make: it unwinds there.
-        let leaf_runs = if budget { 2 } else { 1 };
-        let want = [(2000, leaf_runs), (2000, leaf_runs), (2000, 1), (2000, 1)];
-        assert_eq!(runs, want, "{budget}");
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
     }
 }
 
@@ -1914,11 +1918,7 @@ fn retry_set_before_stashed_read_is_seen() {
             retry_set_before_stashed_read::<Shared, Local>(budget),
             retry_set_before_stashed_read::<Shared, Shared>(budget),
         ];
-        // The budget's extra run is the speculative one off the placeholder,
-        // which a Shared doomed frame does not make: it unwinds there.
-        let leaf_runs = if budget { 2 } else { 1 };
-        let want = [(2000, leaf_runs), (2000, leaf_runs), (2000, 1), (2000, 1)];
-        assert_eq!(runs, want, "{budget}");
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
     }
 }
 
@@ -1990,11 +1990,7 @@ fn stashed_read_under_other_context_sees_the_set() {
             stashed_read_under_other_context::<Shared, Local>(budget),
             stashed_read_under_other_context::<Shared, Shared>(budget),
         ];
-        // The budget's extra run is the speculative one off the placeholder,
-        // which a Shared doomed frame does not make: it unwinds there.
-        let leaf_runs = if budget { 2 } else { 1 };
-        let want = [(2000, leaf_runs), (2000, leaf_runs), (2000, 1), (2000, 1)];
-        assert_eq!(runs, want, "{budget}");
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
     }
 }
 
