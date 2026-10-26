@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::Cycle;
+use crate::cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
 use crate::handle::Incr;
 use crate::state::NodeState;
 
@@ -157,6 +157,38 @@ fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
     rt.assert_invariant_i();
 }
 
+/// Reads `p`, whose landing is held, with its publication panicking at the
+/// first other landing it publishes, where a child sweep's caught panic
+/// resumes.
+fn panic_publishing_before(rt: &Runtime<Shared>, p: Incr<i64>) {
+    let armed = Arc::new(AtomicBool::new(true));
+    let p_first = Arc::new(AtomicBool::new(false));
+    let hook: super::ParkHook = {
+        let (armed, p_first) = (armed.clone(), p_first.clone());
+        Box::new(move |point| {
+            let super::ParkPoint::HeldPublished(id) = point else {
+                return;
+            };
+            if !armed.load(Ordering::SeqCst) {
+                return;
+            }
+            if id == super::NodeId(p.slot()) {
+                p_first.store(true, Ordering::SeqCst);
+                return;
+            }
+            armed.store(false, Ordering::SeqCst);
+            panic!("a held publication panicked on purpose");
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
+    assert!(panic_message(err).contains("on purpose"));
+    assert!(
+        !p_first.load(Ordering::SeqCst),
+        "p published before the panic"
+    );
+}
+
 /// A held publication panics after its first landing, as a child sweep's
 /// caught panic resumes there. p, still to land, had dropped o for n, and
 /// publication had already moved its reverse edges: giving p back moves
@@ -184,35 +216,9 @@ fn shared_held_publication_panic_gives_back_the_moved_edges() {
     );
     let p = rt.create_query(move |rt| rt.get(a) + if rt.get(s) { rt.get(n) } else { rt.get(o) });
     rt.get(p);
-    let armed = Arc::new(AtomicBool::new(false));
-    let p_first = Arc::new(AtomicBool::new(false));
-    let hook: super::ParkHook = {
-        let (armed, p_first) = (armed.clone(), p_first.clone());
-        Box::new(move |point| {
-            let super::ParkPoint::HeldPublished(id) = point else {
-                return;
-            };
-            if !armed.load(Ordering::SeqCst) {
-                return;
-            }
-            if id == super::NodeId(p.slot()) {
-                p_first.store(true, Ordering::SeqCst);
-                return;
-            }
-            armed.store(false, Ordering::SeqCst);
-            panic!("a held publication panicked on purpose");
-        })
-    };
-    assert!(rt.park_hook.set(hook).is_ok());
     rt.set(s, true);
     rt.set(t, 2);
-    armed.store(true, Ordering::SeqCst);
-    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
-    assert!(panic_message(err).contains("on purpose"));
-    assert!(
-        !p_first.load(Ordering::SeqCst),
-        "p published before the panic"
-    );
+    panic_publishing_before(&rt, p);
     assert!(rt.has_reverse_edge(o, p), "o lost its edge to p");
     assert!(!rt.has_reverse_edge(n, p), "phantom edge on n");
     rt.assert_invariant_i();
@@ -222,6 +228,61 @@ fn shared_held_publication_panic_gives_back_the_moved_edges() {
     assert_eq!(rt.get(p), rt.get(a) + 15, "a set of o missed p");
     assert!(rt.try_delete_node(n).is_ok());
     rt.assert_invariant_i();
+}
+
+/// a and b iterate to a fixpoint from 0, a ending at t and b at a.
+fn fixpoint_pair<C: Cells>(rt: &Runtime<C>, t: Incr<i64>) -> (Incr<i64>, Incr<i64>) {
+    let opts = || QueryOpts {
+        cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+        ..QueryOpts::default()
+    };
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let _ = rt.get(*bc.get().unwrap());
+                rt.get(t)
+            },
+            opts(),
+        )
+    };
+    let b = rt.create_query_with(move |rt| rt.get(a), opts());
+    bc.set(b).unwrap();
+    (a, b)
+}
+
+/// A held publication panics after one member of a cycle published over
+/// the other, which it gives back. Once t goes back to its old value, a
+/// read of either member first returns what a fresh runtime does, not the
+/// published member's value from the given-back member's held one.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_rereads_over_a_given_back_landing() {
+    let local = Runtime::<Local>::new();
+    let t = local.create_input(1_i64);
+    let (a, b) = fixpoint_pair(&local, t);
+    let want = (local.get(a), local.get(b));
+    for a_first in [true, false] {
+        let rt = Runtime::<Shared>::new();
+        let t = rt.create_input(1_i64);
+        let (a, b) = fixpoint_pair(&rt, t);
+        let p = rt.create_query(move |rt| rt.get(a) + rt.get(b));
+        rt.get(p);
+        rt.set(t, 2);
+        panic_publishing_before(&rt, p);
+        rt.assert_invariant_i();
+        rt.set(t, 1);
+        let got = if a_first {
+            (rt.get(a), rt.get(b))
+        } else {
+            let b = rt.get(b);
+            (rt.get(a), b)
+        };
+        assert_eq!(got, want, "a first: {a_first}");
+        assert_eq!(rt.get(p), want.0 + want.1);
+        rt.assert_invariant_i();
+    }
 }
 
 /// a (Fallback) and b read each other, counting their runs.
