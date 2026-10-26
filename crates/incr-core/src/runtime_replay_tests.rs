@@ -3097,7 +3097,15 @@ fn lookup_ticket_shape<C: Cells>(
 /// Every budget gives what the unbounded run gives for
 /// `lookup_ticket_shape`, which takes the walk's payload: 205 for the
 /// table miss, and 201 for the other lookups, made before their flip.
+/// Under Miri a slice of the shapes, in which each lookup still holds a
+/// reader of b past the budget.
 fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
+    let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
+    let (outers, mids, chains, budgets): (&[u32], &[u32], &[u32], _) = if cfg!(miri) {
+        (&[0, 3], &[1], &[2], 1..3)
+    } else {
+        (&[0, 1, 3, 8], &[0, 1, 3], &[0, 2, 6], 1..9)
+    };
     let mut differ = Vec::new();
     for (lookup, payload) in [
         (Lookup::ForeignTable, 205_u64),
@@ -3116,9 +3124,10 @@ fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
         (Lookup::SortedSnapshot, 201),
         (Lookup::SortedLen, 201),
     ] {
-        for outer in [0, 1, 3, 8] {
-            for mid in [0, 1, 3] {
-                for chain in [0, 2, 6] {
+        let before = holds();
+        for &outer in outers {
+            for &mid in mids {
+                for &chain in chains {
                     let want = lookup_ticket_shape::<C>(lookup, u32::MAX, outer, mid, chain);
                     assert_eq!(
                         want,
@@ -3126,7 +3135,7 @@ fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
                         "the unbounded run did not take the walk's payload: \
                          {lookup:?} outer={outer} mid={mid} chain={chain}"
                     );
-                    for frames in 1..9 {
+                    for frames in budgets.clone() {
                         let got = lookup_ticket_shape::<C>(lookup, frames, outer, mid, chain);
                         if got != want {
                             differ.push(format!(
@@ -3138,6 +3147,10 @@ fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
                 }
             }
         }
+        assert!(
+            holds() > before,
+            "{lookup:?}: no reader of b was held past the budget"
+        );
     }
     assert!(
         differ.is_empty(),
