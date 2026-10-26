@@ -117,6 +117,24 @@ pub(crate) struct GroupInfo {
 }
 
 impl<C: Cells> Inner<C> {
+    /// Sets `slot`'s group record, or removes it for `None`. Under
+    /// `Shared` the thread notes the record it left there, so that a claim
+    /// of a group entry tells another thread's change from its own.
+    pub(crate) fn set_member_rec(
+        &mut self,
+        rt: RuntimeId,
+        slot: u32,
+        rec: Option<Arc<GroupInfo>>,
+    ) -> Option<Arc<GroupInfo>> {
+        if !C::SINGLE_THREADED {
+            cycle_state::note_rec_left(rt, slot, rec.clone());
+        }
+        match rec {
+            Some(r) => self.member_recs.insert(slot, r),
+            None => self.member_recs.remove(&slot),
+        }
+    }
+
     fn new() -> Self {
         Self {
             compute_fns: SlotVec::new(),
@@ -654,8 +672,8 @@ enum Seen {
     Dirty,
     New,
     /// The member a group expansion stood for, with the record it expanded
-    /// (null if the walk forgot it): a plan that holds only while that
-    /// record stands.
+    /// (null if the walk forgot it): a plan that holds until another thread
+    /// changes the member's record.
     Group(*const GroupInfo),
 }
 
@@ -2444,7 +2462,7 @@ impl<C: Cells> Runtime<C> {
             None
         };
         if bits & IN_GROUP != 0 {
-            inner.member_recs.remove(&slot);
+            inner.set_member_rec(self.runtime_id, slot, None);
         }
         self.set_released(inner, slot, node, None);
         let children = if bits & HAS_INDEX != 0 {
@@ -4055,10 +4073,19 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn expand_group(&self, cur: NodeId, walk: &mut Walk) -> bool {
-        let generation = self.nodes.get(cur.0).generation();
-        let Some(group) = self.standing_group(cur, generation) else {
+        let group = self.inner.read().member_recs.get(&cur.0).cloned();
+        let Some(group) = group else {
             return false;
         };
+        let generation = self.nodes.get(cur.0).generation();
+        if !group
+            .members
+            .iter()
+            .any(|&(m, g)| m == cur.0 && g == generation)
+            || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
+        {
+            return false;
+        }
         let groups = &mut walk.expanded.get_or_insert_with(Box::default).groups;
         // A member keeps the first record expanded at it, which its marked
         // entry's claim checks: a replaced record is replanned there, not
@@ -4096,16 +4123,17 @@ impl<C: Cells> Runtime<C> {
         true
     }
 
-    /// The group record `id` is a member of at `generation`, unless a
-    /// landing took it out or this thread dissolved the group.
-    fn standing_group(&self, id: NodeId, generation: u32) -> Option<Arc<GroupInfo>> {
-        let group = self.inner.read().member_recs.get(&id.0).cloned()?;
-        (group
-            .members
-            .iter()
-            .any(|&(m, g)| m == id.0 && g == generation)
-            && !cycle_state::is_dissolved_group(self.runtime_id, id.0, &group))
-        .then_some(group)
+    /// Whether another thread changed `id`'s group record since the walk
+    /// expanded `expanded` at it. This thread's own changes are the walk's
+    /// to carry on through, as under `Local`.
+    #[cold]
+    #[inline(never)]
+    fn group_replaced_elsewhere(&self, id: NodeId, expanded: *const GroupInfo) -> bool {
+        let current = self.inner.read().member_recs.get(&id.0).cloned();
+        !current
+            .as_ref()
+            .is_some_and(|r| std::ptr::eq(Arc::as_ptr(r), expanded))
+            && !cycle_state::left_rec(self.runtime_id, id.0, current.as_ref())
     }
 
     /// A root the taint memo holds, computed without a walk. Out of line
@@ -4391,11 +4419,7 @@ impl<C: Cells> Runtime<C> {
             // after any wait the walk made, and the plan then never expanded
             // the deps of the members that record does not hold.
             if let Seen::Group(expanded) = seen {
-                if C::u8_load_relaxed(flags) & IN_GROUP == 0
-                    || !self
-                        .standing_group(id, g)
-                        .is_some_and(|group| std::ptr::eq(Arc::as_ptr(&group), expanded))
-                {
+                if self.group_replaced_elsewhere(id, expanded) {
                     self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Revisit;
                 }
@@ -5471,7 +5495,7 @@ impl<C: Cells> Runtime<C> {
                 in_group,
             );
         }
-        inner.member_recs.remove(&id.0);
+        inner.set_member_rec(self.runtime_id, id.0, None);
         C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !IN_GROUP);
     }
 
@@ -6132,7 +6156,7 @@ impl<C: Cells> Runtime<C> {
             cycle: Cycle::new(members.to_vec()),
         });
         for m in members {
-            inner.member_recs.insert(m.slot(), group.clone());
+            inner.set_member_rec(self.runtime_id, m.slot(), Some(group.clone()));
             let flags = self.nodes.get_with_flags(m.slot()).1;
             C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
         }
