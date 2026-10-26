@@ -4827,7 +4827,7 @@ impl<C: Cells> Runtime<C> {
                 payload
             }
         };
-        if cycle_state::wounded() {
+        if cycle_state::wounded() && !std::thread::panicking() {
             drop(payload);
             self.raise_wound();
         }

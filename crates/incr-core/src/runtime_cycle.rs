@@ -292,8 +292,10 @@ impl<C: Cells> Runtime<C> {
             cycle_panic(cycle);
         }
         // A closure that swallowed its wound reads on; its cycle must not
-        // take the wound's place in flight, or a catch returns it.
-        if cycle_state::wounded() {
+        // take the wound's place in flight, or a catch returns it. A drop
+        // the wound's own unwind runs gets the cycle: a raise there aborts,
+        // and `caught` puts the wound back.
+        if cycle_state::wounded() && !std::thread::panicking() {
             self.raise_wound();
         }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
@@ -434,9 +436,12 @@ impl<C: Cells> Runtime<C> {
             self.await_winner();
             return None;
         }
-        if cycle_state::wounded() {
-            // A nested `try_get` returns nothing to a wounded thread: the
-            // wound unwinds on to the outermost entry, whatever came out.
+        // What a nested `try_get` caught is no result for a wounded thread:
+        // the wound unwinds on to the outermost entry, unless a drop of the
+        // wound's own unwind made the read. A cycle `try_get` returns without
+        // an unwind leaves the kind Wound, so the closure's pop raises it.
+        let wounded = !outermost && cycle_state::wounded();
+        if wounded && !std::thread::panicking() {
             drop(payload);
             self.raise_wound();
         }
@@ -457,6 +462,9 @@ impl<C: Cells> Runtime<C> {
                     Err(payload) => resume_unwind(payload),
                 };
                 if kind == ReadKind::TryGet {
+                    if wounded {
+                        cycle_state::set_unwind_kind(Some(UnwindKind::Wound));
+                    }
                     return Some(cycle);
                 }
                 cycle_panic(cycle);
