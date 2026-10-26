@@ -505,7 +505,9 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
         let mut taken: Vec<Held> = Vec::new();
         if let Some(i) = h.by_rt.iter().position(|r| r.0 == rt) {
-            for (at, cell) in h.by_rt.swap_remove(i).1 {
+            let places = h.by_rt.swap_remove(i).1;
+            visited(places.len());
+            for (at, cell) in places {
                 if let Some(e) = h.entries[at].take() {
                     h.by_cell.remove(&cell);
                     taken.push(e);
@@ -547,7 +549,10 @@ pub(crate) fn holds_runtime(rt: RuntimeId) -> bool {
         && with(|h| {
             h.tainted.contains(&rt)
                 || h.closed.contains(&rt)
-                || h.by_rt.iter().any(|r| r.0 == rt)
+                || {
+                    visited(h.by_rt.len());
+                    h.by_rt.iter().any(|r| r.0 == rt)
+                }
                 || h.cut_recs.iter().any(|c| c.rt == rt)
         })
 }
@@ -578,6 +583,25 @@ pub(crate) fn closed(rt: RuntimeId) -> bool {
 
 pub(crate) fn tainted(rt: RuntimeId) -> bool {
     active() && with(|h| h.tainted.contains(&rt))
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts places a runtime's check or take went over, for tests.
+fn visited(n: usize) {
+    #[cfg(all(test, not(loom)))]
+    VISITS.with(|v| v.set(v.get() + n));
+    #[cfg(not(all(test, not(loom))))]
+    let _ = n;
+}
+
+/// The places [`visited`] counted on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_visits() -> usize {
+    VISITS.with(|v| v.replace(0))
 }
 
 /// How many nodes this thread holds now.
