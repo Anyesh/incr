@@ -75,6 +75,10 @@ struct Word {
     state: AtomicU32,
     flights: AtomicU32,
     met: Mutex<Vec<(u32, Claim)>>,
+    /// The owner is stopped in a test's park hook, which stands for an
+    /// engine step however long the test holds it: no holder is stuck there.
+    #[cfg(all(test, not(loom)))]
+    parked: AtomicU32,
 }
 
 /// A thread's attempt word, and the attempt it was read for.
@@ -89,6 +93,8 @@ fn new_word() -> Arc<Word> {
         state: AtomicU32::new(0),
         flights: AtomicU32::new(0),
         met: Mutex::new(Vec::new()),
+        #[cfg(all(test, not(loom)))]
+        parked: AtomicU32::new(0),
     })
 }
 
@@ -226,7 +232,11 @@ impl Attempt {
         if w & WOUNDED != 0 {
             return true;
         }
-        if w & (IN_FLIGHT | HOLDING) == 0 {
+        #[cfg(all(test, not(loom)))]
+        let parked_holder = w & IN_FLIGHT == 0 && self.word.parked.load(Ordering::Acquire) != 0;
+        #[cfg(any(not(test), loom))]
+        let parked_holder = false;
+        if w & (IN_FLIGHT | HOLDING) == 0 || parked_holder {
             patience.seen = None;
             return false;
         }
@@ -345,6 +355,25 @@ impl Attempt {
 /// debug checks.
 pub(crate) fn in_flight() -> bool {
     MINE.with(|w| w.state.load(Ordering::Relaxed) & IN_FLIGHT != 0)
+}
+
+/// While it lives, this thread is stopped in a test's park hook.
+#[cfg(all(test, not(loom)))]
+pub(crate) struct Parked;
+
+#[cfg(all(test, not(loom)))]
+impl Parked {
+    pub(crate) fn new() -> Self {
+        MINE.with(|w| w.parked.fetch_add(1, Ordering::AcqRel));
+        Self
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+impl Drop for Parked {
+    fn drop(&mut self) {
+        MINE.with(|w| w.parked.fetch_sub(1, Ordering::AcqRel));
+    }
 }
 
 /// Attempts a waiter wounded, for tests and the scans' counts.

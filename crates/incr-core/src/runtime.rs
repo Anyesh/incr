@@ -1301,6 +1301,8 @@ impl<C: Cells> Runtime<C> {
     #[cfg(test)]
     fn park(&self, point: ParkPoint) {
         if let Some(hook) = self.park_hook.get() {
+            #[cfg(not(loom))]
+            let _parked = crate::attempt::Parked::new();
             hook(point);
         }
     }
