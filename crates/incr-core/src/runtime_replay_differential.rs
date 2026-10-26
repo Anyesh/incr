@@ -4482,7 +4482,7 @@ fn a_dropped_chain_takes_its_member_runs_failure_counts() {
 
 /// The same truncation under two threads, seed 0x2b13.
 #[test]
-#[ignore = "T10-cmp-2b13-two-thread-boom: op 4 returns a panic no serial order gives"]
+#[cfg_attr(miri, ignore)]
 fn a_two_thread_dropped_chain_takes_its_member_runs_failure_counts() {
     quiet(|| {
         let case = gen_case(0x2b13, false, true);
