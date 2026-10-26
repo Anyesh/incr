@@ -2444,11 +2444,10 @@ fn caught_delivery_shape(
             (DeliveryNode::N(x), true) => rt.try_get(x).map_or(7777, |n| n.0),
         }
     };
-    let even = |v: u64| v % 2 == 0;
+    type Compute = Box<dyn Fn(&Runtime<Shared>) -> u64 + Send + Sync>;
+    let even = |v: u64| v.is_multiple_of(2);
     let caught = |f: &dyn Fn() -> u64| catch_unwind(AssertUnwindSafe(f)).unwrap_or(9999);
-    let q = |f: Box<dyn Fn(&Runtime<Shared>) -> u64 + Send + Sync>,
-             cycle: CycleStrategy<u64>,
-             replay: Replay| {
+    let q = |f: Compute, cycle: CycleStrategy<u64>, replay: Replay| {
         DeliveryNode::U(rt.create_query_with(move |rt| f(rt), QueryOpts { cycle, replay }))
     };
     let fixpoint = |limit| CycleStrategy::Fixpoint(Fixpoint::new(|| 0_u64).max_iterations(limit));
