@@ -2409,3 +2409,222 @@ fn a_closure_that_reads_a_caught_cycle_joins_a_reader_of_its_catcher() {
         assert_eq!(run(frames), unbounded, "budget {frames}");
     }
 }
+
+/// A value without a placeholder, so reads of it nest natively.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Nat(u64);
+
+#[derive(Clone, Copy)]
+enum DeliveryNode {
+    U(Incr<u64>),
+    N(Incr<Nat>),
+}
+
+/// The 0x8b19 budget-1 delivery: 6 reads 9 and then 4, whose Fixpoint
+/// reads 1; 1 `try_get`s 2 and 2 reads 1. At one frame 2's doomed run
+/// closes the cycle after a speculative discard, and the retry of 1 has it
+/// delivered (`take_delivery`), so 1 lands its catch, 7777, held. `at_held`
+/// runs in 4's closure right after its read of 1, with 1's handle. Returns
+/// the `try_get` of 6.
+fn caught_delivery_shape(
+    frames: u32,
+    at_held: impl Fn(&Runtime<Shared>, Incr<u64>) + Send + Sync + 'static,
+) -> u64 {
+    use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
+    let rt = Runtime::<Shared>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let h: Arc<[OnceLock<DeliveryNode>; 14]> = Arc::new(std::array::from_fn(|_| OnceLock::new()));
+    let rd = {
+        let h = h.clone();
+        move |rt: &Runtime<Shared>, i: usize, try_: bool| match (*h[i].get().unwrap(), try_) {
+            (DeliveryNode::U(x), false) => rt.get(x),
+            (DeliveryNode::U(x), true) => rt.try_get(x).unwrap_or(7777),
+            (DeliveryNode::N(x), false) => rt.get(x).0,
+            (DeliveryNode::N(x), true) => rt.try_get(x).map_or(7777, |n| n.0),
+        }
+    };
+    let even = |v: u64| v % 2 == 0;
+    let caught = |f: &dyn Fn() -> u64| catch_unwind(AssertUnwindSafe(f)).unwrap_or(9999);
+    let q = |f: Box<dyn Fn(&Runtime<Shared>) -> u64 + Send + Sync>,
+             cycle: CycleStrategy<u64>,
+             replay: Replay| {
+        DeliveryNode::U(rt.create_query_with(move |rt| f(rt), QueryOpts { cycle, replay }))
+    };
+    let fixpoint = |limit| CycleStrategy::Fixpoint(Fixpoint::new(|| 0_u64).max_iterations(limit));
+    let r = rd.clone();
+    let n0 = q(
+        Box::new(move |rt| r(rt, 5, false)),
+        CycleStrategy::None,
+        Replay::Allowed,
+    );
+    let r = rd.clone();
+    let n1 = q(
+        Box::new(move |rt| r(rt, 2, true)),
+        CycleStrategy::None,
+        Replay::Allowed,
+    );
+    let r = rd.clone();
+    let n2 = q(
+        Box::new(move |rt| {
+            let v = r(rt, 1, false);
+            if v % 7 == 0 {
+                std::panic::panic_any(String::from("boom 2"));
+            }
+            let c = if even(v) { 0 } else { r(rt, 13, true) };
+            if even(c) {
+                r(rt, 8, false)
+            } else {
+                r(rt, 0, false)
+            }
+        }),
+        CycleStrategy::None,
+        Replay::Allowed,
+    );
+    let r = rd.clone();
+    let n3 = q(
+        Box::new(move |rt| {
+            caught(&|| {
+                if even(r(rt, 11, false)) {
+                    r(rt, 4, false)
+                } else {
+                    r(rt, 9, false)
+                }
+            })
+        }),
+        CycleStrategy::None,
+        Replay::Allowed,
+    );
+    let n4 = {
+        let (r, h) = (rd.clone(), h.clone());
+        DeliveryNode::N(rt.create_query_with(
+            move |rt| {
+                Nat(caught(&|| {
+                    let one = r(rt, 1, false);
+                    let DeliveryNode::U(n1) = *h[1].get().unwrap() else {
+                        unreachable!()
+                    };
+                    at_held(rt, n1);
+                    let c = if even(one) {
+                        r(rt, 9, false)
+                    } else {
+                        r(rt, 5, true)
+                    };
+                    if even(c) {
+                        r(rt, 5, true).wrapping_add(r(rt, 12, true))
+                    } else {
+                        0
+                    }
+                }))
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| Nat(0)).max_iterations(2)),
+                replay: Replay::Allowed,
+            },
+        ))
+    };
+    let n5 = q(Box::new(|_| 1), fixpoint(3), Replay::Allowed);
+    let r = rd.clone();
+    let n6 = q(
+        Box::new(move |rt| {
+            let c = if even(r(rt, 9, false)) {
+                r(rt, 4, false)
+            } else {
+                r(rt, 7, false)
+            };
+            if c % 7 == 3 {
+                std::panic::panic_any(String::from("boom 6"));
+            }
+            if even(c) {
+                let d = if even(r(rt, 8, true)) {
+                    r(rt, 1, true)
+                } else {
+                    r(rt, 7, true)
+                };
+                4_u64.wrapping_add(d)
+            } else {
+                r(rt, 2, false)
+            }
+        }),
+        CycleStrategy::None,
+        Replay::Allowed,
+    );
+    let n7 = q(Box::new(|_| 1), CycleStrategy::None, Replay::Allowed);
+    let n8 = q(
+        Box::new(move |_| caught(&|| 2)),
+        CycleStrategy::None,
+        Replay::Native,
+    );
+    let r = rd.clone();
+    let n9 = q(
+        Box::new(move |rt| {
+            if even(caught(&|| r(rt, 10, false))) {
+                0
+            } else if even(r(rt, 11, false)) {
+                if even(r(rt, 13, false)) {
+                    r(rt, 5, false)
+                } else {
+                    r(rt, 1, false)
+                }
+            } else {
+                r(rt, 13, false)
+            }
+        }),
+        CycleStrategy::None,
+        Replay::Allowed,
+    );
+    let inputs = [2_u64, 2, 0, 3].map(|v| rt.create_input(v));
+    for (i, n) in [n0, n1, n2, n3, n4, n5, n6, n7, n8, n9]
+        .into_iter()
+        .enumerate()
+    {
+        let _ = h[i].set(n);
+    }
+    for (i, x) in inputs.iter().enumerate() {
+        let _ = h[10 + i].set(DeliveryNode::U(*x));
+    }
+    let DeliveryNode::U(top) = n0 else {
+        unreachable!()
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
+    rt.set(inputs[0], 4);
+    rt.set(inputs[3], 1);
+    rt.set(inputs[0], 2);
+    let DeliveryNode::U(six) = n6 else {
+        unreachable!()
+    };
+    rt.try_get(six).unwrap_or(7777)
+}
+
+/// The schedule reaches the delivery: by 4's read of 1 at one frame, a
+/// cycle was delivered to 1's frame and 1's catch of it is held; the
+/// unbounded run catches the cycle natively.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn the_8b19_schedule_reaches_a_held_delivery() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let run = |frames: u32| {
+        seen.lock().unwrap().clear();
+        let log = seen.clone();
+        let v = caught_delivery_shape(frames, move |rt, one| {
+            let delivered = rt
+                .deliveries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| d.cycle && d.frame == one.slot());
+            log.lock()
+                .unwrap()
+                .push((delivered, crate::hold::held_count()));
+        });
+        (v, seen.lock().unwrap().clone())
+    };
+    let (unbounded, at_max) = run(u32::MAX);
+    assert!(
+        !at_max.is_empty() && at_max.iter().all(|&(d, _)| !d),
+        "{at_max:?}"
+    );
+    let (bounded, at_one) = run(1);
+    assert!(at_one.iter().any(|&(d, held)| d && held > 0), "{at_one:?}");
+    assert_eq!(bounded, unbounded);
+}
