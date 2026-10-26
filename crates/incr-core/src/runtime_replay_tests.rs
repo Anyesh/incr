@@ -3077,7 +3077,8 @@ local_and_shared!(
 
 /// [`side_read`]'s shape with `c` in an unbudgeted runtime `a`, read from
 /// `rt`'s doomed run, so `c`'s run there is speculative. `c` reads j of a
-/// third runtime, Dirty at that read when `dirty` is set, else Clean.
+/// third runtime, Dirty at that read when `dirty` is set (the framed
+/// foreign read), else Clean (settled by `c`'s keep resolver).
 /// Once j moves to 3, `c` computes 13, as the unbounded run does, rather
 /// than adopt its speculative run's value.
 fn unbudgeted_speculative_foreign_read<C: Cells>(dirty: bool) {

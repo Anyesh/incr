@@ -287,9 +287,9 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// [`Self::resolve_keep`] for a speculative frame, which settles on top
-    /// of the stack: one that keeps no other runtime's Clean reads reads
-    /// them unrecorded, so it is marked `KEPT_UNCHECKED`, and its stash is
-    /// not adopted over them.
+    /// of the stack. One that keeps none of them makes its Clean reads of
+    /// other runtimes unrecorded, so it is marked `KEPT_UNCHECKED`, and its
+    /// stash is not adopted over them.
     ///
     /// # Safety
     ///
@@ -297,10 +297,15 @@ impl<C: Cells> Runtime<C> {
     unsafe fn resolve_speculative_keep(r: *const cycle::KeepResolver, slot: u32) -> bool {
         // SAFETY: `r` is a `SpeculativeKeep`'s, made by a running compute
         // of the runtime at its `rt`.
-        let rt = unsafe { Self::of_keep_resolver((*r.cast::<SpeculativeKeep>()).rt) };
-        let keeps = rt.budgeted() && rt.replayable(slot);
+        let rt_keep = unsafe { (*r.cast::<SpeculativeKeep>()).rt };
+        // SAFETY: as above.
+        let keeps = unsafe { Self::resolve_keep(rt_keep, slot) };
         if !keeps {
-            if let Some((_, _, ctl, _)) = rt.dep_stack.top_frame() {
+            // SAFETY: as above.
+            let rt = unsafe { Self::of_keep_resolver(rt_keep) };
+            let top = rt.dep_stack.top_frame();
+            debug_assert!(top.is_some_and(|(r, n, _, _)| (r, n.0) == (rt.runtime_id, slot)));
+            if let Some((_, _, ctl, _)) = top {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live.
                 unsafe { &*ctl }.raise(cycle::KEPT_UNCHECKED);

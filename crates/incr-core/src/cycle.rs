@@ -469,8 +469,9 @@ pub struct ComputeCtl {
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
-    /// The frame's runtime's [`KeepResolver`], or null for a frame that
-    /// settles its keeping when it is pushed or keeps nothing.
+    /// The frame's runtime's [`KeepResolver`], a speculative frame's own,
+    /// or null for a frame that settles its keeping when it is pushed or
+    /// keeps nothing.
     keep: *const KeepResolver,
     /// The frame's path once found (`path_kept`), left unwritten until
     /// then so a push pays nothing for it.
@@ -508,14 +509,17 @@ impl ComputeCtl {
     }
 
     /// Whether this frame, of node `slot`, keeps other runtimes' Clean
-    /// reads.
+    /// reads. A speculative frame's resolver marks it `KEPT_UNCHECKED`
+    /// when it does not.
     ///
     /// # Safety
     ///
-    /// The frame must be running, so that its runtime is borrowed.
+    /// The frame must be running and on top of the stack, so that its
+    /// runtime is borrowed.
     pub(crate) unsafe fn keeps_foreign(&self, slot: u32) -> bool {
         // SAFETY: the caller's frame is running, so the runtime holding
-        // the resolver is borrowed and in place.
+        // the resolver is borrowed and in place, as is a speculative
+        // frame's resolver beside its run.
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
     }
 
