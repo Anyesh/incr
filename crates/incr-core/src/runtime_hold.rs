@@ -555,9 +555,9 @@ impl<C: Cells> Runtime<C> {
         if let Err(payload) = outcome {
             let rest: Vec<Held> = rest.collect();
             let given: Vec<u32> = rest.iter().map(|e| e.slot).collect();
+            self.unverify_readers(&given);
             self.retract_entries(rest, Vec::new(), true, true);
             self.park(super::ParkPoint::GaveBack);
-            self.unverify_readers(&given);
             bag.drain_carried(payload);
         }
         bag.drain(self);
@@ -566,9 +566,10 @@ impl<C: Cells> Runtime<C> {
 
     /// A published landing that read one given back computed over a value
     /// the give-back undid, while give-backs keep `changed_at`: it must
-    /// recompute, not verify, and what reads it must see it Dirty. Every
-    /// reader of a given-back landing outside the give-back is unverified,
-    /// published or not.
+    /// recompute, not verify, and what reads it must see it Dirty, both
+    /// before the give-back lands, or a read in between verifies it over
+    /// the undone value. Every reader of a given-back landing outside the
+    /// give-back is unverified, published or not.
     fn unverify_readers(&self, given: &[u32]) {
         let mut readers: Vec<NodeId> = Vec::new();
         {
