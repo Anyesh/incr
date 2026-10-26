@@ -2881,15 +2881,50 @@ fn a_read_joining_a_reader_of_a_cycle_through_it_deadlocks() {
 /// x and w read each other with `try_get`, so a read of x lands both
 /// Cyclic, held by the reading attempt.
 fn try_get_pair(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
+    try_get_ring_counted(rt, 2, &std::sync::Arc::default())
+}
+
+/// [`try_get_pair`] as a ring of `ring` nodes: x reads w, each member
+/// reads the one created before it, and the first reads x. Adds every
+/// run of the ring's nodes to `runs`.
+fn try_get_ring_counted(
+    rt: &Rt,
+    ring: usize,
+    runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (Incr<u64>, Incr<u64>) {
     let i = rt.create_input(3_u64);
     let xc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
-    let w = {
-        let xc = std::sync::Arc::clone(&xc);
-        rt.create_query(move |rt: &Rt| rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1))
-    };
-    let x = rt.create_query(move |rt: &Rt| rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000));
+    let mut next: Option<Incr<u64>> = None;
+    for _ in 1..ring {
+        let (xc, runs, after) = (
+            std::sync::Arc::clone(&xc),
+            std::sync::Arc::clone(runs),
+            next,
+        );
+        next = Some(rt.create_query(move |rt: &Rt| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rt.try_get(after.unwrap_or_else(|| *xc.get().unwrap()))
+                .map_or(5, |v| v + 1)
+        }));
+    }
+    let w = next.expect("a ring has a member besides x");
+    let runs = std::sync::Arc::clone(runs);
+    let x = rt.create_query(move |rt: &Rt| {
+        runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000)
+    });
     assert!(xc.set(x).is_ok());
     (x, w)
+}
+
+/// Most runs of a ring's nodes in one execution of an exit-race model:
+/// 8n - 2 on the hand-over alone, plus one episode attempt (2n) when the
+/// owner's retry wounds the reader once more, as x waits on the reader's
+/// claim of w while the reader waits on x. A second extra attempt, or
+/// attempts growing with n, exceed it; a run whose own landing makes it
+/// run again loops past it until loom's branch limit or clock wrap.
+const fn exit_race_ring_runs(ring: usize) -> usize {
+    10 * ring - 2
 }
 
 /// T catches its read of x, which holds x and w, and joins a thread that
@@ -2934,6 +2969,8 @@ fn hand_over_wounds_a_holder_that_joins_a_reader() {
 /// its publication.
 static EXIT_RACE: HandOvers = HandOvers::new();
 static NESTED_EXIT_RACE: HandOvers = HandOvers::new();
+static RING_EXIT_RACE: HandOvers = HandOvers::new();
+static NESTED_RING_EXIT_RACE: HandOvers = HandOvers::new();
 
 /// The owner stands at [`ParkPoint::BeforeHeldPublish`] of `rt` on the
 /// model's main thread as one descheduled there, so the waiter's patience
@@ -2963,12 +3000,12 @@ fn park_before_publish(rt: &Rt, reached: &'static HandOvers) {
 
 /// T's read of x and a reader's `try_get` of w, in serial order on a
 /// fresh runtime: T first, or the reader first.
-fn exit_race_orders(nested: bool) -> [(u64, u64); 2] {
+fn exit_race_orders(nested: bool, ring: usize) -> [(u64, u64); 2] {
     [true, false].map(|t_first| {
         let rt = Arc::new(Rt::new());
         let inner = Arc::new(Rt::new());
         let holder = if nested { &inner } else { &rt };
-        let (x, w) = try_get_pair(holder);
+        let (x, w) = try_get_ring_counted(holder, ring, &std::sync::Arc::default());
         let read_t = move |rt: &Rt| catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
         let t = if nested {
             let inner = Arc::clone(&inner);
@@ -2995,14 +3032,15 @@ fn exit_race_orders(nested: bool) -> [(u64, u64); 2] {
 /// the wound and retries (the outermost entry's exit, or `first_entry`'s
 /// raise when nested), or publishes and the reader reads what it
 /// published. Both reads give one serial order's values.
-fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers) {
+fn hand_over_races_publication_at(nested: bool, ring: usize, reached: &'static HandOvers) {
     use loom::sync::atomic::{AtomicBool, Ordering};
     run(move || {
-        let orders = exit_race_orders(nested);
+        let orders = exit_race_orders(nested, ring);
         let rt = Arc::new(Rt::new());
         let inner = Arc::new(Rt::new());
         let holder = if nested { &inner } else { &rt };
-        let (x, w) = try_get_pair(holder);
+        let ring_runs = std::sync::Arc::default();
+        let (x, w) = try_get_ring_counted(holder, ring, &ring_runs);
         park_before_publish(holder, reached);
         let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(holder))));
         let reader: Arc<Mutex<Option<thread::JoinHandle<u64>>>> = Arc::new(Mutex::new(None));
@@ -3030,6 +3068,11 @@ fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers) {
         let handle = reader.lock().unwrap().take().unwrap();
         let got_w = handle.join().unwrap();
         *me.lock().unwrap() = None;
+        let ring_runs = ring_runs.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ring_runs <= exit_race_ring_runs(ring),
+            "a ring of {ring} ran {ring_runs} times"
+        );
         assert!(
             orders.contains(&(got_t, got_w)),
             "T {got_t}, reader {got_w}: no serial order's, {orders:?}"
@@ -3046,12 +3089,22 @@ fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers) {
 
 #[test]
 fn hand_over_races_publication_at_the_outermost_exit() {
-    hand_over_races_publication_at(false, &EXIT_RACE);
+    hand_over_races_publication_at(false, 2, &EXIT_RACE);
 }
 
 #[test]
 fn hand_over_races_publication_at_a_first_entry_exit() {
-    hand_over_races_publication_at(true, &NESTED_EXIT_RACE);
+    hand_over_races_publication_at(true, 2, &NESTED_EXIT_RACE);
+}
+
+#[test]
+fn hand_over_races_publication_of_a_ring_of_three_at_the_outermost_exit() {
+    hand_over_races_publication_at(false, 3, &RING_EXIT_RACE);
+}
+
+#[test]
+fn hand_over_races_publication_of_a_ring_of_three_at_a_first_entry_exit() {
+    hand_over_races_publication_at(true, 3, &NESTED_RING_EXIT_RACE);
 }
 
 /// x (a Fallback head) and w read each other with `try_get`, and w also

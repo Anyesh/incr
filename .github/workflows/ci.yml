@@ -177,6 +177,8 @@ jobs:
           - { model: "loom_models::hand_over_at_a_cycle_closed_on_the_stack", bound: 2 }
           - { model: "loom_models::hand_over_at_a_cycle_caught_across_runtimes", bound: 2 }
           - { model: "loom_models::hand_over_at_a_cycle_closed_under_another_runtimes_frame", bound: 2 }
+          - { model: "loom_models::hand_over_races_publication_of_a_ring_of_three_at_the_outermost_exit", bound: 2 }
+          - { model: "loom_models::hand_over_races_publication_of_a_ring_of_three_at_a_first_entry_exit", bound: 2 }
           - { model: "loom_seed_models::seed_vs_set", bound: 2 }
           - { model: "loom_seed_models::seed_vs_dep_recompute", bound: 2 }
           - { model: "loom_seed_models::seed_vs_reader", bound: 2 }
