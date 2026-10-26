@@ -2351,10 +2351,15 @@ moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
 | `diamond_shared` | 8890.94 | 8945.93 | +54.99 |
 
 - The check after each expanded node's dep read costs about 17 per
-  walked node under `Shared` (`chain_shared` +1702 over 100 nodes): the
-  mark test and the counter's acquire load and compare at the check line
-  (+12, +7 in `shared_incremental/1000`); the rest is layout, moved code
-  netting to zero.
+  walked node under `Shared` (`chain_shared` +1702 over 100 nodes).
+- `shared_incremental/1000` +49.68 (+0.59 %), by PT lines with tip lines
+  mapped to base (+48.8 traced): 26 is the check's own code, the check
+  line +12, the retraction counter's acquire load +7 and compare
+  (`retracted_since`) +3, the `held_mark` acquire load +3 and the walk's
+  starting counter load +1; the block the check wraps moved, +11 at its
+  new closing line against -11 at the old one; the other 22.8 is layout
+  over unchanged lines, none more than 6 per op (node lookup in
+  `segmented_nodes.rs` +6 and -4, `take` -6).
 - `Walk::visit_pending` first compiled as an outlined call, about 13 per
   walked node under both cells (`chain_local/propagate/10` +130 of +140)
   and over the 1 % bar on `shared_incremental`; `285b26d31` inlines it.
