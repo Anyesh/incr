@@ -699,3 +699,28 @@ fn local_reader_of_a_retracted_shared_entry_holds_nothing_at_its_exit() {
     assert_eq!(crate::hold::held_count(), 0);
     assert_eq!(got, b_rt.get(x) + 7);
 }
+
+thread_local! {
+    static LOCAL_RT: Runtime<Local> = Runtime::new();
+}
+
+/// x, under an outermost `Shared` read, reads its held cycle and then a
+/// `Local` node r that reads the cycle back: r's frame reads a held
+/// landing, but no exit publishes a `Local` runtime's holds, so r must land
+/// at once and pass the hold to x.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_reader_of_a_held_landing_holds_nothing_at_its_exit() {
+    let b_rt = Arc::new(Runtime::<Shared>::new());
+    let (a, b) = two_cycle(&*b_rt);
+    let r = {
+        let b_rt = b_rt.clone();
+        LOCAL_RT.with(|l| l.create_query(move |_| b_rt.get(a) * 10))
+    };
+    let x = b_rt.create_query(move |rt| rt.get(a) + rt.get(b) + LOCAL_RT.with(|l| l.get(r)));
+    let got = b_rt.get(x);
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(got, b_rt.get(a) + b_rt.get(b) + b_rt.get(a) * 10);
+    assert_eq!(LOCAL_RT.with(|l| l.get(r)), b_rt.get(a) * 10);
+}
