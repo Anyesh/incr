@@ -551,10 +551,12 @@ pub(crate) fn held() -> Vec<Claim> {
 }
 
 /// A waiter took over this thread's attempt: the claims its waiters met
-/// are never doomed or reserved again before the thread's outermost entry
-/// exits. Each take-over adds at least the claim its waiter met, which the
-/// wounded attempt reserved and so had not been taken, so a read restarts
-/// for take-overs at most once per claim it can reserve.
+/// are never doomed, reserved or held again before the thread's outermost
+/// entry exits, except as members of an episode held once more because
+/// another member carries hold state from the attempt, which marks them
+/// all. Each wounded attempt so adds at least one claim it reserved or held
+/// while untaken, and a read restarts for take-overs at most once per
+/// claim it can reserve or hold.
 pub(crate) fn mark_taken() {
     let claims = attempt::take_met();
     if claims.is_empty() {
@@ -565,8 +567,7 @@ pub(crate) fn mark_taken() {
     mark_claims_taken(claims);
 }
 
-/// `claims` are never doomed, reserved or held again before the thread's
-/// outermost entry exits.
+/// `claims` are taken, as [`mark_taken`]'s are.
 pub(crate) fn mark_claims_taken(claims: impl IntoIterator<Item = Claim>) {
     TAKEN.with(|t| t.borrow_mut().extend(claims));
     crate::cycle_state::set_any_taken(true);

@@ -372,9 +372,9 @@ pub(crate) fn open(
     open_even_taken(cell, rt, slot, generation, first, verified_at, kept)
 }
 
-/// [`open`] for a claim taken in this outermost entry that lands in an
-/// episode held anyway, since another member carries hold state from
-/// earlier in the attempt.
+/// [`open`] without its refusal of taken claims, for the members of an
+/// episode held although one is taken, since another member carries hold
+/// state from earlier in the attempt.
 pub(crate) fn open_even_taken(
     cell: usize,
     rt: RuntimeId,
