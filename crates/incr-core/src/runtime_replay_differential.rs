@@ -4227,6 +4227,21 @@ fn two_thread_budget_cycle_group_matches_unbounded_seed() {
     });
 }
 
+/// 0x6688, two threads at budgets 1 to 3: with a cycle contained at a walk
+/// entry, the bounded run landed the contained failure across eleven nodes
+/// (Panic(failed) for Value(10011)); a cycle that reaches its reader, as on
+/// main, gives every order.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_contained_cycle_landing_seeds() {
+    let case = gen_case(0x6688, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x6688);
+        }
+    });
+}
+
 /// 0xad crossed: op 16's read of 1 waited on op 15's claim of it, and the
 /// revisit of 1 counted one more walk visit than the unbounded walk makes,
 /// so its walk entered the cycle {4, 5} of recorded deps at the member
