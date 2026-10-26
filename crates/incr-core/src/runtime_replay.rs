@@ -4407,7 +4407,11 @@ impl<C: Cells> Runtime<C> {
     /// has an entry of it yet to run. A retry below that reads the node
     /// again owes nothing: it first runs again what precedes that read,
     /// and a reservation kept through that would make another thread's
-    /// read of the node, joined there, wait on a run not yet begun. Takes
+    /// read of the node, joined there, wait on a run not yet begun. An
+    /// outcome held for a frame of the node does not keep it either: such a
+    /// reader could not wait it out, and its own run differs only in which
+    /// panic text it reads, which the Shared payload contract leaves open.
+    /// Takes
     /// the reservation table's lock only to end one.
     #[cold]
     #[inline(never)]
