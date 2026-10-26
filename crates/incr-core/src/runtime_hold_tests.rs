@@ -2658,26 +2658,29 @@ fn shared_reread_of_a_held_landing_its_own_set_flagged_runs_it_again() {
     assert_eq!(reread_of_a_landing_its_own_set_flagged::<Shared>(), local);
 }
 
-/// d reads a, which a Fallback cycle with b lands Cyclic and held, then
-/// sets a's input k and reads a again: the set's walk meets a's held
-/// Cyclic landing through the view and must take it to New, as it would
-/// a published one, not spin on the node's word. Returns d's value.
+/// d reads b, whose unseeded cycle with a lands Cyclic and held, then sets
+/// a's input g and reads b again: the set's walk meets a's held Cyclic
+/// landing through the view and must take it to New, as it would a
+/// published one, not spin on the node's word. Returns d's value.
 fn set_over_a_held_cycle<C: Cells>(rt: &Runtime<C>) -> i64 {
-    let k = rt.create_input(0_i64);
+    let g = rt.create_input(0_i64);
     let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
     let a = {
         let bc = bc.clone();
-        rt.create_query_with_fallback(
-            move |rt| rt.get(k) + rt.get(*bc.get().unwrap()),
-            |_c: &Cycle| 100,
-        )
+        rt.create_query(move |rt| {
+            if rt.get(g) == 0 {
+                rt.try_get(*bc.get().unwrap()).map_or(-1, |v| v + 1)
+            } else {
+                7
+            }
+        })
     };
-    let b = rt.create_query(move |rt| rt.get(a) * 2);
+    let b = rt.create_query(move |rt| rt.try_get(a).map_or(-1, |v| v * 2));
     bc.set(b).unwrap();
     let d = rt.create_query(move |rt: &Runtime<C>| {
-        let v = rt.get(a);
-        rt.set(k, 1);
-        v * 1000 + rt.get(a)
+        let before = rt.try_get(b).unwrap_or(-100);
+        rt.set(g, 1);
+        before * 1000 + rt.try_get(b).unwrap_or(-100)
     });
     rt.get(d)
 }
