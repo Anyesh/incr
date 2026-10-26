@@ -1911,11 +1911,25 @@ fn custom_payload_shape<C: Cells>(
     rt.try_get(top_r).unwrap_or(7777)
 }
 
+/// The budgets a sweep tries for its next shape, counted in `case`: 1 to 8,
+/// or under Miri one of them, rotating with `case`, so a sweep of eight or
+/// more shapes still tries every budget.
+fn sweep_frames(case: &mut usize) -> std::ops::Range<u32> {
+    *case += 1;
+    if cfg!(miri) {
+        let frames = 1 + (*case % 8) as u32;
+        frames..frames + 1
+    } else {
+        1..9
+    }
+}
+
 /// A reader that catches a dep's custom panic payload, which the engine
 /// cannot copy for a retry, branches on it as the unbounded run does under
 /// every budget, the reader at the budget itself included.
 #[test]
 fn a_caught_custom_payload_survives_the_readers_retries() {
+    let mut case = 0;
     for d_replayable in [true, false] {
         for outer in [0, 1, 4] {
             for mid in [0, 1, 3] {
@@ -1930,7 +1944,7 @@ fn a_caught_custom_payload_survives_the_readers_retries() {
                     for local in [true, false] {
                         let want = shape(u32::MAX, local);
                         assert_eq!(want, 42_000 + 1 + u64::from(chain));
-                        for frames in 1..9 {
+                        for frames in sweep_frames(&mut case) {
                             assert_eq!(
                                 shape(frames, local),
                                 want,
@@ -2041,6 +2055,7 @@ fn failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32, fails: CFails
 /// cycle.
 #[test]
 fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
+    let mut case = 0;
     let counts = || {
         (
             super::replay_impl::THREAD_REGENERATIONS.with(std::cell::Cell::get),
@@ -2072,7 +2087,7 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
                         CFails::Before | CFails::ViaClean => 100,
                     };
                     assert_eq!(want, b * 1000 + 1 + u64::from(chain), "{fails:?}");
-                    for frames in 1..9 {
+                    for frames in sweep_frames(&mut case) {
                         assert_eq!(
                             shape(frames),
                             want,
@@ -2144,6 +2159,7 @@ fn cyclic_failed_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u64 {
 /// did.
 #[test]
 fn a_payload_after_a_virtual_cycle_read_reads_as_unbounded() {
+    let mut case = 0;
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
             for local in [true, false] {
@@ -2156,7 +2172,7 @@ fn a_payload_after_a_virtual_cycle_read_reads_as_unbounded() {
                 };
                 let want = shape(u32::MAX);
                 assert_eq!(want, 5001 + u64::from(chain));
-                for frames in 1..9 {
+                for frames in sweep_frames(&mut case) {
                     assert_eq!(
                         shape(frames),
                         want,
@@ -2239,6 +2255,7 @@ fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32, k0: u64
 /// gives.
 #[test]
 fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
+    let mut case = 0;
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
             for local in [true, false] {
@@ -2257,7 +2274,7 @@ fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
                 );
                 let chain = u64::from(chain);
                 assert_eq!(want, (6001 + chain, 5001 + chain));
-                for frames in 1..9 {
+                for frames in sweep_frames(&mut case) {
                     assert_eq!(
                         shape(frames, 0),
                         want,
@@ -2346,6 +2363,7 @@ fn recomputed_virtual_shape<C: Cells>(
 /// payload instead of given a regenerated one.
 #[test]
 fn a_payload_after_a_virtual_cycle_read_holds_its_reader() {
+    let mut case = 0;
     let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
     let before = holds();
     for fallback in [false, true] {
@@ -2360,7 +2378,7 @@ fn a_payload_after_a_virtual_cycle_read_holds_its_reader() {
                         }
                     };
                     let want = shape(u32::MAX);
-                    for frames in 1..9 {
+                    for frames in sweep_frames(&mut case) {
                         assert_eq!(
                             shape(frames),
                             want,
@@ -2515,6 +2533,7 @@ fn member_b<C: Cells>(rt: &Runtime<C>, i: Incr<u64>) -> Incr<u64> {
 /// member.
 #[test]
 fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
+    let mut case = 0;
     let counts = || {
         (
             super::replay_impl::THREAD_REGENERATIONS.with(std::cell::Cell::get),
@@ -2542,7 +2561,7 @@ fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
             for local in [true, false] {
                 assert_eq!(creating(u32::MAX, local), 11_001 + u64::from(chain));
                 assert_eq!(member(u32::MAX, local), 11_001 + u64::from(chain));
-                for frames in 1..9 {
+                for frames in sweep_frames(&mut case) {
                     let at = format!("local={local} outer={outer} chain={chain} frames={frames}");
                     let before = counts().1;
                     assert_eq!(
@@ -2576,6 +2595,7 @@ fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
 /// read a rerun of b makes as a read of a node of another runtime.
 #[test]
 fn a_payload_from_another_runtimes_node_holds_its_reader_past_the_budget() {
+    let mut case = 0;
     let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
     let before = holds();
     for outer in [0, 1, 3] {
@@ -2604,7 +2624,7 @@ fn a_payload_from_another_runtimes_node_holds_its_reader_past_the_budget() {
                 })
             };
             assert_eq!(shape(u32::MAX), 11_001 + u64::from(chain));
-            for frames in 1..9 {
+            for frames in sweep_frames(&mut case) {
                 assert_eq!(
                     shape(frames),
                     11_001 + u64::from(chain),
@@ -2680,6 +2700,7 @@ fn foreign_ticket_shape<C: Cells>(frames: u32, outer: u32, mid: u32, chain: u32)
 /// (201): b's run read another runtime, so its payload is not rebuilt by a
 /// rerun and r is held past the budget instead.
 fn a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded<C: Cells>() {
+    let mut case = 0;
     let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
     let before = holds();
     let mut differ = Vec::new();
@@ -2693,7 +2714,7 @@ fn a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded<C: Cells>()
                     "the unbounded run did not take the walk's payload: \
                      outer={outer} mid={mid} chain={chain}"
                 );
-                for frames in 1..9 {
+                for frames in sweep_frames(&mut case) {
                     let got = foreign_ticket_shape::<C>(frames, outer, mid, chain);
                     if got != want {
                         differ.push(format!(
@@ -2827,6 +2848,7 @@ fn value_code_foreign_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u6
 /// `value_code_foreign_shape`: b's run read the other runtime from value
 /// code, so its payload is not rebuilt by a rerun.
 fn a_payload_after_a_value_code_foreign_read_reads_as_unbounded<C: Cells>() {
+    let mut case = 0;
     let mut differ = Vec::new();
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
@@ -2836,7 +2858,7 @@ fn a_payload_after_a_value_code_foreign_read_reads_as_unbounded<C: Cells>() {
                 205_002 + u64::from(chain),
                 "the unbounded run did not take the walk's payload: outer={outer} chain={chain}"
             );
-            for frames in 1..9 {
+            for frames in sweep_frames(&mut case) {
                 let got = value_code_foreign_shape::<C>(frames, outer, chain);
                 if got != want {
                     differ.push(format!(
