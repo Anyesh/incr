@@ -4475,7 +4475,7 @@ fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
 /// the cycle: both reads can panic, both return 9999, or `Get(0)` returns
 /// 14, none of which an order gives.
 #[test]
-#[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
+#[cfg_attr(miri, ignore)]
 fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
     let case = gen_case(0x5aab, false, true);
     quiet(|| {
@@ -4489,9 +4489,8 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
 /// node 0, whose cycle branches on a caught panic, and `Get(0)` returns
 /// 9999 where every order panics. Each thread's doom discard-lands a node
 /// the other thread then claims, down the chain from node 26, as in 0x5aab.
-/// It fails in about one debug `differential_two` run in five.
 #[test]
-#[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
+#[cfg_attr(miri, ignore)]
 fn a_doomed_frame_keeps_its_node_from_the_other_thread_e4aa8b2e() {
     let case = gen_case(0xe4aa_8b2e, false, true);
     quiet(|| {
