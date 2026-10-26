@@ -71,6 +71,10 @@ pub(crate) struct Held {
 struct HoldSet {
     by_cell: HashMap<usize, usize, FxBuildHasher>,
     entries: Vec<Option<Held>>,
+    /// Each runtime with held landings: where its entries are, as
+    /// `(entry, cell)` (some taken since), and how many are still held, so
+    /// a runtime's first entry and its exit touch only its own.
+    by_rt: Vec<(RuntimeId, Vec<(usize, usize)>, usize)>,
     seq: u64,
     /// A held node was read through the view since the last claim.
     consulted: bool,
@@ -118,6 +122,28 @@ impl HoldSet {
     fn get(&mut self, cell: usize) -> Option<&mut Held> {
         let at = *self.by_cell.get(&cell)?;
         self.entries[at].as_mut()
+    }
+
+    fn added(&mut self, rt: RuntimeId, at: usize, cell: usize) {
+        match self.by_rt.iter_mut().find(|r| r.0 == rt) {
+            Some(r) => {
+                r.1.push((at, cell));
+                r.2 += 1;
+            }
+            None => self.by_rt.push((rt, vec![(at, cell)], 1)),
+        }
+    }
+
+    fn removed(&mut self, rt: RuntimeId) {
+        let i = self
+            .by_rt
+            .iter()
+            .position(|r| r.0 == rt)
+            .expect("incr-core: a held landing's runtime is listed");
+        self.by_rt[i].2 -= 1;
+        if self.by_rt[i].2 == 0 {
+            self.by_rt.swap_remove(i);
+        }
     }
 }
 
@@ -239,6 +265,7 @@ pub(crate) fn open(
             .position(|c| c.rt == rt && c.slot == slot)
             .map(|i| h.cut_recs.swap_remove(i));
         let at = h.entries.len();
+        h.added(rt, at, cell);
         h.entries.push(Some(Held {
             rt,
             slot,
@@ -388,7 +415,9 @@ pub(crate) fn keys(rt: RuntimeId) -> Vec<u32> {
 pub(crate) fn forget(cell: usize) -> Option<Held> {
     with(|h| {
         let at = h.by_cell.remove(&cell)?;
-        h.entries[at].take()
+        let e = h.entries[at].take()?;
+        h.removed(e.rt);
+        Some(e)
     })
 }
 
@@ -475,12 +504,14 @@ pub(crate) struct Taken {
 pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
         let mut taken: Vec<Held> = Vec::new();
-        for e in h.entries.iter_mut() {
-            if e.as_ref().is_some_and(|e| e.rt == rt) {
-                taken.extend(e.take());
+        if let Some(i) = h.by_rt.iter().position(|r| r.0 == rt) {
+            for (at, cell) in h.by_rt.swap_remove(i).1 {
+                if let Some(e) = h.entries[at].take() {
+                    h.by_cell.remove(&cell);
+                    taken.push(e);
+                }
             }
         }
-        h.by_cell.retain(|_, at| h.entries[*at].is_some());
         h.tainted.retain(|r| *r != rt);
         h.closed.retain(|r| *r != rt);
         h.recs.retain(|r| *r != rt);
@@ -492,6 +523,7 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
             && h.cut_recs.is_empty()
         {
             h.entries.clear();
+            debug_assert!(h.by_rt.is_empty());
             h.consulted = false;
             value_code::set_held_bit(false);
         }
@@ -515,7 +547,7 @@ pub(crate) fn holds_runtime(rt: RuntimeId) -> bool {
         && with(|h| {
             h.tainted.contains(&rt)
                 || h.closed.contains(&rt)
-                || h.entries.iter().flatten().any(|e| e.rt == rt)
+                || h.by_rt.iter().any(|r| r.0 == rt)
                 || h.cut_recs.iter().any(|c| c.rt == rt)
         })
 }
