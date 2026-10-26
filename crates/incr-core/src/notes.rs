@@ -310,10 +310,18 @@ pub(crate) struct Notes {
     /// The groups [`Self::take`] took whole, each kept to go back as it was
     /// when the copy it handed out is delivered at the place it was taken
     /// from. `by_node` keeps their places meanwhile.
-    parked: Vec<Group>,
+    parked: Vec<Parked>,
     /// Each group's key by its id.
     keys: BTreeMap<u64, PayloadKey>,
     next_group: u64,
+}
+
+/// A group [`Notes::take`] parked, with the removal `epoch` and `base` of
+/// the copy it handed out.
+struct Parked {
+    group: Group,
+    epoch: u64,
+    base: u32,
 }
 
 /// The copy a log's last [`Notes::note_copy`] noted, whose first `len`
@@ -373,6 +381,9 @@ impl Notes {
         base: u32,
         copy: SharedCopy<'_>,
     ) {
+        if self.unpark(rt, key, base, &copy) {
+            return;
+        }
         let SharedCopy {
             log,
             len,
@@ -380,21 +391,6 @@ impl Notes {
             base: from_base,
             cut,
         } = copy;
-        if let Some(i) = self
-            .parked
-            .iter()
-            .position(|g| Rc::ptr_eq(&g.logs[0].log, log))
-        {
-            let g = self.parked.swap_remove(i);
-            if (g.logs[0].rt, from_base) == (rt, base)
-                && cut.is_none()
-                && len == log.borrow().entries.len()
-                && !self.groups.contains_key(&key)
-            {
-                self.unpark(key, g, len, epoch, base);
-                return;
-            }
-        }
         let from = match &log.borrow().renoted {
             Some(r)
                 if (r.renote_gen, r.rt, r.key, r.base, r.from_base)
@@ -427,11 +423,36 @@ impl Notes {
         });
     }
 
-    /// Puts parked group `g` back under `key`, as noting again the copy of
-    /// its first `len` entries taken at removal `epoch` above `base` would.
-    fn unpark(&mut self, key: PayloadKey, g: Group, len: usize, epoch: u64, base: u32) {
-        note_work(1);
-        let (rt, top) = (g.logs[0].rt, g.top());
+    /// Puts the group parked with `copy` back under `key`, as noting
+    /// `copy` again above `base` would, when `copy` is the one its take
+    /// handed out, delivered where it was taken, and no note of its log
+    /// came or went since. Any other copy of the log unparks it for good.
+    fn unpark(&mut self, rt: RuntimeId, key: PayloadKey, base: u32, copy: &SharedCopy<'_>) -> bool {
+        if self.parked.is_empty() {
+            return false;
+        }
+        note_work(self.parked.len());
+        let Some(i) = self
+            .parked
+            .iter()
+            .position(|p| Rc::ptr_eq(&p.group.logs[0].log, copy.log))
+        else {
+            return false;
+        };
+        let Parked {
+            group: g,
+            epoch,
+            base: from,
+        } = self.parked.swap_remove(i);
+        let len = copy.log.borrow().entries.len();
+        let as_taken = g.logs[0].rt == rt
+            && (from, copy.base) == (base, base)
+            && (copy.epoch, copy.len) == (epoch, len)
+            && copy.cut.is_none();
+        if !as_taken || self.groups.contains_key(&key) {
+            return false;
+        }
+        let top = g.top();
         self.live += g.live;
         self.keys.insert(g.id, key);
         g.logs[0].log.borrow_mut().renoted = Some(Renoted {
@@ -446,6 +467,7 @@ impl Notes {
         });
         self.groups.insert(key, g);
         self.retop(key, None, top);
+        true
     }
 
     /// Notes the ticket `members` stands for, which a read took with the
@@ -540,7 +562,8 @@ impl Notes {
 
     fn removed(&mut self) {
         // A parked group whose copy went can never go back.
-        self.parked.retain(|g| Rc::strong_count(&g.logs[0].log) > 1);
+        self.parked
+            .retain(|p| Rc::strong_count(&p.group.logs[0].log) > 1);
         if self.live == 0 && self.parked.is_empty() {
             self.by_node.clear();
         }
@@ -557,7 +580,8 @@ impl Notes {
             // A parked group's places are no longer all indexed, so it goes
             // back only as its copy's notes.
             if !self.parked.is_empty() {
-                self.parked.retain(|g| g.id != at.group);
+                note_work(self.parked.len());
+                self.parked.retain(|p| p.group.id != at.group);
             }
             let Some(&key) = self.keys.get(&at.group) else {
                 continue;
@@ -719,7 +743,11 @@ impl Notes {
             let l = &mut g.logs[0];
             l.copied = l.log.borrow().entries.len();
             let copy = Landings::shared(Some(key), l.log.clone(), epoch, base, top);
-            self.parked.push(g);
+            self.parked.push(Parked {
+                group: g,
+                epoch,
+                base,
+            });
             return copy;
         }
         let nodes = g

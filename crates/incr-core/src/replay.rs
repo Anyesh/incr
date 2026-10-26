@@ -398,7 +398,7 @@ impl Landings {
 
     /// At least the deepest landing's depth, if it may have a landing.
     fn deepest(&self) -> Option<u32> {
-        let deepest = match &self.nodes {
+        match &self.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
                 nodes.iter().map(|&(_, depth)| depth).max()
@@ -406,8 +406,7 @@ impl Landings {
             // No landing is deeper than `depth`, and finding the deepest
             // would take each delivery of a deep chain's copy apart.
             Nodes::Shared { depth, .. } => Some(*depth),
-        };
-        deepest
+        }
     }
 
     /// At least the deepest landing's depth.
