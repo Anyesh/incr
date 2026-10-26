@@ -697,8 +697,8 @@ struct Eval {
     returned: Vec<(usize, u64)>,
     /// The reads, by index, whose target was an open run on this thread.
     closing: Vec<usize>,
-    /// Whether the run ended in a doomed frame, which read a placeholder,
-    /// lands nothing and runs again.
+    /// Whether the run's frame was doomed (it or a frame it ran under read
+    /// a placeholder), so it lands nothing and runs again.
     doomed: bool,
 }
 
