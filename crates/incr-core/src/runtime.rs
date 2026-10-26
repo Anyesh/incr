@@ -819,6 +819,14 @@ impl Walk {
         }
     }
 
+    /// [`Self::visit`], returning the index of the visit's own entry: the
+    /// switch to exact mode can drop entries below it, so it may sit lower
+    /// than the length before the visit.
+    fn visit_pending(&mut self, id: NodeId, generation: u32, new: bool) -> usize {
+        self.visit(id, generation, new);
+        self.work.len() - 1
+    }
+
     #[cold]
     #[inline(never)]
     fn visit_exact(&mut self, id: NodeId) {
@@ -3898,9 +3906,8 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let planned_len = walk.work.len();
                     self.park(ParkPoint::WalkBeforeDeps(cur));
-                    walk.visit(cur, generation, observed == NodeState::New);
+                    let pending = walk.visit_pending(cur, generation, observed == NodeState::New);
                     let kept = kept.map_or(usize::MAX, |k| k as usize);
                     if let Some(deps) = node.inline_deps() {
                         for dep in deps.take(kept) {
@@ -3923,7 +3930,7 @@ impl<C: Cells> Runtime<C> {
                     if !C::SINGLE_THREADED && (node.held_mark() || self.retracted_since(&walk)) {
                         self.drop_held_expansion(
                             &mut walk,
-                            planned_len,
+                            pending,
                             (cur, generation),
                             (cur, generation),
                         );
@@ -3940,17 +3947,17 @@ impl<C: Cells> Runtime<C> {
         root
     }
 
-    /// Undoes the expansion of `id` past `planned_len` unless this thread
-    /// holds the run open on `held` (`id` or a member of its group), waits
-    /// another thread's run out, and visits `id` again. A retraction
-    /// counted since the walk last checked may have restored the deps it
-    /// read, so the visit reads them again.
+    /// Undoes the expansion of `id` from its pending entry at `pending` on,
+    /// unless this thread holds the run open on `held` (`id` or a member of
+    /// its group), waits another thread's run out, and visits `id` again. A
+    /// retraction counted since the walk last checked may have restored the
+    /// deps it read, so the visit reads them again.
     #[cold]
     #[inline(never)]
     fn drop_held_expansion(
         &self,
         walk: &mut Walk,
-        planned_len: usize,
+        pending: usize,
         (id, generation): (NodeId, u32),
         (held, held_gen): (NodeId, u32),
     ) {
@@ -3968,7 +3975,7 @@ impl<C: Cells> Runtime<C> {
             self.rereads.fetch_add(1, Relaxed);
             self.max_walk_rereads.fetch_max(walk.rereads, Relaxed);
         }
-        walk.work.truncate(planned_len);
+        walk.work.truncate(pending);
         walk.forget(|&n| n == id);
         let open = || {
             node.held_mark()
@@ -4152,8 +4159,7 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let planned_len = walk.work.len();
-        walk.visit(cur, generation, false);
+        let pending = walk.visit_pending(cur, generation, false);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group
@@ -4182,7 +4188,7 @@ impl<C: Cells> Runtime<C> {
             if held.is_some() || self.retracted_since(walk) {
                 self.drop_held_expansion(
                     walk,
-                    planned_len,
+                    pending,
                     (cur, generation),
                     held.unwrap_or((cur, generation)),
                 );

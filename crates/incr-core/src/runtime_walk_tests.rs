@@ -2533,3 +2533,24 @@ fn an_untainted_entry_merged_into_its_parent_keeps_the_new_mark() {
     assert_eq!(walk.work.len(), 1);
     assert_eq!(walk.work[0].taint, NO_TAINT_NEW);
 }
+
+/// The visit that switches the walk to exact mode drops a repeated pending
+/// entry below its own, so the visit's entry ends up below the length the
+/// walk had before it; cutting an expansion there keeps nothing pushed after
+/// the visit.
+#[test]
+fn a_visit_at_the_exact_switch_reports_its_own_entry() {
+    let (r, m, c, d) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
+    let mut walk = Walk::new(r, 0, NodeState::Dirty);
+    walk.work.clear();
+    walk.visit(m, 0, false);
+    walk.visit(m, 0, false);
+    walk.first_visits = EXACT_MODE_AT - 1;
+    let before = walk.work.len();
+    let pending = walk.visit_pending(c, 0, false);
+    assert!(pending < before);
+    assert_eq!(walk.work[pending].id, c);
+    walk.expand(d, 0, NodeState::Dirty);
+    walk.work.truncate(pending);
+    assert!(walk.work.iter().all(|e| e.id != c && e.id != d));
+}
