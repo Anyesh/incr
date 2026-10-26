@@ -471,7 +471,7 @@ pub(crate) struct Pending {
     by_read: Index<(u32, u32, u32, u64), usize>,
     /// How many deliveries each frame's own runtime's reads have still to
     /// take: those with no `foreign` key and not `taken`, kept by `push`,
-    /// `remove` and `set_taken`.
+    /// `unindex` and `set_taken`.
     untaken: HashMap<(u32, u32, u32), u32, FxBuildHasher>,
     /// By the frame's node and generation, at any position.
     by_node: Index<(u32, u32), usize>,
@@ -519,8 +519,34 @@ fn list<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: K, x: T) {
 
 /// Drops the items `gone` accepts from the list `map` holds under `at`.
 fn unlist<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: &K, gone: impl Fn(&T) -> bool) {
-    if map.get_mut(at).is_some_and(|l| l.retain(|x| !gone(x))) {
+    if map.get_mut(at).is_some_and(|l| {
+        note_work(l.as_slice().len());
+        l.retain(|x| !gone(x))
+    }) {
         map.remove(at);
+    }
+}
+
+/// Drops the items `gone` accepts from each list `map` holds under `keys`,
+/// passing over each list once; with `many` false the keys are taken as
+/// distinct, which spares a single removal the set.
+fn unlist_all<K: std::hash::Hash + Eq + Copy>(
+    map: &mut Index<K, usize>,
+    keys: impl Iterator<Item = K>,
+    gone: impl Fn(&usize) -> bool,
+    many: bool,
+) {
+    if !many {
+        for k in keys {
+            unlist(map, &k, &gone);
+        }
+        return;
+    }
+    let mut seen = HashSet::with_hasher(FxBuildHasher);
+    for k in keys {
+        if seen.insert(k) {
+            unlist(map, &k, &gone);
+        }
     }
 }
 
@@ -558,33 +584,79 @@ impl Pending {
         let d = self.slots[i]
             .take()
             .expect("incr-core: a delivery is removed once");
-        unlist(&mut self.by_key, &d.key, |&j| j == i);
-        unlist(&mut self.by_maker, &d.maker, |&j| j == i);
-        unlist(&mut self.by_frame, &frame_of(&d.key), |&j| j == i);
-        unlist(&mut self.by_read, &read_of(&d.key), |&j| j == i);
-        if awaits(&d) {
-            self.count_taken(frame_of(&d.key));
+        self.unindex(std::slice::from_ref(&d));
+        d
+    }
+
+    /// Removes deliveries `is`, in that order.
+    fn remove_all(&mut self, is: Vec<usize>) -> Vec<Delivery> {
+        let out: Vec<Delivery> = is
+            .into_iter()
+            .map(|i| {
+                self.slots[i]
+                    .take()
+                    .expect("incr-core: a delivery is removed once")
+            })
+            .collect();
+        self.unindex(&out);
+        out
+    }
+
+    /// Drops `out`, deliveries just taken from their slots, from every
+    /// index, passing over each list they share once rather than once per
+    /// delivery: a wide frame's deliveries share its frame's, maker's and
+    /// node's lists.
+    fn unindex(&mut self, out: &[Delivery]) {
+        if out.is_empty() {
+            return;
         }
-        unlist(&mut self.by_node, &(d.key.node, d.key.generation), |&j| {
-            j == i
-        });
-        if d.provenance.is_some() {
-            self.traced -= 1;
-            let own = (d.key.cidx, d.key.node, d.key.generation);
-            for stand in std::iter::once(&own).chain(&d.below) {
-                unlist(&mut self.by_stand, stand, |&j| j == i);
+        let many = out.len() > 1;
+        let slots = &self.slots;
+        let gone = |&j: &usize| slots[j].is_none();
+        unlist_all(&mut self.by_key, out.iter().map(|d| d.key), gone, many);
+        unlist_all(&mut self.by_maker, out.iter().map(|d| d.maker), gone, many);
+        unlist_all(
+            &mut self.by_frame,
+            out.iter().map(|d| frame_of(&d.key)),
+            gone,
+            many,
+        );
+        unlist_all(
+            &mut self.by_read,
+            out.iter().map(|d| read_of(&d.key)),
+            gone,
+            many,
+        );
+        unlist_all(
+            &mut self.by_node,
+            out.iter().map(|d| (d.key.node, d.key.generation)),
+            gone,
+            many,
+        );
+        let traced = || out.iter().filter(|d| d.provenance.is_some());
+        if traced().next().is_some() {
+            self.traced -= traced().count();
+            let stands = traced().flat_map(|d| {
+                std::iter::once((d.key.cidx, d.key.node, d.key.generation))
+                    .chain(d.below.iter().copied())
+            });
+            unlist_all(&mut self.by_stand, stands, gone, many);
+            unlist_all(&mut self.by_frontier, traced().map(frontier), gone, many);
+        }
+        if out.iter().any(|d| d.passed) {
+            note_work(self.deep.len());
+            self.deep.retain(|j| !gone(j));
+        }
+        for d in out {
+            if awaits(d) {
+                self.count_taken(frame_of(&d.key));
             }
-            unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        if d.passed {
-            self.deep.retain(|&j| j != i);
-        }
-        self.live -= 1;
+        self.live -= out.len();
         // No index is held across a point where none is live.
         if self.live == 0 {
             self.slots.clear();
         }
-        d
     }
 
     pub(crate) fn get(&self, i: usize) -> &Delivery {
@@ -752,10 +824,8 @@ impl Pending {
 
     /// Removes the deliveries the run at `level` made, oldest first.
     pub(crate) fn extract_maker(&mut self, level: u32) -> Vec<Delivery> {
-        self.of_maker(level)
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = self.of_maker(level);
+        self.remove_all(is)
     }
 
     /// The deliveries for reads by the frame of `node` at `generation` and
@@ -766,10 +836,8 @@ impl Pending {
 
     /// Removes the deliveries for reads by that frame, oldest first.
     pub(crate) fn extract_frame(&mut self, node: u32, generation: u32, cidx: u32) -> Vec<Delivery> {
-        self.of_frame(node, generation, cidx)
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = self.of_frame(node, generation, cidx);
+        self.remove_all(is)
     }
 
     /// Whether a frame of `node` at `generation`, at any position, has an
@@ -790,10 +858,8 @@ impl Pending {
     /// Removes, oldest first, the deliveries for reads by the frames of
     /// `node` at `generation`, at any position.
     pub(crate) fn extract_node(&mut self, node: u32, generation: u32) -> Vec<Delivery> {
-        listed(&self.by_node, &(node, generation))
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = listed(&self.by_node, &(node, generation));
+        self.remove_all(is)
     }
 
     /// Whether any delivery carries a provenance record.
@@ -1486,8 +1552,8 @@ thread_local! {
 }
 
 /// Counts `units` elements a pass over this thread's notes, their copies,
-/// its kept reads, a context's traced deliveries or the provenance records
-/// looked at.
+/// its kept reads, a context's traced deliveries, the provenance records
+/// or a delivery index's list looked at.
 #[inline(always)]
 pub(crate) fn note_work(units: usize) {
     #[cfg(all(test, not(loom)))]
@@ -3065,7 +3131,7 @@ pub(crate) struct EarliestByFrame {
     /// notes a record again: a record taken for one meanwhile would be one
     /// of the ended runs'.
     #[cfg(debug_assertions)]
-    ended: std::collections::HashSet<(u32, u32), FxBuildHasher>,
+    ended: HashSet<(u32, u32), FxBuildHasher>,
 }
 
 /// A frame's node, generation and position.
