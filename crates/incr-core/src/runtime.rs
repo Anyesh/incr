@@ -489,6 +489,13 @@ pub(crate) type BagHook =
 /// First visits after which an `ensure_clean` walk switches to exact mode.
 const EXACT_MODE_AT: u32 = 4096;
 
+/// Root restarts a read's walk takes for other threads' releases before it
+/// goes on with its plan. Another thread can release in every plan, as a
+/// budgeted read discarding a doomed cycle's rounds does, and a read that
+/// restarted each time would never end.
+// 1: seed 0x88c0's two-thread outcomes stay serializable at 1 as at 4 and 16.
+const ROOT_RESTARTS: u32 = 1;
+
 /// How `compute_one` treats the node it was handed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Visit {
@@ -2424,6 +2431,7 @@ impl<C: Cells> Runtime<C> {
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
         let _root = reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
+        let mut restarts = 0;
         loop {
             if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
                 if let Some(value) = self.stashed_read(handle) {
@@ -2444,8 +2452,9 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             // `get` found the node not Clean, so the walk starts at once.
-            let walk =
-                || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
+            let walk = || {
+                self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed, restarts)
+            };
             let walked = self
                 .entered(kind, walk)
                 .inspect_err(|_| self.unregenerable(frame));
@@ -2474,6 +2483,7 @@ impl<C: Cells> Runtime<C> {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
                 Computed::Replan => {
+                    restarts += 1;
                     observed = state::load::<C>(node.state_cell());
                     continue;
                 }
@@ -3219,14 +3229,15 @@ impl<C: Cells> Runtime<C> {
         // takes locks in this release.
         let word = value_code::checked_word();
 
+        let mut restarts = 0;
         loop {
             // Fast path: already clean.
             let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
             if observed == NodeState::Clean {
                 return Computed::Done;
             }
-            match self.clean_walk::<0>(id, gen, word, observed) {
-                Computed::Replan => {}
+            match self.clean_walk::<0>(id, gen, word, observed, restarts) {
+                Computed::Replan => restarts += 1,
                 computed => return computed,
             }
         }
@@ -3253,12 +3264,16 @@ impl<C: Cells> Runtime<C> {
     /// A node found Computing is waited on here once before its pending
     /// entry's compute loads it again, so that no Computing state is
     /// loaded twice before the first backoff.
+    ///
+    /// `restarts` is how many times the caller's read restarted the walk
+    /// for other threads' releases already.
     fn clean_walk<const MODE: u8>(
         &self,
         id: NodeId,
         gen: u32,
         word: u64,
         observed: NodeState,
+        restarts: u32,
     ) -> Computed {
         // A read whose walk a doom stopped goes on with it even if its root
         // has been memoized since, as the unbounded run's walk goes on.
@@ -3369,9 +3384,11 @@ impl<C: Cells> Runtime<C> {
                     // A root its deps-first computes deferred into this
                     // thread's held map is not walked again, since its walk
                     // would wait on this thread's own claim: the plan goes on
-                    // to the root's compute, which reads it as deferred.
+                    // to the root's compute, which reads it as deferred. A
+                    // read restarts at most `ROOT_RESTARTS` times.
                     let released = !resumed
                         && !ran_unsettled
+                        && restarts < ROOT_RESTARTS
                         && self.released_since(planned)
                         && !cycle_state::holds(self.runtime_id, id.0);
                     resumed = false;

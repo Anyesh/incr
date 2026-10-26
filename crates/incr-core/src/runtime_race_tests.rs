@@ -2409,4 +2409,8 @@ fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
         "the read restarted until the releases stopped: {released} releases, {} root replans",
         rt.root_replans.load(Ordering::Relaxed)
     );
+    assert_eq!(
+        rt.root_replans.load(Ordering::Relaxed),
+        super::ROOT_RESTARTS
+    );
 }
