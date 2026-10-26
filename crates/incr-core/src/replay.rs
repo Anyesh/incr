@@ -3807,6 +3807,31 @@ mod tests {
     use super::*;
     use crate::notes::Notes;
 
+    /// A cut that takes a node's newer, deeper note and keeps its older one
+    /// leaves the older stamp: the frame's containment names only the
+    /// landing its kept notes name.
+    #[test]
+    fn a_cut_newer_note_leaves_the_older_stamp() {
+        let rt = RuntimeId::for_test(7);
+        let payload: Box<dyn Any + Send> = Box::new("p");
+        let key = payload_key(&*payload);
+        let mut notes = Notes::new();
+        notes.push(rt, key, 1, ((5, 0), 10), false);
+        notes.push(rt, key, 3, ((5, 0), 20), false);
+        let whole = notes.copy(rt, key, 0).into_nodes();
+        assert_eq!(whole, vec![((5, 0), 1, 20)]);
+        let mut cut = notes.copy(rt, key, 0);
+        let Nodes::Shared { cut: c, .. } = &mut cut.nodes else {
+            panic!("a copy of a log shares it");
+        };
+        *c = Some(Cut {
+            depth: 2,
+            seen: 0,
+            landed: Rc::new(CutLandings::default()),
+        });
+        assert_eq!(cut.into_nodes(), vec![((5, 0), 1, 10)]);
+    }
+
     /// Copy `a` of a log is taken before a removal and copy `b` after it,
     /// and `b` is marked first: `a` still holds the removed note, so its
     /// mark must not stop at the watermark `b` left.
