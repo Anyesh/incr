@@ -16,6 +16,7 @@ use crate::node::NodeId;
 use crate::state::NodeState;
 use crate::test_size::test_size;
 use crate::value_code;
+use crate::waits;
 
 /// Nested first computes overflow the default test thread stack somewhere
 /// between 600 and 700 levels in debug builds. The taint chain's 10,000
@@ -2454,6 +2455,83 @@ fn shared_stale_dep_whose_episode_cycles_reaches_the_reader() {
     assert_eq!(
         stale_dep_whose_episode_cycles::<Shared>(),
         Err(EPISODE_CYCLE.into())
+    );
+}
+
+/// **A walk that waited out another thread's claim of its root plans as a
+/// fresh walk would.** B's walk visits `r` New and parks before claiming
+/// it; A claims `r` and parks in its run. Released, B waits on A's claim.
+/// A's run catches the cycle `b -> c -> b` entered at `b`, then panics when
+/// `b` sees the fallback of `c` (Fallback), so `r`, `b` and `c` land unwound
+/// with recorded deps on each other. B's walk revisits `r` and alternates
+/// between `b` and `c` until it switches to exact mode: it must enter the
+/// cycle where a later read on one thread does, at `c`, though its first
+/// visit of `r` counted once more than that read's walk.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_walk_that_waited_on_its_root_plans_afresh() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let v = rt.create_input(0_i64);
+    let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let c = {
+        let b_cell = b_cell.clone();
+        rt.create_query_with(
+            move |rt| rt.get(v) + rt.get(*b_cell.get().unwrap()),
+            QueryOpts {
+                cycle: CycleStrategy::fallback(|_| 1),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let _ = rt.try_get(c);
+        match rt.get(c) {
+            1 => panic!("b saw c's fallback"),
+            seen => seen + 100,
+        }
+    });
+    b_cell.set(b).unwrap();
+    let in_run = Gate::new();
+    let r = {
+        let in_run = in_run.clone();
+        rt.create_query(move |rt| {
+            in_run.park();
+            let _ = rt.try_get(b);
+            rt.try_get(c).unwrap_or(0)
+        })
+    };
+    let before_claim = Gate::new();
+    park_at(
+        &rt,
+        vec![(
+            ParkPoint::BeforeComputeOne(NodeId(r.slot())),
+            before_claim.clone(),
+        )],
+    );
+    let read = || {
+        let rt = rt.clone();
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(r))).map_err(panic_message))
+    };
+    let second = read();
+    before_claim.wait_parked();
+    in_run.arm();
+    let first = read();
+    in_run.wait_parked();
+    before_claim.release();
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while !waits::waited_on((rt.runtime_id, r.slot())) {
+        assert!(std::time::Instant::now() < deadline, "B never waited on r");
+        thread::sleep(Duration::from_millis(1));
+    }
+    in_run.release();
+    let boom = || Err("b saw c's fallback".to_owned());
+    assert_eq!(
+        (first.join().unwrap(), second.join().unwrap()),
+        (boom(), boom())
+    );
+    assert_eq!(
+        catch_unwind(AssertUnwindSafe(|| rt.get(r))).map_err(panic_message),
+        boom()
     );
 }
 
