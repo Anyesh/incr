@@ -4781,7 +4781,9 @@ impl<C: Cells> Runtime<C> {
 
     /// [`Self::unwound_poison`] for an unwind out of node `slot`.
     pub(super) fn failed_poison(&self, kind: Option<UnwindKind>, slot: u32) -> u16 {
-        if kind.is_none() && self.nodes.get(slot).state() == NodeState::Failed {
+        let node = self.nodes.get(slot);
+        if kind.is_none() && self.seen_quietly(node.state_cell(), node.state()) == NodeState::Failed
+        {
             cycle::HANDLED
         } else {
             cycle::POISONED

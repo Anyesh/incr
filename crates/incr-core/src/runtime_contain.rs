@@ -439,7 +439,7 @@ impl<C: Cells> Runtime<C> {
             node.generation() == generation
                 && self.in_failed_landing(
                     slot,
-                    self.seen(node.state_cell(), state::load::<C>(node.state_cell())),
+                    self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
                 )
                 && t.of((slot, generation))
                     .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
