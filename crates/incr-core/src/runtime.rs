@@ -653,9 +653,10 @@ enum Seen {
     Unwalked,
     Dirty,
     New,
-    /// The member a group expansion stood for: a plan that no longer holds
-    /// once the group is gone.
-    Group,
+    /// The member a group expansion stood for, with the record it expanded
+    /// (null if the walk forgot it): a plan that holds only while that
+    /// record stands.
+    Group(*const GroupInfo),
 }
 
 /// One entry of `ensure_clean`'s walk. A visit (`taint >= VISIT_COMPUTING`)
@@ -725,11 +726,21 @@ pub(crate) struct Walk {
 struct Expanded {
     /// New nodes with installed deps the walk has expanded.
     new: HashSet<NodeId>,
-    /// The cycle groups the walk has expanded whole.
-    groups: Vec<Arc<GroupInfo>>,
+    /// The cycle groups the walk has expanded whole, each with the member
+    /// it was expanded at; at most one per member.
+    groups: Vec<(NodeId, Arc<GroupInfo>)>,
 }
 
 impl Walk {
+    #[cold]
+    #[inline(never)]
+    fn expanded_group(&self, id: NodeId) -> *const GroupInfo {
+        self.expanded
+            .as_ref()
+            .and_then(|e| e.groups.iter().find(|(at, _)| *at == id))
+            .map_or(std::ptr::null(), |(_, group)| Arc::as_ptr(group))
+    }
+
     /// Drops the pending entry of `id` the walk was to run next, whose
     /// compute ran elsewhere. The root's entry stays: a walk stopped at a
     /// non-root entry of the root's own node (a self-edge's repeat) still
@@ -969,7 +980,7 @@ impl Walk {
             expanded.new.retain(|id| !gone(id));
             expanded
                 .groups
-                .retain(|g| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
+                .retain(|(_, g)| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
         }
     }
 
@@ -3648,7 +3659,7 @@ impl<C: Cells> Runtime<C> {
                 } else if taint == NO_TAINT_NEW || forced {
                     Seen::New
                 } else if taint == NO_TAINT_GROUP {
-                    Seen::Group
+                    Seen::Group(walk.expanded_group(cur))
                 } else {
                     Seen::Dirty
                 };
@@ -4049,10 +4060,16 @@ impl<C: Cells> Runtime<C> {
             return false;
         };
         let groups = &mut walk.expanded.get_or_insert_with(Box::default).groups;
-        if groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
+        // A member keeps the first record expanded at it, which its marked
+        // entry's claim checks: a replaced record is replanned there, not
+        // expanded at the member a second time.
+        if groups
+            .iter()
+            .any(|(at, g)| *at == cur || Arc::ptr_eq(g, &group))
+        {
             return true;
         }
-        groups.push(group.clone());
+        groups.push((cur, group.clone()));
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4370,14 +4387,18 @@ impl<C: Cells> Runtime<C> {
                 return Computed::Revisit;
             }
             // Another thread's landings can take the members out of the
-            // group the walk expanded here, after any wait the walk made,
-            // and the plan then never expanded the members' own deps.
-            if seen == Seen::Group
-                && (C::u8_load_relaxed(flags) & IN_GROUP == 0
-                    || self.standing_group(id, g).is_none())
-            {
-                self.unclaim_unrun(node, claimed_dirty);
-                return Computed::Revisit;
+            // group the walk expanded here, or land them into another one,
+            // after any wait the walk made, and the plan then never expanded
+            // the deps of the members that record does not hold.
+            if let Seen::Group(expanded) = seen {
+                if C::u8_load_relaxed(flags) & IN_GROUP == 0
+                    || !self
+                        .standing_group(id, g)
+                        .is_some_and(|group| std::ptr::eq(Arc::as_ptr(&group), expanded))
+                {
+                    self.unclaim_unrun(node, claimed_dirty);
+                    return Computed::Revisit;
+                }
             }
             // Another thread's memo landing since the load leaves a Dirty
             // the claim succeeds on, and the memo stands for this run.
