@@ -927,26 +927,27 @@ fn shared_contained_chain_stays_linear_at_budget_1() {
 /// the context's deliveries. `through` puts a query between each level and
 /// its panicking one, so each copy holds a landing a level deeper.
 fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
-    if cfg!(miri) || !through {
-        let n = if cfg!(miri) { 8 } else { 4000 };
-        let work = nested_caught_chain_work::<C>(frames, through, n);
-        assert!(
-            work <= 24 * n,
-            "budget {frames}: {work} units of note work for a {n}-chain"
-        );
-        return;
-    }
     // Each doomed level's retry catches its kept reads up on what up to
     // `frames` levels above it did, so the work per level grows with the
     // budget, never with the chain.
-    let (small, large) = (
-        nested_caught_chain_work::<C>(frames, through, 1000),
-        nested_caught_chain_work::<C>(frames, through, 4000),
-    );
+    let per_level = match (through, frames) {
+        (false, _) => 24,
+        (true, 1) => 48,
+        (true, _) => 240,
+    };
+    let n = if cfg!(miri) { 8 } else { 4000 };
+    let work = nested_caught_chain_work::<C>(frames, through, n);
     assert!(
-        large <= 6 * small,
-        "budget {frames}: {small} and {large} units of note work for 1000- and 4000-chains"
+        work <= per_level * n,
+        "budget {frames}: {work} units of note work for a {n}-chain"
     );
+    if through && !cfg!(miri) {
+        let small = nested_caught_chain_work::<C>(frames, through, 1000);
+        assert!(
+            work <= 6 * small,
+            "budget {frames}: {small} and {work} units of note work for 1000- and 4000-chains"
+        );
+    }
 }
 
 /// The note work of a chain of `n` levels as [`nested_caught_chain`] builds it.
