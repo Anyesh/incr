@@ -236,7 +236,8 @@ impl Drop for Scope {
 
 /// Reserves `claim` at `generation` for the scope's context, if a
 /// [`Scope`] is open and no context of this thread reserves it already.
-/// Called before the release.
+/// Called before the release. A claim only a read group lists is listed
+/// again, awake: the one way a walk's listing at rest is woken.
 pub(crate) fn note(claim: Claim, generation: u32) {
     let Some(context) = SCOPE.with(Cell::get) else {
         return;
@@ -331,18 +332,21 @@ pub(crate) fn note_walk(claim: Claim, generation: u32) {
     if listed(context, claim, generation) {
         return;
     }
-    MINE.with(|m| {
+    let listed = MINE.with(|m| {
         let token = m.token();
         {
             let mut t = table();
-            let mine = t
-                .get(&claim)
-                .is_some_and(|&(g, owner, _)| (g, owner) == (generation, token));
-            if !mine {
-                let stamp = SEQ.fetch_add(1, Ordering::SeqCst);
-                if t.insert(claim, (generation, token, stamp)).is_none() {
-                    #[cfg(not(loom))]
-                    bucket(claim).fetch_add(1, Ordering::Relaxed);
+            match t.get(&claim) {
+                // Another thread's reservation already holds every op this
+                // one would.
+                Some(&(g, owner, _)) if g == generation && owner != token => return false,
+                Some(&(g, _, _)) if g == generation => {}
+                _ => {
+                    let stamp = SEQ.fetch_add(1, Ordering::SeqCst);
+                    if t.insert(claim, (generation, token, stamp)).is_none() {
+                        #[cfg(not(loom))]
+                        bucket(claim).fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             LIVE.store(t.len(), Ordering::Relaxed);
@@ -355,8 +359,11 @@ pub(crate) fn note_walk(claim: Claim, generation: u32) {
                 claims: Claims::one((claim, generation)),
             }),
         }
+        true
     });
-    ROOTS.with(|n| n.set(n.get() + 1));
+    if listed {
+        ROOTS.with(|n| n.set(n.get() + 1));
+    }
 }
 
 /// Whether this thread's group of `context` lists `claim`.
