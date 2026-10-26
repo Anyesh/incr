@@ -2193,6 +2193,7 @@ fn held_failed_after_a_delete(
     let x = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(y) + 1, replayable());
     let gone = Arc::new(AtomicBool::new(false));
     let deleted = Arc::clone(&gone);
+    let was_deleted = Arc::clone(&gone);
     let c = rt.create_query_with(
         move |rt: &Runtime<Shared>| -> u64 {
             if !deleted.load(SeqCst) && rt.try_delete_node(x).is_ok() {
@@ -2256,6 +2257,7 @@ fn held_failed_after_a_delete(
     }));
     assert!(installed.is_ok());
     let got = rt.try_get(top).unwrap_or(7777);
+    assert!(was_deleted.load(SeqCst), "c never deleted x");
     let seen = seen.lock().unwrap().clone();
     (got, seen, rt.state_of(c))
 }
