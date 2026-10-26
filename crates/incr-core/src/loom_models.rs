@@ -917,13 +917,18 @@ fn released_group(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
     (r, y)
 }
 
+/// A read's result with its cycle as the slots it names: the serial
+/// orders run on runtimes built alike, whose handles differ by runtime.
+type SlotRead = Result<u64, Vec<u32>>;
+
+fn by_slots(read: Result<u64, crate::cycle::Cycle>) -> SlotRead {
+    read.map_err(|c| c.participants().iter().map(|p| p.slot()).collect())
+}
+
 #[test]
 fn loom_released_group_members_stay_grouped_until_the_read_ends() {
     run(|| {
-        let orders: Vec<(
-            Result<u64, crate::cycle::Cycle>,
-            Result<u64, crate::cycle::Cycle>,
-        )> = [true, false]
+        let orders: Vec<(SlotRead, SlotRead)> = [true, false]
             .into_iter()
             .map(|r_first| {
                 let rt = Rt::new();
@@ -936,6 +941,7 @@ fn loom_released_group_members_stay_grouped_until_the_read_ends() {
                     (rt.try_get(r), b)
                 }
             })
+            .map(|(a, b)| (by_slots(a), by_slots(b)))
             .collect();
         let rt = Arc::new(Rt::new());
         let (r, y) = released_group(&rt);
@@ -947,7 +953,10 @@ fn loom_released_group_members_stay_grouped_until_the_read_ends() {
             let rt = Arc::clone(&rt);
             thread::spawn(move || rt.try_get(y))
         };
-        let got = (reads_r.join().unwrap(), reads_y.join().unwrap());
+        let got = (
+            by_slots(reads_r.join().unwrap()),
+            by_slots(reads_y.join().unwrap()),
+        );
         assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
 
         rt.assert_invariant_i();
@@ -998,10 +1007,7 @@ fn held_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
 #[test]
 fn loom_held_episode_wound_retracts_values() {
     run(|| {
-        let orders: Vec<(
-            Result<u64, crate::cycle::Cycle>,
-            Result<u64, crate::cycle::Cycle>,
-        )> = [true, false]
+        let orders: Vec<(SlotRead, SlotRead)> = [true, false]
             .into_iter()
             .map(|o_first| {
                 let rt = Rt::new();
@@ -1014,6 +1020,7 @@ fn loom_held_episode_wound_retracts_values() {
                     (rt.try_get(o), b)
                 }
             })
+            .map(|(a, b)| (by_slots(a), by_slots(b)))
             .collect();
         let rt = Arc::new(Rt::new());
         let (o, q, x, y) = held_episode(&rt);
@@ -1025,7 +1032,10 @@ fn loom_held_episode_wound_retracts_values() {
             let rt = Arc::clone(&rt);
             thread::spawn(move || rt.try_get(q))
         };
-        let got = (reads_o.join().unwrap(), reads_q.join().unwrap());
+        let got = (
+            by_slots(reads_o.join().unwrap()),
+            by_slots(reads_q.join().unwrap()),
+        );
         assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
         assert_eq!(rt.stale_group_records(), Vec::<String>::new());
         assert!(
@@ -1106,10 +1116,7 @@ fn republished_group(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
 #[test]
 fn loom_held_group_record_precedes_state() {
     run(|| {
-        let orders: Vec<(
-            Result<u64, crate::cycle::Cycle>,
-            Result<u64, crate::cycle::Cycle>,
-        )> = [true, false]
+        let orders: Vec<(SlotRead, SlotRead)> = [true, false]
             .into_iter()
             .map(|o_first| {
                 let rt = Rt::new();
@@ -1122,6 +1129,7 @@ fn loom_held_group_record_precedes_state() {
                     (rt.try_get(o), second)
                 }
             })
+            .map(|(a, b)| (by_slots(a), by_slots(b)))
             .collect();
         let rt = Arc::new(Rt::new());
         let (o, a, b) = republished_group(&rt);
@@ -1133,7 +1141,10 @@ fn loom_held_group_record_precedes_state() {
             let rt = Arc::clone(&rt);
             thread::spawn(move || rt.try_get(b))
         };
-        let got = (reads_o.join().unwrap(), reads_b.join().unwrap());
+        let got = (
+            by_slots(reads_o.join().unwrap()),
+            by_slots(reads_b.join().unwrap()),
+        );
         assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
         assert_eq!(rt.stale_group_records(), Vec::<String>::new());
         assert!(
