@@ -3109,3 +3109,115 @@ fn hand_over_restarts_a_holder_boundedly() {
         assert!(!crate::hold::active(), "a held landing outlived the read");
     });
 }
+
+/// T reads `held`, which the read leaves held at one of the caught-cycle
+/// hold sites, and joins a thread that reads it too (both with `try_get`:
+/// a read of a caught cycle's member after another entry into the cycle
+/// may raise it, on main too). T is blocked in user code on that reader, so the reader
+/// takes `held` over and T's run ends as the wound and retries once.
+/// Returns T's value.
+fn join_reader_of_held(rt: &Arc<Rt>, held: Incr<u64>) -> u64 {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(rt))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let t = {
+        let (me, runs) = (Arc::clone(&me), Arc::clone(&runs));
+        rt.create_query(move |rt: &Rt| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            let v = rt.try_get(held).unwrap_or(9);
+            let other = me.lock().unwrap().clone().unwrap();
+            v + thread::spawn(move || other.try_get(held).unwrap_or(9))
+                .join()
+                .unwrap()
+        })
+    };
+    let got = rt.get(t);
+    *me.lock().unwrap() = None;
+    assert_eq!(runs.load(Ordering::Relaxed), 2, "T's runs");
+    rt.assert_invariant_i();
+    assert_eq!(crate::waits::registered(), 0);
+    assert!(!crate::reserve::any(), "a reservation outlived the read");
+    assert!(!crate::hold::active(), "a held landing outlived the read");
+    got
+}
+
+/// c and d read each other with `get`, so a read of c raises their cycle.
+fn raised_cycle(rt: &Rt) -> Incr<u64> {
+    let dc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+    let c = {
+        let dc = std::sync::Arc::clone(&dc);
+        rt.create_query(move |rt: &Rt| rt.get(*dc.get().unwrap()) + 1)
+    };
+    let d = rt.create_query(move |rt: &Rt| rt.get(c) * 2);
+    assert!(dc.set(d).is_ok());
+    c
+}
+
+/// R3 (`cycle_read`): a catches the cycle a -> b -> a it entered at a, so a
+/// is held for its reader. The joined reader takes a over. What each read
+/// of a gives depends on where the cycle was entered (main's entry-order
+/// class), so the model pins one value across every order.
+#[test]
+fn hand_over_at_a_cycle_closed_on_the_stack() {
+    static VALUE: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let bc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+        let a = {
+            let bc = std::sync::Arc::clone(&bc);
+            rt.create_query(move |rt: &Rt| rt.try_get(*bc.get().unwrap()).unwrap_or(7777))
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + 1);
+        assert!(bc.set(b).is_ok());
+        let got = join_reader_of_held(&rt, a);
+        assert_eq!(*VALUE.lock().unwrap().get_or_insert(got), got);
+    });
+}
+
+/// `first_entry` with a closed cycle: x catches another runtime's cycle,
+/// which closes inside that runtime's first entry, so x is held for its
+/// reader. The joined reader takes x over: both read 7777.
+#[test]
+fn hand_over_at_a_cycle_caught_across_runtimes() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let other = Arc::new(Rt::new());
+        let c = raised_cycle(&other);
+        let x = {
+            let other = Arc::clone(&other);
+            rt.create_query(move |_: &Rt| other.try_get(c).unwrap_or(7777))
+        };
+        assert_eq!(join_reader_of_held(&rt, x), 2 * 7777);
+        other.assert_invariant_i();
+    });
+}
+
+/// A cycle closed under another runtime's frame (`cycle_read` with no
+/// active frame of a's runtime): a reads e of another runtime, and e
+/// catches its read of a, so a is held for its reader. The joined reader
+/// takes a over: both read 7778.
+#[test]
+fn hand_over_at_a_cycle_closed_under_another_runtimes_frame() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let other = Arc::new(Rt::new());
+        let ac: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+        // e's runtime would otherwise keep a's alive past the model.
+        let back: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let e = {
+            let (back, ac) = (Arc::clone(&back), std::sync::Arc::clone(&ac));
+            other.create_query(move |_: &Rt| {
+                let rt = back.lock().unwrap().clone().unwrap();
+                rt.try_get(*ac.get().unwrap()).unwrap_or(7777)
+            })
+        };
+        let a = {
+            let other = Arc::clone(&other);
+            rt.create_query(move |_: &Rt| other.get(e) + 1)
+        };
+        assert!(ac.set(a).is_ok());
+        assert_eq!(join_reader_of_held(&rt, a), 2 * 7778);
+        *back.lock().unwrap() = None;
+        other.assert_invariant_i();
+    });
+}
