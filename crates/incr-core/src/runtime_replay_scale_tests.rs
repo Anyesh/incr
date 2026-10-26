@@ -135,7 +135,9 @@ macro_rules! cycle_100k_tests {
             #[test]
             #[cfg_attr(miri, ignore)]
             fn $name() {
-                on_stack(8 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
+                // A Shared ring level takes about 27 KiB of stack under a
+                // TSan debug build, so budget 256 needs over 7 MiB there.
+                on_stack(16 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
             }
         )*
     };
