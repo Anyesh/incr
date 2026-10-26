@@ -1092,7 +1092,7 @@ pub struct Runtime<C: Cells> {
     /// Delete claims, and speculative reads of a deleted node, so far. A
     /// delete changes what a read returns with no new revision, and so may
     /// the node recreated in its place for a run that read the dead one,
-    /// so a stash stands only at the count its run claimed under.
+    /// so a stash stands only at the count its run began under.
     pub(crate) reshapes: C::U64,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]

@@ -515,7 +515,7 @@ impl<C: Cells> Runtime<C> {
     /// lands them. Any dep that is neither Clean at or below the stash's
     /// verify revision nor adoptable fails the nodes above it, which keep
     /// their claims' source states and compute; the root keeps its claim.
-    /// So does any move of `Runtime::reshapes` since the stash's claim,
+    /// So does any move of `Runtime::reshapes` since the stash's run began,
     /// since a dep found Clean may have changed with no new revision.
     #[cold]
     #[inline(never)]
@@ -564,7 +564,7 @@ impl<C: Cells> Runtime<C> {
             }
             let a = stack.pop().expect("incr-core: adoption has a root");
             let root = stack.is_empty();
-            // A delete since the stash's run claimed may have changed a dep
+            // A delete since the stash's run began may have changed a dep
             // found Clean above.
             failed |= self.reshaped_since(&a.stash);
             if !failed && root {
@@ -1127,7 +1127,7 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether a node was deleted, or a speculative run read a dead handle,
-    /// since `stash`'s run claimed: any value it read may differ now.
+    /// since `stash`'s run began: any value it read may differ now.
     #[inline(always)]
     fn reshaped_since(&self, stash: &Stash) -> bool {
         stash.reshapes != C::u64_load_acquire(&self.reshapes)
@@ -5505,7 +5505,7 @@ pub(super) struct Stash {
     verify_rev: u64,
     /// A creator's child index as its run left it, unlanded.
     index: Option<StashedIndex>,
-    /// `Runtime::reshapes` at its run's claim. Once the count moves on, the
+    /// `Runtime::reshapes` as its run began. Once the count moves on, the
     /// stash stands only as a Native node's tried mark.
     reshapes: u64,
 }
