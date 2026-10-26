@@ -4516,9 +4516,10 @@ fn a_finished_regeneration_keeps_the_mark_of_the_next_rerun() {
     assert!(c.join(), "the second regeneration made no payload");
 }
 
-/// What [`shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload`]
+/// What [`shared_retry_joins_a_reader_that_takes_a_held_payload_over`]
 /// builds: W reads X, X reads Y, which panics "y boom" and arms `gate`;
-/// with `switch` set, W first joins another thread's read of X.
+/// with `switch` set, W first joins another thread's read of X. `joined`
+/// lists the joined reads of every run of W's closure in order.
 struct JoinedOverAPayload {
     rt: Arc<Rt>,
     gate: Gate,
@@ -4526,7 +4527,7 @@ struct JoinedOverAPayload {
     x: Incr<u64>,
     w: Incr<u64>,
     switch: Arc<AtomicBool>,
-    joined: Arc<Mutex<Option<Result<u64, String>>>>,
+    joined: Arc<Mutex<Vec<Result<u64, String>>>>,
     stalled: Arc<AtomicBool>,
 }
 
@@ -4546,7 +4547,7 @@ fn joined_over_a_payload() -> JoinedOverAPayload {
     };
     let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
     let switch = Arc::new(AtomicBool::new(false));
-    let joined = Arc::new(Mutex::new(None));
+    let joined = Arc::new(Mutex::new(Vec::new()));
     let stalled = Arc::new(AtomicBool::new(false));
     let w = {
         let (switch, joined, stalled) = (switch.clone(), joined.clone(), stalled.clone());
@@ -4563,7 +4564,7 @@ fn joined_over_a_payload() -> JoinedOverAPayload {
                     let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
                     loop {
                         if let Ok(read) = rx.try_recv() {
-                            *joined.lock().unwrap() = Some(read);
+                            joined.lock().unwrap().push(read);
                             break;
                         }
                         // Waiting here for a thread that waits on this one
@@ -4600,12 +4601,15 @@ fn joined_over_a_payload() -> JoinedOverAPayload {
 /// Failed and Y's payload waits for X's virtual frame. W's switch, set
 /// while the driver is parked, makes W's retry join another thread's read
 /// of X before W reads X. That read must not wait on this thread, which
-/// waits on it; which of the two reads gets Y's payload is open, as in
-/// the Shared payload contract.
+/// waits on it: it takes Y's held landing over and wounds this thread.
+/// Which of the first joined read and W's read gets Y's payload is open,
+/// as in the Shared payload contract; a run of W's closure the wound
+/// repeats joins a read of X Failed.
 #[test]
-fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
+fn shared_retry_joins_a_reader_that_takes_a_held_payload_over() {
     let s = joined_over_a_payload();
     s.rt.set_max_frames(2);
+    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
     hook(
         &s.rt,
         vec![(ParkPoint::BeforeEntry(id(s.w)), s.gate.clone())],
@@ -4619,9 +4623,16 @@ fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
     s.switch.store(true, SeqCst);
     s.gate.release();
     let first = first.join();
-    let joined = s.joined.lock().unwrap().clone();
+    let joins = s.joined.lock().unwrap().clone();
     assert!(!s.stalled.load(SeqCst), "the joined read waited: {first:?}");
-    let joined = joined.expect("the joined read returned");
+    let (joined, again) = joins.split_first().expect("the joined read returned");
+    assert!(again.iter().all(failed), "{joins:?}");
+    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst) - wounds;
+    assert!(
+        again.len() <= wounds as usize,
+        "{} reruns for {wounds} wounds",
+        again.len()
+    );
     s.rt.assert_invariant_i();
     assert_eq!(
         s.rt.provenance_records(),
@@ -4633,9 +4644,11 @@ fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
     u.rt.set_max_frames(u32::MAX);
     u.switch.store(true, SeqCst);
     let want = (outcome(|| u.rt.get(u.w)), u.joined.lock().unwrap().clone());
-    let want_joined = want.1.clone().expect("the unbounded joined read returned");
-    assert_eq!(want_joined, Err("y boom".to_string()));
-    assert_racing_reads([&first, &joined], [&want.0, &want_joined]);
+    let [want_joined] = &want.1[..] else {
+        panic!("the unbounded run joined {:?}", want.1);
+    };
+    assert_eq!(*want_joined, Err("y boom".to_string()));
+    assert_racing_reads([&first, joined], [&want.0, want_joined]);
     assert_eq!(
         (s.rt.state_of(s.x), s.rt.state_of(s.y), s.rt.state_of(s.w)),
         (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.w))
