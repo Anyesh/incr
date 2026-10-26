@@ -2678,6 +2678,24 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Lands group verify's claims `claimed`, taken from Dirty, back to
+    /// Dirty and out of their group, unverified (see `leave_group`).
+    fn release_group_claims_leaving(&self, claimed: &[u32]) {
+        let rt = self.runtime_id;
+        for &c in claimed {
+            cycle_state::with_held(|h| h.remove(&(rt, c)));
+            let (node, flags) = self.nodes.get_with_flags(c);
+            self.land_single_as(
+                NodeId(c),
+                node,
+                flags,
+                NodeState::Dirty,
+                NodeState::Dirty,
+                true,
+            );
+        }
+    }
+
     /// Group verification of the Dirty group member `x`, whose claim
     /// `compute_one` holds at generation `g`, `walked` if as a walk's entry.
     pub(super) fn group_verify(
@@ -2727,13 +2745,22 @@ impl<C: Cells> Runtime<C> {
             // this thread's stack, whose claim the unbounded run fails.
             let virtual_member = value_code::thread_word() & value_code::REPLAY_BIT != 0
                 && self.virtual_position(m, generation).is_some();
-            let mut ok = !virtual_member && self.claim_member(x, m, &claimed, bag);
+            let took = !virtual_member && self.claim_member(x, m, &claimed, bag);
+            let mut ok = took;
             if ok && node.generation() != generation {
                 self.land_unrun(NodeId(m), node, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
-                self.release_group_claims(&claimed);
+                // A member neither Dirty nor running fails this record in
+                // every order, so its claims leave the group as single
+                // landings do; kept, every visit to a member would claim
+                // them all again, and two threads' passes wait on each other.
+                if !took && !virtual_member && !is_computing(state::load::<C>(node.state_cell())) {
+                    self.release_group_claims_leaving(&claimed);
+                } else {
+                    self.release_group_claims(&claimed);
+                }
                 return GroupEnd::Ordinary;
             }
             cycle_state::with_held(|h| {
