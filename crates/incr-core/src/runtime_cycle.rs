@@ -450,6 +450,11 @@ impl<C: Cells> Runtime<C> {
     /// returned or raised, gives back everything it holds and waits out
     /// its winner's head start before it retries.
     fn retry_wounded<P>(&self, run: P) {
+        // The claims its waiters met, whichever wound arrived first: the
+        // retry's `begin` drops the attempt's list.
+        if !C::SINGLE_THREADED && attempt::wounded() {
+            reserve::mark_taken();
+        }
         cycle_state::take_unwind_kind();
         cycle_state::set_wounded(false);
         drop(run);
@@ -2416,12 +2421,23 @@ impl<C: Cells> Runtime<C> {
             return PopEnd::Retry;
         }
         // Under Shared the episode is held until the attempt ends
-        // (`crate::hold`), which counts it then.
-        if !C::SINGLE_THREADED {
+        // (`crate::hold`), which counts it then, unless a waiter took one of
+        // its members over in this outermost entry: a taken claim is never
+        // held again, and the members land together, so each lands as a
+        // taken claim does (`held_landing`), counted now.
+        let held = !C::SINGLE_THREADED
+            && !entries
+                .iter()
+                .any(|(m, _)| reserve::taken((self.runtime_id, *m)));
+        if held {
             hold::note_episode(self.runtime_id);
             for (m, e) in &entries {
                 self.open_hold(NodeId(*m), self.nodes.get(*m), e.first, None, bag);
             }
+        } else if !C::SINGLE_THREADED {
+            reserve::mark_claims_taken(entries.iter().map(|(m, _)| (self.runtime_id, *m)));
+            cycle_state::own_episode(self.runtime_id, super::LANDED);
+            C::u64_fetch_add(&self.episodes_landed, super::LANDED);
         }
         let mut superseded = false;
         for (m, e) in &entries {
@@ -2438,7 +2454,7 @@ impl<C: Cells> Runtime<C> {
                     && !self.observed_clean(*d, verify_rev)
             });
             if old != new {
-                if !C::SINGLE_THREADED {
+                if held {
                     hold::keep_deps(state::cell_key::<C>(node.state_cell()), || {
                         old.iter()
                             .map(|d| (*d, self.nodes.get(d.0).generation()))
@@ -2471,7 +2487,7 @@ impl<C: Cells> Runtime<C> {
         for (m, _) in &entries {
             let (node, flags) = self.nodes.get_with_flags(*m);
             let old = inner.member_recs.insert(*m, group.clone());
-            if !C::SINGLE_THREADED {
+            if held {
                 let in_group = C::u8_load_relaxed(flags) & IN_GROUP != 0;
                 hold::keep_rec(state::cell_key::<C>(node.state_cell()), old, in_group);
             }

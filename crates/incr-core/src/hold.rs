@@ -116,9 +116,10 @@ struct HoldSet {
 }
 
 // SAFETY: a set is reached from other threads only by `hand_over`, under
-// its lock. Its boxed values and records are those of `Shared` runtimes,
-// whose values are `Send + Sync` (holds are `Shared`-only), and the rest
-// is ids, states and trace actions.
+// its lock, and dropped on another thread only when a waiter's upgrade of
+// it outlives the owner thread. Its boxed values and records are those of
+// `Shared` runtimes, whose values are `Send + Sync` (holds are
+// `Shared`-only), and the rest is ids, states and trace actions.
 unsafe impl Send for HoldSet {}
 
 /// The record a cut took a claim it keeps out of, kept until the claim's
@@ -151,11 +152,15 @@ type SharedSet = Arc<Mutex<HoldSet>>;
 #[cfg(not(loom))]
 thread_local! {
     static HOLD: SharedSet = register();
+    /// This thread's set, once it has one, so a waiter finds its own
+    /// without making one.
+    static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(loom)]
 loom::thread_local! {
     static HOLD: SharedSet = register();
+    static MINE: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
 
 #[cfg(not(loom))]
@@ -177,6 +182,7 @@ fn register() -> SharedSet {
     let mut sets = SETS.lock().unwrap_or_else(PoisonError::into_inner);
     sets.retain(|s| s.strong_count() != 0);
     sets.push(Arc::downgrade(&set));
+    MINE.with(|m| m.set(Arc::as_ptr(&set) as usize));
     set
 }
 
@@ -193,12 +199,14 @@ impl HoldSet {
         }
     }
 
-    /// The set has no entries left: its attempt holds nothing.
-    fn leave_hold(&mut self) {
-        if self.attempt.take().is_some() {
-            attempt::leave_hold();
-            HOLDERS.fetch_sub(1, Ordering::Relaxed);
+    /// The set has no entries left: its attempt holds nothing. True if a
+    /// waiter wounded it first, under this lock or, on a reservation, not.
+    fn leave_hold(&mut self) -> bool {
+        if self.attempt.take().is_none() {
+            return false;
         }
+        HOLDERS.fetch_sub(1, Ordering::Relaxed);
+        attempt::leave_hold()
     }
 }
 
@@ -215,13 +223,13 @@ pub(crate) fn hand_over(cell: usize, claim: Claim, patience: &mut Patience) -> O
     if HOLDERS.load(Ordering::Relaxed) == 0 {
         return None;
     }
-    let mine = HOLD.with(Arc::as_ptr);
+    let mine = MINE.with(std::cell::Cell::get);
     let sets: Vec<SharedSet> = SETS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .filter_map(Weak::upgrade)
-        .filter(|s| Arc::as_ptr(s) != mine)
+        .filter(|s| Arc::as_ptr(s) as usize != mine)
         .collect();
     for set in sets {
         let mut h = set.lock().unwrap_or_else(PoisonError::into_inner);
@@ -289,6 +297,32 @@ pub(crate) fn reclaim(cell: usize, expected: NodeState) -> bool {
     })
 }
 
+/// A delete of the owner's held node: [`view`], and the entry is marked
+/// claimed again so that no waiter takes it while the delete decides.
+/// [`unpin`] undoes the mark if the delete does not go ahead.
+#[cold]
+#[inline(never)]
+pub(crate) fn pin(cell: usize) -> bool {
+    active()
+        && with(|h| {
+            let Some(e) = h.get(cell).filter(|e| !e.reclaimed) else {
+                return false;
+            };
+            e.reclaimed = true;
+            h.consulted = true;
+            h.looks += 1;
+            true
+        })
+}
+
+pub(crate) fn unpin(cell: usize) {
+    with(|h| {
+        if let Some(e) = h.get(cell) {
+            e.reclaimed = false;
+        }
+    });
+}
+
 /// A count of reads that rested on a held landing, to compare across one
 /// read.
 pub(crate) fn looks() -> u64 {
@@ -329,6 +363,10 @@ pub(crate) fn open(
     kept: Option<Option<Box<dyn Any>>>,
 ) -> Option<Box<dyn Any>> {
     if crate::reserve::taken((rt, slot)) {
+        // The claim publishes at once, so the record a cut gave it stays.
+        with(|h| {
+            h.cut_recs.retain(|c| c.rt != rt || c.slot != slot);
+        });
         return kept.flatten();
     }
     value_code::set_held_bit(true);
@@ -498,6 +536,9 @@ pub(crate) fn forget(cell: usize) -> Option<Held> {
 /// retraction puts the whole group back, and a wound puts the record back
 /// before its unwind lands anything ([`take_recs`]).
 pub(crate) fn keep_cut_rec(rt: RuntimeId, slot: u32, rec: Option<Arc<GroupInfo>>, lands_new: bool) {
+    if crate::reserve::taken((rt, slot)) {
+        return;
+    }
     value_code::set_held_bit(true);
     with(|h| {
         if !h.cut_recs.iter().any(|c| c.rt == rt && c.slot == slot) {
@@ -578,7 +619,7 @@ pub(crate) struct Taken {
 /// retraction, and clears its taint.
 pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
-        let wounded = h.attempt.as_ref().is_some_and(Attempt::wounded);
+        let mut wounded = h.attempt.as_ref().is_some_and(Attempt::wounded);
         let mut taken: Vec<Held> = Vec::new();
         for e in h.entries.iter_mut() {
             if e.as_ref().is_some_and(|e| e.rt == rt) {
@@ -587,7 +628,7 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
         }
         h.by_cell.retain(|_, at| h.entries[*at].is_some());
         if h.by_cell.is_empty() {
-            h.leave_hold();
+            wounded |= h.leave_hold();
         }
         h.tainted.retain(|r| *r != rt);
         h.recs.retain(|r| *r != rt);

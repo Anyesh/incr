@@ -161,7 +161,8 @@ impl<C: Cells> Runtime<C> {
             );
             debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
         }
-        hold::land(cell, target, flagged, unrun);
+        let landed = hold::land(cell, target, flagged, unrun);
+        debug_assert!(landed, "incr-core: a held landing has its entry");
         Some(target)
     }
 
@@ -237,17 +238,24 @@ impl<C: Cells> Runtime<C> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         let cell = state::cell_key::<C>(node.state_cell());
-        hold::view(cell)?;
+        // Pinned, so no waiter takes the entry while the delete decides.
+        if !hold::pin(cell) {
+            return None;
+        }
         {
             let inner = self.inner.read();
-            if node.generation() != handle.generation() {
-                return Some(SingleClaim::Gone);
-            }
-            if self.owns_nodes(&inner, slot) {
-                return Some(SingleClaim::Owner);
-            }
-            if self.has_dependents_seen(slot, &inner.dependents[slot as usize]) {
-                return Some(SingleClaim::HasDependents);
+            let refused = if node.generation() != handle.generation() {
+                Some(SingleClaim::Gone)
+            } else if self.owns_nodes(&inner, slot) {
+                Some(SingleClaim::Owner)
+            } else if self.has_dependents_seen(slot, &inner.dependents[slot as usize]) {
+                Some(SingleClaim::HasDependents)
+            } else {
+                None
+            };
+            if refused.is_some() {
+                hold::unpin(cell);
+                return refused;
             }
             // Only another thread's set walk moves the word meanwhile, and
             // only between Computing and ComputingDirty.
@@ -290,7 +298,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     #[must_use]
     pub(super) fn publish_held(&self) -> bool {
-        self.publish_own()
+        self.publish_own_parked()
     }
 
     /// The attempt was wounded: every held landing goes back.
@@ -427,7 +435,7 @@ impl<C: Cells> Runtime<C> {
             if unwound || cycle_state::wounded() || hold::tainted(self.runtime_id) {
                 self.retract_held();
                 self.taint_reader();
-            } else if !self.publish_own() {
+            } else if !self.publish_own_parked() {
                 self.taint_reader();
                 cycle_state::settle_hold();
                 if !std::thread::panicking() {
@@ -466,6 +474,11 @@ impl<C: Cells> Runtime<C> {
         if let Some(reader) = self.dep_stack.raise_hold() {
             hold::taint(reader);
         }
+    }
+
+    fn publish_own_parked(&self) -> bool {
+        self.park(super::ParkPoint::BeforeHeldPublish);
+        self.publish_own()
     }
 
     fn publish_own(&self) -> bool {

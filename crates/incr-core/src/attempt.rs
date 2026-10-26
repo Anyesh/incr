@@ -165,6 +165,11 @@ pub(crate) fn leave_hold() -> bool {
     MINE.with(|w| w.state.fetch_and(!HOLDING, Ordering::AcqRel) & WOUNDED != 0)
 }
 
+/// Whether a waiter wounded this thread's current attempt.
+pub(crate) fn wounded() -> bool {
+    MINE.with(|w| w.state.load(Ordering::Acquire) & WOUNDED != 0)
+}
+
 /// Whether a waiter wounded this thread's attempt while it holds landings.
 pub(crate) fn hold_wounded() -> bool {
     MINE.with(|w| w.state.load(Ordering::Acquire) & (HOLDING | WOUNDED) == HOLDING | WOUNDED)

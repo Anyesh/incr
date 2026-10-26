@@ -280,6 +280,9 @@ pub(crate) enum ParkPoint {
     /// In `caught`'s wound branch, once the wounded attempt has given back
     /// everything it held and before it waits for its winner.
     WoundRetracted,
+    /// At an exit that publishes held landings (the outermost entry's, or a
+    /// runtime's first entry inside another's), just before it does.
+    BeforeHeldPublish,
 }
 
 /// Ends the whole test binary: a parked thread's panic can be caught as a

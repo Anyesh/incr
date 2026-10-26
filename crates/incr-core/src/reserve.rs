@@ -556,9 +556,18 @@ pub(crate) fn held() -> Vec<Claim> {
 /// wounded attempt reserved and so had not been taken, so a read restarts
 /// for take-overs at most once per claim it can reserve.
 pub(crate) fn mark_taken() {
+    let claims = attempt::take_met();
+    if claims.is_empty() {
+        return;
+    }
     #[cfg(all(test, not(loom)))]
     TAKES.with(|n| n.set(n.get() + 1));
-    let claims = attempt::take_met();
+    mark_claims_taken(claims);
+}
+
+/// `claims` are never doomed, reserved or held again before the thread's
+/// outermost entry exits.
+pub(crate) fn mark_claims_taken(claims: impl IntoIterator<Item = Claim>) {
     TAKEN.with(|t| t.borrow_mut().extend(claims));
     crate::cycle_state::set_any_taken(true);
 }
