@@ -697,7 +697,7 @@ impl Pending {
             Some(Filed::Deep(top)) => {
                 self.by_top.remove(&(top, i));
             }
-            Some(Filed::Shallow(top, payloads)) => {
+            Some(Filed::Shallow(above, payloads)) => {
                 for p in payloads.into_iter().flatten() {
                     self.by_payload.remove(&(top, p, i));
                 }
