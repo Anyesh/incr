@@ -7,7 +7,11 @@
 //! where the unbounded run's frame releases its claim, or until the
 //! thread's outermost context of that runtime, which outlives every
 //! context nested in it, is removed; the dooming thread's own claims and unrun releases
-//! of the node keep it. It is stored
+//! of the node keep it. Once the thread's frame of the node is left for a
+//! retry that reruns from the closure start, the reservation rests: it
+//! holds only ops begun before then, since a later op may be a reader the
+//! retry itself started. An op begun after the rest can still compute the
+//! node ahead of the retry. It is stored
 //! before the release that publishes it, so a claim that reads the release
 //! sees it. A node generation has at most one reservation: reserving it
 //! needs its claim, and a claim waits out another thread's reservation.
@@ -43,8 +47,8 @@ use loom::sync::{
 const BUCKETS_LEN: usize = 1024;
 
 /// A reservation's node generation, its owner's token, and the [`SEQ`]
-/// value its owner left its run at ([`AWAKE`] while the owner's frame of
-/// the node stands).
+/// value its owner left its run at ([`AWAKE`] while the unbounded run's
+/// frame of the node would stand).
 type Entry = (u32, usize, u64);
 
 /// The stamp of a reservation every other reader waits on.
@@ -399,19 +403,32 @@ pub(crate) fn mine(claim: Claim, generation: u32) -> bool {
 }
 
 /// Starts this thread's op at the current [`SEQ`].
-#[cold]
-#[inline(never)]
+#[inline]
 pub(crate) fn op_begin() {
     OP.with(|o| o.set(SEQ.load(Ordering::SeqCst)));
 }
 
 /// Leaves this thread's reservation of `claim` at `generation` at rest:
 /// its owner's retry reads the node afresh once it has run what precedes
-/// that read again, so only ops begun before now still wait on it.
+/// that read again, so only ops begun before now still wait on it. A
+/// reservation already at rest keeps its stamp, so the readers an earlier
+/// retry started still pass; a read's reservation of its own node stays
+/// awake until the read has taken the value.
+#[cold]
+#[inline(never)]
 pub(crate) fn rest(claim: Claim, generation: u32) {
-    let Ok(token) = MINE.try_with(Listed::token) else {
+    let Ok((token, root)) = MINE.try_with(|m| {
+        let root =
+            m.0.borrow()
+                .iter()
+                .any(|g| g.context == ROOT_READ && g.claims.contains(&(claim, generation)));
+        (m.token(), root)
+    }) else {
         return;
     };
+    if root {
+        return;
+    }
     if let Some(e) = table().get_mut(&claim) {
         if (e.0, e.1) == (generation, token) && e.2 == AWAKE {
             e.2 = SEQ.fetch_add(1, Ordering::SeqCst);

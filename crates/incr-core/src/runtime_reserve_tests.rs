@@ -308,6 +308,89 @@ fn a_read_and_a_context_both_reserving_a_node_keep_it_until_both_end() {
     assert!(!reserved_elsewhere(claim));
 }
 
+type BegunOp = (mpsc::Sender<()>, thread::JoinHandle<bool>);
+
+/// Another thread's op, begun before this returns, that checks the
+/// reservation of `claim` once [`checked`] lets it.
+fn begun_op(claim: crate::waits::Claim) -> BegunOp {
+    let (ready_tx, ready) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let op = thread::spawn(move || {
+        crate::reserve::op_begin();
+        ready_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+        crate::reserve::elsewhere(claim, 1)
+    });
+    ready.recv().unwrap();
+    (go, op)
+}
+
+fn checked((go, op): BegunOp) -> bool {
+    go.send(()).unwrap();
+    op.join().unwrap()
+}
+
+/// A reservation at rest holds the ops begun before its rest, and an
+/// op begun after passes; a second rest keeps the first one's stamp.
+#[test]
+fn a_rested_reservation_holds_only_ops_begun_before_its_first_rest() {
+    use crate::reserve::{end_contexts, note, rest, Scope};
+    let rt = Rt::new();
+    let claim = (rt.runtime_id, 7);
+    {
+        let _scope = Scope::new(Some(5));
+        note(claim, 1);
+    }
+    let before = begun_op(claim);
+    rest(claim, 1);
+    let between = begun_op(claim);
+    rest(claim, 1);
+    let after = begun_op(claim);
+    assert!(checked(before), "an op begun before the rest passed");
+    assert!(!checked(between), "the second rest restamped it");
+    assert!(!checked(after), "an op begun after the rest waited");
+    end_contexts();
+}
+
+/// Reserving a rested node again wakes its reservation for every op.
+#[test]
+fn reserving_a_rested_node_again_holds_ops_begun_after_the_rest() {
+    use crate::reserve::{end_contexts, note, rest, Scope};
+    let rt = Rt::new();
+    let claim = (rt.runtime_id, 7);
+    let _scope = Scope::new(Some(5));
+    note(claim, 1);
+    rest(claim, 1);
+    note(claim, 1);
+    assert!(
+        checked(begun_op(claim)),
+        "the second reservation stayed at rest"
+    );
+    end_contexts();
+}
+
+/// A context's frame leaving the node does not rest a read's reservation
+/// of its own node: the read takes the value after any op begins.
+#[test]
+fn a_rest_leaves_a_read_reserving_its_own_node_holding_every_op() {
+    use crate::reserve::{end_contexts, note, note_root, rest, Root, Scope};
+    let rt = Rt::new();
+    let claim = (rt.runtime_id, 7);
+    let root = Root::arm(true, claim);
+    note_root(claim, 1);
+    {
+        let _scope = Scope::new(Some(5));
+        note(claim, 1);
+    }
+    rest(claim, 1);
+    assert!(
+        checked(begun_op(claim)),
+        "the rest let a later op past the read"
+    );
+    drop(root);
+    end_contexts();
+}
+
 /// A read nested in a read of the same node, whose walk lands the node
 /// Dirty, leaves the reservation to the enclosing read, which takes the
 /// value after it.
