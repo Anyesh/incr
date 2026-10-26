@@ -1054,9 +1054,10 @@ pub struct Runtime<C: Cells> {
     pub(crate) provenance: provenance_impl::Table<C>,
     tickets: C::Lock<contain_impl::Tickets>,
     tickets_held: std::sync::atomic::AtomicBool,
-    /// The slots `tickets` notes Failed landings under, by `past_bit`.
-    /// Stored under `tickets`'s lock, so a walk ordered after a note sees
-    /// its bit; one concurrent with the note may miss it either way.
+    /// The slots `tickets` notes Failed landings under, by `past_bit`,
+    /// written only under `tickets`'s lock so that writers keep each other's
+    /// bits. A walk's Relaxed load sees every note that happens before it;
+    /// one concurrent with the note may miss it either way.
     failed_past: std::sync::atomic::AtomicU64,
     regens: C::Lock<replay_impl::Regens>,
     /// Set once `regens` holds a record, so a delete looks for one only then.
@@ -3100,6 +3101,9 @@ impl<C: Cells> Runtime<C> {
                     }
                     NodeState::Failed => {
                         if self.flip_failed(id) {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3141,6 +3145,9 @@ impl<C: Cells> Runtime<C> {
                         // Former cycle members are New with edges on each
                         // other, so each is expanded once per walk.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             let list = &inner.dependents[id.0 as usize];
                             if !list.is_empty()
@@ -3157,6 +3164,9 @@ impl<C: Cells> Runtime<C> {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::New)
                             .is_ok()
                         {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);

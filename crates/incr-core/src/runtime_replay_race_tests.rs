@@ -3934,10 +3934,37 @@ fn a_deleted_dep_drops_the_failed_landings_noted_over_it() {
     );
 }
 
+/// Two deps 64 slots apart share a bit of `failed_past`: the walk that
+/// takes one's notes keeps the bit for the other's, whose set then flips
+/// its noted landing.
+#[test]
+fn a_taken_note_keeps_the_bit_of_a_dep_sharing_it() {
+    let (rt, i, d, x) = noted_failed_landing();
+    while id(rt.create_input(0_u64)).0 + 2 < id(d).0 + 64 {}
+    let (i2, d2, x2) = noted_over(&rt);
+    assert_eq!(id(d2).0, id(d).0 + 64);
+    rt.set(i, 2);
+    assert_eq!(rt.nodes.get(id(x).0).state(), NodeState::Dirty);
+    assert_eq!(
+        rt.failed_past.load(SeqCst),
+        super::contain_impl::past_bit(id(d2).0),
+        "d's take dropped d2's bit"
+    );
+    rt.set(i2, 2);
+    assert_eq!(rt.nodes.get(id(x2).0).state(), NodeState::Dirty);
+    assert_eq!(rt.failed_past.load(SeqCst), 0);
+}
+
 /// i -> d -> x, where x panics: x lands Failed over d, then d is made
 /// Dirty with no walk, as a caught panic leaves it, and x is noted.
 fn noted_failed_landing() -> (Rt, Incr<u64>, Incr<u64>, Incr<u64>) {
     let rt = Rt::new();
+    let (i, d, x) = noted_over(&rt);
+    (rt, i, d, x)
+}
+
+/// [`noted_failed_landing`]'s three nodes, created in `rt`.
+fn noted_over(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
     let i = rt.create_input(1_u64);
     let d = rt.create_query(move |rt: &Rt| rt.get(i));
     let x = rt.create_query(move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(d))) });
@@ -3949,7 +3976,7 @@ fn noted_failed_landing() -> (Rt, Incr<u64>, Incr<u64>, Incr<u64>) {
     );
     rt.note_past_sets(id(x), x.generation(), &[(id(d), 0)]);
     assert_ne!(rt.failed_past.load(SeqCst), 0);
-    (rt, i, d, x)
+    (i, d, x)
 }
 
 /// x's walk contains `failed`'s panic once x stops reading it, holding a
