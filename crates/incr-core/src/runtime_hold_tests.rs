@@ -159,12 +159,13 @@ fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
 
 /// Reads `p`, whose landing is held, with its publication panicking at the
 /// first other landing it publishes, where a child sweep's caught panic
-/// resumes.
-fn panic_publishing_before(rt: &Runtime<Shared>, p: Incr<i64>) {
+/// resumes. Returns that landing's slot.
+fn panic_publishing_before(rt: &Runtime<Shared>, p: Incr<i64>) -> u32 {
     let armed = Arc::new(AtomicBool::new(true));
     let p_first = Arc::new(AtomicBool::new(false));
+    let at = Arc::new(AtomicUsize::new(usize::MAX));
     let hook: super::ParkHook = {
-        let (armed, p_first) = (armed.clone(), p_first.clone());
+        let (armed, p_first, at) = (armed.clone(), p_first.clone(), at.clone());
         Box::new(move |point| {
             let super::ParkPoint::HeldPublished(id) = point else {
                 return;
@@ -177,6 +178,7 @@ fn panic_publishing_before(rt: &Runtime<Shared>, p: Incr<i64>) {
                 return;
             }
             armed.store(false, Ordering::SeqCst);
+            at.store(id.0 as usize, Ordering::SeqCst);
             panic!("a held publication panicked on purpose");
         })
     };
@@ -187,6 +189,7 @@ fn panic_publishing_before(rt: &Runtime<Shared>, p: Incr<i64>) {
         !p_first.load(Ordering::SeqCst),
         "p published before the panic"
     );
+    at.load(Ordering::SeqCst) as u32
 }
 
 /// A held publication panics after its first landing, as a child sweep's
@@ -230,8 +233,9 @@ fn shared_held_publication_panic_gives_back_the_moved_edges() {
     rt.assert_invariant_i();
 }
 
-/// a and b iterate to a fixpoint from 0, a ending at t and b at a.
-fn fixpoint_pair<C: Cells>(rt: &Runtime<C>, t: Incr<i64>) -> (Incr<i64>, Incr<i64>) {
+/// a and b iterate to a fixpoint from 0, each reading the other; the one
+/// `t_in_a` names ends at t, the other at its value.
+fn fixpoint_pair<C: Cells>(rt: &Runtime<C>, t: Incr<i64>, t_in_a: bool) -> (Incr<i64>, Incr<i64>) {
     let opts = || QueryOpts {
         cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
         ..QueryOpts::default()
@@ -241,13 +245,27 @@ fn fixpoint_pair<C: Cells>(rt: &Runtime<C>, t: Incr<i64>) -> (Incr<i64>, Incr<i6
         let bc = bc.clone();
         rt.create_query_with(
             move |rt| {
-                let _ = rt.get(*bc.get().unwrap());
-                rt.get(t)
+                let b = rt.get(*bc.get().unwrap());
+                if t_in_a {
+                    rt.get(t)
+                } else {
+                    b
+                }
             },
             opts(),
         )
     };
-    let b = rt.create_query_with(move |rt| rt.get(a), opts());
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(a);
+            if t_in_a {
+                a
+            } else {
+                rt.get(t)
+            }
+        },
+        opts(),
+    );
     bc.set(b).unwrap();
     (a, b)
 }
@@ -255,22 +273,27 @@ fn fixpoint_pair<C: Cells>(rt: &Runtime<C>, t: Incr<i64>) -> (Incr<i64>, Incr<i6
 /// A held publication panics after one member of a cycle published over
 /// the other, which it gives back. Once t goes back to its old value, a
 /// read of either member first returns what a fresh runtime does, not the
-/// published member's value from the given-back member's held one.
+/// published member's value from the given-back member's held one. Each
+/// member reads t in turn, so in one shape the member that published read
+/// t only through the one given back.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_held_publication_panic_rereads_over_a_given_back_landing() {
-    let local = Runtime::<Local>::new();
-    let t = local.create_input(1_i64);
-    let (a, b) = fixpoint_pair(&local, t);
-    let want = (local.get(a), local.get(b));
-    for a_first in [true, false] {
+    let mut over_given = false;
+    for (t_in_a, a_first) in [(true, true), (true, false), (false, true), (false, false)] {
+        let local = Runtime::<Local>::new();
+        let t = local.create_input(1_i64);
+        let (a, b) = fixpoint_pair(&local, t, t_in_a);
+        let want = (local.get(a), local.get(b));
         let rt = Runtime::<Shared>::new();
         let t = rt.create_input(1_i64);
-        let (a, b) = fixpoint_pair(&rt, t);
+        let (a, b) = fixpoint_pair(&rt, t, t_in_a);
         let p = rt.create_query(move |rt| rt.get(a) + rt.get(b));
         rt.get(p);
         rt.set(t, 2);
-        panic_publishing_before(&rt, p);
+        let published = panic_publishing_before(&rt, p);
+        let t_reader = if t_in_a { a.slot() } else { b.slot() };
+        over_given |= published != t_reader;
         rt.assert_invariant_i();
         rt.set(t, 1);
         let got = if a_first {
@@ -279,10 +302,14 @@ fn shared_held_publication_panic_rereads_over_a_given_back_landing() {
             let b = rt.get(b);
             (rt.get(a), b)
         };
-        assert_eq!(got, want, "a first: {a_first}");
+        assert_eq!(got, want, "t in a: {t_in_a}, a first: {a_first}");
         assert_eq!(rt.get(p), want.0 + want.1);
         rt.assert_invariant_i();
     }
+    assert!(
+        over_given,
+        "no shape published the member that reads t through the other"
+    );
 }
 
 /// a (Fallback) and b read each other, counting their runs.
