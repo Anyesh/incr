@@ -1744,30 +1744,53 @@ fn two_holders_that_join_readers_of_each_others_landings_both_end() {
     }
 }
 
-/// r reads a cycle and catches x, which reads the cycle's held member and
-/// panics, so x's Failed landing is held. At publication x lands
+/// r reads a cycle k moved and catches x, which reads the cycle's held
+/// member and panics, so x's Failed landing is held. At publication x lands
 /// otherwise: stopped by a panic before its landing (`stop`), or flagged by
-/// a set of i. Another thread then runs x, which lands Failed with its own
-/// record, before the publication drops the record of x's held run: it
-/// must leave the new one.
+/// a set of i. Another thread's walk of y then runs x, which lands Failed
+/// with its own record and a ticket for the panic y's entry contained,
+/// before the publication drops what x's held run left: it must leave both.
 fn held_failed_target_keeps_the_next_runs_record(stop: bool) {
     let rt = Arc::new(Runtime::<Shared>::new());
     rt.set_placeholder(0_i64);
     rt.set_max_frames(16);
-    let (a, _) = two_cycle(&*rt);
-    let i = rt.create_input(0_i64);
+    let k = rt.create_input(1_i64);
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt| rt.get(*bc.get().unwrap()) + rt.get(k),
+            |_c: &Cycle| 100,
+        )
+    };
+    let b = rt.create_query(move |rt| rt.get(a) * 2);
+    bc.set(b).unwrap();
+    let (i, j, sel) = (
+        rt.create_input(0_i64),
+        rt.create_input(1_i64),
+        rt.create_input(0_i64),
+    );
     let x = rt.create_query_with(
         move |rt: &Runtime<Shared>| -> i64 {
-            std::panic::panic_any(HeldPayload(rt.get(a) + rt.get(i)))
+            let v = rt.get(a) + rt.get(i);
+            if rt.get(j) == 0 {
+                std::panic::panic_any(HeldPayload(v));
+            }
+            v
         },
         replayable(),
     );
+    let y = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(x) } else { 100 });
     let r = rt.create_query_with(
         move |rt| rt.get(a) + i64::from(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err()),
         replayable(),
     );
+    let _ = rt.get(y);
+    rt.set(k, 2);
+    rt.set(j, 0);
+    rt.set(sel, 1);
     let x_id = super::NodeId(x.slot());
-    let next_run: Arc<OnceLock<Option<u64>>> = Arc::default();
+    let next_run: Arc<OnceLock<(Option<u64>, usize)>> = Arc::default();
     let hook: super::ParkHook = {
         let (weak, next_run) = (Arc::downgrade(&rt), next_run.clone());
         let (landing, otherwise) = (AtomicBool::new(true), AtomicBool::new(true));
@@ -1785,33 +1808,36 @@ fn held_failed_target_keeps_the_next_runs_record(stop: bool) {
                 && otherwise.swap(false, Ordering::SeqCst)
             {
                 let run = Arc::clone(&rt);
-                let b = std::thread::spawn(move || {
-                    catch_unwind(AssertUnwindSafe(|| run.get(x))).is_err()
-                });
+                let walk = std::thread::spawn(move || run.get(y));
                 let start = std::time::Instant::now();
-                while !b.is_finished() {
+                while !walk.is_finished() {
                     assert!(
                         start.elapsed() < std::time::Duration::from_secs(20),
-                        "the other thread's run of x never finished"
+                        "the other thread's walk of y never finished"
                     );
                     std::thread::yield_now();
                 }
-                assert!(b.join().unwrap(), "x's run did not fail");
-                next_run
-                    .set(rt.failed_run_token(x_id.0, x.generation()))
-                    .unwrap();
+                assert_eq!(walk.join().unwrap(), 100);
+                let record = rt.failed_run_token(x_id.0, x.generation());
+                next_run.set((record, rt.contained_payloads())).unwrap();
             }
         })
     };
     assert!(rt.park_hook.set(hook).is_ok());
     let read = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
     assert_eq!(read.is_err(), stop);
-    let b_record = next_run.get().copied().expect("x never landed otherwise");
+    let (b_record, b_tickets) = *next_run.get().expect("x never landed otherwise");
     assert!(b_record.is_some(), "x's run left no record");
+    assert_eq!(b_tickets, 1, "y's entry held no payload for x's landing");
     assert_eq!(
         rt.failed_run_token(x_id.0, x.generation()),
         b_record,
         "the publication forgot the record of x's next run"
+    );
+    assert_eq!(
+        rt.contained_payloads(),
+        1,
+        "the publication released the ticket of x's next run"
     );
     rt.assert_invariant_i();
 }
