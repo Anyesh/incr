@@ -2338,7 +2338,18 @@ impl<C: Cells> Runtime<C> {
 
     /// `id` at `generation`, its frame at `cidx` just popped, lands but not
     /// Failed: its run's takes and an earlier Failed landing's record go.
+    /// Every landing comes here, and only a thread holding takes or a
+    /// runtime holding records has anything to drop.
+    #[inline(always)]
     pub(super) fn unfailed_landing(&self, id: NodeId, generation: u32, cidx: u32) {
+        if replay::takes_held() || self.regens_held.load(std::sync::atomic::Ordering::Relaxed) {
+            self.drop_unfailed(id, generation, cidx);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drop_unfailed(&self, id: NodeId, generation: u32, cidx: u32) {
         if !self.budgeted() || replay::speculative() {
             return;
         }
@@ -2350,7 +2361,16 @@ impl<C: Cells> Runtime<C> {
     /// computed value: its run's takes go. Its earlier Failed record went
     /// when it left Failed (`flip_failed_from`), and one another thread's
     /// run lands once the claim is released must stay.
+    #[inline(always)]
     pub(super) fn drop_takes(&self, id: NodeId, generation: u32, cidx: u32) {
+        if replay::takes_held() {
+            self.drop_run_takes(id, generation, cidx);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drop_run_takes(&self, id: NodeId, generation: u32, cidx: u32) {
         if !self.budgeted() || replay::speculative() {
             return;
         }
