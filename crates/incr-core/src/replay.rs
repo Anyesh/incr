@@ -13,7 +13,7 @@
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
@@ -396,29 +396,30 @@ impl Landings {
         std::mem::take(self.owned_nodes())
     }
 
-    fn is_deep(&self) -> bool {
-        match &self.nodes {
+    /// The deepest landing's depth, if it is above just the reading frame.
+    fn deep_depth(&self) -> Option<u32> {
+        let deepest = match &self.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
-                nodes.iter().any(|&(_, depth)| depth > 0)
+                nodes.iter().map(|&(_, depth)| depth).max()
             }
             // No landing is deeper than `depth`.
+            Nodes::Shared { depth: 0, .. } => None,
             Nodes::Shared {
                 log,
                 len,
                 epoch,
                 base,
-                depth,
                 cut,
-            } => {
-                *depth > 0
-                    && log
-                        .borrow()
-                        .landings(*len, *epoch, *base, cut.as_ref())
-                        .iter()
-                        .any(|&(_, depth)| depth > 0)
-            }
-        }
+                ..
+            } => log
+                .borrow()
+                .landings(*len, *epoch, *base, cut.as_ref())
+                .iter()
+                .map(|&(_, depth)| depth)
+                .max(),
+        };
+        deepest.filter(|&d| d > 0)
     }
 
     /// At least the deepest landing's depth.
@@ -522,8 +523,10 @@ pub(crate) struct Pending {
     /// they stand for, which the pop of the virtual frame below extends.
     by_frontier: Index<u32, usize>,
     /// The passed deliveries that carry a landing deeper than just above
-    /// their frame, which a pop can retire.
-    deep: Vec<usize>,
+    /// their frame, which a pop can retire, by the highest position one of
+    /// their landings may have (`deep_top`).
+    deep: BTreeSet<(u32, usize)>,
+    deep_top: HashMap<usize, u32, FxBuildHasher>,
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -584,10 +587,11 @@ impl Pending {
             }
             list(&mut self.by_frontier, frontier(&d), i);
         }
-        if d.passed && d.is_deep() {
-            self.deep.push(i);
-        }
+        let top = if d.passed { d.deep_top() } else { None };
         self.slots.push(Some(d));
+        if let Some(top) = top {
+            self.list_deep(i, top);
+        }
         self.live += 1;
     }
 
@@ -613,8 +617,8 @@ impl Pending {
             }
             unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        if d.passed {
-            self.deep.retain(|&j| j != i);
+        if let Some(top) = self.deep_top.remove(&i) {
+            self.deep.remove(&(top, i));
         }
         self.live -= 1;
         // No index is held across a point where none is live.
@@ -641,10 +645,15 @@ impl Pending {
         let d = self.get_mut(i);
         if !d.passed {
             d.passed = true;
-            if d.is_deep() {
-                self.deep.push(i);
+            if let Some(top) = d.deep_top() {
+                self.list_deep(i, top);
             }
         }
+    }
+
+    fn list_deep(&mut self, i: usize, top: u32) {
+        self.deep.insert((top, i));
+        self.deep_top.insert(i, top);
     }
 
     /// Applies `ev` to the landings the passed deliveries carry: those of
@@ -667,15 +676,31 @@ impl Pending {
                 apply(d);
             }
         }
-        self.deep.retain(|&i| {
+        // Short of a copied node's landing, a pop or a containment retires
+        // only landings above its position, or at it, so a delivery none of
+        // whose landings reaches that high keeps them all.
+        let from = match *ev {
+            _ if all => 0,
+            Retire::Above(at) => at.saturating_add(1),
+            Retire::Contained { cidx: at, .. } => at,
+            Retire::Landing { .. } => 0,
+        };
+        let hit: Vec<(u32, usize)> = self.deep.range((from, 0)..).copied().collect();
+        for (top, i) in hit {
+            self.deep.remove(&(top, i));
             let d = slots[i]
                 .as_mut()
                 .expect("incr-core: a delivery's index is live");
             if !all {
                 apply(d);
             }
-            d.is_deep()
-        });
+            if let Some(top) = d.deep_top() {
+                self.deep.insert((top, i));
+                self.deep_top.insert(i, top);
+            } else {
+                self.deep_top.remove(&i);
+            }
+        }
     }
 
     /// The deliveries for read `key`, oldest first.
@@ -894,8 +919,13 @@ impl Delivery {
         self.taken
     }
 
-    fn is_deep(&self) -> bool {
-        matches!(&self.what, Delivered::Unwind { nodes, .. } if nodes.is_deep())
+    /// The highest position its landings have, if one is deeper than just
+    /// above its frame.
+    fn deep_top(&self) -> Option<u32> {
+        match &self.what {
+            Delivered::Unwind { nodes, .. } => nodes.deep_depth().map(|d| self.key.cidx + 1 + d),
+            _ => None,
+        }
     }
 
     fn is_untaken_panic(&self) -> bool {
