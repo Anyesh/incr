@@ -397,8 +397,9 @@ impl Landings {
         std::mem::take(self.owned_nodes())
     }
 
-    /// The depth of the deepest landing the copy still holds, or `None`
-    /// once it holds none; a shared copy at depth 0 answers 0 unread.
+    /// A bound on the depth of the deepest landing the copy still holds:
+    /// exact for an owned copy, `None` once it holds none; a shared copy
+    /// answers its depth unread, even once its notes are all removed.
     fn deepest(&self) -> Option<u32> {
         match &self.nodes {
             Nodes::Owned(nodes) => {
