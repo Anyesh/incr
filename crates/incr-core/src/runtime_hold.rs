@@ -292,7 +292,8 @@ impl<C: Cells> Runtime<C> {
     /// is held to the attempt's end, so a wound later in the attempt takes
     /// it back before another thread plans from it. A run that wrote its
     /// slot outside `HOLD` kept nothing to restore, so it retracts to New.
-    /// An entry opened already, a `HOLD` run's, stays as it is.
+    /// An entry opened already, a `HOLD` run's, stays as it is. The reader
+    /// the panic reaches lands over it, so its landing is held too.
     #[inline]
     pub(super) fn hold_panic_landing(
         &self,
@@ -304,6 +305,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         if !C::SINGLE_THREADED {
             self.open_hold(id, node, first || wrote, None, bag);
+            self.dep_stack.raise_hold();
         }
     }
 
@@ -814,8 +816,11 @@ impl<C: Cells> Runtime<C> {
                 held.get_or_insert_with(|| entries.iter().map(|e| (e.slot, e.target)).collect());
             let failed = e.target == NodeState::Failed;
             if e.read.iter().any(|&(d, _)| {
-                !(self.settled_at_publication(d, held, rev)
-                    || (failed && self.failed_at_publication(d, held, rev)))
+                if failed {
+                    self.moved_since_read(d, held, rev)
+                } else {
+                    !self.settled_at_publication(d, held, rev)
+                }
             }) {
                 lowered.push(i);
             }
@@ -930,16 +935,19 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// A new dep of a published Failed landing that failed too, unmoved
-    /// since the landing's run read it: the run read it so.
-    fn failed_at_publication(&self, d: NodeId, held: &Targets, rev: u64) -> bool {
+    /// A new dep of a Failed landing that may have moved since the
+    /// landing's run read it at `rev`: a walk left it Dirty, it changed
+    /// after `rev`, or another thread computes it now. One its attempt left
+    /// New, such as a cycle's discard, did not move.
+    fn moved_since_read(&self, d: NodeId, held: &Targets, rev: u64) -> bool {
         let dep = self.nodes.get(d.0);
         let raw = state::load::<C>(dep.state_cell());
-        let failed = match held.get(&d.0) {
-            Some(&t) if is_computing(raw) => raw == NodeState::Computing && t == NodeState::Failed,
-            _ => raw == NodeState::Failed,
+        let now = match held.get(&d.0) {
+            Some(&t) if raw == NodeState::Computing => t,
+            _ if is_computing(raw) => return true,
+            _ => raw,
         };
-        failed && dep.changed_at() <= rev
+        now == NodeState::Dirty || dep.changed_at() > rev
     }
 
     /// Every entry goes back to what it replaced, and its node lands as

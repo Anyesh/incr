@@ -1187,12 +1187,117 @@ fn shared_holder_joining_a_reader_of_its_held_panic_landing_finishes() {
         })
     };
     assert_eq!(rt.get(d), 7);
-    assert!(joined.lock().unwrap().iter().all(|&failed| failed));
+    let joined = std::mem::take(&mut *joined.lock().unwrap());
+    assert!(!joined.is_empty() && joined.iter().all(|&failed| failed));
     assert_eq!(rt.state_of(f), NodeState::Failed);
     assert_eq!(crate::hold::held_count(), 0);
     assert_eq!(crate::waits::registered(), 0);
     rt.set(x, 1);
     assert_eq!(rt.get(d), 10);
+}
+
+/// `d` catches `f`'s panic, so its attempt holds `f`'s Failed landing, and
+/// then reads `g`, which another thread claimed first and whose run reads
+/// `f`: each thread waits on the other, through a claim and a held
+/// landing. Both finish with what a single thread reads, and neither is
+/// left holding or registered.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_holder_waiting_on_a_claim_of_a_reader_of_its_held_panic_landing_finishes() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let (caught, claimed) = (
+        crate::runtime::race_tests::Gate::new(),
+        crate::runtime::race_tests::Gate::new(),
+    );
+    let x = rt.create_input(0_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        assert!(v % 2 == 1, "even");
+        v
+    });
+    let g = {
+        let claimed = claimed.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            claimed.park();
+            catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(1, |v| v)
+        })
+    };
+    let d = {
+        let caught = caught.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10);
+            caught.park();
+            v + rt.get(g)
+        })
+    };
+    let read = |rt: &Arc<Runtime<Shared>>, n: Incr<i64>| {
+        let rt = Arc::clone(rt);
+        std::thread::spawn(move || {
+            let v = rt.get(n);
+            (v, crate::hold::held_count())
+        })
+    };
+    caught.arm();
+    let holder = read(&rt, d);
+    caught.wait_parked();
+    claimed.arm();
+    let reader = read(&rt, g);
+    claimed.wait_parked();
+    claimed.release();
+    caught.release();
+    assert_eq!(holder.join().unwrap(), (8, 0));
+    assert_eq!(reader.join().unwrap(), (1, 0));
+    assert_eq!(crate::waits::registered(), 0);
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    rt.assert_invariant_i();
+    rt.set(x, 1);
+    assert_eq!(rt.get(d), 11);
+}
+
+/// Once `on` is set, `r`'s read walks `d` as an entry, and `d` first runs
+/// `f` beneath it, catches `f`'s panic and parks while its attempt holds
+/// `f`'s Failed landing. A set of `x`, `f`'s dep, then finds no published
+/// edge to walk, so `f` lands Dirty at the attempt's end rather than
+/// Failed, and so do `d` and `r` over it: the next read runs them again.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_failed_landing_over_a_dep_a_set_moved_lands_dirty() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let gate = crate::runtime::race_tests::Gate::new();
+    let x = rt.create_input(0_i64);
+    let on = rt.create_input(0_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        assert!(v % 2 == 1, "even");
+        v
+    });
+    let d = {
+        let gate = gate.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            if rt.get(on) == 0 {
+                return 0;
+            }
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10);
+            gate.park();
+            v
+        })
+    };
+    let r = rt.create_query(move |rt: &Runtime<Shared>| rt.get(d));
+    assert_eq!(rt.get(r), 0);
+    rt.set(on, 1);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        std::thread::spawn(move || rt.get(r))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(f), NodeState::Computing);
+    rt.set(x, 1);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 7);
+    assert_eq!(rt.state_of(f), NodeState::Dirty);
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(r), 10);
 }
 
 /// The thread's state after a caught wound: whether it held, and what
