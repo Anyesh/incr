@@ -5485,6 +5485,22 @@ fn two_thread_wound_retracts_a_member_run_landing_under_a_closed_cycle() {
     .assert_clean();
 }
 
+/// 0x329f unbounded: op 1's `TryGet(4)` returned 1 where every order
+/// raises the cycle through 4, in about one run in ten under load, until
+/// what catches a cycle closed on this thread's stack was held.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_read_builds_on_no_unfinished_attempts_caught_cycle_329f() {
+    let case = gen_case(0x329f, false, true);
+    let phases = phases(&case, 0x329f);
+    let serial = Serial::new(&case, &phases);
+    quiet(|| {
+        for _ in 0..80 {
+            serial.differential("0x329f", None, 0, &|_| {});
+        }
+    });
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
