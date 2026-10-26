@@ -448,6 +448,79 @@ fn shared_held_publication_panic_before_a_landing_leaves_no_node_computing() {
     rt.assert_invariant_i();
 }
 
+/// A held publication's last landing, p, is published, a set of t dirties
+/// it and another thread claims it, and only then does the publication
+/// panic, as a child sweep's caught panic resumes after the landing. The
+/// panic leaves p alone: the other thread's claim lands its own value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_after_its_last_landing_leaves_a_new_claim_alone() {
+    fn graph<C: Cells>(rt: &Runtime<C>, gate: Arc<[AtomicBool; 2]>) -> (Incr<i64>, Incr<i64>) {
+        let (a, b) = two_cycle(rt);
+        let t = rt.create_input(0_i64);
+        let p = rt.create_query(move |rt| {
+            if gate[0].load(Ordering::SeqCst) {
+                gate[1].store(true, Ordering::SeqCst);
+                while gate[0].load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+            rt.get(a) + rt.get(b) + rt.get(t)
+        });
+        (t, p)
+    }
+    let local = Runtime::<Local>::new();
+    let (lt, lp) = graph(&local, Arc::default());
+    local.get(lp);
+    local.set(lt, 1);
+    let want = local.get(lp);
+
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let gate: Arc<[AtomicBool; 2]> = Arc::default();
+    let (t, p) = graph(&*rt, gate.clone());
+    let claimer: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<i64>>>> = Arc::default();
+    let hook: super::ParkHook = {
+        let (weak, gate, claimer) = (Arc::downgrade(&rt), gate.clone(), claimer.clone());
+        let armed = AtomicBool::new(true);
+        Box::new(move |point| {
+            if point != super::ParkPoint::HeldPublished(super::NodeId(p.slot()))
+                || !armed.swap(false, Ordering::SeqCst)
+            {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            gate[0].store(true, Ordering::SeqCst);
+            *claimer.lock().unwrap() = Some(std::thread::spawn(move || {
+                rt.set(t, 1);
+                rt.get(p)
+            }));
+            let start = std::time::Instant::now();
+            while !gate[1].load(Ordering::SeqCst) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "the other thread never claimed p"
+                );
+                std::thread::yield_now();
+            }
+            panic!("a held publication panicked on purpose");
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
+    assert!(panic_message(err).contains("on purpose"));
+    gate[0].store(false, Ordering::SeqCst);
+    let claimed = claimer
+        .lock()
+        .unwrap()
+        .take()
+        .expect("p was never published");
+    let got = claimed.join().map_err(panic_message);
+    assert_eq!(got, Ok(want), "the claim on p lost its landing");
+    assert_eq!(rt.state_of(p), NodeState::Clean);
+    assert_eq!(rt.get(p), want);
+    rt.assert_invariant_i();
+}
+
 /// a (Fallback) and b read each other, counting their runs.
 fn counted_cycle<C: Cells>(rt: &Runtime<C>, runs: &Arc<AtomicUsize>) -> (Incr<i64>, Incr<i64>) {
     let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
