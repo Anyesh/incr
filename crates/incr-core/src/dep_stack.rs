@@ -22,7 +22,9 @@ use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
 use crate::cells::Cells;
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, POISONED, UNREGENERABLE};
+use crate::cycle::{
+    ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, KEPT_UNCHECKED, POISONED, UNREGENERABLE,
+};
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -452,6 +454,25 @@ pub trait DepStack: sealed::Sealed + 'static {
         self.with(|s| {
             if let Some(top) = s.frames.last_mut().filter(|top| top.rt() == rt) {
                 top.read_rt = rt;
+            }
+        });
+    }
+
+    /// A read of a deleted node's handle by the top compute frame, of any
+    /// runtime: it panics with no dep recorded, so a stash of the frame's
+    /// outcome could not see the slot recreated (`KEPT_UNCHECKED`).
+    #[cold]
+    #[inline(never)]
+    fn stale_read(&self) {
+        self.with(|s| {
+            if let Some(top) = s
+                .frames
+                .last()
+                .filter(|top| top.rt() != RuntimeId::SENTINEL)
+            {
+                // SAFETY: the frame is on the stack, so its control block
+                // is live (see `Frame::ctl`).
+                unsafe { &*top.ctl }.raise(KEPT_UNCHECKED);
             }
         });
     }

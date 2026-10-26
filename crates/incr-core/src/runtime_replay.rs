@@ -343,15 +343,23 @@ impl<C: Cells> Runtime<C> {
         word & value_code::REPLAY_BIT != 0
             && replay::speculative()
             && !ctl.has(cycle::DOOMED)
-            && (ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_UNCHECKED) != 0
-                || deps.iter().any(|&(d, generation)| {
-                    let cell = self.nodes.get(d.0).state_cell();
-                    !matches!(
-                        self.seen(cell, state::load::<C>(cell)),
-                        NodeState::Clean | NodeState::Cyclic
-                    ) && !self.stashed(d.0, generation, false)
-                })
-                || self.frame_owes_outcome(id))
+            && self.speculative_unkeepable(id, ctl, deps)
+    }
+
+    /// Whether a speculative frame's outcome, value or panic, has a
+    /// history no stash may keep for a later claim (see
+    /// [`Self::speculative_lands_dirty`]); `cycle::UNSTASHED` frames keep
+    /// none either.
+    fn speculative_unkeepable(&self, id: NodeId, ctl: &ComputeCtl, deps: &[(NodeId, u32)]) -> bool {
+        ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_UNCHECKED) != 0
+            || deps.iter().any(|&(d, generation)| {
+                let cell = self.nodes.get(d.0).state_cell();
+                !matches!(
+                    self.seen(cell, state::load::<C>(cell)),
+                    NodeState::Clean | NodeState::Cyclic
+                ) && !self.stashed(d.0, generation, false)
+            })
+            || self.frame_owes_outcome(id)
     }
 
     fn frame_owes_outcome(&self, id: NodeId) -> bool {
@@ -914,10 +922,12 @@ impl<C: Cells> Runtime<C> {
         attempt: &Attempt,
         payload: Box<dyn Any + Send>,
     ) -> (Box<dyn Any + Send>, bool) {
-        // A panic stash's adoption raises it unchecked, so none stands over
-        // a checked read, its own or a stashed dep's.
-        if ctl.flags.get() & (cycle::DOOMED | cycle::POISONED | cycle::KEPT_READ) != 0
-            || !replay::speculative()
+        // What no value stash keeps, no panic stash keeps; and a panic
+        // stash's adoption raises it unchecked, so none stands over a
+        // checked read either, its own or a stashed dep's.
+        if !replay::speculative()
+            || ctl.flags.get() & (cycle::UNSTASHED | cycle::KEPT_READ) != 0
+            || self.speculative_unkeepable(id, ctl, deps)
             || !self.inherited_none(deps)
         {
             return (payload, false);

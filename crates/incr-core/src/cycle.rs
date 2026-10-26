@@ -410,9 +410,10 @@ pub(crate) const HANDLED: u16 = 2048;
 /// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
-/// `ComputeCtl::flags`: the frame kept a read (`KEPT_READ`) whose stash
-/// adoption can't check: of its own runtime, or of another runtime's node
-/// that was not Clean or was read while that runtime was changing.
+/// `ComputeCtl::flags`: the frame made a read its stash adoption can't
+/// check: a kept read (`KEPT_READ`) of its own runtime, or of another
+/// runtime's node that was not Clean or was read while that runtime was
+/// changing, or a read of a deleted node's handle.
 pub(crate) const KEPT_UNCHECKED: u16 = 8192;
 
 /// `ComputeCtl::flags`: the frame read a landing this thread's attempt
@@ -424,6 +425,9 @@ pub(crate) const HOLD: u16 = 16384;
 /// ends (`crate::hold::KeptGuard`).
 pub(crate) const KEPT: u16 = 32768;
 pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
+/// A speculative frame whose outcome no stash keeps: a doomed run is
+/// discarded, and an open cycle's provisional read may settle otherwise.
+pub(crate) const UNSTASHED: u16 = DOOMED | LOW;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
