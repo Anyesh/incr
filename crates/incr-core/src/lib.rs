@@ -19,6 +19,7 @@
 
 pub mod arena;
 mod arena_registry;
+mod attempt;
 mod bits;
 pub mod cells;
 mod changes;

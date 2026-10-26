@@ -747,6 +747,15 @@ impl<C: Cells> Runtime<C> {
         defer(self.release_left(id, mark), bag);
     }
 
+    /// A mark for [`Self::left_failed_landing`] that leaves the tickets
+    /// joined from here on, which a later landing's readers took.
+    pub(super) fn ticket_mark(&self) -> u64 {
+        if !self.tickets_held() {
+            return 0;
+        }
+        self.tickets.read().next
+    }
+
     fn release_left(&self, id: NodeId, mark: u64) -> Vec<Ticket> {
         let mut t = self.tickets.write();
         let stale = release(&mut t, mark, slot_landings(id.0));

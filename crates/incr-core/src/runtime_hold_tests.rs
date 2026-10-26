@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use super::race_tests::{park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::Cycle;
+use crate::cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
 use crate::handle::Incr;
 use crate::node::NodeId;
 use crate::state::NodeState;
@@ -106,6 +106,421 @@ fn shared_delete_of_a_node_landed_earlier_in_the_read() {
         delete_of_a_node_landed_earlier_in_the_read::<Shared>(),
         delete_of_a_node_landed_earlier_in_the_read::<Local>()
     );
+}
+
+/// p reads a held cycle and then d, its first read of d, so p's edge on d
+/// waits for the read's exit. Another thread deletes d, which has no
+/// dependent yet, and recycles its slot before the exit publishes. As for
+/// an unheld compute over a recycled dep, the read's value is not
+/// returned, p's retry fails on d's stale handle, and the slot's new node
+/// gets no edge.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let (a, _) = two_cycle(&*rt);
+    let d = rt.create_input(7_i64);
+    let p = rt.create_query(move |rt| rt.get(a) + rt.get(d));
+    let recycled: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let hook: super::ParkHook = {
+        let (weak, recycled) = (Arc::downgrade(&rt), recycled.clone());
+        let owner = std::thread::current().id();
+        Box::new(move |point| {
+            if point != super::ParkPoint::BeforeHeldPublish
+                || std::thread::current().id() != owner
+                || recycled.get().is_some()
+            {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            let node = std::thread::spawn(move || {
+                rt.delete_node(d);
+                rt.create_input(99_i64)
+            })
+            .join()
+            .unwrap();
+            recycled.set(node).unwrap();
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let read = catch_unwind(AssertUnwindSafe(|| rt.get(p)));
+    assert!(
+        read.is_err(),
+        "the read returned a value over a deleted dep"
+    );
+    let recycled = *recycled.get().expect("the read published held landings");
+    assert_eq!(recycled.slot(), d.slot(), "the delete freed d's slot");
+    assert!(
+        !rt.has_reverse_edge(recycled, p),
+        "phantom edge on the recycled slot"
+    );
+    assert_eq!(rt.state_of(p), NodeState::Failed);
+    assert!(rt.try_delete_node(recycled).is_ok());
+    rt.assert_invariant_i();
+}
+
+/// Reads `p`, whose landing is held, with its publication panicking at the
+/// first other landing it publishes, where a child sweep's caught panic
+/// resumes, and `also` sees every other park point. Returns that landing's
+/// slot.
+fn panic_publishing_before(
+    rt: &Runtime<Shared>,
+    p: Incr<i64>,
+    also: impl Fn(super::ParkPoint) + Send + Sync + 'static,
+) -> u32 {
+    let armed = Arc::new(AtomicBool::new(true));
+    let p_first = Arc::new(AtomicBool::new(false));
+    let at = Arc::new(AtomicUsize::new(usize::MAX));
+    let hook: super::ParkHook = {
+        let (armed, p_first, at) = (armed.clone(), p_first.clone(), at.clone());
+        Box::new(move |point| {
+            let super::ParkPoint::HeldPublished(id) = point else {
+                also(point);
+                return;
+            };
+            if !armed.load(Ordering::SeqCst) {
+                return;
+            }
+            if id == super::NodeId(p.slot()) {
+                p_first.store(true, Ordering::SeqCst);
+                return;
+            }
+            armed.store(false, Ordering::SeqCst);
+            at.store(id.0 as usize, Ordering::SeqCst);
+            panic!("a held publication panicked on purpose");
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
+    assert!(panic_message(err).contains("on purpose"));
+    assert!(
+        !p_first.load(Ordering::SeqCst),
+        "p published before the panic"
+    );
+    at.load(Ordering::SeqCst) as u32
+}
+
+/// A held publication panics after its first landing, as a child sweep's
+/// caught panic resumes there. p, still to land, had dropped o for n, and
+/// publication had already moved its reverse edges: giving p back moves
+/// them back, so a later set of o reaches p and n stays deletable, and a
+/// landing published over one given back is Dirty, as (I) needs.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_gives_back_the_moved_edges() {
+    let rt = Runtime::<Shared>::new();
+    let t = rt.create_input(1_i64);
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt| rt.get(*bc.get().unwrap()) + rt.get(t),
+            |_c: &Cycle| 100,
+        )
+    };
+    let b = rt.create_query(move |rt| rt.get(a) * 2);
+    bc.set(b).unwrap();
+    let (s, o, n) = (
+        rt.create_input(false),
+        rt.create_input(10_i64),
+        rt.create_input(20_i64),
+    );
+    let p = rt.create_query(move |rt| rt.get(a) + if rt.get(s) { rt.get(n) } else { rt.get(o) });
+    rt.get(p);
+    rt.set(s, true);
+    rt.set(t, 2);
+    panic_publishing_before(&rt, p, |_| {});
+    assert!(rt.has_reverse_edge(o, p), "o lost its edge to p");
+    assert!(!rt.has_reverse_edge(n, p), "phantom edge on n");
+    rt.assert_invariant_i();
+    rt.set(s, false);
+    assert_eq!(rt.get(p), rt.get(a) + 10);
+    rt.set(o, 15);
+    assert_eq!(rt.get(p), rt.get(a) + 15, "a set of o missed p");
+    assert!(rt.try_delete_node(n).is_ok());
+    rt.assert_invariant_i();
+}
+
+/// a and b iterate to a fixpoint from 0, each reading the other; the one
+/// `t_in_a` names ends at t, the other at its value.
+fn fixpoint_pair<C: Cells>(rt: &Runtime<C>, t: Incr<i64>, t_in_a: bool) -> (Incr<i64>, Incr<i64>) {
+    let opts = || QueryOpts {
+        cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+        ..QueryOpts::default()
+    };
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let b = rt.get(*bc.get().unwrap());
+                if t_in_a {
+                    rt.get(t)
+                } else {
+                    b
+                }
+            },
+            opts(),
+        )
+    };
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(a);
+            if t_in_a {
+                a
+            } else {
+                rt.get(t)
+            }
+        },
+        opts(),
+    );
+    bc.set(b).unwrap();
+    (a, b)
+}
+
+/// A held publication panics after one member of a cycle published over
+/// the other, which it gives back. Once t goes back to its old value, a
+/// read of either member first returns what a fresh runtime does, not the
+/// published member's value from the given-back member's held one. Each
+/// member reads t in turn, so in one shape the member that published read
+/// t only through the one given back.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_rereads_over_a_given_back_landing() {
+    let mut over_given = false;
+    for (t_in_a, a_first) in [(true, true), (true, false), (false, true), (false, false)] {
+        let local = Runtime::<Local>::new();
+        let t = local.create_input(1_i64);
+        let (a, b) = fixpoint_pair(&local, t, t_in_a);
+        let want = (local.get(a), local.get(b));
+        let rt = Runtime::<Shared>::new();
+        let t = rt.create_input(1_i64);
+        let (a, b) = fixpoint_pair(&rt, t, t_in_a);
+        let p = rt.create_query(move |rt| rt.get(a) + rt.get(b));
+        rt.get(p);
+        rt.set(t, 2);
+        let published = panic_publishing_before(&rt, p, |_| {});
+        let t_reader = if t_in_a { a.slot() } else { b.slot() };
+        over_given |= published != t_reader;
+        rt.assert_invariant_i();
+        rt.set(t, 1);
+        let got = if a_first {
+            (rt.get(a), rt.get(b))
+        } else {
+            let b = rt.get(b);
+            (rt.get(a), b)
+        };
+        assert_eq!(got, want, "t in a: {t_in_a}, a first: {a_first}");
+        assert_eq!(rt.get(p), want.0 + want.1);
+        rt.assert_invariant_i();
+    }
+    assert!(
+        over_given,
+        "no shape published the member that reads t through the other"
+    );
+}
+
+/// g (Fallback) reads x while t is 1 and p otherwise; p reads g. Once t is
+/// 2 a read of g forms a cycle that lands p, created first, before g, and
+/// g's dep list before it read p was t and x.
+struct Formed {
+    t: Incr<i64>,
+    p: Incr<i64>,
+    g: Incr<i64>,
+}
+
+fn formed_cycle<C: Cells>(rt: &Runtime<C>) -> Formed {
+    let t = rt.create_input(1_i64);
+    let x = rt.create_input(5_i64);
+    let gc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let p = {
+        let gc = gc.clone();
+        rt.create_query(move |rt| rt.get(*gc.get().unwrap()))
+    };
+    let g = rt.create_query_with_fallback(
+        move |rt| if rt.get(t) == 1 { rt.get(x) } else { rt.get(p) },
+        |_c: &Cycle| 100,
+    );
+    gc.set(g).unwrap();
+    Formed { t, p, g }
+}
+
+/// Reads `f.g` at t = 2, its publication panicking right after p lands, so
+/// g goes back to x's value with its held `changed_at`.
+fn panic_after_p(
+    rt: &Runtime<Shared>,
+    f: &Formed,
+    also: impl Fn(super::ParkPoint) + Send + Sync + 'static,
+) {
+    assert_eq!(rt.get(f.p), 5);
+    rt.set(f.t, 2);
+    let published = panic_publishing_before(rt, f.g, also);
+    assert_eq!(published, f.p.slot(), "g published before p");
+}
+
+/// A cycle formed in the hold publishes p over g, then panics and gives g
+/// back. With t back at 1, g recomputes to the value it went back to, so
+/// its `changed_at` stays the held one: p must recompute rather than
+/// verify against it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_reader_of_a_formed_cycle_recomputes() {
+    let rt = Runtime::<Shared>::new();
+    let f = formed_cycle(&rt);
+    panic_after_p(&rt, &f, |_| {});
+    rt.set(f.t, 1);
+    assert_eq!(rt.get(f.g), 5);
+    assert_eq!(rt.get(f.p), 5, "p verified over the given-back g");
+    rt.assert_invariant_i();
+}
+
+/// As above, with another thread reverting t and reading p once g's
+/// give-back has landed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_reader_read_during_the_give_back() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let f = formed_cycle(&*rt);
+    let during: Arc<OnceLock<i64>> = Arc::new(OnceLock::new());
+    let also = {
+        let (weak, during, (t, p)) = (Arc::downgrade(&rt), during.clone(), (f.t, f.p));
+        move |point| {
+            if point != super::ParkPoint::GaveBack || during.get().is_some() {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            let read = std::thread::spawn(move || {
+                rt.set(t, 1);
+                rt.get(p)
+            })
+            .join()
+            .unwrap();
+            during.set(read).unwrap();
+        }
+    };
+    panic_after_p(&rt, &f, also);
+    assert_eq!(
+        during.get(),
+        Some(&5),
+        "a read during the give-back saw p over g's held value"
+    );
+    assert_eq!(rt.get(f.p), 5);
+    rt.assert_invariant_i();
+}
+
+/// A held publication panics in the first landing it publishes, before
+/// that node lands: no node is left Computing without an owner, and every
+/// read afterwards returns what Local returns.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_before_a_landing_leaves_no_node_computing() {
+    let local = Runtime::<Local>::new();
+    let (la, lb) = two_cycle(&local);
+    let lp = local.create_query(move |rt| rt.get(la) + rt.get(lb));
+    let want = (local.get(lp), local.get(la), local.get(lb));
+    let rt = Runtime::<Shared>::new();
+    let (a, b) = two_cycle(&rt);
+    let p = rt.create_query(move |rt| rt.get(a) + rt.get(b));
+    let landing = Arc::new(AtomicUsize::new(usize::MAX));
+    let hook: super::ParkHook = {
+        let landing = landing.clone();
+        Box::new(move |point| {
+            if let super::ParkPoint::HeldLanding(id) = point {
+                if landing.swap(id.0 as usize, Ordering::SeqCst) == usize::MAX {
+                    panic!("a held landing panicked on purpose");
+                }
+            }
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
+    assert!(panic_message(err).contains("on purpose"));
+    assert_ne!(landing.load(Ordering::SeqCst), usize::MAX);
+    for (name, state) in [
+        ("a", rt.state_of(a)),
+        ("b", rt.state_of(b)),
+        ("p", rt.state_of(p)),
+    ] {
+        assert!(
+            !matches!(state, NodeState::Computing | NodeState::ComputingDirty),
+            "{name} left {state:?}"
+        );
+    }
+    assert_eq!((rt.get(p), rt.get(a), rt.get(b)), want);
+    rt.assert_invariant_i();
+}
+
+/// A held publication's last landing, p, is published, a set of t dirties
+/// it and another thread claims it, and only then does the publication
+/// panic, as a child sweep's caught panic resumes after the landing. The
+/// panic leaves p alone: the other thread's claim lands its own value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_after_its_last_landing_leaves_a_new_claim_alone() {
+    fn graph<C: Cells>(rt: &Runtime<C>, gate: Arc<[AtomicBool; 2]>) -> (Incr<i64>, Incr<i64>) {
+        let (a, b) = two_cycle(rt);
+        let t = rt.create_input(0_i64);
+        let p = rt.create_query(move |rt| {
+            if gate[0].load(Ordering::SeqCst) {
+                gate[1].store(true, Ordering::SeqCst);
+                while gate[0].load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+            rt.get(a) + rt.get(b) + rt.get(t)
+        });
+        (t, p)
+    }
+    let local = Runtime::<Local>::new();
+    let (lt, lp) = graph(&local, Arc::default());
+    local.get(lp);
+    local.set(lt, 1);
+    let want = local.get(lp);
+
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let gate: Arc<[AtomicBool; 2]> = Arc::default();
+    let (t, p) = graph(&*rt, gate.clone());
+    let claimer: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<i64>>>> = Arc::default();
+    let hook: super::ParkHook = {
+        let (weak, gate, claimer) = (Arc::downgrade(&rt), gate.clone(), claimer.clone());
+        let armed = AtomicBool::new(true);
+        Box::new(move |point| {
+            if point != super::ParkPoint::HeldPublished(super::NodeId(p.slot()))
+                || !armed.swap(false, Ordering::SeqCst)
+            {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            gate[0].store(true, Ordering::SeqCst);
+            *claimer.lock().unwrap() = Some(std::thread::spawn(move || {
+                rt.set(t, 1);
+                rt.get(p)
+            }));
+            let start = std::time::Instant::now();
+            while !gate[1].load(Ordering::SeqCst) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "the other thread never claimed p"
+                );
+                std::thread::yield_now();
+            }
+            panic!("a held publication panicked on purpose");
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
+    assert!(panic_message(err).contains("on purpose"));
+    gate[0].store(false, Ordering::SeqCst);
+    let claimed = claimer
+        .lock()
+        .unwrap()
+        .take()
+        .expect("p was never published");
+    let got = claimed.join().map_err(panic_message);
+    assert_eq!(got, Ok(want), "the claim on p lost its landing");
+    assert_eq!(rt.state_of(p), NodeState::Clean);
+    assert_eq!(rt.get(p), want);
+    rt.assert_invariant_i();
 }
 
 /// a (Fallback) and b read each other, counting their runs.
@@ -1418,4 +1833,379 @@ fn shared_walk_skips_deps_of_two_held_runs_retracted_during_one_read() {
         },
     )
     .assert_clean();
+}
+
+/// Runs `f` on a fresh thread and returns its result, or `None` if it has
+/// not returned within 10 s (the thread is left running).
+fn within_10s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
+}
+
+/// x and w read each other through `try_get`, x a Fallback head if
+/// `fallback`; T reads x under a catch and then joins a thread that reads
+/// w with `try_get`. T's value, or `None` if T or its child hung, and the
+/// take-overs T's read restarted for.
+fn join_reader_of_held_member(fallback: bool) -> (Option<u64>, u32) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let i = rt.create_input(3_u64);
+    let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let w = {
+        let xc = xc.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1)
+        })
+    };
+    let read_w = move |rt: &Runtime<Shared>| rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000);
+    let x = if fallback {
+        rt.create_query_with(
+            read_w,
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+                ..crate::cycle::QueryOpts::default()
+            },
+        )
+    } else {
+        rt.create_query(read_w)
+    };
+    assert!(xc.set(x).is_ok());
+    let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let t = {
+        let takes = takes.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + std::thread::scope(|s| s.spawn(|| rt.try_get(w).unwrap_or(9)).join().unwrap())
+        })
+    };
+    let got = within_10s(move || rt.get(t));
+    (got, takes.load(Ordering::SeqCst))
+}
+
+/// **A closure that holds a cycle's landings can join a reader of one.**
+/// x and w land Cyclic, held by T's read, which caught the cycle; the
+/// child reading w must not wait for T's attempt to end, since T waits for
+/// it. The child takes w over and T's read restarts, at most once per held
+/// node, with what every order gives.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_join_reads_a_member_its_reader_holds_cyclic() {
+    let (got, takes) = join_reader_of_held_member(false);
+    assert_eq!(got, Some(9));
+    assert!(takes <= 2, "{takes} take-overs");
+}
+
+/// As above with x a Fallback head, so the episode lands values held.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_join_reads_a_member_its_reader_holds_with_a_value() {
+    let (got, takes) = join_reader_of_held_member(true);
+    assert_eq!(got, Some(101));
+    assert!(takes <= 2, "{takes} take-overs");
+}
+
+/// **A cycle landed after a take-over sees a later set.** T holds the
+/// cycle x, w and joins a child that takes w over, reads it and sets i, so
+/// T's retry runs the cycle again with w taken, and w now reads k too: the
+/// episode lands unheld, and w's new dep must get its reverse edge as any
+/// landing's does, or a later set of k never reaches w, which then reads
+/// stale against a runtime that saw i's and k's last values from the start.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_cycle_landed_after_a_take_over_sees_a_later_set() {
+    let cycle = |input: u64, extra: u64| {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let i = rt.create_input(input);
+        let k = rt.create_input(extra);
+        let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let w = {
+            let xc = xc.clone();
+            rt.create_query(move |rt: &Runtime<Shared>| {
+                let more = if rt.get(i) >= 4 { rt.get(k) } else { 0 };
+                rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1) + more
+            })
+        };
+        let x = rt.create_query_with(
+            move |rt: &Runtime<Shared>| rt.try_get(w).map_or(100, |v| v + 1000),
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+                ..crate::cycle::QueryOpts::default()
+            },
+        );
+        assert!(xc.set(x).is_ok());
+        (rt, i, k, x, w)
+    };
+    let (rt, i, k, x, w) = cycle(3, 20);
+    let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let set_once = Arc::new(AtomicBool::new(false));
+    let t = {
+        let (takes, set_once) = (takes.clone(), set_once.clone());
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + std::thread::scope(|s| {
+                s.spawn(|| {
+                    let r = rt.try_get(w).unwrap_or(9);
+                    if !set_once.swap(true, Ordering::SeqCst) {
+                        rt.set(i, 4);
+                    }
+                    r
+                })
+                .join()
+                .unwrap()
+            })
+        })
+    };
+    let reader = rt.clone();
+    assert!(
+        within_10s(move || reader.get(t)).is_some(),
+        "T or its child hung"
+    );
+    assert!(
+        takes.load(Ordering::SeqCst) >= 1,
+        "T's read was never taken over"
+    );
+    rt.set(k, 30);
+    let after = (rt.try_get(x).ok(), rt.try_get(w).ok());
+    let (fresh, _, _, fx, fw) = cycle(4, 30);
+    assert_eq!(after, (fresh.try_get(fx).ok(), fresh.try_get(fw).ok()));
+}
+
+/// **A reader that dirties the cycle on every run restarts its holder a
+/// bounded number of times.** As above, but every child sets i after its
+/// read, so each retry of T runs the cycle again. A taken claim is never
+/// held again in T's outermost entry, so after the first take-over the
+/// next child reads w published and T ends; were w held again, each child
+/// would take it over and T would restart for good.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_reader_that_dirties_the_cycle_each_run_restarts_its_holder_boundedly() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let i = rt.create_input(0_u64);
+    let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let w = {
+        let xc = xc.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1) + rt.get(i)
+        })
+    };
+    let x = rt.create_query_with(
+        move |rt: &Runtime<Shared>| rt.try_get(w).map_or(100, |v| v + 1000),
+        crate::cycle::QueryOpts {
+            cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+            ..crate::cycle::QueryOpts::default()
+        },
+    );
+    assert!(xc.set(x).is_ok());
+    let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let t = {
+        let (takes, runs) = (takes.clone(), runs.clone());
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+            runs.fetch_add(1, Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + std::thread::scope(|s| {
+                s.spawn(|| {
+                    let r = rt.try_get(w).unwrap_or(9);
+                    rt.set(i, rt.get(i) + 1);
+                    r
+                })
+                .join()
+                .unwrap()
+            })
+        })
+    };
+    let reader = rt.clone();
+    assert!(
+        within_10s(move || reader.get(t)).is_some(),
+        "T restarted for good"
+    );
+    assert!(
+        takes.load(Ordering::SeqCst) >= 1,
+        "T's read was never taken over"
+    );
+    let runs = runs.load(Ordering::SeqCst);
+    assert!(runs <= 3, "T ran {runs} times");
+}
+
+/// **Two holders that join readers of each other's landings both end.**
+/// Each of two runtimes has a `try_get` cycle that its read T catches and
+/// holds; once both hold, each T joins a child reading the other's member.
+/// Each child takes its member over, so both reads restart, and a taken
+/// claim is never held again, so neither restarts for good.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_holders_that_join_readers_of_each_others_landings_both_end() {
+    struct Side {
+        rt: Arc<Runtime<Shared>>,
+        x: Incr<u64>,
+        w: Incr<u64>,
+    }
+    fn side() -> Side {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let w = {
+            let xc = xc.clone();
+            rt.create_query(move |rt: &Runtime<Shared>| {
+                rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1)
+            })
+        };
+        let x = rt.create_query(move |rt: &Runtime<Shared>| rt.try_get(w).map_or(7, |v| v + 1));
+        assert!(xc.set(x).is_ok());
+        Side { rt, x, w }
+    }
+    let (a, b) = (side(), side());
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let reader = |me: &Side, other: &Side| {
+        let (x, w, other_rt) = (me.x, other.w, other.rt.clone());
+        let arrived = arrived.clone();
+        let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t = {
+            let takes = takes.clone();
+            me.rt.create_query(move |rt: &Runtime<Shared>| {
+                takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                // Both hold their cycle before either joins, on the first
+                // attempt; a restart finds both arrived.
+                arrived.fetch_add(1, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while arrived.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let other_rt = other_rt.clone();
+                v + std::thread::scope(|s| {
+                    s.spawn(move || other_rt.try_get(w).unwrap_or(9))
+                        .join()
+                        .unwrap()
+                })
+            })
+        };
+        let rt = me.rt.clone();
+        (
+            std::thread::spawn(move || within_10s(move || rt.get(t))),
+            takes,
+        )
+    };
+    let (ta, takes_a) = reader(&a, &b);
+    let (tb, takes_b) = reader(&b, &a);
+    let (got_a, got_b) = (ta.join().unwrap(), tb.join().unwrap());
+    assert_eq!((got_a, got_b), (Some(9), Some(9)));
+    for takes in [takes_a, takes_b] {
+        let n = takes.load(Ordering::SeqCst);
+        assert!(n <= 2, "{n} take-overs");
+    }
+}
+
+/// r reads a cycle k moved and catches x, which reads the cycle's held
+/// member and panics, so x's Failed landing is held. At publication x lands
+/// otherwise: stopped by a panic before its landing (`stop`), or flagged by
+/// a set of i. Another thread's walk of y then runs x, which lands Failed
+/// with its own record and a ticket for the panic y's entry contained,
+/// before the publication drops what x's held run left: it must leave both.
+fn held_failed_target_keeps_the_next_runs_record(stop: bool) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(16);
+    let k = rt.create_input(1_i64);
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt| rt.get(*bc.get().unwrap()) + rt.get(k),
+            |_c: &Cycle| 100,
+        )
+    };
+    let b = rt.create_query(move |rt| rt.get(a) * 2);
+    bc.set(b).unwrap();
+    let (i, j, sel) = (
+        rt.create_input(0_i64),
+        rt.create_input(1_i64),
+        rt.create_input(0_i64),
+    );
+    let x = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> i64 {
+            let v = rt.get(a) + rt.get(i);
+            if rt.get(j) == 0 {
+                std::panic::panic_any(HeldPayload(v));
+            }
+            v
+        },
+        replayable(),
+    );
+    let y = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(x) } else { 100 });
+    let r = rt.create_query_with(
+        move |rt| rt.get(a) + i64::from(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err()),
+        replayable(),
+    );
+    let _ = rt.get(y);
+    rt.set(k, 2);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    let x_id = super::NodeId(x.slot());
+    let next_run: Arc<OnceLock<(Option<u64>, usize)>> = Arc::default();
+    let hook: super::ParkHook = {
+        let (weak, next_run) = (Arc::downgrade(&rt), next_run.clone());
+        let (landing, otherwise) = (AtomicBool::new(true), AtomicBool::new(true));
+        Box::new(move |point| {
+            let rt = weak.upgrade().unwrap();
+            if point == super::ParkPoint::HeldLanding(x_id) && landing.swap(false, Ordering::SeqCst)
+            {
+                if stop {
+                    panic!("a held landing panicked on purpose");
+                }
+                let set = Arc::clone(&rt);
+                std::thread::spawn(move || set.set(i, 1)).join().unwrap();
+            }
+            if point == super::ParkPoint::FailedLandedOtherwise(x_id)
+                && otherwise.swap(false, Ordering::SeqCst)
+            {
+                let run = Arc::clone(&rt);
+                let walk = std::thread::spawn(move || run.get(y));
+                let start = std::time::Instant::now();
+                while !walk.is_finished() {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(20),
+                        "the other thread's walk of y never finished"
+                    );
+                    std::thread::yield_now();
+                }
+                assert_eq!(walk.join().unwrap(), 100);
+                let record = rt.failed_run_token(x_id.0, x.generation());
+                next_run.set((record, rt.contained_payloads())).unwrap();
+            }
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let read = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+    assert_eq!(read.is_err(), stop);
+    let (b_record, b_tickets) = *next_run.get().expect("x never landed otherwise");
+    assert!(b_record.is_some(), "x's run left no record");
+    assert_eq!(b_tickets, 1, "y's entry held no payload for x's landing");
+    assert_eq!(
+        rt.failed_run_token(x_id.0, x.generation()),
+        b_record,
+        "the publication forgot the record of x's next run"
+    );
+    assert_eq!(
+        rt.contained_payloads(),
+        1,
+        "the publication released the ticket of x's next run"
+    );
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_stopped_held_failed_target_keeps_the_next_runs_record() {
+    held_failed_target_keeps_the_next_runs_record(true);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_flagged_held_failed_target_keeps_the_next_runs_record() {
+    held_failed_target_keeps_the_next_runs_record(false);
 }

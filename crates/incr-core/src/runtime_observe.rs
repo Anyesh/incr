@@ -365,6 +365,16 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         stamp: u64,
     ) -> Result<(), ObsErr> {
+        cycle_state::KeptUnwind::around(|| self.observer_walk_kept(handle, observed, stamp))
+    }
+
+    #[inline(always)]
+    fn observer_walk_kept<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        stamp: u64,
+    ) -> Result<(), ObsErr> {
         let id = NodeId(handle.slot());
         if observed == NodeState::Cyclic || is_computing(observed) {
             // `Ok` is a node on this thread's stack or held map, in a

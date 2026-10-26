@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashSet};
 #[cfg(not(loom))]
 use std::hash::{Hash, Hasher};
 
+use crate::attempt::{self, Attempt};
 use crate::fx::FxBuildHasher;
 #[cfg(not(loom))]
 use crate::fx::FxHasher;
@@ -63,7 +64,7 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 static BUCKETS: [AtomicU32; BUCKETS_LEN] = [const { AtomicU32::new(0) }; BUCKETS_LEN];
 
 #[cfg(not(loom))]
-static TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
+static TABLE: Mutex<BTreeMap<Claim, (Entry, Attempt)>> = Mutex::new(BTreeMap::new());
 
 /// Orders the start of each op that leaves the Clean fast path against
 /// [`rest`]s.
@@ -73,7 +74,7 @@ static SEQ: AtomicU64 = AtomicU64::new(1);
 #[cfg(loom)]
 loom::lazy_static! {
     static ref LIVE: AtomicUsize = AtomicUsize::new(0);
-    static ref TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
+    static ref TABLE: Mutex<BTreeMap<Claim, (Entry, Attempt)>> = Mutex::new(BTreeMap::new());
     static ref SEQ: AtomicU64 = AtomicU64::new(1);
 }
 
@@ -149,6 +150,12 @@ impl Drop for Listed {
 
 #[cfg(not(loom))]
 thread_local! {
+    /// Claims waiters met as they took over this thread's attempts, which
+    /// never doom again before its outermost entry exits.
+    static TAKEN: RefCell<Vec<Claim>> = const { RefCell::new(Vec::new()) };
+    /// Taken claims this thread landed for a Cyclic outcome, at their
+    /// generations, not read since: published Dirty, with no value.
+    static TAKEN_CYCLIC: RefCell<Vec<(Claim, u32)>> = const { RefCell::new(Vec::new()) };
     static MINE: Listed = const { Listed(RefCell::new(Vec::new())) };
     static SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
     /// The [`root_key`] of the innermost read's node, 0 outside reads.
@@ -162,6 +169,8 @@ thread_local! {
 
 #[cfg(loom)]
 loom::thread_local! {
+    static TAKEN: RefCell<Vec<Claim>> = RefCell::new(Vec::new());
+    static TAKEN_CYCLIC: RefCell<Vec<(Claim, u32)>> = RefCell::new(Vec::new());
     static MINE: Listed = Listed(RefCell::new(Vec::new()));
     static SCOPE: Cell<Option<u64>> = Cell::new(None);
     static ROOT: Cell<u64> = Cell::new(0);
@@ -185,7 +194,7 @@ fn for_read(context: u64) -> bool {
     context == ROOT_READ || context & WALK != 0
 }
 
-fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, Entry>> {
+fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, (Entry, Attempt)>> {
     #[cfg(not(loom))]
     {
         TABLE.lock().unwrap_or_else(|e| e.into_inner())
@@ -242,6 +251,9 @@ pub(crate) fn note(claim: Claim, generation: u32) {
     let Some(context) = SCOPE.with(Cell::get) else {
         return;
     };
+    if taken(claim) {
+        return;
+    }
     // Only the read-root group may list it besides this one; a context
     // that reserves it already keeps it, as without a read.
     let again = ROOTS.with(Cell::get) != 0
@@ -305,7 +317,10 @@ impl Drop for Root {
 #[cold]
 #[inline(never)]
 pub(crate) fn note_root(claim: Claim, generation: u32) {
-    if ROOT.with(Cell::get) != root_key(claim) || listed(ROOT_READ, claim, generation) {
+    if ROOT.with(Cell::get) != root_key(claim)
+        || listed(ROOT_READ, claim, generation)
+        || taken(claim)
+    {
         return;
     }
     // Listed even if a context of this thread reserves it already, so it
@@ -336,15 +351,17 @@ pub(crate) fn note_walk(claim: Claim, generation: u32) {
         let token = m.token();
         {
             let mut t = table();
-            match t.get(&claim) {
+            match t.get_mut(&claim) {
                 // Another thread's reservation stands for the node; at
                 // rest it holds fewer ops than this listing would, the known
                 // later-op gap.
-                Some(&(g, owner, _)) if g == generation && owner != token => return false,
-                Some(&(g, _, _)) if g == generation => {}
+                Some(((g, owner, _), _)) if *g == generation && *owner != token => return false,
+                Some(((g, _, _), a)) if *g == generation => *a = attempt::mine(),
                 _ => {
                     let stamp = SEQ.fetch_add(1, Ordering::SeqCst);
-                    if t.insert(claim, (generation, token, stamp)).is_none() {
+                    if t.insert(claim, ((generation, token, stamp), attempt::mine()))
+                        .is_none()
+                    {
                         #[cfg(not(loom))]
                         bucket(claim).fetch_add(1, Ordering::Relaxed);
                     }
@@ -408,8 +425,8 @@ fn list(context: u64, claim: Claim, generation: u32, again: bool) {
         let token = m.token();
         {
             let mut t = table();
-            match t.insert(claim, (generation, token, AWAKE)) {
-                Some((g, owner, _)) if (g, owner) == (generation, token) && !again => return,
+            match t.insert(claim, ((generation, token, AWAKE), attempt::mine())) {
+                Some(((g, owner, _), _)) if (g, owner) == (generation, token) && !again => return,
                 Some(_) => {}
                 None => {
                     #[cfg(not(loom))]
@@ -445,18 +462,42 @@ fn reserved(claim: Claim, generation: u32) -> Option<(bool, u64)> {
     let token = MINE.with(Listed::token);
     table()
         .get(&claim)
-        .filter(|&&(g, _, _)| g == generation)
-        .map(|&(_, owner, stamp)| (owner == token, stamp))
+        .filter(|((g, _, _), a)| *g == generation && !a.wounded())
+        .map(|&((_, owner, stamp), _)| (owner == token, stamp))
+}
+
+/// The attempt of another thread that reserved `claim` at `generation`.
+fn owner_elsewhere(claim: Claim, generation: u32) -> Option<Attempt> {
+    if !any() || !bucket_hit(claim) {
+        return None;
+    }
+    let token = MINE.with(Listed::token);
+    table()
+        .get(&claim)
+        .filter(|&&((g, owner, _), _)| g == generation && owner != token)
+        .map(|(_, a)| a.clone())
 }
 
 /// Whether another thread reserved `claim` at `generation` against this
-/// thread's op. A reservation at rest holds only ops begun before its
-/// owner left the node's run: a later op is a reader the owner's retry
-/// may itself have started, before that retry reads the node again.
+/// thread's op, for an attempt no waiter has wounded: a wounded attempt's
+/// reservations hold no one. A reservation at rest holds only ops begun
+/// before its owner left the node's run: a later op is a reader the
+/// owner's retry may itself have started, before that retry reads the
+/// node again.
 #[cold]
 #[inline(never)]
 pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
     matches!(reserved(claim, generation), Some((false, stamp)) if OP.with(Cell::get) <= stamp)
+}
+
+/// A waiter on another thread's reservation of `claim`: wounds the
+/// owner's attempt once its discard has stayed in flight through the
+/// waiter's `patience`, which frees the reservation. True if the
+/// reservation holds no one now.
+#[cold]
+#[inline(never)]
+pub(crate) fn take_over(claim: Claim, generation: u32, patience: &mut attempt::Patience) -> bool {
+    owner_elsewhere(claim, generation).is_none_or(|a| a.wound_if_stuck(claim, patience))
 }
 
 /// Whether this thread reserved `claim` at `generation`.
@@ -493,7 +534,7 @@ pub(crate) fn rest(claim: Claim, generation: u32) {
     if root {
         return;
     }
-    if let Some(e) = table().get_mut(&claim) {
+    if let Some((e, _)) = table().get_mut(&claim) {
         if (e.0, e.1) == (generation, token) && e.2 == AWAKE {
             e.2 = SEQ.fetch_add(1, Ordering::SeqCst);
         }
@@ -506,7 +547,7 @@ pub(crate) fn rest(claim: Claim, generation: u32) {
 fn unlist(claims: impl IntoIterator<Item = (Claim, u32)>, token: usize, shared: bool) {
     let mut t = table();
     for (claim, generation) in claims {
-        let Some(e) = t.get_mut(&claim) else {
+        let Some((e, _)) = t.get_mut(&claim) else {
             continue;
         };
         if (e.0, e.1) != (generation, token) {
@@ -674,6 +715,88 @@ pub(crate) fn held() -> Vec<Claim> {
             .flat_map(|g| g.claims.keys().map(|(c, _)| c))
             .collect()
     })
+}
+
+/// A waiter took over this thread's attempt: the claims its waiters met
+/// are never doomed, reserved or held again before the thread's outermost
+/// entry exits, except as members of an episode held once more because
+/// another member carries hold state from the attempt, which marks them
+/// all. Each wounded attempt so adds at least one claim it reserved or held
+/// while untaken, and a read restarts for take-overs at most once per
+/// claim it can reserve or hold.
+pub(crate) fn mark_taken() {
+    let claims = attempt::take_met();
+    if claims.is_empty() {
+        return;
+    }
+    #[cfg(all(test, not(loom)))]
+    TAKES.with(|n| n.set(n.get() + 1));
+    mark_claims_taken(claims);
+}
+
+/// `claims` are taken, as [`mark_taken`]'s are.
+pub(crate) fn mark_claims_taken(claims: impl IntoIterator<Item = Claim>) {
+    TAKEN.with(|t| t.borrow_mut().extend(claims));
+    crate::cycle_state::set_any_taken(true);
+}
+
+/// Whether a take-over during the thread's outermost entry met `claim`.
+#[inline(always)]
+pub(crate) fn taken(claim: Claim) -> bool {
+    crate::cycle_state::any_taken() && taken_slow(claim)
+}
+
+#[cold]
+#[inline(never)]
+fn taken_slow(claim: Claim) -> bool {
+    TAKEN.with(|t| t.borrow().contains(&claim))
+}
+
+/// This thread landed taken `claim` at `generation`, for a Cyclic outcome
+/// if `cyclic`: the next read of it on this thread, and only that one,
+/// gives that cycle, so no later landing by any thread is read as it.
+pub(crate) fn note_taken_landing(claim: Claim, generation: u32, cyclic: bool) {
+    TAKEN_CYCLIC.with(|t| {
+        let mut t = t.borrow_mut();
+        t.retain(|&(c, _)| c != claim);
+        if cyclic {
+            t.push((claim, generation));
+        }
+    });
+}
+
+/// Whether this thread's last landing of taken `claim` at `generation`
+/// was for a Cyclic outcome not read since; the read takes it.
+pub(crate) fn take_taken_cyclic(claim: Claim, generation: u32) -> bool {
+    crate::cycle_state::any_taken()
+        && TAKEN_CYCLIC.with(|t| {
+            let mut t = t.borrow_mut();
+            let at = t.iter().position(|&n| n == (claim, generation));
+            at.map(|at| t.swap_remove(at)).is_some()
+        })
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static TAKES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Take-overs during the thread's outermost entry so far, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn takes() -> u32 {
+    TAKES.with(Cell::get)
+}
+
+/// The thread's outermost entry, whose retries the taken claims span,
+/// has exited.
+#[cold]
+#[inline(never)]
+pub(crate) fn clear_taken() {
+    #[cfg(all(test, not(loom)))]
+    TAKES.with(|n| n.set(0));
+    crate::cycle_state::set_any_taken(false);
+    TAKEN.with(|t| t.borrow_mut().clear());
+    TAKEN_CYCLIC.with(|t| t.borrow_mut().clear());
 }
 
 /// Whether this thread holds no reservation, as it must once its

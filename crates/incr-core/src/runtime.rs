@@ -218,8 +218,8 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a run that did not land Clean released its
     /// claim, with the attempt's bag carried along.
     UnsettledLanding(NodeId),
-    /// In `land_failed`, after a landing meant as Failed released its
-    /// claim landing otherwise, before it forgets its record.
+    /// In `land_failed` or a held publication, after a landing meant as
+    /// Failed released its claim landing otherwise.
     FailedLandedOtherwise(NodeId),
     /// In `flip_failed_from`, before the flip's CAS.
     FlipBeforeCas(NodeId),
@@ -289,6 +289,17 @@ pub(crate) enum ParkPoint {
     /// In `contain`, before the walk entry's notes name the landings its
     /// payload holds.
     BeforeContain,
+    /// At an exit that publishes held landings (the outermost entry's, or a
+    /// runtime's first entry inside another's), just before it does.
+    BeforeHeldPublish,
+    /// In a held publication, once the node has landed and before a panic
+    /// its children's landing caught is resumed.
+    HeldPublished(NodeId),
+    /// In a held publication, just before the node lands.
+    HeldLanding(NodeId),
+    /// As a panicking held publication's give-back has landed, before its
+    /// catch does anything more.
+    GaveBack,
 }
 
 /// Ends the whole test binary: a parked thread's panic can be caught as a
@@ -518,7 +529,13 @@ pub(crate) type BagHook =
     Box<dyn Fn(ParkPoint) -> Option<crate::deferred::ErasedDrop> + Send + Sync>;
 
 /// First visits after which an `ensure_clean` walk switches to exact mode.
+#[cfg(not(loom))]
 const EXACT_MODE_AT: u32 = 4096;
+/// Under loom, every pop is several modelled atomics, so a Dirty cycle's
+/// 4096 repeated visits run one execution past the branch cap and the
+/// version vector's u16. Models see repeated expansion only up to 8 visits.
+#[cfg(loom)]
+const EXACT_MODE_AT: u32 = 8;
 
 /// Root restarts a read's walk takes for other threads' releases before it
 /// goes on with its plan. Another thread can release in every plan, as a
@@ -1421,9 +1438,14 @@ impl<C: Cells> Runtime<C> {
         self.expansions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    // Out of line, so its guard's cleanup stays out of the landing-pad
+    // tables of the frames a caught panic unwinds, which scale gates time.
     #[cfg(test)]
+    #[inline(never)]
     fn park(&self, point: ParkPoint) {
         if let Some(hook) = self.park_hook.get() {
+            #[cfg(not(loom))]
+            let _parked = crate::attempt::Parked::new();
             hook(point);
         }
     }
@@ -2549,10 +2571,10 @@ impl<C: Cells> Runtime<C> {
     /// is the state `get` loaded.
     #[inline(never)]
     fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
-        match self.read_slow(handle, observed, ReadKind::Get) {
+        cycle_state::KeptUnwind::around(|| match self.read_slow(handle, observed, ReadKind::Get) {
             Ok(value) => value,
             Err(cycle) => self.raise_cycle(cycle),
-        }
+        })
     }
 
     /// Read the current value of a node, like [`Self::get`], or the cycle
@@ -2589,7 +2611,7 @@ impl<C: Cells> Runtime<C> {
 
     #[inline(never)]
     fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
-        self.read_slow(handle, observed, ReadKind::TryGet)
+        cycle_state::KeptUnwind::around(|| self.read_slow(handle, observed, ReadKind::TryGet))
     }
 
     /// The cycle of the group `handle` landed in last, if its last
@@ -2715,7 +2737,8 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
-        let _root = reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
+        let arm = || reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
+        let mut root = Some(arm());
         let mut restarts = 0;
         loop {
             if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
@@ -2786,14 +2809,32 @@ impl<C: Cells> Runtime<C> {
                     == NodeState::Dirty
             };
             let dirty_before = !C::SINGLE_THREADED && frame.is_some() && dirty();
-            match self.try_read_slot(handle, node, type_tag, arena_slot) {
-                Some(value) => {
+            let mut dirty_pinned = false;
+            let mut reserving = false;
+            // Under Shared the value is pinned before the clone, which is
+            // user code and may wait on a thread that reads this node, so the
+            // read's reservation of its own node ends there. Local holds no
+            // reservation and no other thread lands the node during the clone.
+            let read = if C::SINGLE_THREADED {
+                self.try_read_slot(handle, node, type_tag, arena_slot)
+            } else {
+                self.try_read_slot_then(handle, node, type_tag, arena_slot, || {
                     // Outside an open context only a doom's pending claims are
                     // reserved, and no read takes a value before they are adopted.
-                    let reserving = !C::SINGLE_THREADED
-                        && value_code::thread_word() & value_code::REPLAY_BIT != 0
-                        && reserve::any();
-                    if (frame.is_some() || reserving) && (dirty_before || dirty()) {
+                    reserving =
+                        value_code::thread_word() & value_code::REPLAY_BIT != 0 && reserve::any();
+                    dirty_pinned = (frame.is_some() || reserving) && (dirty_before || dirty());
+                    drop(root.take());
+                })
+            };
+            match read {
+                Some(value) => {
+                    let noted = if C::SINGLE_THREADED {
+                        frame.is_some() && dirty()
+                    } else {
+                        dirty_pinned
+                    };
+                    if noted {
                         if let Some(f) = frame {
                             if !self.unchanged_stash(handle.slot(), handle.generation()) {
                                 self.note_dirty_read(f, handle, &value);
@@ -2813,7 +2854,10 @@ impl<C: Cells> Runtime<C> {
                     Err(NodeState::Clean) => {
                         return Ok(self.read_slot(handle, node, type_tag, arena_slot));
                     }
-                    Err(now) => observed = now,
+                    Err(now) => {
+                        observed = now;
+                        root = Some(arm());
+                    }
                 },
             }
         }
@@ -2835,7 +2879,16 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != handle.generation() {
             self.stale_handle(handle);
         }
-        if matches!(state, NodeState::Cyclic | NodeState::New) {
+        // This thread's own landing of a taken claim for a Cyclic outcome
+        // is Dirty to every reader, but walking it again would land it so
+        // again, for good: its next read takes the cycle it landed.
+        let own_cyclic = || {
+            !C::SINGLE_THREADED
+                && reserve::take_taken_cyclic((self.runtime_id, handle.slot()), handle.generation())
+        };
+        if matches!(state, NodeState::Cyclic | NodeState::New)
+            || (state == NodeState::Dirty && own_cyclic())
+        {
             if let Some(cycle) = self.landed_cycle(handle) {
                 return Ok(cycle);
             }
@@ -2926,6 +2979,33 @@ impl<C: Cells> Runtime<C> {
             Some(value) => value,
             None => self.read_failed(handle),
         }
+    }
+
+    /// [`Self::try_read_slot`], with `loaded` run once the value is pinned
+    /// and before it is cloned.
+    #[inline(always)]
+    fn try_read_slot_then<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+        loaded: impl FnOnce(),
+    ) -> Option<T> {
+        self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
+        let arena = self.arenas.tagged_arena::<T>(type_tag);
+        let value = value_code::run(|| match arena {
+            Some(arena) => arena.try_read_then(arena_slot, loaded),
+            None => {
+                loaded();
+                None
+            }
+        });
+        C::fence_acquire();
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
+        value
     }
 
     /// [`Self::read_slot`], with `None` for an empty slot.
@@ -3164,6 +3244,39 @@ impl<C: Cells> Runtime<C> {
         &self,
         handle: Incr<T>,
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
+        cycle_state::KeptUnwind::around(|| self.claim_input_kept(handle))
+    }
+
+    /// A set from a closure that caught a discard, a doom's included, or
+    /// a wound raises it again as a read does: its run is discarded, and
+    /// the unbounded run never makes the write.
+    #[cold]
+    #[inline(never)]
+    fn raise_caught_unwind(&self) {
+        if std::thread::panicking() {
+            return;
+        }
+        match cycle_state::unwind_kind() {
+            Some(UnwindKind::Discard) => {
+                debug_assert!(
+                    C::SINGLE_THREADED || crate::attempt::in_flight(),
+                    "incr-core: a discard a closure caught is out of flight"
+                );
+                std::panic::resume_unwind(Box::new(cycle::DiscardUnwind))
+            }
+            Some(UnwindKind::Wound) => self.raise_wound(),
+            _ => {}
+        }
+    }
+
+    #[inline(always)]
+    fn claim_input_kept<T: Value>(
+        &self,
+        handle: Incr<T>,
+    ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
+        if value_code::thread_word() & value_code::UNWIND_MASK != 0 {
+            self.raise_caught_unwind();
+        }
         let slot = handle.slot();
         let id = NodeId(slot);
         let (node, flags) = self.nodes.get_with_flags(slot);
@@ -4714,7 +4827,12 @@ impl<C: Cells> Runtime<C> {
                 let ctl = ComputeCtl::resolved_by(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
-                        | if speculative { cycle::SPECULATIVE } else { 0 },
+                        | if speculative { cycle::SPECULATIVE } else { 0 }
+                        | if !C::SINGLE_THREADED && reserve::taken((self.runtime_id, id.0)) {
+                            cycle::NO_DOOM
+                        } else {
+                            0
+                        },
                     if speculative {
                         speculative_keep = self.speculative_keep();
                         std::ptr::from_ref(&speculative_keep).cast()
@@ -4751,6 +4869,12 @@ impl<C: Cells> Runtime<C> {
                         compute(self, id.0, &ctl)
                     })),
                 };
+                if !C::SINGLE_THREADED
+                    && ctl.has(cycle::DOOMED)
+                    && cycle_state::end_lazy(std::ptr::from_ref(&ctl) as usize)
+                {
+                    result = Err(Box::new(cycle::WoundUnwind));
+                }
                 let (deps, reading) = self.dep_stack.pop_frame_reading();
                 let word = value_code::thread_word();
                 if word
@@ -4780,6 +4904,12 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
 
+                // A waiter took over a node this thread's discard left
+                // reserved: the pop raises the wound the attempt retries
+                // from, as for a swallowed wound.
+                if result.is_err() && !C::SINGLE_THREADED && cycle_state::settle_discard() {
+                    result = Err(Box::new(cycle::WoundUnwind));
+                }
                 if result.is_err() && ctl.has(cycle::SPECULATIVE) {
                     self.unbuild_speculative(&ctl, bag);
                 }
@@ -4802,6 +4932,10 @@ impl<C: Cells> Runtime<C> {
                         return self.discard_doomed(id, attempt, &ctl, Some(payload), bag);
                     }
                     Err(payload) => {
+                        debug_assert!(
+                            !payload.is::<cycle::DoomUnwind>(),
+                            "incr-core: a doom unwind reached an undoomed frame"
+                        );
                         return self.compute_panicked(
                             id,
                             node,
@@ -4817,7 +4951,7 @@ impl<C: Cells> Runtime<C> {
                             bag,
                             walked,
                             payload,
-                        )
+                        );
                     }
                 };
 
@@ -5005,6 +5139,9 @@ impl<C: Cells> Runtime<C> {
         walked: bool,
         payload: Box<dyn std::any::Any + Send>,
     ) -> Computed {
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         let kind = cycle_state::take_unwind_kind();
         let (payload, children_stashed) = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
             self.stash_panic(id, ctl, deps, &attempt, payload)
@@ -5418,6 +5555,15 @@ impl<C: Cells> Runtime<C> {
         // Whatever the pop does, the reader read this frame's node.
         if ctl.has(cycle::HOLD) {
             self.dep_stack.raise_hold();
+        }
+        // A holder's pop is engine progress, which restarts its waiters'
+        // patience; once one has taken a landing over, the pop raises the
+        // wound the attempt retries from.
+        if !C::SINGLE_THREADED && word & value_code::HELD_BIT != 0 {
+            crate::attempt::hold_progress();
+            if crate::attempt::hold_wounded() && cycle_state::settle_hold() {
+                *result = Err(Box::new(cycle::WoundUnwind));
+            }
         }
         // A doomed run's pop is discarded and its retry pops in its place,
         // so it retires nothing the unbounded run keeps.
@@ -5871,12 +6017,14 @@ impl<C: Cells> Runtime<C> {
             && hold::active()
             && hold::holds(state::cell_key::<C>(node.state_cell()));
         if held {
-            hold::keep_deps(state::cell_key::<C>(node.state_cell()), || {
+            let cell = state::cell_key::<C>(node.state_cell());
+            hold::keep_deps(cell, || {
                 diff.old
                     .iter()
                     .map(|d| (*d, self.nodes.get(d.0).generation()))
                     .collect()
             });
+            hold::keep_read(cell, recorded.iter().copied(), panic.is_some());
         }
 
         // The displaced list is retired at the attempt's drain, after its

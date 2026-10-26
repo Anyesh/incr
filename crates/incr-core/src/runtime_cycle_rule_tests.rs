@@ -1524,8 +1524,19 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
         // The landed case runs a third time; the ignored
         // `landed_foreign_reader_runs_twice` tracks it.
         if !matches!(first, FirstRead::ForeignLandedClean) {
-            assert_eq!(runs, (2, 1), "{first:?}");
+            assert_eq!(runs, (doomed_reader_first_runs::<A>(n), 1), "{first:?}");
         }
+    }
+}
+
+/// The reader's runs in a first revision: a Shared doomed frame unwinds at
+/// its next read, so it takes one doomed run per leaf where Local's one
+/// doomed run reads them all.
+fn doomed_reader_first_runs<A: Cells>(n: u64) -> u32 {
+    if A::SINGLE_THREADED {
+        2
+    } else {
+        n as u32 + 1
     }
 }
 
@@ -1653,7 +1664,12 @@ fn rereading_foreign_reader_runs(first: FirstRead, steady: bool) {
             doomed_reader_runs::<Shared, Local>(n, first, steady),
             doomed_reader_runs::<Shared, Shared>(n, first, steady),
         ];
-        assert_eq!(runs, [(2, 1); 4], "{n}");
+        let shared = if steady {
+            2
+        } else {
+            doomed_reader_first_runs::<Shared>(n)
+        };
+        assert_eq!(runs, [(2, 1), (2, 1), (shared, 1), (shared, 1)], "{n}");
     }
 }
 
@@ -1826,6 +1842,14 @@ fn stashed_clean_read_after_set<A: Cells, B: Cells>(budget: bool) -> (u64, u32) 
     (r1.get(leaf), runs.load(Ordering::Relaxed))
 }
 
+/// The stash tests' values and leaf runs for Local and Shared readers: the
+/// budget's extra run is the speculative one off the placeholder, which a
+/// Shared doomed frame does not make, as it unwinds there.
+fn stashed_leaf_runs(budget: bool) -> [(u64, u32); 4] {
+    let local = if budget { 2 } else { 1 };
+    [(2000, local), (2000, local), (2000, 1), (2000, 1)]
+}
+
 #[test]
 fn stashed_clean_read_is_not_adopted_after_a_set() {
     for budget in [false, true] {
@@ -1835,9 +1859,7 @@ fn stashed_clean_read_is_not_adopted_after_a_set() {
             stashed_clean_read_after_set::<Shared, Local>(budget),
             stashed_clean_read_after_set::<Shared, Shared>(budget),
         ];
-        // The budget's extra run is the speculative one off the placeholder.
-        let leaf_runs = if budget { 2 } else { 1 };
-        assert_eq!(runs, [(2000, leaf_runs); 4], "{budget}");
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
     }
 }
 
@@ -1896,9 +1918,7 @@ fn retry_set_before_stashed_read_is_seen() {
             retry_set_before_stashed_read::<Shared, Local>(budget),
             retry_set_before_stashed_read::<Shared, Shared>(budget),
         ];
-        // The budget's extra run is the speculative one off the placeholder.
-        let leaf_runs = if budget { 2 } else { 1 };
-        assert_eq!(runs, [(2000, leaf_runs); 4], "{budget}");
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
     }
 }
 
@@ -1970,9 +1990,7 @@ fn stashed_read_under_other_context_sees_the_set() {
             stashed_read_under_other_context::<Shared, Local>(budget),
             stashed_read_under_other_context::<Shared, Shared>(budget),
         ];
-        // The budget's extra run is the speculative one off the placeholder.
-        let leaf_runs = if budget { 2 } else { 1 };
-        assert_eq!(runs, [(2000, leaf_runs); 4], "{budget}");
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
     }
 }
 
