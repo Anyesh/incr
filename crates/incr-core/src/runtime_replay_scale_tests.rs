@@ -924,8 +924,9 @@ fn shared_contained_chain_stays_linear_at_budget_1() {
 /// reads and catches its own panicking query and then reads the level
 /// below. Every caught panic's Failed landing is copied into a delivery,
 /// and a later landing of a node no copy holds must not cost a pass over
-/// the context's deliveries.
-fn nested_caught_chain<C: Cells>(frames: u32) {
+/// the context's deliveries. `through` puts a query between each level and
+/// its panicking one, so each copy holds a landing a level deeper.
+fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
     let n: u64 = if cfg!(miri) { 8 } else { 4000 };
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
@@ -933,10 +934,14 @@ fn nested_caught_chain<C: Cells>(frames: u32) {
     let input = rt.create_input(7_u64);
     let mut below = rt.create_query_with(move |rt| rt.get(input), replayable());
     for k in 0..n {
-        let failing = rt.create_query_with(
+        let mut failing = rt.create_query_with(
             move |rt: &Runtime<C>| -> u64 { panic!("chain {}", k + rt.get(input)) },
             replayable(),
         );
+        if through {
+            let panicking = failing;
+            failing = rt.create_query_with(move |rt| rt.get(panicking), replayable());
+        }
         let dep = below;
         below = rt.create_query_with(
             move |rt| {
@@ -957,22 +962,42 @@ fn nested_caught_chain<C: Cells>(frames: u32) {
 
 #[test]
 fn local_nested_caught_chain_stays_linear() {
-    on_stack(1 << 26, || nested_caught_chain::<Local>(256));
+    on_stack(1 << 26, || nested_caught_chain::<Local>(256, false));
 }
 
 #[test]
 fn shared_nested_caught_chain_stays_linear() {
-    on_stack(1 << 26, || nested_caught_chain::<Shared>(256));
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(256, false));
+}
+
+#[test]
+fn local_nested_caught_chain_through_a_query_stays_linear() {
+    on_stack(1 << 26, || nested_caught_chain::<Local>(256, true));
+}
+
+#[test]
+fn shared_nested_caught_chain_through_a_query_stays_linear() {
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(256, true));
 }
 
 #[test]
 fn local_nested_caught_chain_stays_linear_at_budget_1() {
-    on_stack(1 << 26, || nested_caught_chain::<Local>(1));
+    on_stack(1 << 26, || nested_caught_chain::<Local>(1, false));
 }
 
 #[test]
 fn shared_nested_caught_chain_stays_linear_at_budget_1() {
-    on_stack(1 << 26, || nested_caught_chain::<Shared>(1));
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(1, false));
+}
+
+#[test]
+fn local_nested_caught_chain_through_a_query_stays_linear_at_budget_1() {
+    on_stack(1 << 26, || nested_caught_chain::<Local>(1, true));
+}
+
+#[test]
+fn shared_nested_caught_chain_through_a_query_stays_linear_at_budget_1() {
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(1, true));
 }
 
 /// One replayable reader catches `n / 2` panics and then reads a chain
