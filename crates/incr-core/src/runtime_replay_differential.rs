@@ -7044,16 +7044,17 @@ fn high_range_clean_read_delivery_seeds() {
 
 /// 0x92b17580fc, whose op 3 is the stale-dep split main shares (CHANGELOG
 /// known limitation): the unbounded walk cleans a recorded dep the reader
-/// no longer reads and its run closes a cycle, where a bounded run reruns
-/// the reader first and gives the fresh Value(6). Main splits op 3 the
-/// same way under this harness (cycle [23]) and op 4 is main's cycle too.
-/// Ops 0 and 1 are each engine's own fresh and held reads: op 0 the fresh
-/// cycle, op 1 the read with node 4, which op 0 left Failed, held failing.
-/// With every query replayable a bounded run closes op 3's cycle as the
-/// unbounded run does, and the split moves to op 4, whose bounded read
-/// gives the fresh Value(9999); main still splits op 3 in that mode, so
-/// op 4's split is this engine's, accepted under the same known
-/// limitation by the integrator's ruling of 26 Oct.
+/// no longer reads and its run closes a cycle, where a fresh runtime gives
+/// Value(6). Main's bounded run also gave Value(6) there (cycle [23]
+/// unbounded under this harness), a replay divergence; since a stash is
+/// adopted only over recorded deps the unbounded walk leaves settled
+/// (b444be751), the bounded run closes op 3's cycle as the unbounded run
+/// does. Ops 0 and 1 are each engine's own fresh and held reads: op 0 the
+/// fresh cycle, op 1 the read with node 4, which op 0 left Failed, held
+/// failing. With every query replayable the split moves to op 4, whose
+/// bounded read gives the fresh Value(9999); main still splits op 3 in
+/// that mode, so op 4's split is this engine's, accepted under the same
+/// known limitation by the integrator's ruling of 26 Oct.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn stale_dep_split_seed_keeps_its_known_split() {
@@ -7065,7 +7066,7 @@ fn stale_dep_split_seed_keeps_its_known_split() {
     let bounded = if super::replay_defaults().1 {
         with(Out::Cycle(vec![17, 24]), Out::Value(9999))
     } else {
-        with(Out::Value(6), cycle())
+        unbounded.clone()
     };
     quiet(|| {
         assert_eq!(
