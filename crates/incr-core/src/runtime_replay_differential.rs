@@ -4254,17 +4254,15 @@ fn two_thread_contained_cycle_read_seeds() {
 /// 0xad crossed: op 16's read of 1 waited on op 15's claim of it, and the
 /// revisit of 1 counted one more walk visit than the unbounded walk makes,
 /// so its walk entered the cycle {4, 5} of recorded deps at the member
-/// the unbounded walk does not.
+/// the unbounded walk does not. Without the walk's restart at its root,
+/// ops 15 and 16 failed 17 of 80 runs under 4-way load.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_walk_entry_after_a_claim_wait_matches_unbounded_seed() {
-    let seed = 0xad;
-    let case = gen_case(seed, true, true);
-    let phases = phases(&case, seed);
-    let label = format!("seed {seed:#x}, two threads {phases:?}");
+    let case = gen_case(0xad, true, true);
     quiet(|| {
         for _ in 0..20 {
-            Serial::new(&case, &phases).differential(&label, None, 0, &|_| {});
+            differential_two(&case, 0xad);
         }
     });
 }
