@@ -58,6 +58,10 @@ pub(crate) const REGEN_ABORTED: u64 = 1 << 55;
 /// regeneration in the engine call (`replay::note_took`).
 pub(crate) const TOOK_BIT: u64 = 1 << 54;
 
+/// Set while this thread holds landings (`hold`), so that a frame pop
+/// passes a frame's `HOLD` to its reader with the load it already makes.
+pub(crate) const HELD_BIT: u64 = 1 << 53;
+
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
 /// so a live memo, unwind kind, replay context or note never trips the
 /// contract panic.
@@ -69,7 +73,8 @@ pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT
     | FOREIGN_BIT
     | REGEN_BIT
     | REGEN_ABORTED
-    | TOOK_BIT);
+    | TOOK_BIT
+    | HELD_BIT);
 
 const _: () = assert!(crate::bits::disjoint(&[
     MEMO_BIT,
@@ -81,6 +86,7 @@ const _: () = assert!(crate::bits::disjoint(&[
     REGEN_BIT,
     REGEN_ABORTED,
     TOOK_BIT,
+    HELD_BIT,
 ]));
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
@@ -106,6 +112,10 @@ pub(crate) fn set_memo_bit() {
 
 pub(crate) fn clear_memo_bit() {
     THREAD_WORD.with(|w| w.set(w.get() & !MEMO_BIT));
+}
+
+pub(crate) fn set_held_bit(held: bool) {
+    set_bits(HELD_BIT, held);
 }
 
 /// Sets or clears `bits` in this thread's word.

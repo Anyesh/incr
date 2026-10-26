@@ -3739,8 +3739,8 @@ fn two_threads_hang() {
 fn cross_seeds() {
     for seed in [
         0x2, 0xb, 0xfa, 0xfb, 0xfe, 0x109, 0x135, 0x14a, 0x14d, 0x19a, 0x19e, 0x1b5, 0x1b6, 0x1e4,
-        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x401, 0x441, 0x4f9,
-        0x50d, 0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0x3f39,
+        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x441, 0x4f9, 0x50d,
+        0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0x3f39,
         0x432a,
     ] {
         let case = gen_case(seed, true, false);
@@ -3749,6 +3749,19 @@ fn cross_seeds() {
             differential::<Shared>(&case, seed);
         });
     }
+}
+
+/// 0x401 at budget 1: a read of runtime 2 reads runtime 1, which reads
+/// runtime 2 back while runtime 2's frames are virtual: runtime 2's open
+/// entry, not its frames, makes the read-back a re-entry that retracts.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_seed_reading_back_under_virtual_frames() {
+    let case = gen_case(0x401, true, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x401);
+        differential::<Shared>(&case, 0x401);
+    });
 }
 
 /// Two-thread seeds, with a second runtime when `.1`, whose reads pushed a
@@ -4027,34 +4040,50 @@ fn released_claims_leave_two_threads_a_serial_outcome() {
 #[cfg_attr(miri, ignore)]
 fn two_thread_doom_reservation_seeds() {
     for (seed, frames) in [(0x11d, 1), (0x3661_4919, 1), (0x3661_5207, 1)] {
-        let case = gen_case(seed, false, true);
-        let phases = phases(&case, seed);
-        let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
-        let outcomes = |t: &Trace, of: &dyn Fn(usize) -> usize| -> Vec<String> {
-            (0..t.len()).map(|i| format!("{:?}", t[of(i)].0)).collect()
-        };
-        let mut serial = Vec::new();
-        let mut got = Vec::new();
-        quiet(|| {
-            for swaps in 0..1u64 << pairs {
-                let order = Order::new(&case, &phases, swaps);
-                let t = run::<Shared>(&order.case, None, 0);
-                let mut back = vec![0; t.len()];
-                for (j, &i) in order.of.iter().enumerate() {
-                    back[i] = j;
-                }
-                serial.push(outcomes(&t, &|i| back[i]));
-            }
-            for _ in 0..300 {
-                got.push(outcomes(&run_two(&case, &phases, Some(frames), 0), &|i| i));
-            }
-        });
-        let wrong = got.iter().filter(|g| !serial.contains(g)).count();
-        assert_eq!(
-            wrong, 0,
-            "seed {seed:#x}: {wrong} of 300 runs match no read order's outcomes"
-        );
+        assert_runs_match_an_order(seed, Some(frames), 300);
     }
+}
+
+/// 0x195f, with no budget: one thread's read of 6 records a group from an
+/// episode it aborts, the other thread's read of 9 grows that group to take
+/// in 6 and 7, and the first read's retry verified 6 in the grown group and
+/// returned a value where every order of the two reads panics "cycle".
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_retried_read_seeds() {
+    assert_runs_match_an_order(0x195f, None, 300);
+}
+
+/// Runs `seed`'s two-thread case `runs` times at `frames`: each run's
+/// outcomes must be some read order's unbounded outcomes.
+fn assert_runs_match_an_order(seed: u64, frames: Option<u32>, runs: usize) {
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
+    let outcomes = |t: &Trace, of: &dyn Fn(usize) -> usize| -> Vec<String> {
+        (0..t.len()).map(|i| format!("{:?}", t[of(i)].0)).collect()
+    };
+    let mut serial = Vec::new();
+    let mut got = Vec::new();
+    quiet(|| {
+        for swaps in 0..1u64 << pairs {
+            let order = Order::new(&case, &phases, swaps);
+            let t = run::<Shared>(&order.case, None, 0);
+            let mut back = vec![0; t.len()];
+            for (j, &i) in order.of.iter().enumerate() {
+                back[i] = j;
+            }
+            serial.push(outcomes(&t, &|i| back[i]));
+        }
+        for _ in 0..runs {
+            got.push(outcomes(&run_two(&case, &phases, frames, 0), &|i| i));
+        }
+    });
+    let wrong = got.iter().filter(|g| !serial.contains(g)).count();
+    assert_eq!(
+        wrong, 0,
+        "seed {seed:#x}: {wrong} of {runs} runs match no read order's outcomes"
+    );
 }
 
 /// 0x25e4, over several schedules: a read that panics in a member of a
@@ -4462,6 +4491,87 @@ fn until(done: impl Fn() -> bool) {
         assert!(start.elapsed().as_secs() < 20, "the schedule stalled");
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+/// 0x527's ops 0 (`Get(0)`) and 1 (`Get(4)`) overlap. Op 1's attempt runs
+/// a nested episode under its `try_get(8)` that lands 8 and 15 Dirty,
+/// then parks until op 0 has registered a wait. Without a hold, op 0 waits
+/// on another claim of op 1's, op 1 then waits on op 0 and is wounded, and
+/// op 0 finds 8 Dirty where either order has it New or op 1 finished: it
+/// lands 8 Failed alone, and op 1's retry reads that, `Panic("failed")`
+/// where every order gives a cycle panic. Another read must not build on
+/// an unfinished attempt's landings; with them held, op 0 waits on 8 or 15
+/// instead and no wound need happen.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_read_builds_on_no_unfinished_attempts_nested_episode() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_read_builds_on_no_unfinished_attempts_nested_episode",
+        || {
+            struct Hold {
+                on: AtomicBool,
+                landed: AtomicBool,
+                waited: AtomicBool,
+                b_started: AtomicBool,
+            }
+            let case = gen_case(0x527, false, true);
+            let phases = phases(&case, 0x527);
+            assert_eq!(phases[0].ops(), [0, 1]);
+            assert_eq!(phases[0].of(0), Some(1));
+            quiet(|| {
+                for round in 0..10 {
+                    let hold = Arc::new(Hold {
+                        on: AtomicBool::new(true),
+                        landed: AtomicBool::new(false),
+                        waited: AtomicBool::new(false),
+                        b_started: AtomicBool::new(false),
+                    });
+                    // Thread 0 runs op 1 and holds after its episode lands
+                    // 8 or 15 until op 0 waits; thread 1 runs op 0 and
+                    // starts only after that landing.
+                    let rig = |live: &Live<Shared>| {
+                        let (hold, world) = (hold.clone(), live.world.clone());
+                        let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                        let (n8, n15) = (slot(8), slot(15));
+                        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                            if !hold.on.load(SeqCst) {
+                                return;
+                            }
+                            match TWO_THREAD.with(std::cell::Cell::get) {
+                                Some(0) if matches!(p, ParkPoint::EpisodeLanded(id) if id == n8 || id == n15)
+                                    && !hold.landed.swap(true, SeqCst) =>
+                                {
+                                    until(|| crate::waits::registered() > 0);
+                                    hold.waited.store(true, SeqCst);
+                                }
+                                Some(1) if !hold.b_started.swap(true, SeqCst) => {
+                                    until(|| hold.landed.load(SeqCst));
+                                }
+                                _ => {}
+                            }
+                        });
+                        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                    };
+                    let serial = Serial::new(&case, &phases);
+                    let verdict = Mutex::new(None);
+                    let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+                        hold.on.store(false, SeqCst);
+                        let v = serial.at_overlap("0x527", prefix, live);
+                        let stop = p == 0 || v.is_some();
+                        *verdict.lock().unwrap() = v;
+                        stop
+                    });
+                    assert!(hold.landed.load(SeqCst), "round {round}: op 1 landed no episode of 8 or 15");
+                    assert!(
+                        hold.waited.load(SeqCst),
+                        "round {round}: op 0 registered no wait while op 1's episode was held"
+                    );
+                    serial.check("0x527", &got, verdict.into_inner().unwrap());
+                }
+            });
+        },
+    )
+    .assert_clean();
 }
 
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
@@ -9493,76 +9603,4 @@ fn seed_381_first_run_state() {
         differential::<Local>(&case, 0x381);
         differential::<Shared>(&case, 0x381);
     });
-}
-
-/// **A Dirty landing's delivery survives a claim given back unrun.** In
-/// 0x36615207 op0's replay reruns n1 as an entry below n0 and lands it
-/// Dirty; op1, which has waited on n1, claims it there, finds op0's
-/// reservation and gives it back. The landing's delivery to n0's retry
-/// must not depend on that claim: pinned with op1 holding its claim while
-/// op0 loads n1's state, the reads are still a serial order's.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_dirty_landing_delivery_survives_a_given_back_claim() {
-    use std::sync::atomic::AtomicU8;
-    use std::time::{Duration, Instant};
-    let seed = 0x3661_5207;
-    let case = gen_case(seed, false, true);
-    let phases = phases(&case, seed);
-    let stage = Arc::new(AtomicU8::new(0));
-    let rig = |live: &Live<Shared>| {
-        let slot = |n: usize| match &*live.world.tables[0][n].lock().unwrap() {
-            Some(Handle::Plain(h)) => h.slot(),
-            _ => unreachable!(),
-        };
-        let (n0, n1) = (slot(0), slot(1));
-        let stage = stage.clone();
-        let rt = live.world.rts[0].0 as usize;
-        let hooked = live.world.rt(0).park_hook.set(Box::new(move |p| {
-            if TWO_PHASE.with(std::cell::Cell::get) != 0 {
-                return;
-            }
-            // SAFETY: the runtime outlives the run.
-            let rt = unsafe { &*(rt as *const Runtime<Shared>) };
-            let wait = |want: u8| {
-                let deadline = Instant::now() + Duration::from_secs(4);
-                while stage.load(SeqCst) < want && Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
-            };
-            // Thread 0 runs op1 and thread 1 op0 in this phase.
-            match (TWO_THREAD.with(std::cell::Cell::get), p) {
-                (Some(0), ParkPoint::BeforeClaim(n)) if n.0 == n1 => wait(1),
-                (Some(1), ParkPoint::HoldLanding(n))
-                    if n.0 == n1
-                        && rt.nodes.get(n1).state() == NodeState::Dirty
-                        && stage.compare_exchange(0, 1, SeqCst, SeqCst).is_ok() =>
-                {
-                    wait(2);
-                }
-                (Some(0), ParkPoint::BeforeReservationCheck(n))
-                    if n.0 == n1 && stage.compare_exchange(1, 2, SeqCst, SeqCst).is_ok() =>
-                {
-                    // Holds the claim while op0 loads n1's state, for at
-                    // most a moment if op0 waits for its give-back.
-                    let deadline = Instant::now() + Duration::from_millis(200);
-                    while stage.load(SeqCst) < 3 && Instant::now() < deadline {
-                        std::thread::yield_now();
-                    }
-                }
-                (Some(1), ParkPoint::BeforeEntry(n)) if n.0 == n0 => {
-                    let _ = stage.compare_exchange(2, 3, SeqCst, SeqCst);
-                }
-                _ => {}
-            }
-        }));
-        assert!(hooked.is_ok());
-    };
-    let t = run_two_until(&case, &phases, Some(1), 0, &rig, &|_, _, _| false);
-    assert_eq!(stage.load(SeqCst), 3, "the interleaving was not pinned");
-    let got = (t[0].0.clone(), t[1].0.clone());
-    assert!(
-        got == (Out::Value(7782), Out::Value(6)) || got == (Out::Value(6), Out::Value(7782)),
-        "{got:?} is no serial order's"
-    );
 }

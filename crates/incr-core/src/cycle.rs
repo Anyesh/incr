@@ -410,6 +410,16 @@ pub(crate) const HANDLED: u16 = 2048;
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
 
+/// `ComputeCtl::flags`: the frame read a landing this thread's attempt
+/// holds (`crate::hold`), so its own landing is held too, and so is its
+/// reader's.
+pub(crate) const HOLD: u16 = 16384;
+/// A `HOLD` frame's write kept what it displaced in `crate::hold`, keyed
+/// by this control block, until the landing's entry takes it or the frame
+/// ends (`crate::hold::KeptGuard`).
+pub(crate) const KEPT: u16 = 32768;
+pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
+
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
     BUFFERED as u64,
@@ -424,6 +434,8 @@ const _: () = assert!(crate::bits::disjoint(&[
     SPECULATIVE as u64,
     HANDLED as u64,
     UNREGENERABLE as u64,
+    HOLD as u64,
+    KEPT as u64,
 ]));
 
 /// What one compute frame tells its wrapper and its landing. It lives on
@@ -498,6 +510,10 @@ impl ComputeCtl {
     #[inline(always)]
     pub(crate) fn raise(&self, flag: u16) {
         self.flags.set(self.flags.get() | flag);
+    }
+
+    pub(crate) fn clear(&self, flag: u16) {
+        self.flags.set(self.flags.get() & !flag);
     }
 
     /// Marks the frame part of an open cycle reaching down to `p`.

@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED, UNREGENERABLE};
+use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, POISONED, UNREGENERABLE};
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -548,6 +548,31 @@ pub trait DepStack: 'static {
         });
     }
 
+    /// Marks the nearest `Shared` compute frame, past any callback's
+    /// barrier, as having read a landing this thread holds, so its own
+    /// landing is held. Returns the frame's runtime. A `Local` frame between
+    /// lands at once, as no exit publishes a `Local` runtime's holds.
+    fn raise_hold(&self) -> Option<RuntimeId> {
+        self.with(|s| {
+            let f = s.frames.iter().rev().find(|f| holds_for(f.rt()))?;
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            unsafe { (*f.ctl).raise(HOLD) };
+            Some(f.rt())
+        })
+    }
+
+    /// The control block of the frame [`Self::raise_hold`] marks.
+    fn hold_reader(&self) -> Option<*const ComputeCtl> {
+        self.with(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .find(|f| holds_for(f.rt()))
+                .map(|f| f.ctl)
+        })
+    }
+
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
@@ -738,6 +763,12 @@ impl Drop for FramesGuard {
             }
         });
     }
+}
+
+/// Whether a frame of `rt` can hold its landing: a compute frame of a
+/// `Shared` runtime.
+fn holds_for(rt: RuntimeId) -> bool {
+    rt != RuntimeId::SENTINEL && crate::cycle_state::shared_open(rt)
 }
 
 /// Registers `FRAMES_GUARD`'s destructor, on the push that allocates the

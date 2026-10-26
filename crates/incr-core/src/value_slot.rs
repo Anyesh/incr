@@ -80,6 +80,13 @@ pub trait ValueSlot<T: Value>: 'static {
     #[must_use]
     fn clear(&self) -> Option<Self::Displaced>;
 
+    /// Put back a value this slot displaced, without comparing, and hand
+    /// back the one it replaces; `None` empties the slot. A held
+    /// landing's undo, which must run no user code.
+    #[doc(hidden)]
+    #[must_use]
+    fn restore(&self, old: Option<Self::Displaced>) -> Option<Self::Displaced>;
+
     /// `displaced` boxed so that a drop of the box under
     /// [`crate::deferred::isolate`] isolates the value's own `Drop` too,
     /// which a retire token runs only at a later reclaim.
@@ -206,6 +213,12 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
         unsafe { (*self.0.get()).take() }
     }
 
+    fn restore(&self, old: Option<T>) -> Option<T> {
+        value_code::check();
+        // SAFETY: see read().
+        unsafe { std::mem::replace(&mut *self.0.get(), old) }
+    }
+
     #[inline(always)]
     fn refuse_value_code() {
         value_code::check();
@@ -305,6 +318,19 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         // pointer goes through the standard retire path, so concurrent
         // readers finish their clone before the free.
         unsafe { self.0.swap_ptr(std::ptr::null_mut()) }.map(RetiredValue)
+    }
+
+    fn restore(&self, old: Option<RetiredValue<T>>) -> Option<RetiredValue<T>> {
+        let ptr = old.map_or(std::ptr::null_mut(), |token| {
+            let replaced = token.0;
+            std::mem::forget(token);
+            replaced.into_inner().as_ptr()
+        });
+        // SAFETY: a token's pointer came from `Box::into_raw` via this
+        // slot's write and was never retired (the token is forgotten,
+        // not dropped), so it is live and owned by nothing else; readers
+        // that still protect it read it unchanged.
+        unsafe { self.0.swap_ptr(ptr) }.map(RetiredValue)
     }
 
     fn isolating(displaced: RetiredValue<T>) -> Box<dyn std::any::Any> {
