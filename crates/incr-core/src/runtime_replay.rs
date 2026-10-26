@@ -2580,6 +2580,10 @@ impl<C: Cells> Runtime<C> {
         // Another thread's rerun of the node holds it only for that run,
         // which never waits, so this waits it out. The claim is noted first,
         // so a rerun that finds the node Computing sees it.
+        debug_assert!(
+            !crate::hold::holds(state::cell_key::<C>(node.state_cell())),
+            "incr-core: a held landing has a regeneration record"
+        );
         replay::regen_claim(self.runtime_id, id.0, true);
         let mut spins = 0;
         loop {

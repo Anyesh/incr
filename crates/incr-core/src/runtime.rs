@@ -4899,9 +4899,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 &[],
                 Some(&*payload),
-                // A `HOLD` run's Failed landing is held, so a rerun could
-                // not take it from Failed.
-                !ctl.has(cycle::UNREGENERABLE | cycle::HOLD),
+                !ctl.has(cycle::UNREGENERABLE),
                 bag,
             );
             self.end_reservation(id, node);
@@ -5066,7 +5064,10 @@ impl<C: Cells> Runtime<C> {
             if !C::SINGLE_THREADED {
                 self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
             }
-            let regenerable = own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0;
+            // A rerun can't take a held landing from Failed, as its word
+            // stays Computing until the exit publishes it.
+            let regenerable =
+                own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0 && !self.lands_held(id, node);
             mark = self.failed_landing(
                 id,
                 node.generation(),

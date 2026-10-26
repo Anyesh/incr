@@ -105,10 +105,19 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Whether a landing of `id` now is held: the thread holds landings
+    /// and the node already has an entry, the landing was decided by
+    /// reading a held landing since the claim, or a cut kept the claim.
+    pub(super) fn lands_held(&self, id: NodeId, node: &NodeData<C>) -> bool {
+        !C::SINGLE_THREADED
+            && hold::active()
+            && (hold::holds(state::cell_key::<C>(node.state_cell()))
+                || hold::consulted()
+                || hold::cut_kept(self.runtime_id, id.0))
+    }
+
     /// `land_as` while this thread holds landings: the landing is held if
-    /// the node already has an entry, if it was decided by reading a held
-    /// landing since the claim, or if a cut kept the claim; `None` lets it
-    /// land. A wound's unwind lands nothing before the records the attempt
+    /// [`Self::lands_held`]; `None` lets it land. A wound's unwind lands nothing before the records the attempt
     /// replaced are back ([`hold::take_recs`]), whichever runtime raised
     /// it, so a cut's claim then lands unrun under its old record.
     #[cold]
@@ -124,11 +133,11 @@ impl<C: Cells> Runtime<C> {
         if cycle_state::wounded() {
             self.retract_held_records();
         }
+        if !self.lands_held(id, node) {
+            return None;
+        }
         let cell = state::cell_key::<C>(node.state_cell());
         if !hold::holds(cell) {
-            if !hold::consulted() && !hold::cut_kept(self.runtime_id, id.0) {
-                return None;
-            }
             // Only a verify or an unrun release lands without opening an
             // entry first, and a release to New is of a claim from New; a
             // cut's claim released unrun takes its origin from the cut.
