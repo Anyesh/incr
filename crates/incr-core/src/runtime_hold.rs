@@ -544,18 +544,31 @@ impl<C: Cells> Runtime<C> {
         }
         let mut bag = Deferred::new();
         let mut rest = entries.into_iter();
+        let mut last: Option<u32> = None;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let targets = self.publication_targets(rest.as_slice());
             for (e, target) in rest.by_ref().zip(targets) {
+                last = Some(e.slot);
                 self.publish_one(e, target, &mut bag);
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
-        // what is left goes back as on a wound (G9), its edges with it.
+        // what is left goes back as on a wound (G9), its edges with it, and
+        // an entry the panic stopped before it landed lands Dirty, never
+        // verified, over the deps and edges it installed.
         if let Err(payload) = outcome {
             let rest: Vec<Held> = rest.collect();
-            let given: Vec<u32> = rest.iter().map(|e| e.slot).collect();
+            let stopped = last.filter(|&slot| is_computing(self.nodes.get(slot).state()));
+            let given: Vec<u32> = rest.iter().map(|e| e.slot).chain(stopped).collect();
             self.unverify_readers(&given);
+            if let Some(slot) = stopped {
+                let node = self.nodes.get(slot);
+                node.set_verified_at(0);
+                if rest.is_empty() {
+                    self.count_release();
+                }
+                self.land_now(NodeId(slot), node, NodeState::Dirty, NodeState::Dirty, true);
+            }
             self.retract_entries(rest, Vec::new(), true, true);
             self.park(super::ParkPoint::GaveBack);
             bag.drain_carried(payload);
@@ -569,7 +582,8 @@ impl<C: Cells> Runtime<C> {
     /// recompute, not verify, and what reads it must see it Dirty, both
     /// before the give-back lands, or a read in between verifies it over
     /// the undone value. Every reader of a given-back landing outside the
-    /// give-back is unverified, published or not.
+    /// give-back is unverified, published or not, so one Clean over the
+    /// value restored recomputes once after the panic.
     fn unverify_readers(&self, given: &[u32]) {
         let mut readers: Vec<NodeId> = Vec::new();
         {
@@ -703,6 +717,10 @@ impl<C: Cells> Runtime<C> {
         let id = NodeId(e.slot);
         let node = self.nodes.get(e.slot);
         debug_assert_eq!(node.generation(), e.generation);
+        // First, so that a panic below drops no user value mid-unwind.
+        if let Some(Some(own)) = e.undo.value {
+            bag.push_erased(own);
+        }
         // The node lands whatever its children's landing does.
         let children = e.children.map(|(landing, opened)| {
             let landing = match landing {
@@ -724,9 +742,6 @@ impl<C: Cells> Runtime<C> {
             let token = self.failed_run_token(e.slot, e.generation);
             self.forget_failed_run_if(e.slot, e.generation, token);
             self.left_failed_landing(id, u64::MAX, bag);
-        }
-        if let Some(Some(own)) = e.undo.value {
-            bag.push_erased(own);
         }
         self.park(super::ParkPoint::HeldPublished(id));
         if let Some(Err(payload)) = children {
