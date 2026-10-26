@@ -2956,6 +2956,93 @@ fn seed_56cd8c2_keeps_the_failed_set() {
     });
 }
 
+/// 0x36b61, shrunk. At budget 3, `Get(17)` reaches 6, which reads 5 and
+/// is doomed below 7; its discard keeps 5's claim for 6's retry. 20 then
+/// runs at 6's position and is discarded too, and that discard released
+/// 5's claim, so 5 ran again under 12, and the release of 9's panic over
+/// dead 13 landed it New where the unbounded run leaves it Dirty.
+fn seed_36b61_case() -> Case {
+    let q = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let r = |n, try_| Box::new(Expr::Read(n, try_));
+    let mut specs: Vec<Spec> = (0..4).map(|_| q(Expr::Const(0), true, false)).collect();
+    specs.extend([
+        q(Expr::Const(2), true, false),
+        q(Expr::Read(6, true), true, false),
+        Spec::Query {
+            expr: Expr::If(r(5, false), r(7, false), r(16, false)),
+            replay: true,
+            bare: false,
+            strategy: Strat::Fixpoint {
+                initial: 2,
+                limit: 2,
+            },
+        },
+        q(Expr::Catch(r(8, false)), true, false),
+        q(Expr::Const(0), true, false),
+        q(
+            Expr::If(r(10, false), r(13, false), Box::new(Expr::Const(0))),
+            true,
+            true,
+        ),
+        q(Expr::Read(11, false), true, false),
+        q(Expr::Read(20, false), true, false),
+        q(Expr::Read(5, true), true, false),
+        q(Expr::Const(0), true, true),
+        q(Expr::Const(0), true, false),
+        q(Expr::Const(0), true, false),
+        q(Expr::Read(17, false), false, false),
+        q(Expr::Add(r(10, false), r(20, false)), true, false),
+        q(Expr::Const(0), true, false),
+        q(Expr::Const(0), true, false),
+        q(Expr::Read(21, true), true, true),
+        q(Expr::Add(r(26, false), r(23, false)), false, true),
+        q(Expr::Const(0), false, false),
+        q(
+            Expr::If(r(25, false), r(12, false), Box::new(Expr::Const(0))),
+            false,
+            false,
+        ),
+        Spec::Input(4),
+        Spec::Input(0),
+        Spec::Input(4),
+    ]);
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 24,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![
+            Op::Delete(13),
+            Op::Delete(8),
+            Op::Recreate(8, q(Expr::Add(r(9, true), r(9, false)), true, false)),
+            Op::TryGet(9),
+            Op::Set(26, 1),
+            Op::TryGet(12),
+            Op::Set(26, 2),
+            Op::Get(10),
+            Op::Set(25, 2),
+            Op::Get(17),
+        ],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_36b61_keeps_a_doomed_frames_claims_past_another_discard() {
+    let case = seed_36b61_case();
+    quiet(|| {
+        differential::<Local>(&case, 0x3_6b61);
+        differential::<Shared>(&case, 0x3_6b61);
+    });
+}
+
 /// 0x198c2, shrunk (cross): 9 reads the chain 16 to 18 only at budget 1's
 /// depth, so its doomed run reads 18's foreign dep, the other runtime's 0,
 /// Clean; a set of that runtime's input follows, and the next `Get(0)`
