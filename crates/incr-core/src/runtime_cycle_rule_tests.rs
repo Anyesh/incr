@@ -1694,9 +1694,10 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
 /// its `get` of runtime B's c closes (c and d read each other), then is
 /// doomed by a read past the budget. The retry takes the caught cycle the
 /// first read kept instead of computing c again, so c runs as often as in
-/// the unbounded run.
+/// the unbounded run. The same holds when c catches the cycle and panics
+/// on its own, which unwinds with the cycle's kind.
 fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
-    let run = |frames: u32| {
+    let run = |frames: u32, own_panic: bool| {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_max_frames(frames);
@@ -1707,7 +1708,12 @@ fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
             let (runs, d) = (runs.clone(), d.clone());
             r2.create_query(move |rt| {
                 runs.fetch_add(1, Ordering::Relaxed);
-                rt.get(*d.get().unwrap())
+                let d = *d.get().unwrap();
+                if own_panic {
+                    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(d)));
+                    panic!("c gave up on its cycle");
+                }
+                rt.get(d)
             })
         };
         d.set(r2.create_query(move |rt| rt.get(c))).unwrap();
@@ -1728,9 +1734,15 @@ fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
         let doomed = !r1.dooms.lock().unwrap().is_empty();
         (value, runs.load(Ordering::Relaxed), doomed)
     };
-    let (value, runs, doomed) = run(u32::MAX);
-    assert_eq!((value, doomed), (10000, false));
-    assert_eq!(run(1), (value, runs, true));
+    for own_panic in [false, true] {
+        let (value, runs, doomed) = run(u32::MAX, own_panic);
+        assert_eq!((value, doomed), (10000, false), "own panic {own_panic}");
+        assert_eq!(
+            run(1, own_panic),
+            (value, runs, true),
+            "own panic {own_panic}"
+        );
+    }
 }
 
 /// A replayable chain of `n` levels read top-down in runtime A, where every
