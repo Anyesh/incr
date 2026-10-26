@@ -3034,6 +3034,47 @@ impl PartialEq for ReadsOther {
     }
 }
 
+/// [`side_read`]'s shape with a replayable `c` that reads `v`, whose
+/// `Clone` reads j of another runtime (1), a held read no stash adoption
+/// checks. Once j moves to 2, `c` computes 12, as the unbounded run does,
+/// rather than adopt the speculative 11.
+fn speculative_value_code_foreign_read<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let jin = other.create_input(1_u64);
+    let j = other.create_query(move |o: &Runtime<Shared>| o.get(jin));
+    assert_eq!(other.get(j), 1);
+    let v = rt.create_input(ReadsOther {
+        other: Arc::clone(&other),
+        j,
+        seen: 0,
+    });
+    let b = rt.create_query(|_| 5_u64);
+    let c = rt.create_query_with(move |rt| rt.get(v).seen + 10, replayable());
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    other.set(jin, 2);
+    assert_eq!(other.get(j), 2);
+    assert_eq!(rt.get(c), 12);
+}
+
+local_and_shared!(
+    speculative_value_code_foreign_read,
+    local_speculative_value_code_foreign_read,
+    shared_speculative_value_code_foreign_read
+);
+
 /// `foreign_ticket_shape` with b's read of j moved into value code: b
 /// clones `v`, whose `Clone` reads j of the other runtime. When x's walk
 /// runs b, j is Dirty, so the value code's read takes the cold path and
