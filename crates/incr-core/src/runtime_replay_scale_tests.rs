@@ -847,12 +847,12 @@ fn shared_many_foreign_clean_reads_stay_linear() {
     many_foreign_reads::<Shared>(true);
 }
 
-/// The note work of the second read of a chain of `n` queries over a
-/// Failed node at budget `frames`, after a set below the chain. One
-/// payload goes up the chain, and its ticket
-/// gains a landing per step: each reader takes the ticket and the next
-/// landing holds it again.
-fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
+/// The note work of the first read of a chain of `n` queries over a
+/// panicking node at budget `frames`, and of the second read after a set
+/// below the chain. One payload goes up the chain, and its ticket gains a
+/// landing per step: each reader takes the ticket and the next landing
+/// holds it again.
+fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
     let rt = Runtime::<C>::new();
     let opts = || match frames {
         Some(_) => replayable(),
@@ -870,11 +870,13 @@ fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
         below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
     }
     let top = below;
+    crate::replay::take_note_work();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let first = crate::replay::take_note_work();
     rt.set(input, 1);
     crate::replay::take_note_work();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
-    crate::replay::take_note_work()
+    (first, crate::replay::take_note_work())
 }
 
 fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
@@ -884,7 +886,13 @@ fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
         &[1000, 2000, 4000]
     };
     for &n in sizes {
-        let work = contained_chain::<C>(frames, n);
+        let (first, work) = contained_chain::<C>(frames, n);
+        // A budget of 1 dooms every level of the first read, whose note
+        // work was quadratic before this bound existed (known limitation).
+        assert!(
+            frames.is_some() || first <= 16 * n as u64,
+            "{frames:?}: {first} units of note work for a {n}-chain's first read"
+        );
         assert!(
             work <= 16 * n as u64,
             "{frames:?}: {work} units of note work for a {n}-chain"
