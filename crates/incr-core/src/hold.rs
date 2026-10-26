@@ -461,8 +461,8 @@ pub(crate) fn keep_deps(cell: usize, old: impl FnOnce() -> Vec<(NodeId, u32)>) {
 /// The deps a held node's landing installs, each with its generation
 /// when read, less those its published dep list has, replacing an earlier
 /// landing's, or adding to it for a landing that keeps the deps it
-/// installed (`keep`, a panicked one's union), each dep once. Linear: past
-/// a short list, the deps to skip are hashed.
+/// installed (`keep`, a panicked one's union). A dep installed twice may
+/// appear twice. Linear: past a short list, the deps to skip are hashed.
 pub(crate) fn keep_read(cell: usize, installed: impl Iterator<Item = (NodeId, u32)>, keep: bool) {
     with(|h| {
         if let Some(e) = h.get(cell) {
@@ -470,20 +470,13 @@ pub(crate) fn keep_read(cell: usize, installed: impl Iterator<Item = (NodeId, u3
                 e.read.clear();
             }
             let published = e.undo.deps.as_deref().unwrap_or(&[]);
-            let known = published.iter().chain(&e.read).map(|&(d, _)| d);
-            let most = installed.size_hint().1.unwrap_or(usize::MAX);
-            if (published.len() + e.read.len()).saturating_add(most) > SCAN_MAX {
-                let mut skip: HashSet<NodeId, FxBuildHasher> = known.collect();
-                e.read.extend(installed.filter(|&(d, _)| skip.insert(d)));
+            let skip = published.iter().chain(&e.read).map(|&(d, _)| d);
+            if published.len() + e.read.len() > SCAN_MAX {
+                let skip: HashSet<NodeId, FxBuildHasher> = skip.collect();
+                e.read.extend(installed.filter(|(d, _)| !skip.contains(d)));
             } else {
-                let mut skip: Vec<NodeId> = known.collect();
-                e.read.extend(installed.filter(|&(d, _)| {
-                    let new = !skip.contains(&d);
-                    if new {
-                        skip.push(d);
-                    }
-                    new
-                }));
+                let skip: Vec<NodeId> = skip.collect();
+                e.read.extend(installed.filter(|(d, _)| !skip.contains(d)));
             }
         }
     });
