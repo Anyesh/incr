@@ -268,6 +268,7 @@ impl Frames {
     }
 
     /// Frame `i`'s step in the paths of the frames above it.
+    #[inline]
     pub(crate) fn step(&mut self, i: usize) -> Step {
         let reads = self.reads_of_reading(i);
         self.frames[i].step_with(reads)
@@ -275,11 +276,13 @@ impl Frames {
 
     /// How many times frame `i` has read the node it reads now, this read
     /// included.
+    #[inline]
     fn reads_of_reading(&mut self, i: usize) -> u32 {
         self.reads_of_key(i, self.frames[i].reading)
     }
 
     /// How many reads frame `i` has recorded of the node keyed `key`.
+    #[inline]
     fn reads_of_key(&mut self, i: usize, key: u64) -> u32 {
         let deps = &self.frames[i].deps;
         if deps.len() <= SCAN_DEPS {
