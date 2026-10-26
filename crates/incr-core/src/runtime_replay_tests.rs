@@ -1951,6 +1951,33 @@ fn queued_entries_follow_the_levels_after_the_first_ask() {
     assert_eq!(queued, (true, true, false));
 }
 
+/// The count keys on node and generation: an entry of another node, or of
+/// the node at another generation, is not one of the running entry's.
+#[test]
+fn queued_entries_are_told_apart_by_node_and_generation() {
+    let queued = with_a_context(|x, entry| {
+        let other = crate::replay::Entry {
+            node: entry.node + 1,
+            ..entry
+        };
+        let later = crate::replay::Entry {
+            generation: entry.generation + 1,
+            ..entry
+        };
+        x.push_entry(1, other);
+        x.push_entry(1, later);
+        x.run_entry(0, entry);
+        let asked = (
+            x.queues(entry.node, entry.generation),
+            x.queues(other.node, other.generation),
+            x.queues(later.node, later.generation),
+        );
+        x.truncate_levels(1);
+        (asked, x.queues(other.node, other.generation))
+    });
+    assert_eq!(queued, ((false, true, true), false));
+}
+
 #[derive(Debug)]
 struct CustomPayload(u64);
 
