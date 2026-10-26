@@ -2832,12 +2832,13 @@ fn value_code_foreign_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u6
     );
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
     let armed = Arc::new(AtomicBool::new(false));
-    let (hook_armed, hook_other) = (Arc::clone(&armed), Arc::clone(&other));
+    // Weak: the hook lives in `other`, so a strong count would keep it alive.
+    let (hook_armed, hook_other) = (Arc::clone(&armed), Arc::downgrade(&other));
     let j_id = NodeId(j.slot());
     let installed = other.park_hook.set(Box::new(move |point| {
         if point == super::ParkPoint::ValueCodeBeforeReload(j_id) && hook_armed.swap(false, SeqCst)
         {
-            let o = Arc::clone(&hook_other);
+            let o = hook_other.upgrade().expect("the hook runs inside other");
             assert_eq!(std::thread::spawn(move || o.get(j)).join().unwrap(), 5);
         }
     }));

@@ -461,7 +461,7 @@ fn below_shape(rt: Rt) -> Below {
                 }
                 x1_caught.fetch_add(1, SeqCst);
                 let f = *fc.get().unwrap();
-                catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v)
+                catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_or(7)
             },
             replayable(),
         )
