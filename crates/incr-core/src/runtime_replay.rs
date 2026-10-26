@@ -404,16 +404,16 @@ impl<C: Cells> Runtime<C> {
                 "incr-core: a placeholder read dooms its frame"
             );
         }
-        let foreign = if ctl.has(cycle::KEPT_READ) {
-            let counts = replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl);
-            ForeignReads {
-                context: (!counts.is_empty())
-                    .then(replay::outermost_context)
-                    .flatten(),
-                counts,
-            }
+        let mut counts = if ctl.has(cycle::KEPT_READ) {
+            replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl)
         } else {
-            ForeignReads::default()
+            Vec::new()
+        };
+        let context = replay::outermost_context();
+        let shared = self.inherit_counts(&deps, &mut counts, context);
+        let foreign = ForeignReads {
+            context: (!counts.is_empty() && shared).then_some(context).flatten(),
+            counts,
         };
         let kept = self.stash(
             id.0,
@@ -912,8 +912,11 @@ impl<C: Cells> Runtime<C> {
         attempt: &Attempt,
         payload: Box<dyn Any + Send>,
     ) -> (Box<dyn Any + Send>, bool) {
+        // A panic stash's adoption raises it unchecked, so none stands over
+        // a checked read, its own or a stashed dep's.
         if ctl.flags.get() & (cycle::DOOMED | cycle::POISONED | cycle::KEPT_READ) != 0
             || !replay::speculative()
+            || !self.inherited_none(deps)
         {
             return (payload, false);
         }
@@ -1055,6 +1058,54 @@ impl<C: Cells> Runtime<C> {
         s.revision == revision
             && (s.map.get_mut(&(slot, generation)))
                 .is_some_and(|e| tried || !matches!(e.get_mut().outcome, Outcome::Tried))
+    }
+
+    /// Adds to `counts` the checked reads of the stashes among `deps`: the
+    /// run read their stashed values, which a refused adoption of theirs
+    /// replaces with a real run's in the same revision, past this stash's
+    /// check of its deps. False if one was stashed under another context
+    /// than `context`, whose speculative changes are not this run's.
+    fn inherit_counts(
+        &self,
+        deps: &[(NodeId, u32)],
+        counts: &mut Vec<Count>,
+        context: Option<replay::ContextName>,
+    ) -> bool {
+        if C::u32_load_relaxed(&self.stash_count) == 0
+            || deps.iter().all(|&(d, _)| {
+                state::load::<C>(self.nodes.get(d.0).state_cell()) == NodeState::Clean
+            })
+        {
+            return true;
+        }
+        let revision = self.current_revision();
+        let mut s = self.stashes.write();
+        if s.revision != revision {
+            return true;
+        }
+        let mut shared = true;
+        for &(d, generation) in deps {
+            let Some(entry) = s.map.get_mut(&(d.0, generation)) else {
+                continue;
+            };
+            let foreign = &entry.get_mut().foreign;
+            if foreign.counts.is_empty() {
+                continue;
+            }
+            shared &= foreign.context == context;
+            for count in &foreign.counts {
+                if !counts.iter().any(|c| c.same(count)) {
+                    counts.push(count.clone());
+                }
+            }
+        }
+        shared
+    }
+
+    fn inherited_none(&self, deps: &[(NodeId, u32)]) -> bool {
+        let mut counts = Vec::new();
+        self.inherit_counts(deps, &mut counts, None);
+        counts.is_empty()
     }
 
     /// Takes the stash of node `slot` at `generation` for a real run that
@@ -5060,6 +5111,11 @@ impl<C: Cells> Runtime<C> {
             self.note_delivered(nodes, &*payload);
             resume_unwind(payload);
         }
+        // The delivered cycle closed on this thread's stack in the doomed
+        // run, so what catches it is held as a natively caught one is.
+        if !C::SINGLE_THREADED {
+            self.hold_closed_cycle();
+        }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
         // passes on as an ordinary panic, as `entered` does, unless the read
@@ -5079,6 +5135,10 @@ impl<C: Cells> Runtime<C> {
                 payload
             }
         };
+        if cycle_state::wounded() && !std::thread::panicking() {
+            drop(payload);
+            self.raise_wound();
+        }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(payload)
     }
@@ -5298,7 +5358,7 @@ impl<C: Cells> Runtime<C> {
                 return Computed::Done;
             }
             match self.clean_walk::<VIRT>(id, gen, word, observed, restarts) {
-                Computed::Replan => restarts += 1,
+                Computed::Replan { .. } => restarts += 1,
                 computed => return computed,
             }
         }

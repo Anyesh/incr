@@ -291,6 +291,13 @@ impl<C: Cells> Runtime<C> {
         if cycle_state::depth() == 0 {
             cycle_panic(cycle);
         }
+        // A closure that swallowed its wound reads on; its cycle must not
+        // take the wound's place in flight, or a catch returns it. A drop
+        // the wound's own unwind runs gets the cycle: a raise there aborts,
+        // and `caught` puts the wound back.
+        if cycle_state::wounded() && !std::thread::panicking() {
+            self.raise_wound();
+        }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(Box::new(CycleUnwind(cycle)))
     }
@@ -372,6 +379,9 @@ impl<C: Cells> Runtime<C> {
                     if outermost && !C::SINGLE_THREADED && hold::active() {
                         self.publish_held();
                     }
+                    if outermost {
+                        cycle_state::debug_assert_exit_clear();
+                    }
                     return Ok(r);
                 }
                 Err(payload) => {
@@ -426,10 +436,22 @@ impl<C: Cells> Runtime<C> {
             self.await_winner();
             return None;
         }
+        // What a nested `try_get` caught is no result for a wounded thread:
+        // the wound unwinds on to the outermost entry, unless a drop of the
+        // wound's own unwind made the read. A cycle `try_get` returns without
+        // an unwind leaves the kind Wound, so the closure's pop raises it.
+        let wounded = !outermost && cycle_state::wounded();
+        if wounded && !std::thread::panicking() {
+            drop(payload);
+            self.raise_wound();
+        }
         // Any other unwind out of the outermost entry ends the attempt as
         // its read's outcome, which every landing it made is part of.
         if outermost && !C::SINGLE_THREADED && hold::active() {
             self.publish_held();
+        }
+        if outermost {
+            cycle_state::debug_assert_exit_clear();
         }
         match cycle_state::take_unwind_kind() {
             Some(UnwindKind::Cycle) => {
@@ -440,6 +462,9 @@ impl<C: Cells> Runtime<C> {
                     Err(payload) => resume_unwind(payload),
                 };
                 if kind == ReadKind::TryGet {
+                    if wounded {
+                        cycle_state::set_unwind_kind(Some(UnwindKind::Wound));
+                    }
                     return Some(cycle);
                 }
                 cycle_panic(cycle);
@@ -719,6 +744,9 @@ impl<C: Cells> Runtime<C> {
             .active_frame(rt)
             .filter(|_| !self.foreign_frame_above(p));
         let Some((ctl, at)) = active else {
+            if !C::SINGLE_THREADED {
+                self.hold_closed_cycle();
+            }
             return Some(Err(self.cycle_at(p)));
         };
         // SAFETY: the active frame is on the stack, so its control block
@@ -763,6 +791,9 @@ impl<C: Cells> Runtime<C> {
         // R3: an unseeded node on the stack has no value to give.
         if on_stack.is_some() {
             ctl.lower(p);
+            if !C::SINGLE_THREADED {
+                self.hold_closed_cycle();
+            }
             return Some(Err(self.cycle_at(p)));
         }
         let (anchor, _, buffered, ..) = held.expect("an unseeded node off the stack is held");
