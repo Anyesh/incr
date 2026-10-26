@@ -3033,6 +3033,21 @@ fn seed_198c2_retry_reads_the_foreign_set() {
     });
 }
 
+/// 0x16a03 at one frame: node 21 is a released entry kept 0 of 1, which
+/// the unbounded walk runs as a leaf with its dep 22 nested. The bounded
+/// walk's run of it dooms on the read of 22, and the retry then runs 4
+/// for real, whose placeholder branch reads 12: the episode records
+/// deps on 12 and 13, which the unbounded run leaves New with none.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_16a03_doomed_leaf_entry_records_only_unbounded_deps() {
+    let case = gen_case(0x1_6a03, true, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x1_6a03);
+        differential::<Shared>(&case, 0x1_6a03);
+    });
+}
+
 /// 0xe126d92b8f, shrunk. 9 (Fallback) reads 4, which `try_get`s 5, and 5
 /// reaches 9 again through 6. In `Get(9)` the walk of Fixpoint member 2's
 /// run computes 9 twice at the same position and path, and at budget 3
