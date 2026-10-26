@@ -2028,60 +2028,9 @@ impl<'a> Serial<'a> {
                         if c.iter().all(|slot| landed_there_after(slot, at)))
                 })
             });
-            // The read-twice class one level up (ruled for 0x13b77): a node
-            // x whose run in the op caught a non-empty cycle, every member of
-            // which the phase left landed and the other read ran, one of
-            // them after x's last read before the catch and before q's run
-            // ended, and whose value from that run q read, may give each
-            // read of it either order's value. The other read's runs need
-            // not land last, nor end after the catch returned: on 0x13b77
-            // its unwound runs move x and this thread reruns the cycle.
-            let landed_there = |slot: &u32| {
-                spec_of.get(slot).is_some_and(|&x| {
-                    matches!(states[x], NodeState::Clean | NodeState::Failed)
-                        && theirs.iter().any(|o| o.node == (0, x))
-                })
-            };
             let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
-            let q_end = last.map_or(u64::MAX, |run| run.end);
-            let moved_after = |slot: &u32, lo: u64| {
-                spec_of.get(slot).is_some_and(|&x| {
-                    theirs
-                        .iter()
-                        .any(|o| o.node == (0, x) && o.end > lo && o.end < q_end)
-                })
-            };
-            let catchers: HashSet<usize> = (mine.iter())
-                .filter(|e| e.node.0 == 0 && e.node.1 != q)
-                .filter(|e| {
-                    e.caught.iter().any(|&(k, _)| {
-                        let lo = (e.returned.iter().chain(&e.caught))
-                            .filter(|&&(j, _)| j < k)
-                            .map(|&(_, t)| t)
-                            .max()
-                            .unwrap_or(0);
-                        matches!(&e.reads[k], (0, _, true, ReadOut::Cycle(c))
-                            if !c.is_empty()
-                                && c.iter().all(landed_there)
-                                && c.iter().any(|s| moved_after(s, lo)))
-                    })
-                })
-                .filter(|e| {
-                    last.is_some_and(|run| {
-                        run.reads.iter().any(|r| {
-                            r.0 == 0
-                                && r.1 == e.node.1
-                                && e.value.map(ReadOut::Value) == Some(r.3.clone())
-                        })
-                    })
-                })
-                .map(|e| e.node.1)
-                .collect();
-            let reads_catcher = !catchers.is_empty();
-            if let (true, Some(run)) = (caught || reads_catcher, last) {
-                // Once `caught`, every read is per read over allowed_reads, catchers or not.
-                let nested = if caught { HashSet::new() } else { catchers };
-                let verdict = self.closure_over_reads(label, prefix, p, i, q, run, &nested);
+            if let (true, Some(run)) = (caught, last) {
+                let verdict = self.closure_over_reads(label, prefix, p, i, q, run);
                 self.per_read.lock().unwrap().insert(i, verdict);
             }
         }
@@ -2154,12 +2103,10 @@ impl<'a> Serial<'a> {
     }
 
     /// The outcome node `q`'s closure gives over `run`'s reads, for op `i`
-    /// of phase `p`, or why its reads are no orders' outcomes for it. With
-    /// no `catchers`, each read must be that of a read in some order's last
-    /// run of `q` in op `i`; otherwise as [`Self::catcher_reads`] takes
-    /// them. The orders are those an order of the phases before gives
+    /// of phase `p`, or why a read is no order's outcome for it, an
+    /// order's outcome being that of a read in the order's last run of `q`
+    /// in op `i`: the orders are those an order of the phases before gives
     /// `prefix` in, with either read of phase `p` first.
-    #[allow(clippy::too_many_arguments)]
     fn closure_over_reads(
         &self,
         label: &str,
@@ -2168,17 +2115,12 @@ impl<'a> Serial<'a> {
         i: usize,
         q: usize,
         run: &Eval,
-        catchers: &HashSet<usize>,
     ) -> Result<Out, String> {
-        if catchers.is_empty() {
-            let allowed = self.allowed_reads(label, prefix, p, i, q);
-            if let Some(r) = run.reads.iter().find(|r| !allowed.contains(*r)) {
-                return Err(format!(
-                    "op {i}: node {q} read {r:?}, which no order gives that read"
-                ));
-            }
-        } else {
-            self.catcher_reads(label, prefix, p, i, q, run, catchers)?;
+        let allowed = self.allowed_reads(label, prefix, p, i, q);
+        if let Some(r) = run.reads.iter().find(|r| !allowed.contains(*r)) {
+            return Err(format!(
+                "op {i}: node {q} read {r:?}, which no order gives that read"
+            ));
         }
         let Spec::Query { expr, .. } = spec_at(self.case, prefix, 0, q) else {
             return Err(format!("op {i}: node {q} is an input"));
@@ -2208,99 +2150,6 @@ impl<'a> Serial<'a> {
         i: usize,
         q: usize,
     ) -> HashSet<Read> {
-        let mut allowed: HashSet<Read> = HashSet::new();
-        self.each_order_run(label, prefix, p, i, |log, _| {
-            let last = (log.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
-            allowed.extend(last.into_iter().flat_map(|e| e.reads.iter().cloned()));
-        });
-        allowed
-    }
-
-    /// Checks `run`'s reads, of op `i`'s get of `q` in phase `p`, that read
-    /// `catchers`, as [`Self::allowed_reads`] takes the orders: its reads
-    /// of a catcher's value each give that node's value in some order's
-    /// last run of it or of `q` in op `i`, switching at most once, from
-    /// orders with op `i` first to orders with the other read first, as
-    /// the other read's runs are not undone; its other reads are all one
-    /// order's last run of `q`'s.
-    #[allow(clippy::too_many_arguments)]
-    fn catcher_reads(
-        &self,
-        label: &str,
-        prefix: &Trace,
-        p: usize,
-        i: usize,
-        q: usize,
-        run: &Eval,
-        catchers: &HashSet<usize>,
-    ) -> Result<(), String> {
-        let mut values: HashSet<(usize, bool, u64)> = HashSet::new();
-        let mut orders: Vec<HashSet<Read>> = Vec::new();
-        self.each_order_run(label, prefix, p, i, |log, first| {
-            for &x in catchers {
-                let last = (log.iter().filter(|e| e.node == (0, x))).max_by_key(|e| e.end);
-                values.extend(last.and_then(|e| e.value).map(|v| (x, first, v)));
-            }
-            let last = (log.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
-            let reads: HashSet<Read> = last
-                .into_iter()
-                .flat_map(|e| e.reads.iter().cloned())
-                .collect();
-            values.extend(reads.iter().filter_map(|r| match *r {
-                (0, x, _, ReadOut::Value(v)) if catchers.contains(&x) => Some((x, first, v)),
-                _ => None,
-            }));
-            orders.push(reads);
-        });
-        let (mut switched, mut rest) = (HashSet::new(), Vec::new());
-        for r in &run.reads {
-            let &(0, x, _, ReadOut::Value(v)) = r else {
-                rest.push(r);
-                continue;
-            };
-            if !catchers.contains(&x) {
-                rest.push(r);
-                continue;
-            }
-            let (mine_first, theirs_first) = (
-                values.contains(&(x, true, v)),
-                values.contains(&(x, false, v)),
-            );
-            if !mine_first && !theirs_first {
-                return Err(format!(
-                    "op {i}: node {q} read {r:?}, which no order gives that read"
-                ));
-            }
-            if switched.contains(&x) && !theirs_first {
-                return Err(format!(
-                    "op {i}: node {q} read {r:?}, which only orders with op {i} first give, \
-                     after a read of node {x} only orders with the other read first give"
-                ));
-            }
-            if !mine_first {
-                switched.insert(x);
-            }
-        }
-        if !orders.iter().any(|o| rest.iter().all(|r| o.contains(*r))) {
-            return Err(format!(
-                "op {i}: node {q}'s reads {rest:?} besides those of catchers {catchers:?} \
-                 are no one order's"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Calls `f` with op `i`'s closure runs in each order an order of the
-    /// phases before phase `p` gives `prefix` in, with either read of
-    /// phase `p` first, and whether op `i` runs first in it.
-    fn each_order_run(
-        &self,
-        label: &str,
-        prefix: &Trace,
-        p: usize,
-        i: usize,
-        mut f: impl FnMut(&[Eval], bool),
-    ) {
         let (case, phases) = (self.case, self.phases);
         let start = phases[p].ops()[0];
         let pair = phases[..p].iter().filter(|ph| ph.ops().len() == 2).count();
@@ -2316,6 +2165,7 @@ impl<'a> Serial<'a> {
             )
             .0
         };
+        let mut allowed: HashSet<Read> = HashSet::new();
         for m in masks.iter().flat_map(|m| [m & !(1 << pair), m | 1 << pair]) {
             let order = Order::new(case, phases, m);
             let at = order
@@ -2329,8 +2179,10 @@ impl<'a> Serial<'a> {
                     run_logged::<Shared>(&order.case, None, 0, true).1
                 })
             });
-            f(&log[at], order.ends[at] != at);
+            let last = (log[at].iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
+            allowed.extend(last.into_iter().flat_map(|e| e.reads.iter().cloned()));
         }
+        allowed
     }
 
     /// The runs on runtime 0 of the read phase `prefix` ends with, by op,
@@ -5672,242 +5524,6 @@ fn two_thread_delivered_read_of_a_held_landing_holds_its_reader_157d3() {
     });
 }
 
-/// 0x13b77 unbounded: thread 0's read of 5 enters the cycle {8, 9} at 8,
-/// so 6 catches it as 7780, then thread 1's read of 9 enters it at 9 and
-/// lands 8 and 9 Failed, and 5's later reads of 6 give 9999: 19998, which
-/// the oracle takes per read, each read of the catcher 6 being one order's.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_reader_of_a_caught_cycle_is_ordered_per_read_13b77() {
-    let case = gen_case(0x13b77, false, true);
-    let phases = phases(&case, 0x13b77);
-    quiet(|| {
-        std::thread::scope(|s| {
-            for _ in 0..4 {
-                s.spawn(|| {
-                    let serial = Serial::new(&case, &phases);
-                    for _ in 0..40 {
-                        serial.differential("0x13b77", None, 0, &|_| {});
-                    }
-                });
-            }
-        });
-    });
-}
-
-/// A hand-made history for [`Serial::per_read`]'s catchers. W (3), Y1 (4)
-/// and Z1 (5) are [`history_failed_set`]'s and 0 reads W twice: with op 0
-/// `Get(0)` first W enters its cycles at the Zs and is 15554, with op 1
-/// `Get(8)` first it is 8. Op 0's W caught {4, 5}, op 1 then ran 5 and 4
-/// last, landing them Failed, and 0 read W = 15554 and then 8. `patch`
-/// edits the runs before the oracle sees them; returns op 0's per-read
-/// verdict, `None` when the oracle matches op 0 to one order as a whole.
-fn catcher_reader(
-    patch: impl FnOnce(&mut HashMap<usize, Vec<Eval>>),
-) -> Option<Result<Out, String>> {
-    let query = |expr, strategy| Spec::Query {
-        expr,
-        replay: true,
-        bare: false,
-        strategy,
-    };
-    let read = |n, try_| Box::new(Expr::Read(n, try_));
-    let one = || Box::new(Expr::Const(1));
-    let case = Case {
-        specs: vec![
-            query(Expr::Add(read(3, false), read(3, false)), Strat::None),
-            query(Expr::Const(1), Strat::None),
-            query(Expr::Const(1), Strat::None),
-            query(Expr::Add(read(5, true), read(7, true)), Strat::None),
-            query(Expr::Add(read(5, false), one()), Strat::Fallback(3)),
-            query(Expr::Add(read(4, false), one()), Strat::None),
-            query(Expr::Add(read(7, false), one()), Strat::Fallback(3)),
-            query(Expr::Add(read(6, false), one()), Strat::None),
-            query(Expr::Add(read(4, true), read(6, true)), Strat::None),
-        ],
-        panics: true,
-        cycles: true,
-        queries: 9,
-        specs2: Vec::new(),
-        queries2: 0,
-        ops: vec![Op::Get(0), Op::Get(8)],
-    };
-    let phases = vec![Phase::Read([Some(0), Some(1)])];
-    let mut verdict = None;
-    quiet(|| {
-        let runs = [0, 1].map(|m| run::<Shared>(&Order::new(&case, &phases, m).case, None, 0));
-        assert_eq!(runs[0][0].0, Out::Value(31108));
-        assert_eq!(runs[1][1].0, Out::Value(16));
-        let mut snap = runs[0][1].1.clone();
-        snap.0[4] = NodeState::Failed;
-        snap.0[5] = NodeState::Failed;
-        let prefix: Trace = vec![(Out::Value(15562), snap.clone()), (Out::Value(6), snap)];
-
-        let rts = runtimes::<Shared>(None, 0);
-        let live = Live::new(&rts, &case);
-        let cycle = |x: usize, y: usize| {
-            let mut slots = [x, y].map(|x| live.world.handle(0, x).erased().slot());
-            slots.sort_unstable();
-            ReadOut::Cycle(slots.to_vec())
-        };
-        let run = |node, reads: Vec<Read>, value, end, caught, returned| Eval {
-            node: (0, node),
-            first: true,
-            reads,
-            value,
-            end,
-            caught,
-            returned,
-            closing: Vec::new(),
-        };
-        let value = ReadOut::Value;
-        let mut evals = HashMap::from([
-            (
-                0,
-                vec![
-                    run(
-                        3,
-                        vec![(0, 5, true, cycle(4, 5)), (0, 7, true, cycle(6, 7))],
-                        Some(15554),
-                        3,
-                        vec![(0, 1), (1, 2)],
-                        vec![],
-                    ),
-                    run(
-                        0,
-                        vec![(0, 3, false, value(15554)), (0, 3, false, value(8))],
-                        Some(15562),
-                        8,
-                        vec![],
-                        vec![(0, 4), (1, 7)],
-                    ),
-                ],
-            ),
-            (
-                1,
-                vec![
-                    run(
-                        5,
-                        vec![(0, 4, false, ReadOut::Unwound)],
-                        None,
-                        5,
-                        vec![],
-                        vec![],
-                    ),
-                    run(
-                        4,
-                        vec![(0, 5, false, ReadOut::Unwound)],
-                        None,
-                        6,
-                        vec![],
-                        vec![],
-                    ),
-                ],
-            ),
-        ]);
-        patch(&mut evals);
-        *live.evals.lock().unwrap() = evals;
-
-        let serial = Serial::new(&case, &phases);
-        serial.per_read("catcher fixture", &prefix, &live);
-        verdict = serial.per_read.lock().unwrap().remove(&0);
-    });
-    verdict
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_takes_a_catchers_reads_switching_once_to_the_partner_first() {
-    assert_eq!(catcher_reader(|_| {}), Some(Ok(Out::Value(15562))));
-}
-
-/// W is 9 in no order.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_rejects_a_catchers_value_no_order_gives() {
-    let v = catcher_reader(|evals| run_of(evals, 0).reads[1].3 = ReadOut::Value(9));
-    assert!(
-        matches!(&v, Some(Err(m)) if m.contains("no order gives that read")),
-        "{v:?}"
-    );
-}
-
-/// Op 1 ran 4 and 5 and op 0 ran them after it: who ran a member last
-/// does not decide, as 0x13b77's thread reruns the cycle the partner's
-/// unwound runs left.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_takes_a_catchers_reads_when_this_thread_reran_the_cycle_last() {
-    let v = catcher_reader(|evals| {
-        let later: Vec<Eval> = (evals[&1].iter())
-            .map(|e| Eval {
-                end: e.end + 10,
-                ..e.clone()
-            })
-            .collect();
-        evals.get_mut(&0).unwrap().extend(later);
-    });
-    assert_eq!(v, Some(Ok(Out::Value(15562))));
-}
-
-/// Op 1 ran no member of the cycle W caught.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_keeps_whole_orders_for_a_cycle_the_other_read_never_ran() {
-    let v = catcher_reader(|evals| evals.get_mut(&1).unwrap().clear());
-    assert_eq!(v, None);
-}
-
-/// Op 1's runs of 4 and 5 ended after 0's run, so they moved nothing 0
-/// read.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_keeps_whole_orders_when_the_other_read_ran_the_cycle_after() {
-    let v = catcher_reader(|evals| {
-        for e in evals.get_mut(&1).unwrap() {
-            e.end += 10;
-        }
-    });
-    assert_eq!(v, None);
-}
-
-/// 0 also read 1, a constant, as 2, which no order's run of 0 read.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_rejects_a_catchers_reader_whose_other_reads_are_no_order() {
-    let v = catcher_reader(|evals| {
-        (run_of(evals, 0).reads).push((0, 1, false, ReadOut::Value(2)));
-    });
-    assert!(
-        matches!(&v, Some(Err(m)) if m.contains("are no one order's")),
-        "{v:?}"
-    );
-}
-
-/// 0 read W = 8 both times, never the 15554 its catch gave.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_keeps_whole_orders_when_the_catch_was_never_read() {
-    let v = catcher_reader(|evals| {
-        for r in &mut run_of(evals, 0).reads {
-            r.3 = ReadOut::Value(8);
-        }
-    });
-    assert_eq!(v, None);
-}
-
-/// 0 read W = 8, which op 1's landing gives, then 15554, as if that
-/// landing had been undone.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_oracle_rejects_a_catchers_reads_switching_back() {
-    let v = catcher_reader(|evals| run_of(evals, 0).reads.swap(0, 1));
-    assert!(
-        matches!(&v, Some(Err(m)) if m.contains("after a read of node 3")),
-        "{v:?}"
-    );
-}
-
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
@@ -6261,7 +5877,7 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
             .unwrap();
         read.3 = ReadOut::Value(3);
         let why = serial
-            .closure_over_reads("0x1006", &prefix, overlap, 7, 7, &sevens, &HashSet::new())
+            .closure_over_reads("0x1006", &prefix, overlap, 7, 7, &sevens)
             .unwrap_err();
         assert!(why.contains("no order gives that read"), "{why}");
         let rejects = |bad: Trace, what: &str| {
