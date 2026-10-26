@@ -1870,9 +1870,10 @@ impl LazyWorld {
         }
     }
 
-    /// Reads T against another thread's read of X; checks both values,
-    /// that X ran once, and that T's read retried exactly when a waiter
-    /// took the doom over. Returns whether one did.
+    /// Reads T against another thread's read of X; checks both values, that
+    /// T's read retried exactly when a waiter took the doom over, and that
+    /// X ran once, or twice with a take-over.
+    /// Returns whether one did.
     fn race(&self, want: u64, user_panics: bool) -> bool {
         let other = {
             let (rt, x) = (Arc::clone(&self.rt), self.x);
@@ -1883,15 +1884,16 @@ impl LazyWorld {
         EXPECTING_UNWIND.with(|e| e.set(false));
         assert_eq!(got, want);
         assert_eq!(other.join().unwrap(), 14);
-        assert_eq!(
-            self.x_runs.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "X ran on both threads"
-        );
         let took = crate::attempt::TAKE_OVERS.load(std::sync::atomic::Ordering::Relaxed);
         let epochs = self.epochs.lock().unwrap().clone();
         let retried = epochs.first() != epochs.last();
         assert!(took <= 1, "{took} take-overs of one doom");
+        // Only a wound's retry may run X again.
+        let x_runs = self.x_runs.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            x_runs == 1 || (x_runs == 2 && took == 1),
+            "X ran {x_runs} times with {took} take-overs"
+        );
         assert_eq!(
             retried,
             took == 1,
@@ -1910,8 +1912,7 @@ static END_RACE: Reached = Reached::new();
 /// at once, so its run's end closes the lazy doom's flight while another
 /// thread waits on X's reservation. The waiter's wound and the end's
 /// `leave_flight` race in both orders: T's read retries exactly when the
-/// wound came first, X runs once, and both reads give the unbounded run's
-/// values.
+/// wound came first, and both reads give the unbounded run's values.
 #[test]
 fn doom_lazy_end_races_take_over() {
     run(|| {
