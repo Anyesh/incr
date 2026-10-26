@@ -1988,7 +1988,7 @@ fn read_over_a_delivery(
         spawn(move || outcome(|| rt.get(top)))
     };
     s.gate.wait_parked();
-    assert_eq!(rt.state_of(s.y), NodeState::Failed);
+    assert_eq!(rt.state_of(s.y), NodeState::Computing);
     let waits = rt.reservation_waits.load(SeqCst);
     let other = {
         let rt = rt.clone();
@@ -2372,7 +2372,7 @@ fn shared_vframe_reader_waits_over_a_failed_dep_of_its_dep() {
         spawn(move || outcome(|| rt.get(x)))
     };
     gate.wait_parked();
-    assert_eq!(rt.state_of(y), NodeState::Failed);
+    assert_eq!(rt.state_of(y), NodeState::Computing);
     let waits = rt.reservation_waits.load(SeqCst);
     let other = {
         let rt = rt.clone();
@@ -2428,7 +2428,7 @@ fn shared_vframe_reader_waits_then_relands_it_failed_by_its_own_panic() {
         spawn(move || outcome(|| rt.get(x)))
     };
     gate.wait_parked();
-    assert_eq!(rt.state_of(y), NodeState::Failed);
+    assert_eq!(rt.state_of(y), NodeState::Computing);
     let waits = rt.reservation_waits.load(SeqCst);
     let other = {
         let rt = rt.clone();
@@ -3086,7 +3086,7 @@ fn shared_vframe_landed_failed_over_an_episodes_delivery() {
         spawn(move || outcome(|| rt.get(t)))
     };
     gate.wait_parked();
-    assert_eq!(rt.state_of(f), NodeState::Failed);
+    assert_eq!(rt.state_of(f), NodeState::Computing);
     assert_eq!(
         rt.provenance_records(),
         1,
@@ -3190,7 +3190,7 @@ fn shared_episode_reader_and_a_vframes_retry_break_a_waits_for_cycle() {
         spawn(move || outcome(|| rt.get(x)))
     };
     s.gate.wait_parked();
-    assert_eq!(s.rt.state_of(s.y), NodeState::Failed);
+    assert_eq!(s.rt.state_of(s.y), NodeState::Computing);
     s.in_cycle.store(1, SeqCst);
     let waits = s.rt.reservation_waits.load(SeqCst);
     let other = {
@@ -3340,7 +3340,7 @@ fn shared_reader_waits_out_a_held_delivery_at_an_equal_path() {
         spawn(move || outcome(|| rt.get(w)))
     };
     gate.wait_parked();
-    assert_eq!(rt.state_of(y), NodeState::Failed);
+    assert_eq!(rt.state_of(y), NodeState::Computing);
     switch.store(true, SeqCst);
     let waits = rt.reservation_waits.load(SeqCst);
     let other = {
@@ -3477,8 +3477,8 @@ fn shared_retaken_delivery_with_a_waiting_reader() {
     gate.wait_parked();
     assert_eq!(
         s.rt.state_of(s.x),
-        NodeState::Dirty,
-        "the first take landed X Dirty"
+        NodeState::Computing,
+        "the first take holds X's landing"
     );
     let waits = s.rt.reservation_waits.load(SeqCst);
     let other = {
@@ -4615,7 +4615,7 @@ fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
         spawn(move || outcome(|| rt.get(w)))
     };
     s.gate.wait_parked();
-    assert_eq!(s.rt.state_of(s.y), NodeState::Failed);
+    assert_eq!(s.rt.state_of(s.y), NodeState::Computing);
     s.switch.store(true, SeqCst);
     s.gate.release();
     let first = first.join();
