@@ -2410,3 +2410,176 @@ mod review_8b_mid_compute_budget {
         assert_eq!(own_panic_then_own_read::<Shared>(unbudgeted, frames_2), 12);
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BareValue(u64);
+
+fn get_outcome(f: impl FnOnce() -> u64) -> String {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v.to_string(),
+        Err(_) => "panic".to_owned(),
+    }
+}
+
+fn set_outcome(f: impl FnOnce()) -> String {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(()) => "done".to_owned(),
+        Err(_) => "panic".to_owned(),
+    }
+}
+
+/// The harness's `PanicIf`, with its payload.
+fn panic_if(v: u64, when: u64, side: usize, at: usize) -> u64 {
+    if v % 7 == when {
+        std::panic::panic_any(format!("boom {side}:{at}"));
+    }
+    v
+}
+
+/// Seed 0x366152c0, shrunk (frames 1, single thread, cross): the last op,
+/// `Get(6)`, gives 0 either way, but node 10 is Failed unbounded and Dirty
+/// at frames 1. Every node is kept and made in the harness's order (each
+/// runtime's list reversed). Returns each op's outcome and the first
+/// runtime's nodes 10, 11, 12, 13, 15 and 16's states after the last op.
+fn seed_366152c0<C: Cells>(frames: u32) -> (Vec<String>, Vec<(usize, NodeState)>) {
+    let r1 = Box::new(Runtime::<C>::new());
+    let r2 = Box::new(Runtime::<C>::new());
+    for rt in [&r1, &r2] {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let bare_replayable = || QueryOpts::<BareValue> {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let late_b0 = Arc::new(OnceLock::<Incr<BareValue>>::new());
+    let _x20 = r1.create_input(1_u64);
+    let x19 = r1.create_input(2_u64);
+    let n18 = r1.create_query_with(
+        move |rt: &Runtime<C>| {
+            let a = rt.try_get(x19).unwrap_or(7777).wrapping_add(rt.get(x19));
+            a.wrapping_add(rt.try_get(x19).unwrap_or(7777).wrapping_add(1))
+        },
+        replayable(),
+    );
+    let n17 = r1.create_query(move |rt: &Runtime<C>| rt.get(n18));
+    let n16 =
+        r1.create_query(move |rt: &Runtime<C>| panic_if(rt.try_get(n17).unwrap_or(7777), 1, 0, 16));
+    let n15 = r1.create_query_with(
+        move |rt: &Runtime<C>| panic_if(rt.get(n16), 0, 0, 15),
+        replayable(),
+    );
+    let n14 = r1.create_query(|_| 0_u64);
+    let n13 = r1.create_query_with(
+        move |rt: &Runtime<C>| rt.try_get(n15).unwrap_or(7777),
+        replayable(),
+    );
+    let n12 = r1.create_query_with(move |rt: &Runtime<C>| rt.get(n13), replayable());
+    let n11 = r1.create_query_with(
+        move |rt: &Runtime<C>| rt.try_get(n12).unwrap_or(7777),
+        replayable(),
+    );
+    let n10 = r1.create_query(move |rt: &Runtime<C>| rt.try_get(n11).unwrap_or(7777));
+    let n9 = {
+        let (r2, late_b0) = (OtherRt(&*r2), late_b0.clone());
+        r1.create_query_with(
+            move |rt: &Runtime<C>| {
+                let b0 = *late_b0.get().expect("node 0 of the second runtime is made");
+                rt.get(x19)
+                    .wrapping_add(r2.try_get(b0).map_or(7777, |b| b.0))
+            },
+            replayable(),
+        )
+    };
+    let n8 = r1.create_query_with(
+        move |rt: &Runtime<C>| {
+            if rt.get(n9).is_multiple_of(2) {
+                rt.try_get(n10).unwrap_or(7777)
+            } else {
+                0
+            }
+        },
+        replayable(),
+    );
+    let n7 = r1.create_query_with(move |rt: &Runtime<C>| rt.get(n8), replayable());
+    let n6 = r1.create_query_with(
+        move |rt: &Runtime<C>| {
+            let c = if rt.get(n14).is_multiple_of(2) {
+                rt.try_get(n7).unwrap_or(7777)
+            } else {
+                0
+            };
+            BareValue(if c.is_multiple_of(2) { rt.get(n7) } else { 0 })
+        },
+        bare_replayable(),
+    );
+    let _n5 = r1.create_query_with(|_| 4_u64, replayable());
+    let _n4 = r1.create_query(|_| 0_u64);
+    let _n3 = r1.create_query_with(|_| 0_u64, replayable());
+    let _n2 = r1.create_query_with(|_| BareValue(0), bare_replayable());
+    let _n1 = r1.create_query_with(|_| 2_u64, replayable());
+    let _n0 = r1.create_query_with(|_| 0_u64, replayable());
+
+    let _y4 = r2.create_input(0_u64);
+    let y3 = r2.create_input(0_u64);
+    let _b2 = {
+        let r1 = OtherRt(&*r1);
+        r2.create_query_with(move |_| r1.get(n7), replayable())
+    };
+    let b1 = {
+        let (r1, late_b0) = (OtherRt(&*r1), late_b0.clone());
+        r2.create_query(move |rt: &Runtime<C>| {
+            let b0 = *late_b0.get().expect("node 0 of the second runtime is made");
+            let a = r1.get(n9).wrapping_add(rt.get(b0).0);
+            BareValue(a.wrapping_add(panic_if(rt.get(b0).0, 2, 1, 1)))
+        })
+    };
+    let b0 = r2.create_query_with(
+        move |rt: &Runtime<C>| BareValue(rt.try_get(y3).unwrap_or(7777)),
+        bare_replayable(),
+    );
+    assert!(late_b0.set(b0).is_ok());
+
+    let outs = vec![
+        get_outcome(|| r1.get(n8)),
+        set_outcome(|| r2.set(y3, 3)),
+        set_outcome(|| r1.set(x19, 0)),
+        get_outcome(|| r1.get(n11)),
+        get_outcome(|| r2.get(b1).0),
+        get_outcome(|| r1.get(n6).0),
+    ];
+    let states = vec![
+        (10, r1.state_of(n10)),
+        (11, r1.state_of(n11)),
+        (12, r1.state_of(n12)),
+        (13, r1.state_of(n13)),
+        (15, r1.state_of(n15)),
+        (16, r1.state_of(n16)),
+    ];
+    (outs, states)
+}
+
+/// At frames 1 the doomed read of 7 runs 8's walk speculatively, which
+/// stashes 10's panic and leaves 10 Dirty; the retry adopts 8's stash
+/// nested, over 8's recorded dep 10 that 8's rerun now skips. The
+/// unbounded walk of 8 lands 10 Failed first, so the adoption must too.
+#[test]
+fn an_adoption_lands_a_recorded_dep_its_rerun_skips_as_unbounded() {
+    fn check<C: Cells>() {
+        let want = seed_366152c0::<C>(u32::MAX);
+        assert_eq!(
+            want.1[0],
+            (10, NodeState::Failed),
+            "the unbounded walk lands 10"
+        );
+        for frames in [1, 2, 3] {
+            assert_eq!(seed_366152c0::<C>(frames), want, "frames {frames}");
+        }
+    }
+    check::<Local>();
+    check::<Shared>();
+}

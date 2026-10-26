@@ -661,6 +661,17 @@ impl<C: Cells> Runtime<C> {
         } else {
             NodeState::New
         };
+        // The unbounded run walks the node's recorded deps before its run
+        // and computes the unsettled ones it expands, even one the run then
+        // skips; an adoption would skip that walk (seed 0x366152c0).
+        let mut unsettled = false;
+        node.for_each_dep(|dep| {
+            unsettled |= !state::load::<C>(self.nodes.get(dep.0).state_cell()).is_settled();
+        });
+        if unsettled {
+            self.land(id, node, source, source);
+            return None;
+        }
         let stash = (node.generation() == generation)
             .then(|| self.take_stash(id.0, generation, true, false))
             .flatten();
