@@ -4716,7 +4716,7 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         let owed = replay::with(|c| {
-            c.iter()
+            c.iter_mut()
                 .any(|x| x.rt == rt && (x.stacks(slot, generation) || x.queues(slot, generation)))
         });
         if !owed {

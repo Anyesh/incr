@@ -992,9 +992,11 @@ pub(crate) struct Context {
     /// The position of level 0.
     pub(crate) boundary: u32,
     pub(crate) levels: Vec<VecDeque<Entry>>,
-    /// How many entries of each node and generation `levels` holds, so
-    /// [`Self::queues`] needs no scan.
-    queued: HashMap<(u32, u32), u32, FxBuildHasher>,
+    /// How many entries of each node and generation `levels` holds, built
+    /// when [`Self::queues`] first asks and kept in step from then on. Only
+    /// a `Shared` reservation's end asks, so other contexts count nothing,
+    /// and a scan per ask instead is quadratic on a long budget-1 chain.
+    queued: Option<HashMap<(u32, u32), u32, FxBuildHasher>>,
     pub(crate) vstack: Vec<VFrame>,
     /// Each node's `vstack` positions, lowest first, with the generation
     /// its virtual frame recorded.
@@ -1097,7 +1099,7 @@ impl Context {
             rt,
             boundary,
             levels: vec![VecDeque::from([target])],
-            queued: HashMap::from_iter([((target.node, target.generation), 1)]),
+            queued: None,
             vstack: Vec::new(),
             vindex: HashMap::default(),
             running: None,
@@ -1140,12 +1142,25 @@ impl Context {
 
     /// Whether an entry of `node` at `generation` has yet to run: the
     /// running entry is not one until the driver pops it.
-    pub(crate) fn queues(&self, node: u32, generation: u32) -> bool {
+    pub(crate) fn queues(&mut self, node: u32, generation: u32) -> bool {
         let running = self.running_fronts
             && self
                 .running_entry
                 .is_some_and(|e| e.node == node && e.generation == generation);
-        self.queued.get(&(node, generation)).copied().unwrap_or(0) > u32::from(running)
+        let queued = self
+            .queued
+            .get_or_insert_with(|| Self::count_levels(&self.levels));
+        queued.get(&(node, generation)).copied().unwrap_or(0) > u32::from(running)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_levels(levels: &[VecDeque<Entry>]) -> HashMap<(u32, u32), u32, FxBuildHasher> {
+        let mut queued = HashMap::default();
+        for e in levels.iter().flatten() {
+            *queued.entry((e.node, e.generation)).or_default() += 1;
+        }
+        queued
     }
 
     /// Whether `node`'s virtual frame at `generation` stands for a frame
@@ -1161,10 +1176,9 @@ impl Context {
             self.levels.resize_with(level + 1, VecDeque::new);
         }
         self.levels[level].push_back(entry);
-        *self
-            .queued
-            .entry((entry.node, entry.generation))
-            .or_default() += 1;
+        if let Some(q) = &mut self.queued {
+            *q.entry((entry.node, entry.generation)).or_default() += 1;
+        }
     }
 
     /// Removes the oldest entry at `level`, the one the driver ran.
@@ -1185,10 +1199,14 @@ impl Context {
 
     /// Drops every level from `len` up with its entries.
     pub(crate) fn truncate_levels(&mut self, len: usize) {
-        for q in self.levels.split_off(len.min(self.levels.len())) {
-            for e in q {
-                self.unqueue(e);
+        if self.queued.is_some() {
+            for q in self.levels.split_off(len.min(self.levels.len())) {
+                for e in q {
+                    self.unqueue(e);
+                }
             }
+        } else {
+            self.levels.truncate(len);
         }
         if self.running.is_some_and(|level| level as usize >= len) {
             self.running_fronts = false;
@@ -1196,7 +1214,10 @@ impl Context {
     }
 
     fn unqueue(&mut self, e: Entry) {
-        if let MapEntry::Occupied(mut n) = self.queued.entry((e.node, e.generation)) {
+        let Some(q) = &mut self.queued else {
+            return;
+        };
+        if let MapEntry::Occupied(mut n) = q.entry((e.node, e.generation)) {
             *n.get_mut() -= 1;
             if *n.get() == 0 {
                 n.remove();
