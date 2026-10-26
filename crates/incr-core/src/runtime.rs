@@ -2483,10 +2483,11 @@ impl<C: Cells> Runtime<C> {
             }
             self.park(ParkPoint::AfterWalk(NodeId(slot)));
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            // Also loaded before the slot is read, so a value another
-            // thread lands Clean after a Dirty read is still noted as Dirty.
+            // Under Shared also loaded before the slot is read, so a value
+            // another thread lands Clean after a Dirty read is still noted
+            // as Dirty.
             let dirty = || state::load::<C>(node.state_cell()) == NodeState::Dirty;
-            let dirty_before = frame.is_some() && dirty();
+            let dirty_before = !C::SINGLE_THREADED && frame.is_some() && dirty();
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
                     if let Some(f) = frame.filter(|_| dirty_before || dirty()) {
