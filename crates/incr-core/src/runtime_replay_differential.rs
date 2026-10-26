@@ -9108,6 +9108,19 @@ fn a_walk_replans_after_another_thread_lands_an_intermediate_by_a_cycle() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_replan_waits_for_an_episode_counted_before_its_landing() {
+    replan_in_a_publication(false);
+}
+
+/// As above, with thread 1's publication panicking where it parked: the
+/// retraction ends the publication, so thread 0's replan stops waiting
+/// and its read finishes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_replan_waits_out_a_publication_that_panics() {
+    replan_in_a_publication(true);
+}
+
+fn replan_in_a_publication(panics: bool) {
     let seed = 0x7c3a12bcc;
     let mut case = gen_case(seed, false, true);
     case.specs[18] = Spec::Query {
@@ -9154,6 +9167,9 @@ fn a_replan_waits_for_an_episode_counted_before_its_landing() {
                     Some(1) if p == ParkPoint::BeforePublish(slot(7)) => {
                         flags.parked.store(true, SeqCst);
                         until(|| flags.go.load(SeqCst) && unclaims() > flags.base.load(SeqCst));
+                        if panics {
+                            panic!("a publication panics in its window");
+                        }
                     }
                     Some(1) => until(|| flags.ready.load(SeqCst)),
                     _ => {}
@@ -9169,17 +9185,30 @@ fn a_replan_waits_for_an_episode_counted_before_its_landing() {
                     flags.go.load(SeqCst),
                     "thread 1 never parked before 7's landing"
                 );
+                if panics {
+                    let rt = live.world.rt(0);
+                    for slot in 0..rt.nodes.len() {
+                        let state = rt.nodes.get(slot).state();
+                        assert!(
+                            !matches!(state, NodeState::Computing | NodeState::ComputingDirty),
+                            "node {slot} is {state:?} after the panicked publication"
+                        );
+                    }
+                    return true;
+                }
             }
             let v = serial.at_overlap("episode before landing", prefix, live);
             let stop = v.is_some();
             *verdict.lock().unwrap() = v;
             stop
         });
-        serial.check(
-            "episode before landing",
-            &got,
-            verdict.into_inner().unwrap(),
-        );
+        if !panics {
+            serial.check(
+                "episode before landing",
+                &got,
+                verdict.into_inner().unwrap(),
+            );
+        }
     });
 }
 

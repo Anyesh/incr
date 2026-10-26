@@ -460,9 +460,11 @@ impl<C: Cells> Runtime<C> {
         let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
         let mut rest = entries.into_iter();
         let published = catch_unwind(AssertUnwindSafe(|| {
-            for e in rest.by_ref() {
-                self.park(ParkPoint::BeforePublish(NodeId(e.slot)));
-                self.publish_one(e, &held, &mut bag);
+            while let Some(slot) = rest.as_slice().first().map(|e| e.slot) {
+                self.park(ParkPoint::BeforePublish(NodeId(slot)));
+                if let Some(e) = rest.next() {
+                    self.publish_one(e, &held, &mut bag);
+                }
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
