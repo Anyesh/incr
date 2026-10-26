@@ -4540,10 +4540,10 @@ impl<C: Cells> Runtime<C> {
     /// The `Err` arm of a compute: the closure panicked, or an engine
     /// unwind passed through it. Lands the node and every claim this
     /// thread held above its frame, then resumes the unwind. A walk's entry
-    /// (`walked`) contains a panic, or a cycle whose claims all ran above
-    /// it, and returns `Unsettled`: the recorder's rerun reads the node
-    /// again if it still does, and the payload stays with the Failed node
-    /// for that read.
+    /// (`walked`) contains a panic ([`Self::containable`]) and returns
+    /// `Unsettled`. If the recorder's rerun still reads the node, a Failed
+    /// node gives that read its held payload, while one whose closure
+    /// panicked after catching a cycle landed unwound and runs again.
     #[cold]
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
@@ -4569,7 +4569,7 @@ impl<C: Cells> Runtime<C> {
         // A closure that catches a speculative run's discard can't land a
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
-        let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
+        let contain = walked && self.containable(kind, &*payload);
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -4638,20 +4638,14 @@ impl<C: Cells> Runtime<C> {
         bag.drain_carried(payload)
     }
 
-    /// Whether walk entry `entry`, at position `cidx`, contains an unwind
-    /// out of its compute, asked before the compute's frame releases its
-    /// claims: a panic, or a cycle none of whose members this thread will
-    /// still hold or has a virtual frame of, so that every member ran above
-    /// the walk and the unwind released it. The entry's own claim and the
-    /// claims held at or above its position are not counted: the unwind
-    /// releases them too, and a virtual frame's run still holds the entry's
-    /// when this is asked. A closure that swallowed a cycle and then
-    /// panicked is contained as any panic. A wounded thread must reach its
-    /// outermost entry, so it contains none.
+    /// Whether a walk's entry contains an unwind out of its compute: a
+    /// panic, including one a closure raised after catching a cycle, which
+    /// unwinds with the cycle's kind and its own payload. A cycle goes on
+    /// to the reader, as every member's run would close it again for the
+    /// recorder's rerun. A wounded thread must reach its outermost entry,
+    /// so it contains none.
     pub(super) fn containable(
         &self,
-        entry: NodeId,
-        cidx: u32,
         kind: Option<UnwindKind>,
         payload: &(dyn std::any::Any + Send),
     ) -> bool {
@@ -4660,15 +4654,7 @@ impl<C: Cells> Runtime<C> {
         }
         match kind {
             None => true,
-            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_none_or(|c| {
-                c.0.participants()
-                    .iter()
-                    .map(|p| NodeId(p.slot()))
-                    .all(|p| {
-                        (p == entry || self.unwind_releases(p, cidx))
-                            && self.virtual_owner(p).is_none()
-                    })
-            }),
+            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_none(),
             Some(_) => false,
         }
     }

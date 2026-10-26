@@ -6601,12 +6601,13 @@ fn seed_783_at_budget_3() {
     });
 }
 
-/// A query whose run read the node being deleted keeps that dependency,
-/// so the delete is refused at every budget. In 0x2343 node 15's run
-/// completes with the read; in 0xc17 node 7's claim, released by another
-/// node's user panic, lands New over the deps its run read.
+/// A delete of a node that a query's unwound run read gives the unbounded
+/// outcome at every budget: the run's cycle reached its reader, so the run
+/// kept no dependency on the node and the delete succeeds, as on main
+/// (0x2343 op 9; 0xc17 op 5, where node 7's claim was released by another
+/// node's user panic).
 #[test]
-fn delete_of_a_node_a_query_read_is_refused() {
+fn delete_after_an_unwound_read_gives_the_unbounded_outcome() {
     for (seed, op) in [(0x2343, 9), (0xc17, 5)] {
         let mut case = gen_case(seed, false, false);
         assert!(matches!(case.ops[op], Op::Delete(_)));
@@ -6618,7 +6619,7 @@ fn delete_of_a_node_a_query_read_is_refused() {
                 for trace in [&local, &shared] {
                     assert_eq!(
                         trace[op].0,
-                        Out::Deleted(Err("HasDependents".into())),
+                        Out::Deleted(Ok(())),
                         "seed {seed:#x} at {frames:?}/{bytes}"
                     );
                 }
@@ -6700,18 +6701,59 @@ fn paired_clean_read_delivery_seeds() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn high_range_clean_read_delivery_seeds() {
-    for seed in [
-        0x92_b175_80fc,
-        0x92_b175_83ef,
-        0x92_b175_829f,
-        0x92_b175_8479,
-    ] {
+    for seed in [0x92_b175_83ef, 0x92_b175_829f, 0x92_b175_8479] {
         let case = gen_case(seed, false, false);
         quiet(|| {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);
         });
     }
+}
+
+/// 0x92b17580fc op 3, the stale-dep split main shares (CHANGELOG known
+/// limitation): the unbounded walk cleans a recorded dep the reader no
+/// longer reads and its run closes the cycle [23], while a bounded run
+/// reruns the reader first and gives the fresh Value(6).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stale_dep_split_seed_matches_main() {
+    let case = gen_case(0x92_b175_80fc, false, false);
+    let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
+    let panic = |m: &str| Out::Panic(m.to_owned());
+    let with = |op3| {
+        vec![
+            panic("failed"),
+            panic("failed"),
+            Out::Done,
+            op3,
+            panic("cycle"),
+            Out::Done,
+        ]
+    };
+    quiet(|| {
+        assert_eq!(
+            outs(run::<Local>(&case, None, 0)),
+            with(Out::Cycle(vec![23])),
+            "Local unbounded"
+        );
+        assert_eq!(
+            outs(run::<Shared>(&case, None, 0)),
+            with(Out::Cycle(vec![23])),
+            "Shared unbounded"
+        );
+        for frames in [1, 2, 3] {
+            assert_eq!(
+                outs(run::<Local>(&case, Some(frames), 0)),
+                with(Out::Value(6)),
+                "Local, budget {frames}"
+            );
+            assert_eq!(
+                outs(run::<Shared>(&case, Some(frames), 0)),
+                with(Out::Value(6)),
+                "Shared, budget {frames}"
+            );
+        }
+    });
 }
 
 /// 0xa02 (see [`cross_seeds`]): a speculative landing read the second
@@ -8256,7 +8298,8 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
     });
 }
 
-/// Seed 0x9ab9's base case, shrunk. Unbounded, `TryGet(12)` reads 0. At
+/// Seed 0x9ab9's base case, shrunk. Unbounded, `TryGet(12)` gets the cycle
+/// [5, 6, 13, 14] that a walk entry closes, as on main. At
 /// budget 1 a speculative run of node 3 (slot 20) writes its slot and is
 /// discarded, so `discard_target` takes the value back and lands the node
 /// New where the unbounded run leaves it Dirty; the claim releases and
@@ -8377,7 +8420,7 @@ fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
     let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
     quiet(|| {
         let unbounded = outs(run::<Local>(&case, None, 0));
-        assert_eq!(unbounded[2], Out::Value(0), "unbounded");
+        assert_eq!(unbounded[2], Out::Cycle(vec![5, 6, 13, 14]), "unbounded");
         for frames in [1, 2, 3] {
             let local = outs(run::<Local>(&case, Some(frames), 0));
             assert_eq!(local, unbounded, "Local, budget {frames}");
@@ -8867,16 +8910,16 @@ fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
 
 /// Seed 0x56cdd78's op 9, `Get(8)`: its read of 4 runs 4's cycle episode,
 /// which releases 4, 8, 9 and 10 Dirty with no value, so the read walks 4
-/// again and the walk contains the cycle at its entries until 10's
-/// strategy closes it, reading 0. At a budget of 3 a doom stops the first
-/// walk; after the release, the frame reading 4 must walk again rather
-/// than take the `Direct` delivery made for the first walk.
+/// again, and the cycle a walk entry closes reaches the read, as on main.
+/// At a budget of 3 a doom stops the first walk; after the release, the
+/// frame reading 4 must walk again rather than take the `Direct` delivery
+/// made for the first walk, and so gives the unbounded outcome.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
     let seed = 0x56c_dd78;
     assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(8)));
-    let want = (Out::Value(0), Vec::new());
+    let want = (Out::Panic("cycle".into()), Vec::new());
     quiet(|| {
         let local = op9_at_budget_3::<Local>(seed);
         let shared = op9_at_budget_3::<Shared>(seed);
