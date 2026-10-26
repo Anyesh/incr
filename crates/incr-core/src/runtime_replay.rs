@@ -4999,7 +4999,7 @@ impl<C: Cells> Runtime<C> {
                 return Computed::Done;
             }
             match self.clean_walk::<VIRT>(id, gen, word, observed) {
-                Computed::Replan => {}
+                Computed::Replan { .. } => {}
                 computed => return computed,
             }
         }
