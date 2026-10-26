@@ -2376,10 +2376,13 @@ moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
   `619c9e167` 1647.72M), where `_dl_find_object` goes from 11.22M to
   27.27M over the same 321,960 calls (callgrind), 34.8 to 84.7
   instructions per call: the lookup's cost moved with the test binary's
-  layout, not its count, and engine symbols net -4M. With the cfg(test)
-  code in, the same step lands at `61d37ff85` instead. Same family as
-  `B7-clean-walk-fde-growth`, unwind cost through the walk that moves
-  with codegen.
+  layout, not its count. Over `096fb59d6` to `9a6be2014` everything
+  outside `_dl_find_object` nets -3.8M (+12.13M against its +15.96M:
+  B-tree and `Notes` code moving between symbols, `_Unwind_Find_FDE`
+  -3.0M); across the `619c9e167` step alone it is about +2.6M. With
+  the cfg(test) code in, the same step lands at `61d37ff85` instead.
+  Same family as `B7-clean-walk-fde-growth`, unwind cost through the
+  walk that moves with codegen.
 
 ## The replay context counts queued entries only once a reservation asks
 
