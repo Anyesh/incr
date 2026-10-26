@@ -135,6 +135,7 @@ impl<C: Cells> Runtime<C> {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::Deleting)
                             .is_ok()
                         {
+                            C::u64_fetch_add(&self.reshapes, 1);
                             taken.push((m, cur));
                             break;
                         }

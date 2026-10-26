@@ -289,18 +289,6 @@ pub(crate) fn park_timed_out(test: Option<&str>) -> ! {
     std::process::abort()
 }
 
-/// The panic of a read that found its node `Dead` under the handle's
-/// generation: a delete has claimed it and not yet unhooked it.
-#[cold]
-#[inline(never)]
-fn deleted_while_reading(id: NodeId) -> ! {
-    panic!(
-        "incr-core: node {} was deleted while a read was reaching it (a \
-         compute raced delete_node on one of its recorded dependencies)",
-        id.0,
-    );
-}
-
 /// What [`Runtime::delete_erased`] did with a node.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DeleteOutcome {
@@ -1101,6 +1089,11 @@ pub struct Runtime<C: Cells> {
     pub(crate) stashes: OrderedLock<replay_impl::Stashes, C>,
     /// How many stashes `stashes` holds, so a claim can skip its lock.
     pub(crate) stash_count: C::U32,
+    /// Delete claims, and speculative reads of a deleted node, so far. A
+    /// delete changes what a read returns with no new revision, and so may
+    /// the node recreated in its place for a run that read the dead one,
+    /// so a stash stands only at the count its run claimed under.
+    pub(crate) reshapes: C::U64,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -1220,6 +1213,7 @@ impl<C: Cells> Runtime<C> {
             drop_unwinds: std::sync::atomic::AtomicU32::new(0),
             stashes: OrderedLock::new(LockKind::Stashes, replay_impl::Stashes::default()),
             stash_count: C::new_u32(0),
+            reshapes: C::new_u64(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -1699,9 +1693,31 @@ impl<C: Cells> Runtime<C> {
         NodeTable::new(self.runtime_id, hasher)
     }
 
+    /// A speculative run that reads a deleted node stashes what a recreate
+    /// in its place may change, with no new revision.
+    fn count_dead_read(&self) {
+        if replay::speculative() {
+            C::u64_fetch_add(&self.reshapes, 1);
+        }
+    }
+
+    /// The panic of a read that found its node `Dead` under the handle's
+    /// generation: a delete has claimed it and not yet unhooked it.
+    #[cold]
+    #[inline(never)]
+    fn deleted_while_reading(&self, id: NodeId) -> ! {
+        self.count_dead_read();
+        panic!(
+            "incr-core: node {} was deleted while a read was reaching it (a \
+             compute raced delete_node on one of its recorded dependencies)",
+            id.0,
+        );
+    }
+
     #[cold]
     #[inline(never)]
     fn stale_handle<T: Value>(&self, handle: Incr<T>) -> ! {
+        self.count_dead_read();
         panic!(
             "incr-core: stale Incr<{}> handle: the node at slot {} was deleted (handle \
              generation {}, slot generation {})",
@@ -1974,6 +1990,9 @@ impl<C: Cells> Runtime<C> {
                         return SingleClaim::HasDependents;
                     }
                     if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok() {
+                        // After the CAS, so a run that loads the new count
+                        // sees the node Dead.
+                        C::u64_fetch_add(&self.reshapes, 1);
                         return SingleClaim::Claimed;
                     }
                 }
@@ -2577,7 +2596,7 @@ impl<C: Cells> Runtime<C> {
             // the panic any reader of a node being deleted gets. Under
             // Local only this thread can be mid-delete, so the value code
             // was called from inside the delete.
-            NodeState::Dead if !C::SINGLE_THREADED => deleted_while_reading(id),
+            NodeState::Dead if !C::SINGLE_THREADED => self.deleted_while_reading(id),
             _ => value_code::contract_panic(),
         }
     }
@@ -3868,7 +3887,7 @@ impl<C: Cells> Runtime<C> {
                     if observe_impl::is_observed(self.runtime_id, id.0) {
                         return Computed::Gone;
                     }
-                    deleted_while_reading(id);
+                    self.deleted_while_reading(id);
                 }
                 NodeState::New => {
                     // Nothing to verify against, and the walk must not run
@@ -4041,6 +4060,11 @@ impl<C: Cells> Runtime<C> {
             // dirtied our deps yet would let us verify Clean past it (B6).
             let stamp_rev = self.current_revision();
             let mut verify_rev = C::walked(&self.walk, &self.revision);
+            let reshapes = if MODE & VIRT != 0 {
+                C::u64_load_acquire(&self.reshapes)
+            } else {
+                0
+            };
 
             let mut adopted_panic = None;
             if C::u32_load_relaxed(&self.stash_count) != 0 && !matches!(visit, Visit::VerifyOnly(_))
@@ -4154,7 +4178,15 @@ impl<C: Cells> Runtime<C> {
                 if !any_changed {
                     self.park(ParkPoint::VerifyAfterScan(id));
                     if MODE & VIRT != 0 && replay::speculative() {
-                        return self.stash_verify(id, node, g, my_verified, stamp_rev, verify_rev);
+                        return self.stash_verify(
+                            id,
+                            node,
+                            g,
+                            my_verified,
+                            stamp_rev,
+                            verify_rev,
+                            reshapes,
+                        );
                     }
                     node.max_verified_at(verify_rev);
                     let landed =
@@ -4259,6 +4291,7 @@ impl<C: Cells> Runtime<C> {
                         cidx,
                         stamp_rev,
                         verify_rev,
+                        reshapes,
                     };
                     if let Err(payload) = &result {
                         if word & value_code::UNWIND_MASK != 0 {
@@ -4290,6 +4323,7 @@ impl<C: Cells> Runtime<C> {
                             cidx,
                             stamp_rev,
                             verify_rev,
+                            reshapes,
                         };
                         return self.discard_doomed(id, attempt, &ctl, Some(payload), bag);
                     }
@@ -4303,6 +4337,7 @@ impl<C: Cells> Runtime<C> {
                                 cidx,
                                 stamp_rev,
                                 verify_rev,
+                                reshapes,
                             },
                             &ctl,
                             &deps,
@@ -4319,6 +4354,7 @@ impl<C: Cells> Runtime<C> {
                         cidx,
                         stamp_rev,
                         verify_rev,
+                        reshapes,
                     };
                     if ctl.has(cycle::DOOMED) {
                         return self.discard_doomed(id, attempt, &ctl, None, bag);
