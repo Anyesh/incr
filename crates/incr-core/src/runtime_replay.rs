@@ -2597,6 +2597,13 @@ impl<C: Cells> Runtime<C> {
             drop_payloads(made.into_iter().map(|m| m.1));
             return None;
         }
+        // A landing this thread holds stays Computing to the exit, which a
+        // rerun's raw release would publish early; a set's flip can leave
+        // the record of such a node until it forgets it.
+        if crate::hold::holds(state::cell_key::<C>(node.state_cell())) {
+            drop_payloads(made.into_iter().map(|m| m.1));
+            return None;
+        }
         // Another thread's rerun of the node holds it only for that run,
         // which never waits, so this waits it out. The claim is noted first,
         // so a rerun that finds the node Computing sees it.
