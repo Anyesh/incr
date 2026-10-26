@@ -4169,6 +4169,23 @@ fn two_thread_group_exit_seeds() {
     });
 }
 
+/// 0x4df26 (second runtime), over several schedules: a group verify that
+/// failed on a New member, which no verify of that record can claim, left
+/// its released claims in the group, so every later visit to a member
+/// claimed them all again; the two threads' claim passes waited on each
+/// other, one was wounded, and the read it lost left node 6 Cyclic where
+/// every order of the two reads leaves it New.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_unverifiable_group_seeds() {
+    let case = gen_case(0x4df26, true, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x4df26);
+        }
+    });
+}
+
 /// Two-thread seeds with a second runtime, each over several schedules.
 /// 0x43c2 and 0x4c08, with no cycles, compare with the unbounded run: a
 /// concurrent `Get2` panicked "dependency cycle" before a doomed frame's
