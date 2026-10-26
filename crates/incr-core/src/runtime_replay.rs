@@ -2919,21 +2919,23 @@ impl<C: Cells> Runtime<C> {
     fn frames_below(&self) -> Vec<Below> {
         let rt = self.runtime_id;
         let mut frames: Vec<Below> = self.dep_stack.with(|s| {
-            let len = s.frames.len();
-            s.frames
-                .iter()
-                .rev()
-                .enumerate()
-                .take_while(|(_, f)| f.rt() == rt)
-                .map(|(i, f)| Below {
+            let mut frames = Vec::new();
+            for i in (0..s.frames.len()).rev() {
+                if s.frames[i].rt() != rt {
+                    break;
+                }
+                let step = s.step(i);
+                let f = &s.frames[i];
+                frames.push(Below {
                     node: f.node.0,
                     cidx: f.cidx,
-                    depth: (len - i) as u32,
+                    depth: i as u32 + 1,
                     ctl: f.ctl,
-                    step: f.step(),
+                    step,
                     path: 0,
-                })
-                .collect()
+                });
+            }
+            frames
         });
         // Bottom up, each frame's path extends the one below it.
         let mut below: Option<(u32, u64, replay::Step)> = None;
@@ -4325,8 +4327,10 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let below = depth.checked_sub(1)?;
         let (ctl, mut step) = self.dep_stack.with(|s| {
-            let f = s.frames.get(below.checked_sub(1)? as usize)?;
-            (f.rt() == rt && f.cidx + 1 == cidx).then(|| (f.ctl, f.step()))
+            let i = below.checked_sub(1)? as usize;
+            let f = s.frames.get(i)?;
+            let ctl = f.ctl;
+            (f.rt() == rt && f.cidx + 1 == cidx).then(|| (ctl, s.step(i)))
         })?;
         let (seq, path) = replay::run_at(rt, ctl, below)?;
         let virtual_below = replay::peek(|c| {
@@ -5058,13 +5062,18 @@ impl<C: Cells> Runtime<C> {
         let (from, path) = base.map_or((0, 0), |(at, path)| (at + 1, path));
         replay::with_seqs(|seqs| {
             self.dep_stack.with(|s| {
-                (s.frames.iter().zip(1..))
-                    .filter(|(f, _)| f.rt() == rt && (from..cidx).contains(&f.cidx))
-                    .fold(path, |path, (f, depth)| {
-                        let mut step = f.step();
-                        step.seq = seqs.of(rt, f.ctl, depth);
-                        replay::extend_path(path, step)
-                    })
+                let mut path = path;
+                for i in 0..s.frames.len() {
+                    let f = &s.frames[i];
+                    if f.rt() != rt || !(from..cidx).contains(&f.cidx) {
+                        continue;
+                    }
+                    let ctl = f.ctl;
+                    let mut step = s.step(i);
+                    step.seq = seqs.of(rt, ctl, i as u32 + 1);
+                    path = replay::extend_path(path, step);
+                }
+                path
             })
         })
     }

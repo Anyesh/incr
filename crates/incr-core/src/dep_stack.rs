@@ -19,9 +19,11 @@
 //! and their positions on the thread.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
 use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED, UNREGENERABLE};
+use crate::fx::FxBuildHasher;
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -51,8 +53,34 @@ pub struct Frame {
 }
 
 /// Up to this many deps a frame finds how often it read a node by scanning
-/// them, at a cost bounded by this constant, which note work leaves out.
+/// them, at a cost bounded by this constant, which note work leaves out;
+/// past it, through [`ReadCounts`], so that a frame reading n nodes pays
+/// O(n) for their ordinals, not O(n^2).
 const SCAN_DEPS: usize = 32;
+
+/// Lookups a frame past `SCAN_DEPS` deps answers by scanning before it
+/// builds [`ReadCounts`]. Filling the table costs about 10 scans of the
+/// same deps when they repeat a few nodes and over 100 when all differ, so
+/// a frame looked up a few times pays only its scans, and one looked up
+/// per child of a fan-out pays this many before its lookups turn constant.
+const SCANS_BEFORE_COUNTING: u32 = 32;
+
+/// A frame's reads per node, keyed as `Frame::reading`, over the first
+/// `counted` of its deps, which only grow while the frame is on the stack.
+/// Kept beside the frames rather than in them, so that a frame, which
+/// every compute level builds on its stack, stays its size. They are the
+/// frame's at their index only while its control block is `ctl` and has
+/// `reads_counted` set, so a frame's pop leaves them in place.
+struct ReadCounts {
+    ctl: *const ComputeCtl,
+    scans: u32,
+    counted: usize,
+    by_node: HashMap<u64, u32, FxBuildHasher>,
+}
+
+fn read_key(&(dep, generation): &(NodeId, u32)) -> u64 {
+    u64::from(dep.0) | (u64::from(generation) << 32)
+}
 
 impl Frame {
     #[inline(always)]
@@ -74,30 +102,13 @@ impl Frame {
         self.read_rt != self.rt()
     }
 
-    /// How many times the frame has read the node it reads now, this read
-    /// included.
-    fn reads_of_reading(&self) -> u32 {
-        if self.deps.len() > SCAN_DEPS {
-            crate::replay::note_work(self.deps.len());
-        }
-        self.deps
-            .iter()
-            .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == self.reading)
-            .count() as u32
-    }
-
-    /// The frame's step in the paths of the frames above it.
-    pub(crate) fn step(&self) -> Step {
+    /// The frame's step in the paths of the frames above it, given how
+    /// many times it has read the node it reads now.
+    fn step_with(&self, reads: u32) -> Step {
         // SAFETY: the frame is on the stack, so its control block is live
         // (see `Frame::ctl`).
         let member = unsafe { &*self.ctl }.has(BUFFERED);
-        Step::of(
-            self.rt(),
-            self.node.0,
-            member,
-            self.reading,
-            self.reads_of_reading(),
-        )
+        Step::of(self.rt(), self.node.0, member, self.reading, reads)
     }
 }
 
@@ -129,6 +140,13 @@ pub struct Frames {
     /// against its byte budget there, since at a doom the stack is past it.
     /// Indexes increase, and a hold drops the entries at or above its own.
     holds: Vec<(u32, *const ComputeCtl, usize)>,
+    /// The read counts of frames past `SCAN_DEPS` deps, by frame index,
+    /// indexes increasing. Popped frames' entries go at the next counted
+    /// lookup, so until then a thread keeps the tables of its last frames
+    /// looked up more than `SCANS_BEFORE_COUNTING` times: a constant times
+    /// the deps their nodes keep. Dropping them at a pop or a context's
+    /// close would cost every compute, or every replayed level's stack.
+    read_counts: Vec<(u32, ReadCounts)>,
 }
 
 /// A placement [`DepStack::place_next_at`] replaced, to restore.
@@ -244,6 +262,79 @@ impl Frames {
             bias: 0,
             placed: u32::MAX,
             holds: Vec::new(),
+            read_counts: Vec::new(),
+        }
+    }
+
+    /// Frame `i`'s step in the paths of the frames above it.
+    pub(crate) fn step(&mut self, i: usize) -> Step {
+        let reads = self.reads_of_reading(i);
+        self.frames[i].step_with(reads)
+    }
+
+    /// How many times frame `i` has read the node it reads now, this read
+    /// included.
+    fn reads_of_reading(&mut self, i: usize) -> u32 {
+        self.reads_of_key(i, self.frames[i].reading)
+    }
+
+    /// How many reads frame `i` has recorded of the node keyed `key`.
+    fn reads_of_key(&mut self, i: usize, key: u64) -> u32 {
+        let deps = &self.frames[i].deps;
+        if deps.len() <= SCAN_DEPS {
+            return deps.iter().filter(|d| read_key(d) == key).count() as u32;
+        }
+        self.counted_reads_of(i, key)
+    }
+
+    #[inline(never)]
+    fn counted_reads_of(&mut self, i: usize, key: u64) -> u32 {
+        self.drop_popped_counts();
+        let at = match self.read_counts.binary_search_by_key(&(i as u32), |e| e.0) {
+            Ok(at) => at,
+            Err(at) => {
+                let counts = ReadCounts {
+                    ctl: std::ptr::null(),
+                    scans: 0,
+                    counted: 0,
+                    by_node: HashMap::default(),
+                };
+                self.read_counts.insert(at, (i as u32, counts));
+                at
+            }
+        };
+        let frame = &self.frames[i];
+        let counts = &mut self.read_counts[at].1;
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        let ctl = unsafe { &*frame.ctl };
+        if counts.ctl != frame.ctl || !ctl.reads_counted() {
+            counts.ctl = frame.ctl;
+            counts.scans = 0;
+            counts.counted = 0;
+            // A fresh table, since clearing one costs its capacity, which
+            // a wider frame counted here before may have left large.
+            counts.by_node = HashMap::default();
+            ctl.count_reads();
+        }
+        let deps = &frame.deps;
+        if counts.scans < SCANS_BEFORE_COUNTING {
+            counts.scans += 1;
+            crate::replay::note_work(deps.len());
+            return deps.iter().filter(|d| read_key(d) == key).count() as u32;
+        }
+        crate::replay::note_work(deps.len() - counts.counted);
+        for d in &deps[counts.counted..] {
+            *counts.by_node.entry(read_key(d)).or_default() += 1;
+        }
+        counts.counted = deps.len();
+        counts.by_node.get(&key).copied().unwrap_or(0)
+    }
+
+    fn drop_popped_counts(&mut self) {
+        let len = self.frames.len() as u32;
+        while self.read_counts.last().is_some_and(|e| e.0 >= len) {
+            self.read_counts.pop();
         }
     }
 
@@ -283,10 +374,15 @@ pub trait DepStack: 'static {
 
     /// Push a frame for `node` of runtime `rt` at the top of the stack,
     /// with the frame's depth as its conceptual-stack position, which is
-    /// returned.
+    /// returned. `ctl` serves this frame only: the read-count side table
+    /// tells frames at one index apart by it.
     #[doc(hidden)]
     #[inline(always)]
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
+        debug_assert!(
+            !ctl.reads_counted(),
+            "incr-core: a control block serves one frame"
+        );
         crate::lock_order::enter_frame();
         // Left to the inliner, any change to what the push writes has
         // moved this closure out of line, at about 57 instructions a push.
@@ -301,9 +397,14 @@ pub trait DepStack: 'static {
     }
 
     /// Push a frame at conceptual-stack position `cidx`: an episode's
-    /// member runs all sit at the root's.
+    /// member runs all sit at the root's. `ctl` serves this frame only, as
+    /// in [`Self::push_frame`].
     #[doc(hidden)]
     fn push_frame_at(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl, cidx: u32) {
+        debug_assert!(
+            !ctl.reads_counted(),
+            "incr-core: a control block serves one frame"
+        );
         crate::lock_order::enter_frame();
         self.with(|s| s.push(Frames::frame(node, rt, ctl, cidx)))
     }
@@ -434,13 +535,10 @@ pub trait DepStack: 'static {
     /// recorded: a read's ordinal less one.
     fn reads_of(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> u32 {
         self.with(|s| {
-            s.active(rt).map_or(0, |top| {
-                if top.deps.len() > SCAN_DEPS {
-                    crate::replay::note_work(top.deps.len());
-                }
-                top.deps.iter().filter(|&&d| d == (dep, generation)).count() as u32
-            })
+            s.active(rt)?;
+            Some(s.reads_of_key(s.frames.len() - 1, read_key(&(dep, generation))))
         })
+        .unwrap_or(0)
     }
 
     /// Records `dep` in `rt`'s top frame, for a diverted Clean read that
@@ -589,7 +687,8 @@ pub trait DepStack: 'static {
                 cidx: top.cidx,
                 depth,
             };
-            Some((f, top.reading, top.reads_of_reading()))
+            let reading = top.reading;
+            Some((f, reading, s.reads_of_reading(depth as usize - 1)))
         })
     }
 
@@ -597,15 +696,20 @@ pub trait DepStack: 'static {
     /// how many times it has read it, this read included.
     fn active_read(&self, rt: RuntimeId) -> Option<(NodeId, u32, u64, u32)> {
         self.with(|s| {
-            s.active(rt)
-                .map(|top| (top.node, top.cidx, top.reading, top.reads_of_reading()))
+            let (node, cidx, reading) =
+                s.active(rt).map(|top| (top.node, top.cidx, top.reading))?;
+            Some((node, cidx, reading, s.reads_of_reading(s.frames.len() - 1)))
         })
     }
 
     /// How many times `rt`'s active frame has read the node it reads
     /// now, this read included.
     fn reads_of_current(&self, rt: RuntimeId) -> u32 {
-        self.with(|s| s.active(rt).map_or(0, |top| top.reads_of_reading()))
+        self.with(|s| {
+            s.active(rt)?;
+            Some(s.reads_of_reading(s.frames.len() - 1))
+        })
+        .unwrap_or(0)
     }
 
     fn active_frame(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32)> {
@@ -996,6 +1100,130 @@ mod tests {
         })
         .join()
         .unwrap();
+        s.pop_frame();
+    }
+
+    /// A frame's read counts agree with its deps on both sides of
+    /// `SCAN_DEPS`, Clean reads recorded between the counted ones too.
+    #[test]
+    fn read_counts_follow_the_deps_past_the_scan_limit() {
+        let s = LocalDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        for i in 0..3 * SCAN_DEPS as u32 {
+            let node = NodeId(i % 7);
+            if i % 3 == 0 {
+                s.record_dep(rt(1), node, 1, 4);
+            } else {
+                s.record_read(rt(1), node, 1);
+                let want = (0..=i).filter(|k| k % 7 == i % 7).count() as u32;
+                assert_eq!(s.reads_of_current(rt(1)), want, "read {i}");
+            }
+            assert_eq!(
+                s.reads_of(rt(1), NodeId(3), 1),
+                (0..=i).filter(|k| k % 7 == 3).count() as u32,
+                "read {i}"
+            );
+            assert_eq!(s.reads_of(rt(1), NodeId(3), 2), 0);
+        }
+        s.pop_frame();
+    }
+
+    /// Nested frames past `SCAN_DEPS` keep their own counts, and a frame
+    /// pushed where a counted one popped, with nothing counted below in
+    /// between, starts from its own deps, for the same node too.
+    #[test]
+    fn read_counts_belong_to_their_frame() {
+        let s = LocalDepStack::new();
+        let outer = ComputeCtl::new(0);
+        let reads = 2 * SCAN_DEPS as u32;
+        s.push_frame(rt(1), NodeId(100), &outer);
+        for _ in 0..reads {
+            s.record_read(rt(1), NodeId(1), 1);
+        }
+        assert_eq!(s.reads_of_current(rt(1)), reads);
+        for (round, inner) in [NodeId(2), NodeId(3), NodeId(3)].into_iter().enumerate() {
+            let ctl = ComputeCtl::new(0);
+            s.push_frame(rt(1), NodeId(101), &ctl);
+            for k in 1..=reads {
+                s.record_read(rt(1), inner, 1);
+                assert_eq!(s.reads_of_current(rt(1)), k, "round {round}");
+                assert_eq!(s.reads_of(rt(1), NodeId(1), 1), 0, "round {round}");
+            }
+            s.pop_frame();
+        }
+        assert_eq!(s.reads_of(rt(1), NodeId(1), 1), reads);
+        s.pop_frame();
+    }
+
+    /// A frame counted at an index where a much wider one was counted
+    /// before starts from a table its own size, so that resetting a
+    /// reused entry costs what the new frame reads, not what the old one
+    /// did.
+    #[test]
+    fn a_reused_count_entry_starts_small() {
+        let s = LocalDepStack::new();
+        let outer = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &outer);
+        for (round, width) in [(0, 64 * SCAN_DEPS as u32), (1, SCAN_DEPS as u32 + 1)] {
+            let ctl = ComputeCtl::new(0);
+            s.push_frame(rt(1), NodeId(101), &ctl);
+            for k in 0..width {
+                s.record_read(rt(1), NodeId(k), 1);
+            }
+            for _ in 0..=SCANS_BEFORE_COUNTING {
+                assert_eq!(s.reads_of_current(rt(1)), 1, "round {round}");
+            }
+            let capacity = s.with(|f| f.read_counts[0].1.by_node.capacity());
+            assert!(
+                capacity < 4 * width as usize,
+                "round {round}: {capacity} slots for {width} reads"
+            );
+            s.pop_frame();
+        }
+        s.pop_frame();
+    }
+
+    /// A counted lookup drops the counts of popped frames and keeps those
+    /// of frames still on the stack.
+    #[test]
+    fn a_lookup_drops_popped_counts() {
+        let s = LocalDepStack::new();
+        let (outer, inner) = (ComputeCtl::new(0), ComputeCtl::new(0));
+        let reads = 2 * SCAN_DEPS as u32;
+        for ctl in [&outer, &inner] {
+            s.push_frame(rt(1), NodeId(100), ctl);
+            for _ in 0..reads {
+                s.record_read(rt(1), NodeId(1), 1);
+            }
+            assert_eq!(s.reads_of_current(rt(1)), reads);
+        }
+        s.pop_frame();
+        assert_eq!(s.reads_of_current(rt(1)), reads);
+        assert_eq!(
+            s.with(|f| f.read_counts.iter().map(|e| e.0).collect::<Vec<_>>()),
+            [0]
+        );
+        s.pop_frame();
+    }
+
+    /// A frame past `SCAN_DEPS` deps looked up a few times answers by
+    /// scanning and builds no table.
+    #[test]
+    fn a_few_lookups_build_no_table() {
+        let s = LocalDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        let reads = 4 * SCAN_DEPS as u32;
+        for k in 0..reads {
+            s.record_read(rt(1), NodeId(k % 3), 1);
+        }
+        for _ in 0..SCANS_BEFORE_COUNTING {
+            assert_eq!(s.reads_of(rt(1), NodeId(0), 1), reads.div_ceil(3));
+        }
+        assert_eq!(s.with(|f| f.read_counts[0].1.by_node.capacity()), 0);
+        assert_eq!(s.reads_of(rt(1), NodeId(0), 1), reads.div_ceil(3));
+        assert!(s.with(|f| f.read_counts[0].1.by_node.capacity()) > 0);
         s.pop_frame();
     }
 }

@@ -438,6 +438,8 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
+    /// See [`Self::reads_counted`].
+    reads_counted: Cell<bool>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
@@ -468,6 +470,7 @@ impl ComputeCtl {
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
+            reads_counted: Cell::new(false),
             children: Cell::new(std::ptr::null()),
             keep,
         }
@@ -483,6 +486,17 @@ impl ComputeCtl {
         // SAFETY: the caller's frame is running, so the runtime holding
         // the resolver is borrowed and in place.
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
+    }
+
+    /// Whether the dep stack counts this frame's reads in its side table.
+    /// A control block serves one frame, so a fresh one at a popped
+    /// frame's address says no.
+    pub(crate) fn reads_counted(&self) -> bool {
+        self.reads_counted.get()
+    }
+
+    pub(crate) fn count_reads(&self) {
+        self.reads_counted.set(true);
     }
 
     #[inline(always)]
