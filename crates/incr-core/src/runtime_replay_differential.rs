@@ -4406,6 +4406,28 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread_e4aa8b2e() {
     });
 }
 
+/// Seed 0x783f, two threads at a byte or frame budget: thread 1 reads 11
+/// while thread 0 reads 12, both on the cycle 11, 12, 13, 14, 7, and every
+/// order of the two reads gives 4. A doom replay's direct rerun of 14 reads
+/// 7, whose read unwinds at once; 14's `Catch` took that engine unwind for
+/// a user panic and 14 landed 12, so both reads returned 24.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_user_catch_of_an_engine_unwind_lands_no_value_an_order_gives() {
+    let seed = 0x783f;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    quiet(|| {
+        assert_eq!(run::<Shared>(&case, None, 0)[3].0, Out::Value(4));
+        for (frames, bytes) in [(None, 16 * 1024), (Some(1), 0)] {
+            for _ in 0..40 {
+                let t = run_two(&case, &phases, frames, bytes);
+                assert_eq!(t[3].0, Out::Value(4), "budget {frames:?}/{bytes}");
+            }
+        }
+    });
+}
+
 /// Seed 0x57c2661 cut to `Get(12)` on a fresh runtime with 24 at 4: a
 /// cycle reaches the read unbounded, aborting 13's episode, which is no
 /// walk's. At budgets 1 to 3 a doom discards a member run of that episode

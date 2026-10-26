@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
+use crate::attempt::Patience;
 use crate::cells::Cells;
 use crate::cycle::ComputeCtl;
 use crate::cycle_state::{self, UnwindKind};
@@ -14,6 +15,7 @@ use crate::deferred::Deferred;
 use crate::fx::FxBuildHasher;
 use crate::hold::{self, Held};
 use crate::node::{NodeData, NodeId};
+use crate::reserve;
 use crate::segmented_nodes::IN_GROUP;
 use crate::state::{self, NodeState};
 
@@ -126,6 +128,22 @@ impl<C: Cells> Runtime<C> {
         }
         let cell = state::cell_key::<C>(node.state_cell());
         if !hold::holds(cell) {
+            // A waiter took this claim's landing over in this outermost
+            // entry: it is never held again, or the waiter's next read could
+            // be held up and take it again, so a read could restart without
+            // bound. It publishes at once, as a landing no other thread may
+            // trust: Dirty and never verified, so another reader runs it
+            // again. One with an entry still lands into it.
+            if reserve::taken((self.runtime_id, id.0)) {
+                if !matches!(
+                    target,
+                    NodeState::Clean | NodeState::Failed | NodeState::Cyclic
+                ) {
+                    return None;
+                }
+                node.set_verified_at(0);
+                return Some(self.land_now(id, node, NodeState::Dirty, NodeState::Dirty, unrun));
+            }
             if !hold::consulted() && !hold::cut_kept(self.runtime_id, id.0) {
                 return None;
             }
@@ -144,7 +162,8 @@ impl<C: Cells> Runtime<C> {
             );
             debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
         }
-        hold::land(cell, target, flagged, unrun);
+        let landed = hold::land(cell, target, flagged, unrun);
+        debug_assert!(landed, "incr-core: a held landing has its entry");
         Some(target)
     }
 
@@ -174,6 +193,24 @@ impl<C: Cells> Runtime<C> {
         ) {
             bag.push_erased(own);
         }
+    }
+
+    /// [`Self::open_hold`] of a member of an episode held although a waiter
+    /// took one of its members over.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn open_hold_even_taken(&self, id: NodeId, node: &NodeData<C>, first: bool) {
+        let cell = state::cell_key::<C>(node.state_cell());
+        let own = hold::open_even_taken(
+            cell,
+            self.runtime_id,
+            id.0,
+            node.generation(),
+            first,
+            Some(node.verified_at()),
+            None,
+        );
+        debug_assert!(own.is_none(), "incr-core: an episode member keeps no value");
     }
 
     /// Whether `c` has a dependent as `Local` would list it: a held
@@ -220,17 +257,24 @@ impl<C: Cells> Runtime<C> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         let cell = state::cell_key::<C>(node.state_cell());
-        hold::view(cell)?;
+        // Pinned, so no waiter takes the entry while the delete decides.
+        if !hold::pin(cell) {
+            return None;
+        }
         let change = {
             let inner = self.inner.read();
-            if node.generation() != handle.generation() {
-                return Some(SingleClaim::Gone);
-            }
-            if self.owns_nodes(&inner, slot) {
-                return Some(SingleClaim::Owner);
-            }
-            if self.has_dependents_seen(slot, &inner.dependents[slot as usize]) {
-                return Some(SingleClaim::HasDependents);
+            let refused = if node.generation() != handle.generation() {
+                Some(SingleClaim::Gone)
+            } else if self.owns_nodes(&inner, slot) {
+                Some(SingleClaim::Owner)
+            } else if self.has_dependents_seen(slot, &inner.dependents[slot as usize]) {
+                Some(SingleClaim::HasDependents)
+            } else {
+                None
+            };
+            if refused.is_some() {
+                hold::unpin(cell);
+                return refused;
             }
             // Only another thread's set walk moves the word meanwhile, and
             // only between Computing and ComputingDirty.
@@ -269,11 +313,13 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The attempt ended without a wound: every held landing lands, in
-    /// landing order, with what it deferred.
+    /// landing order, with what it deferred. False if a waiter wounded it
+    /// first: they are retracted instead, and the attempt retries.
     #[cold]
     #[inline(never)]
-    pub(super) fn publish_held(&self) {
-        self.publish_own();
+    #[must_use]
+    pub(super) fn publish_held(&self) -> bool {
+        self.publish_own_parked()
     }
 
     /// The attempt was wounded: every held landing goes back.
@@ -283,7 +329,26 @@ impl<C: Cells> Runtime<C> {
         let hold::Taken {
             entries, cut_recs, ..
         } = hold::take(self.runtime_id);
-        self.retract_entries(entries, cut_recs);
+        self.retract_entries(entries, cut_recs, true);
+    }
+
+    /// A claim wait on `on`, past `REGISTER_AFTER`: if another thread holds
+    /// `on`'s landing and has made no engine progress through `patience`,
+    /// it may be in user code that waits on this thread, so its attempt is
+    /// wounded and the landing retracted here ([`hold::hand_over`]). True if
+    /// it was; the wait then finds `on` landed unrun.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn hand_over(&self, on: NodeId, patience: &mut Patience) -> bool {
+        let cell = state::cell_key::<C>(self.nodes.get(on.0).state_cell());
+        let Some(e) = hold::hand_over(cell, (self.runtime_id, on.0), patience) else {
+            return false;
+        };
+        // The retraction is the owner's: none of this thread's contexts
+        // reserves what it lands.
+        let _scope = reserve::Scope::new(None);
+        self.retract_entries(vec![e], Vec::new(), false);
+        true
     }
 
     /// A wound's first step, before its unwind lands anything: the
@@ -391,8 +456,14 @@ impl<C: Cells> Runtime<C> {
             if unwound || cycle_state::wounded() || hold::tainted(self.runtime_id) {
                 self.retract_held();
                 self.taint_reader();
+            } else if !self.publish_own_parked() {
+                self.taint_reader();
+                cycle_state::settle_hold();
+                if !std::thread::panicking() {
+                    drop(outcome);
+                    self.raise_wound();
+                }
             } else {
-                self.publish_own();
                 // The frames' pops passed their HOLD to the reader, but
                 // what it read is published now.
                 if !reader_held {
@@ -426,11 +497,23 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    fn publish_own(&self) {
-        // A cut claim's record stays as the cut left it.
+    fn publish_own_parked(&self) -> bool {
+        self.park(super::ParkPoint::BeforeHeldPublish);
+        self.publish_own()
+    }
+
+    fn publish_own(&self) -> bool {
         let hold::Taken {
-            entries, episodes, ..
+            entries,
+            episodes,
+            cut_recs,
+            wounded,
         } = hold::take(self.runtime_id);
+        if wounded {
+            self.retract_entries(entries, cut_recs, true);
+            return false;
+        }
+        // A cut claim's record stays as the cut left it.
         if episodes != 0 {
             // Before the members land, so a read of one of their landings
             // also reads the count.
@@ -455,10 +538,11 @@ impl<C: Cells> Runtime<C> {
         // An engine panic partway leaves no node Computing without an owner:
         // what is left goes back as on a wound (G9).
         if let Err(payload) = published {
-            self.retract_entries(rest.collect(), Vec::new());
+            self.retract_entries(rest.collect(), Vec::new(), true);
             bag.drain_carried(payload);
         }
         bag.drain(self);
+        true
     }
 
     fn publish_one(&self, e: Held, held: &Targets, bag: &mut Deferred<C>) {
@@ -543,16 +627,22 @@ impl<C: Cells> Runtime<C> {
     /// its claim found it, unrun. Records and dep lists first, then
     /// values, then the state words, so no node is visible before its
     /// fields are back. Runs no user code; the attempt's values drop at
-    /// the drain.
+    /// the drain. `own` is false for a waiter's retraction of another
+    /// thread's entry, whose release this thread's walks did not make.
     fn retract_entries(
         &self,
         mut entries: Vec<Held>,
         cut_recs: Vec<(u32, Option<Arc<GroupInfo>>)>,
+        own: bool,
     ) {
         entries.reverse();
         // The retracted claims land unrun, as a release's do.
         if !entries.is_empty() {
-            self.count_release();
+            if own {
+                self.count_release();
+            } else {
+                self.count_foreign_release();
+            }
         }
         let mut bag = Deferred::new();
         let mut lost = vec![false; entries.len()];

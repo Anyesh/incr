@@ -241,3 +241,38 @@ fn alternating_runtimes_switch_back_on_exit() {
     drop(s1);
     drop(l1);
 }
+
+/// An engine call from a destructor that raises and catches a discard of
+/// its own.
+struct DiscardOnDrop;
+
+impl Drop for DiscardOnDrop {
+    fn drop(&mut self) {
+        super::KeptUnwind::around(|| {
+            super::set_unwind_kind(Some(super::UnwindKind::Discard));
+            super::set_unwind_kind(None);
+        });
+    }
+}
+
+/// A doomed frame runs on past its placeholder and panics in user code,
+/// and a destructor's engine call raises and catches a discard: the lazy
+/// doom's flight stays open for its waiters until the frame's end closes
+/// it.
+#[test]
+fn a_destructors_discard_leaves_a_lazy_doom_in_flight() {
+    crate::attempt::begin();
+    super::open_lazy(1);
+    assert!(crate::attempt::in_flight());
+    let unwound = std::panic::catch_unwind(|| {
+        let _guard = DiscardOnDrop;
+        panic!("user panic past the placeholder");
+    });
+    assert!(unwound.is_err());
+    assert!(
+        crate::attempt::in_flight(),
+        "the destructor's discard closed the lazy doom's flight"
+    );
+    assert!(!super::end_lazy(1));
+    assert!(!crate::attempt::in_flight());
+}
