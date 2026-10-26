@@ -426,7 +426,7 @@ impl Notes {
     /// Puts the group parked with `copy` back under `key`, as noting
     /// `copy` again above `base` would, when `copy` is the one its take
     /// handed out, delivered where it was taken, and no note of its log
-    /// came or went since. Any other copy of the log unparks it for good.
+    /// came or went since. Any other copy of the log drops it.
     fn unpark(&mut self, rt: RuntimeId, key: PayloadKey, base: u32, copy: &SharedCopy<'_>) -> bool {
         if self.parked.is_empty() {
             return false;
