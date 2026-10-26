@@ -5537,8 +5537,11 @@ impl<C: Cells> Runtime<C> {
         if !C::SINGLE_THREADED && unrun {
             reserve::note((self.runtime_id, id.0), node.generation());
         }
-        if !C::SINGLE_THREADED && !unrun && target == NodeState::Dirty {
-            reserve::note_root((self.runtime_id, id.0), node.generation());
+        if !C::SINGLE_THREADED && !unrun && matches!(target, NodeState::Dirty | NodeState::New) {
+            if target == NodeState::Dirty {
+                reserve::note_root((self.runtime_id, id.0), node.generation());
+            }
+            reserve::note_walk((self.runtime_id, id.0), node.generation());
         }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
