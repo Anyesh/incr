@@ -5,10 +5,12 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use super::Runtime;
+use super::race_tests::{park_at, Gate};
+use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::Cycle;
 use crate::handle::Incr;
+use crate::node::NodeId;
 use crate::state::NodeState;
 
 fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
@@ -1062,4 +1064,358 @@ fn a_cycle_caught_under_a_local_root_holds_nothing_past_the_read() {
     assert_eq!(LOCAL_RT.with(|l| l.get(r)), 7777);
     assert!(!crate::hold::active(), "the thread holds past its exit");
     assert_eq!(crate::hold::held_count(), 0);
+}
+
+/// Waits for `flag`, or gives up after a few seconds so that a run the
+/// test did not plan for still ends.
+fn wait_for(flag: &AtomicBool) {
+    wait_until(|| flag.load(Ordering::SeqCst));
+}
+
+fn wait_until(done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Thread 1's read of A holds A's cycle episode and then waits on B's b1,
+/// which thread 2 is running; b1 then reads the held member of A. Each
+/// thread waits on the other across two runtimes, so the wait registry
+/// must see thread 1's held landing of A while it waits in B.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wait_across_runtimes_on_a_held_episode_ends() {
+    crate::child_test::run_in_child(
+        "runtime::hold_tests::shared_wait_across_runtimes_on_a_held_episode_ends",
+        || {
+            let ra = Arc::new(Runtime::<Shared>::new());
+            let rb = Arc::new(Runtime::<Shared>::new());
+            let (c1, _) = two_cycle(&ra);
+            let (claimed, held) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let b1 = {
+                let (ra, claimed, held) = (ra.clone(), claimed.clone(), held.clone());
+                rb.create_query(move |_| {
+                    claimed.store(true, Ordering::SeqCst);
+                    wait_for(&held);
+                    ra.get(c1) + 1
+                })
+            };
+            let q = {
+                let (rb, held) = (rb.clone(), held.clone());
+                ra.create_query(move |rt| {
+                    let v = rt.get(c1);
+                    held.store(true, Ordering::SeqCst);
+                    v + rb.get(b1)
+                })
+            };
+            let t2 = {
+                let rb = rb.clone();
+                std::thread::spawn(move || rb.get(b1))
+            };
+            wait_for(&claimed);
+            assert_eq!(ra.get(q), 100 + 101);
+            assert_eq!(t2.join().unwrap(), 101);
+        },
+    )
+    .assert_clean();
+}
+
+/// Thread 2's walk of A's c, inside B's b1, loads c New, and thread 1's
+/// read of q claims c and lands A's c-d cycle held. Thread 2's read never
+/// restarts after a release, so only the walk's own check keeps it off the
+/// held run's deps. In round 1 thread 2 reads c's deps [d] while thread 1
+/// holds them, and thread 1, waiting on b1, is wounded. In round 2 thread
+/// 2 reads [d] again and stops before checking them; thread 3, older than
+/// both from its wait on g, waits on c inside B's x, and thread 1 waits on
+/// x and is wounded, retracting c and d to New before thread 2's check,
+/// which a check of the open mark alone misses. A walk that kept either
+/// expansion computes d before c and enters the cycle at d, which has no
+/// strategy; a read from c gets c's fallback.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_walk_skips_deps_another_threads_retracted_held_run_installed() {
+    crate::child_test::run_in_child(
+        "runtime::hold_tests::shared_walk_skips_deps_another_threads_retracted_held_run_installed",
+        || {
+            let ra = Arc::new(Runtime::<Shared>::new());
+            let rb = Arc::new(Runtime::<Shared>::new());
+            let (c, _) = two_cycle(&ra);
+            let b1 = {
+                let ra = ra.clone();
+                rb.create_query(move |_| ra.get(c) + 1)
+            };
+            let (g_started, g_go, reads_c) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let g = {
+                let (g_started, g_go) = (g_started.clone(), g_go.clone());
+                rb.create_query(move |_| {
+                    g_started.store(true, Ordering::SeqCst);
+                    wait_for(&g_go);
+                    0
+                })
+            };
+            let x = {
+                let (ra, reads_c) = (ra.clone(), reads_c.clone());
+                rb.create_query(move |rt| {
+                    let gv = rt.get(g);
+                    wait_for(&reads_c);
+                    ra.get(c) + 1 + gv
+                })
+            };
+            let (held, waiting) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let q = {
+                let (rb, held, waiting) = (rb.clone(), held.clone(), waiting.clone());
+                ra.create_query(move |rt| {
+                    let v = rt.get(c);
+                    let round = held.fetch_add(1, Ordering::SeqCst) + 1;
+                    wait_until(|| waiting.load(Ordering::SeqCst) >= round);
+                    v + rb.get(if round == 2 { x } else { b1 })
+                })
+            };
+            let c_id = NodeId(c.erase().slot());
+            let (before, after, retracted) = (Gate::new(), Gate::new(), Gate::new());
+            park_at(
+                &ra,
+                vec![
+                    (ParkPoint::WalkBeforeDeps(c_id), before.clone()),
+                    (ParkPoint::WalkAfterDeps(c_id), after.clone()),
+                    (ParkPoint::WoundRetracted, retracted.clone()),
+                ],
+            );
+            let t4 = {
+                let rb = rb.clone();
+                std::thread::spawn(move || rb.get(g))
+            };
+            wait_for(&g_started);
+            let t3 = {
+                let rb = rb.clone();
+                std::thread::spawn(move || rb.get(x))
+            };
+            wait_until(|| crate::waits::registered() >= 1);
+            g_go.store(true, Ordering::SeqCst);
+            assert_eq!(t4.join().unwrap(), 0);
+            wait_until(|| crate::waits::registered() == 0);
+
+            let t2 = {
+                let rb = rb.clone();
+                std::thread::spawn(move || {
+                    super::NO_RESTART_HERE.with(|f| f.set(true));
+                    catch_unwind(AssertUnwindSafe(|| rb.get(b1)))
+                })
+            };
+            before.wait_parked();
+            let t1 = {
+                let ra = ra.clone();
+                std::thread::spawn(move || ra.get(q))
+            };
+            after.wait_parked();
+            after.release();
+            wait_until(|| held.load(Ordering::SeqCst) >= 1);
+            before.arm();
+            before.release();
+            wait_until(|| crate::waits::registered() >= 1);
+            waiting.store(1, Ordering::SeqCst);
+            retracted.wait_parked();
+            wait_until(|| before.reached() || t2.is_finished());
+            if t2.is_finished() {
+                let b = t2.join().unwrap().map_err(panic_message);
+                panic!("thread 2's read ended in round 1: {b:?}");
+            }
+            before.wait_parked();
+
+            retracted.arm();
+            retracted.release();
+            wait_until(|| held.load(Ordering::SeqCst) >= 2);
+            after.arm();
+            before.arm();
+            before.release();
+            after.wait_parked();
+            reads_c.store(true, Ordering::SeqCst);
+            wait_until(|| crate::waits::registered() >= 1);
+            waiting.store(2, Ordering::SeqCst);
+            retracted.wait_parked();
+            before.wait_parked();
+            after.release();
+            let b = t2.join().unwrap().map_err(panic_message);
+            assert_eq!(b, Ok(101));
+
+            waiting.store(3, Ordering::SeqCst);
+            before.release();
+            retracted.release();
+            assert_eq!(t3.join().unwrap(), 101);
+            assert_eq!(t1.join().unwrap(), 100 + 101);
+        },
+    )
+    .assert_clean();
+}
+
+/// A read of A holds `k` landings of A's two-node cycles, then reads `n`
+/// nodes of B, each a first entry of B inside A's entry. Prints the time
+/// of the read for the sizes given.
+#[test]
+#[ignore = "a timing probe"]
+fn shared_first_entries_under_held_landings_probe() {
+    for size in [1000usize, 2000, 4000, 8000] {
+        let ra = Runtime::<Shared>::new();
+        let rb = Arc::new(Runtime::<Shared>::new());
+        let cycles: Vec<Incr<i64>> = (0..size / 2).map(|_| two_cycle(&ra).0).collect();
+        let bs: Vec<Incr<i64>> = (0..size)
+            .map(|i| {
+                let input = rb.create_input(i as i64);
+                rb.create_query(move |rt| rt.get(input))
+            })
+            .collect();
+        let held = Arc::new(AtomicUsize::new(0));
+        let root = {
+            let (rb, held) = (rb.clone(), held.clone());
+            ra.create_query(move |rt| {
+                let mut sum = 0;
+                for &c in &cycles {
+                    sum += rt.get(c);
+                }
+                held.store(crate::hold::held_count(), Ordering::SeqCst);
+                for &b in &bs {
+                    sum += rb.get(b);
+                }
+                sum
+            })
+        };
+        let t = std::time::Instant::now();
+        ra.get(root);
+        println!(
+            "HELDPROBE size {size} held {} read {:.1} ms",
+            held.load(Ordering::SeqCst),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+
+/// Thread 2's walk of A's c, inside B's b1, loads c New and stops just
+/// before reading c's deps. Thread 1's read of q then lands A's cycles c-d,
+/// e-f and k-l held twice, and is wounded each time by an older thread
+/// waiting on e (round 1) or k (round 2), retracting them all to New.
+/// Thread 2 reads c's deps [d] during round 2's hold and checks them only
+/// after round 2's retraction, so a check that counts held episodes in a
+/// few bits sees the count it started with. Thread 2's read never restarts
+/// after a release. A walk that kept the expansion computes d before c and
+/// enters the cycle at d, which has no strategy.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_walk_skips_deps_of_two_held_runs_retracted_during_one_read() {
+    crate::child_test::run_in_child(
+        "runtime::hold_tests::shared_walk_skips_deps_of_two_held_runs_retracted_during_one_read",
+        || {
+            let ra = Arc::new(Runtime::<Shared>::new());
+            let rb = Arc::new(Runtime::<Shared>::new());
+            let (c, _) = two_cycle(&ra);
+            let (e, _) = two_cycle(&ra);
+            let (k, _) = two_cycle(&ra);
+            let b1 = {
+                let ra = ra.clone();
+                rb.create_query(move |_| ra.get(c) + 1)
+            };
+            let flag = || Arc::new(AtomicBool::new(false));
+            let (z_started, z_go, reads_e, reads_k) = (flag(), flag(), flag(), flag());
+            let z = {
+                let (z_started, z_go) = (z_started.clone(), z_go.clone());
+                rb.create_query(move |_| {
+                    z_started.store(true, Ordering::SeqCst);
+                    wait_for(&z_go);
+                    0
+                })
+            };
+            let waits_on = |member: Incr<i64>, go: &Arc<AtomicBool>| {
+                let (ra, go) = (ra.clone(), go.clone());
+                rb.create_query(move |rt| {
+                    let zv = rt.get(z);
+                    wait_for(&go);
+                    ra.get(member) + 1 + zv
+                })
+            };
+            let (x1, x2) = (waits_on(e, &reads_e), waits_on(k, &reads_k));
+            let (held, waiting) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let q = {
+                let (rb, held, waiting) = (rb.clone(), held.clone(), waiting.clone());
+                ra.create_query(move |rt| {
+                    let v = rt.get(c) + rt.get(e) + rt.get(k);
+                    let round = held.fetch_add(1, Ordering::SeqCst) + 1;
+                    wait_until(|| waiting.load(Ordering::SeqCst) >= round);
+                    v + rb.get(match round {
+                        1 => x1,
+                        2 => x2,
+                        _ => b1,
+                    })
+                })
+            };
+            let c_id = NodeId(c.erase().slot());
+            let (before, after, retracted) = (Gate::new(), Gate::new(), Gate::new());
+            park_at(
+                &ra,
+                vec![
+                    (ParkPoint::WalkBeforeDeps(c_id), before.clone()),
+                    (ParkPoint::WalkAfterDeps(c_id), after.clone()),
+                    (ParkPoint::WoundRetracted, retracted.clone()),
+                ],
+            );
+            let spawn_b = |n: Incr<i64>| {
+                let rb = rb.clone();
+                std::thread::spawn(move || rb.get(n))
+            };
+            let t4 = spawn_b(z);
+            wait_for(&z_started);
+            let (t3, t5) = (spawn_b(x1), spawn_b(x2));
+            wait_until(|| crate::waits::registered() >= 2);
+            z_go.store(true, Ordering::SeqCst);
+            assert_eq!(t4.join().unwrap(), 0);
+            wait_until(|| crate::waits::registered() == 0);
+
+            let t2 = {
+                let rb = rb.clone();
+                std::thread::spawn(move || {
+                    super::NO_RESTART_HERE.with(|f| f.set(true));
+                    catch_unwind(AssertUnwindSafe(|| rb.get(b1)))
+                })
+            };
+            before.wait_parked();
+            let t1 = {
+                let ra = ra.clone();
+                std::thread::spawn(move || ra.get(q))
+            };
+            after.wait_parked();
+            after.release();
+            wait_until(|| held.load(Ordering::SeqCst) >= 1);
+            reads_e.store(true, Ordering::SeqCst);
+            wait_until(|| crate::waits::registered() >= 1);
+            waiting.store(1, Ordering::SeqCst);
+            retracted.wait_parked();
+            assert_eq!(t3.join().unwrap(), 101);
+
+            retracted.arm();
+            retracted.release();
+            wait_until(|| held.load(Ordering::SeqCst) >= 2);
+            after.arm();
+            before.release();
+            after.wait_parked();
+            reads_k.store(true, Ordering::SeqCst);
+            wait_until(|| crate::waits::registered() >= 1);
+            waiting.store(2, Ordering::SeqCst);
+            retracted.wait_parked();
+            assert_eq!(t5.join().unwrap(), 101);
+            after.release();
+            let b = t2.join().unwrap().map_err(panic_message);
+            assert_eq!(b, Ok(101));
+
+            waiting.store(3, Ordering::SeqCst);
+            retracted.release();
+            assert_eq!(t1.join().unwrap(), 3 * 100 + 101);
+        },
+    )
+    .assert_clean();
 }

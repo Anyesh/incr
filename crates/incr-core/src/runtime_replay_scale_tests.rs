@@ -1387,3 +1387,52 @@ fn local_wide_frame_deliveries_stay_linear() {
 fn shared_wide_frame_deliveries_stay_linear() {
     on_stack(1 << 28, wide_frame_deliveries::<Shared>);
 }
+
+/// A read of one runtime holds `n` landings of its two-node cycles, then
+/// reads `n` nodes of another runtime, each a first entry inside the
+/// read: each entry's check and exit go over the other runtime's held
+/// landings only.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_first_entries_under_held_landings_stay_linear() {
+    let n: usize = 4000;
+    let held = Runtime::<Shared>::new();
+    let cycles: Vec<Incr<i64>> = (0..n / 2)
+        .map(|_| {
+            let other: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+            let a = {
+                let other = other.clone();
+                held.create_query_with_fallback(
+                    move |rt| rt.get(*other.get().unwrap()) + 1,
+                    |_: &crate::cycle::Cycle| 100,
+                )
+            };
+            other
+                .set(held.create_query(move |rt| rt.get(a) * 2))
+                .unwrap();
+            a
+        })
+        .collect();
+    let read = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<i64>> = (0..n as i64)
+        .map(|i| read.create_query(move |_| i))
+        .collect();
+    let root = {
+        let read = read.clone();
+        held.create_query(move |rt| {
+            let sum = cycles.iter().map(|&c| rt.get(c)).sum::<i64>();
+            assert_eq!(crate::hold::held_count(), n);
+            sum + reads.iter().map(|&r| read.get(r)).sum::<i64>()
+        })
+    };
+    crate::hold::take_visits();
+    assert_eq!(
+        held.get(root),
+        100 * (n / 2) as i64 + (n as i64) * (n as i64 - 1) / 2
+    );
+    let visits = crate::hold::take_visits();
+    assert!(
+        visits <= 8 * n,
+        "{visits} held places visited for {n} first entries"
+    );
+}

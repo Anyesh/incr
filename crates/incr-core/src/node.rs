@@ -22,7 +22,7 @@
 //!   52     4     arena_slot    u32
 //!   56     2     type_tag      u16
 //!   58     1     state         Cells::State
-//!   59     1     dep_count     Cells::U8    (0x80 the unrun mark, 0x40 the released mark)
+//!   59     1     dep_count     Cells::U8    (0x80 unrun, 0x40 released, 0x20 held marks)
 //!   60     4     generation    Cells::U32
 //! ```
 //!
@@ -171,6 +171,7 @@ const _: () = assert!(crate::bits::disjoint(&[
     NodeData::<crate::cells::Local>::COUNT_MASK as u64,
     NodeData::<crate::cells::Local>::RELEASED as u64,
     NodeData::<crate::cells::Local>::UNRUN as u64,
+    NodeData::<crate::cells::Local>::HELD as u64,
 ]));
 
 impl<C: Cells> NodeData<C> {
@@ -538,7 +539,23 @@ impl<C: Cells> NodeData<C> {
         self.set_mark(Self::RELEASED, released);
     }
 
-    /// The unrun and released marks, which an install keeps.
+    /// Whether a held landing's entry is open on the node, so its dep list
+    /// may be a run no other thread may build on yet. Acquire, so a scan
+    /// that read an id a held run installed and loads this after it sees
+    /// the mark.
+    #[inline(always)]
+    pub(crate) fn held_mark(&self) -> bool {
+        C::u8_load_acquire(&self.dep_count) & Self::HELD != 0
+    }
+
+    /// Only the holder calls it, under its claim: before the held run's
+    /// writes, and before the publication or retraction releases the claim.
+    #[inline(always)]
+    pub(crate) fn set_held_mark(&self, held: bool) {
+        self.set_mark(Self::HELD, held);
+    }
+
+    /// The unrun, released and held marks, which an install keeps.
     #[inline(always)]
     fn marks(&self) -> u8 {
         C::u8_load_relaxed(&self.dep_count) & !Self::COUNT_MASK
@@ -623,6 +640,10 @@ impl<C: Cells> NodeData<C> {
     /// `dep_count` bit for [`Self::released_mark`]: `NodeData` fills its
     /// line, and a publish already reads this cell.
     const RELEASED: u8 = 0x40;
+
+    /// `dep_count` bit for [`Self::held_mark`], read with the count by a
+    /// walk's expansion.
+    const HELD: u8 = 0x20;
 
     const COUNT_MASK: u8 = 0x0f;
 

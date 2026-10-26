@@ -157,6 +157,12 @@ pub(crate) enum ParkPoint {
     BeforeReservationCheck(NodeId),
     /// In `clean_walk`, before a visit of a non-root entry loads its state.
     BeforeVisit(NodeId),
+    /// In `clean_walk`, after a visit loaded the node's state and decided
+    /// to expand it, just before it reads the node's deps.
+    WalkBeforeDeps(NodeId),
+    /// In `clean_walk`, after a visit read the node's deps and before it
+    /// checks whether another thread's held run wrote them.
+    WalkAfterDeps(NodeId),
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
@@ -543,6 +549,9 @@ struct Planned {
     own: u64,
 }
 
+#[repr(align(64))]
+pub(crate) struct OwnLine<T>(pub(crate) T);
+
 /// What a landed episode adds to `episodes_landed`.
 pub(crate) const LANDED: u64 = 1;
 /// What a release of held claims adds to `episodes_landed`: it lands them
@@ -567,6 +576,13 @@ static FORCE_REPLAN: std::sync::LazyLock<bool> =
 thread_local! {
     /// `FORCE_REPLAN` for this thread alone.
     pub(crate) static FORCE_REPLAN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// Test toggle: a walk on this thread never restarts its read after
+    /// another thread's release.
+    pub(crate) static NO_RESTART_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How `compute_one` left the node it was handed.
@@ -715,6 +731,11 @@ pub(crate) struct Walk {
     /// count: counting those let restarts on releases the walk never met
     /// back in (0x14ea7). Carries over a resume.
     waited: bool,
+    /// The runtime's retraction count as the walk last checked it, loaded
+    /// before any dep list it reads since.
+    retracted: u64,
+    #[cfg(test)]
+    rereads: u32,
 }
 
 #[derive(Default, Clone)]
@@ -757,6 +778,9 @@ impl Walk {
             failed_from: 0,
             planned: Planned::default(),
             waited: false,
+            retracted: 0,
+            #[cfg(test)]
+            rereads: 0,
         }
     }
 
@@ -808,6 +832,15 @@ impl Walk {
         if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
             self.visit_exact(id);
         }
+    }
+
+    /// [`Self::visit`], returning the index of the visit's own entry: the
+    /// switch to exact mode can drop entries below it, so it may sit lower
+    /// than the length before the visit.
+    #[inline(always)]
+    fn visit_pending(&mut self, id: NodeId, generation: u32, new: bool) -> usize {
+        self.visit(id, generation, new);
+        self.work.len() - 1
     }
 
     #[cold]
@@ -1125,6 +1158,13 @@ pub struct Runtime<C: Cells> {
     /// land a member Clean over nodes it leaves New or Dirty, which a
     /// walk another thread planned earlier would go on to compute.
     pub(crate) episodes_landed: <C as Cells>::U64,
+    /// Retractions of held landings on this runtime, by every thread. On
+    /// its own cache line, as every walk's dep read under `Shared` loads it.
+    /// A walk rereads a dep list once per retraction since its last check,
+    /// so the rereads are lock-free: only retractions arriving faster than
+    /// one dep read, each of which takes a wound, could starve a walk. A
+    /// walk that meets another thread's open mark waits for it as a claim.
+    pub(crate) retractions: OwnLine<<C as Cells>::U64>,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
@@ -1165,6 +1205,11 @@ pub struct Runtime<C: Cells> {
     first_visits: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     expansions: std::sync::atomic::AtomicU64,
+    /// Expansions dropped and read again, and the most one walk did.
+    #[cfg(test)]
+    pub(crate) rereads: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) max_walk_rereads: std::sync::atomic::AtomicU32,
     /// Group verifications failed by a member's `verified_at` of 0.
     #[cfg(test)]
     pub(crate) group_zero_fails: std::sync::atomic::AtomicU64,
@@ -1288,6 +1333,7 @@ impl<C: Cells> Runtime<C> {
             watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
             episodes_landed: C::new_u64(0),
+            retractions: OwnLine(C::new_u64(0)),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id,
@@ -1314,6 +1360,10 @@ impl<C: Cells> Runtime<C> {
             first_visits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             expansions: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            rereads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            max_walk_rereads: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             group_zero_fails: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -3591,6 +3641,7 @@ impl<C: Cells> Runtime<C> {
             let mut walk = Walk::new(id, gen, observed);
             if !C::SINGLE_THREADED {
                 walk.failed_from = cycle_state::failed_here_count();
+                walk.retracted = self.retraction_count();
             }
             walk
         });
@@ -3679,6 +3730,12 @@ impl<C: Cells> Runtime<C> {
                     // would wait on this thread's own claim: the plan goes on
                     // to the root's compute, which reads it as deferred. A
                     // read restarts at most `ROOT_RESTARTS` times.
+                    #[cfg(all(test, not(loom)))]
+                    let restarts = if NO_RESTART_HERE.with(std::cell::Cell::get) {
+                        ROOT_RESTARTS
+                    } else {
+                        restarts
+                    };
                     let released = !resumed
                         && !ran_unsettled
                         && restarts < ROOT_RESTARTS
@@ -3877,7 +3934,8 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    walk.visit(cur, generation, observed == NodeState::New);
+                    self.park(ParkPoint::WalkBeforeDeps(cur));
+                    let pending = walk.visit_pending(cur, generation, observed == NodeState::New);
                     let kept = kept.map_or(usize::MAX, |k| k as usize);
                     if let Some(deps) = node.inline_deps() {
                         for dep in deps.take(kept) {
@@ -3892,6 +3950,19 @@ impl<C: Cells> Runtime<C> {
                             }
                         });
                     }
+                    self.park(ParkPoint::WalkAfterDeps(cur));
+                    // Another thread's held run is no landing yet: walking
+                    // its deps first can enter a cycle where no serial
+                    // order does. Its mark precedes its dep writes, and a
+                    // retraction counts itself before it clears the mark.
+                    if !C::SINGLE_THREADED && (node.held_mark() || self.retracted_since(&walk)) {
+                        self.drop_held_expansion(
+                            &mut walk,
+                            pending,
+                            (cur, generation),
+                            (cur, generation),
+                        );
+                    }
                 }
             }
         }
@@ -3902,6 +3973,52 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// Undoes the expansion of `id` from its pending entry at `pending` on,
+    /// unless this thread holds the run open on `held` (`id` or a member of
+    /// its group), waits another thread's run out, and visits `id` again. A
+    /// retraction counted since the walk last checked may have restored the
+    /// deps it read, so the visit reads them again.
+    #[cold]
+    #[inline(never)]
+    fn drop_held_expansion(
+        &self,
+        walk: &mut Walk,
+        pending: usize,
+        (id, generation): (NodeId, u32),
+        (held, held_gen): (NodeId, u32),
+    ) {
+        let moved = self.retracted_since(walk);
+        walk.retracted = self.retraction_count();
+        let node = self.nodes.get(held.0);
+        let own = hold::holds(state::cell_key::<C>(node.state_cell()));
+        if own && !moved {
+            return;
+        }
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            walk.rereads += 1;
+            self.rereads.fetch_add(1, Relaxed);
+            self.max_walk_rereads.fetch_max(walk.rereads, Relaxed);
+        }
+        walk.work.truncate(pending);
+        walk.forget(|&n| n == id);
+        let open = || {
+            node.held_mark()
+                && node.generation() == held_gen
+                && state::load::<C>(node.state_cell()) != NodeState::Dead
+        };
+        let mut spins = 0;
+        while !own && open() {
+            self.spin_on(held, &mut spins, || !open());
+        }
+        walk.push(Entry {
+            id,
+            taint: VISIT,
+            generation,
+        });
     }
 
     /// Queues `dep` on `walk` at its generation unless it is settled as
@@ -3952,6 +4069,17 @@ impl<C: Cells> Runtime<C> {
     fn others_landed(&self, planned: Planned, all: u64) -> bool {
         let own = cycle_state::own_episodes(self.runtime_id);
         all.wrapping_sub(planned.all) != own.wrapping_sub(planned.own)
+    }
+
+    #[inline(always)]
+    fn retraction_count(&self) -> u64 {
+        C::u64_load_acquire(&self.retractions.0)
+    }
+
+    /// Whether a retraction was counted since the walk last checked.
+    #[inline(always)]
+    fn retracted_since(&self, walk: &Walk) -> bool {
+        self.retraction_count() != walk.retracted
     }
 
     /// Whether another thread has released held claims on this runtime
@@ -4059,7 +4187,7 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        walk.visit(cur, generation, false);
+        let pending = walk.visit_pending(cur, generation, false);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group
@@ -4078,6 +4206,21 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             });
+        }
+        if !C::SINGLE_THREADED {
+            let held = group
+                .members
+                .iter()
+                .find(|&&(m, _)| self.nodes.get(m).held_mark())
+                .map(|&(m, g)| (NodeId(m), g));
+            if held.is_some() || self.retracted_since(walk) {
+                self.drop_held_expansion(
+                    walk,
+                    pending,
+                    (cur, generation),
+                    held.unwrap_or((cur, generation)),
+                );
+            }
         }
         true
     }
