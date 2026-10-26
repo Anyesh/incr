@@ -672,9 +672,10 @@ enum Seen {
     Dirty,
     New,
     /// The member a group expansion stood for, with the record it expanded
-    /// (null if the walk forgot it): a plan that holds until another thread
-    /// changes the member's record.
-    Group(*const GroupInfo),
+    /// (null if the walk forgot it) and this thread's count of record
+    /// changes then: a plan that holds until another thread changes the
+    /// member's record.
+    Group(*const GroupInfo, usize),
 }
 
 /// One entry of `ensure_clean`'s walk. A visit (`taint >= VISIT_COMPUTING`)
@@ -745,18 +746,21 @@ struct Expanded {
     /// New nodes with installed deps the walk has expanded.
     new: HashSet<NodeId>,
     /// The cycle groups the walk has expanded whole, each with the member
-    /// it was expanded at; at most one per member.
-    groups: Vec<(NodeId, Arc<GroupInfo>)>,
+    /// it was expanded at (at most one per member) and this thread's count
+    /// of record changes then.
+    groups: Vec<(NodeId, Arc<GroupInfo>, usize)>,
 }
 
 impl Walk {
     #[cold]
     #[inline(never)]
-    fn expanded_group(&self, id: NodeId) -> *const GroupInfo {
+    fn expanded_group(&self, id: NodeId) -> Seen {
         self.expanded
             .as_ref()
-            .and_then(|e| e.groups.iter().find(|(at, _)| *at == id))
-            .map_or(std::ptr::null(), |(_, group)| Arc::as_ptr(group))
+            .and_then(|e| e.groups.iter().find(|(at, ..)| *at == id))
+            .map_or(Seen::Group(std::ptr::null(), 0), |(_, group, notes)| {
+                Seen::Group(Arc::as_ptr(group), *notes)
+            })
     }
 
     /// Drops the pending entry of `id` the walk was to run next, whose
@@ -998,7 +1002,7 @@ impl Walk {
             expanded.new.retain(|id| !gone(id));
             expanded
                 .groups
-                .retain(|(_, g)| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
+                .retain(|(_, g, _)| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
         }
     }
 
@@ -3677,7 +3681,7 @@ impl<C: Cells> Runtime<C> {
                 } else if taint == NO_TAINT_NEW || forced {
                     Seen::New
                 } else if taint == NO_TAINT_GROUP {
-                    Seen::Group(walk.expanded_group(cur))
+                    walk.expanded_group(cur)
                 } else {
                     Seen::Dirty
                 };
@@ -4092,11 +4096,11 @@ impl<C: Cells> Runtime<C> {
         // expanded at the member a second time.
         if groups
             .iter()
-            .any(|(at, g)| *at == cur || Arc::ptr_eq(g, &group))
+            .any(|(at, g, _)| *at == cur || Arc::ptr_eq(g, &group))
         {
             return true;
         }
-        groups.push((cur, group.clone()));
+        groups.push((cur, group.clone(), cycle_state::recs_left_count()));
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4124,16 +4128,22 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether another thread changed `id`'s group record since the walk
-    /// expanded `expanded` at it. This thread's own changes are the walk's
-    /// to carry on through, as under `Local`.
+    /// expanded `expanded` at it, when this thread had noted `notes` record
+    /// changes. This thread's own changes are the walk's to carry on
+    /// through, as a `Local` walk, which never replans here, does.
     #[cold]
     #[inline(never)]
-    fn group_replaced_elsewhere(&self, id: NodeId, expanded: *const GroupInfo) -> bool {
+    fn group_replaced_elsewhere(
+        &self,
+        id: NodeId,
+        expanded: *const GroupInfo,
+        notes: usize,
+    ) -> bool {
         let current = self.inner.read().member_recs.get(&id.0).cloned();
         !current
             .as_ref()
             .is_some_and(|r| std::ptr::eq(Arc::as_ptr(r), expanded))
-            && !cycle_state::left_rec(self.runtime_id, id.0, current.as_ref())
+            && !cycle_state::left_rec_since(notes, self.runtime_id, id.0, current.as_ref())
     }
 
     /// A root the taint memo holds, computed without a walk. Out of line
@@ -4418,8 +4428,8 @@ impl<C: Cells> Runtime<C> {
             // group the walk expanded here, or land them into another one,
             // after any wait the walk made, and the plan then never expanded
             // the deps of the members that record does not hold.
-            if let Seen::Group(expanded) = seen {
-                if self.group_replaced_elsewhere(id, expanded) {
+            if let Seen::Group(expanded, notes) = seen {
+                if self.group_replaced_elsewhere(id, expanded, notes) {
                     self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Revisit;
                 }

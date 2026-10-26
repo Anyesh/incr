@@ -1356,19 +1356,31 @@ pub(crate) fn first_nested_of(rt: RuntimeId) -> bool {
     ENTRY.with(|e| e.depth.get() != 0 && e.cur_rt.get() & !SHARED_KEY != rt && !outer_open(rt))
 }
 
-/// Whether `rt` has an open entry on this thread as a `Shared` runtime.
 /// Notes `rec` as the group record this thread left at `slot`.
 pub(crate) fn note_rec_left(rt: RuntimeId, slot: u32, rec: Option<Arc<GroupInfo>>) {
     OUTER.with(|o| o.borrow_mut().recs_left.push((rt, slot, rec)));
     ENTRY.with(|e| e.outer_set.set(true));
 }
 
-/// Whether `current` is the group record this thread last left at `slot`
-/// in this outermost entry.
-pub(crate) fn left_rec(rt: RuntimeId, slot: u32, current: Option<&Arc<GroupInfo>>) -> bool {
+/// How many group record changes this thread has noted in this outermost
+/// entry.
+pub(crate) fn recs_left_count() -> usize {
+    OUTER.with(|o| o.borrow().recs_left.len())
+}
+
+/// Whether `current` is the group record this thread last left at `slot`,
+/// among the changes it noted after its first `since`.
+pub(crate) fn left_rec_since(
+    since: usize,
+    rt: RuntimeId,
+    slot: u32,
+    current: Option<&Arc<GroupInfo>>,
+) -> bool {
     OUTER.with(|o| {
         o.borrow()
             .recs_left
+            .get(since..)
+            .unwrap_or_default()
             .iter()
             .rev()
             .find(|(r, s, _)| *r == rt && *s == slot)
@@ -1380,6 +1392,7 @@ pub(crate) fn left_rec(rt: RuntimeId, slot: u32, current: Option<&Arc<GroupInfo>
     })
 }
 
+/// Whether `rt` has an open entry on this thread as a `Shared` runtime.
 pub(crate) fn shared_open(rt: RuntimeId) -> bool {
     let key = rt.get() | SHARED_KEY;
     ENTRY.with(|e| e.depth.get() != 0 && e.cur_rt.get() == key)
