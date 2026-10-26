@@ -322,12 +322,15 @@ impl<C: Cells> NodeData<C> {
     /// a change from a later verifier.
     #[inline(always)]
     pub fn max_verified_at(&self, v: u64) {
+        debug_assert!(v & !Self::REVISION_BITS == 0);
         let cur = C::u64_load_relaxed(&self.verified_at);
-        if C::SINGLE_THREADED {
-            C::u64_store_relaxed(&self.verified_at, (cur & !Self::MEMO).max(v));
+        // A memo's bit is above every revision, so a stamp that raises the
+        // word under Local is never over one.
+        if C::SINGLE_THREADED && v > cur {
+            C::u64_store_relaxed(&self.verified_at, v);
         } else if cur & Self::MEMO != 0 {
             self.stamp_over_memo(cur, v);
-        } else {
+        } else if !C::SINGLE_THREADED {
             C::u64_fetch_max(&self.verified_at, v);
         }
     }
@@ -416,9 +419,7 @@ impl<C: Cells> NodeData<C> {
     #[inline(always)]
     pub fn max_changed_at(&self, v: u64) {
         let cur = C::u64_load_relaxed(&self.verified_at);
-        if C::SINGLE_THREADED {
-            C::u64_store_relaxed(&self.verified_at, cur & !Self::MEMO);
-        } else if cur & Self::MEMO != 0 {
+        if cur & Self::MEMO != 0 {
             self.stamp_over_memo(cur, 0);
         }
         C::u64_fetch_max(&self.changed_at, v);
@@ -439,11 +440,12 @@ impl<C: Cells> NodeData<C> {
     /// `revision` loads, which only a memo's node loads.
     #[inline(always)]
     pub(crate) fn memo_at(&self, revision: impl FnOnce() -> u64) -> bool {
-        // The bit is loaded again after `changed_at`: a `changed_at` from a
-        // later landing orders the clear before it.
+        // Under Shared the bit is loaded again after `changed_at`: a
+        // `changed_at` from a later landing orders the clear before it.
         C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && {
             let changed = self.changed_at();
-            C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && changed == revision()
+            (C::SINGLE_THREADED || C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0)
+                && changed == revision()
         }
     }
 
@@ -786,9 +788,8 @@ mod tests {
         assert_eq!(n.dep_count(), 0);
     }
 
-    #[test]
-    fn max_stamps_are_monotonic() {
-        let n: NodeData<Shared> = NodeData::new_input(0, 0, 10);
+    fn max_stamps_are_monotonic<C: Cells>() {
+        let n: NodeData<C> = NodeData::new_input(0, 0, 10);
         n.max_verified_at(7);
         assert_eq!(n.verified_at(), 10);
         n.max_verified_at(12);
@@ -797,6 +798,16 @@ mod tests {
         assert_eq!(n.changed_at(), 11);
         n.max_changed_at(5);
         assert_eq!(n.changed_at(), 11);
+    }
+
+    #[test]
+    fn max_stamps_are_monotonic_local() {
+        max_stamps_are_monotonic::<Local>();
+    }
+
+    #[test]
+    fn max_stamps_are_monotonic_shared() {
+        max_stamps_are_monotonic::<Shared>();
     }
 
     fn memo_ends_at_a_changed_at_raise<C: Cells>() {
