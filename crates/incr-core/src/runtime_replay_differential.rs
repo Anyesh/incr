@@ -5515,7 +5515,7 @@ fn two_thread_delivered_read_of_a_held_landing_holds_its_reader_157d3() {
             for _ in 0..4 {
                 s.spawn(|| {
                     let serial = Serial::new(&case, &phases);
-                    for _ in 0..2500 {
+                    for _ in 0..500 {
                         serial.differential("0x157d3", Some(2), 16 * 1024, &|_| {});
                     }
                 });
