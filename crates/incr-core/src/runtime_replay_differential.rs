@@ -7787,6 +7787,20 @@ fn stale_dep_split_seed_matches_unbounded() {
     });
 }
 
+/// 0x6feb7: a doom discarded a walk root's own compute, a cycle episode,
+/// and the retry walked the root again, computing a former member against
+/// the root's new value; a later retry's Clean read resumed that walk's
+/// rest and landed three nodes Clean that the unbounded run leaves Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_discarded_walk_root_is_computed_again_not_walked() {
+    let case = gen_case(0x6feb7, false, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x6feb7);
+        differential::<Shared>(&case, 0x6feb7);
+    });
+}
+
 /// 0xa02 (see [`cross_seeds`]): a speculative landing read the second
 /// runtime's input before a set of it, and a later read returns the old
 /// value.
