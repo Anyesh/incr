@@ -520,7 +520,13 @@ pub(crate) type BagHook =
     Box<dyn Fn(ParkPoint) -> Option<crate::deferred::ErasedDrop> + Send + Sync>;
 
 /// First visits after which an `ensure_clean` walk switches to exact mode.
+#[cfg(not(loom))]
 const EXACT_MODE_AT: u32 = 4096;
+/// Under loom, every pop is several modelled atomics, so a Dirty cycle's
+/// 4096 repeated visits run one execution past the branch cap and the
+/// version vector's u16. Models see repeated expansion only up to 8 visits.
+#[cfg(loom)]
+const EXACT_MODE_AT: u32 = 8;
 
 /// Root restarts a read's walk takes for other threads' releases before it
 /// goes on with its plan. Another thread can release in every plan, as a
