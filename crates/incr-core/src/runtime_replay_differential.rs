@@ -2029,33 +2029,42 @@ impl<'a> Serial<'a> {
                 })
             });
             // The read-twice class one level up (ruled for 0x13b77): a node
-            // whose run in the op caught a cycle the other read ran every
-            // member of in the phase may give each read of it either order's
-            // value, whether those runs landed before its catch returned or
-            // after.
-            let ran_there = |slot: &u32| {
-                spec_of
-                    .get(slot)
-                    .is_some_and(|&x| theirs.iter().any(|o| o.node == (0, x)))
+            // x whose run in the op caught a non-empty cycle, every member of
+            // which the other read ran and the phase left landed, and whose
+            // value from that run q read, may give each read of it either
+            // order's value, whether those runs landed before its catch
+            // returned or after.
+            let landed_there = |slot: &u32| {
+                spec_of.get(slot).is_some_and(|&x| {
+                    matches!(states[x], NodeState::Clean | NodeState::Failed)
+                        && theirs.iter().any(|o| o.node == (0, x))
+                })
             };
+            let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
             let catchers: HashSet<usize> = (mine.iter())
                 .filter(|e| e.node.0 == 0 && e.node.1 != q)
                 .filter(|e| {
                     e.caught.iter().any(|&(k, _)| {
                         matches!(&e.reads[k], (0, _, true, ReadOut::Cycle(c))
-                            if c.iter().all(ran_there))
+                            if !c.is_empty() && c.iter().all(landed_there))
+                    })
+                })
+                .filter(|e| {
+                    last.is_some_and(|run| {
+                        run.reads.iter().any(|r| {
+                            r.0 == 0
+                                && r.1 == e.node.1
+                                && e.value.map(ReadOut::Value) == Some(r.3.clone())
+                        })
                     })
                 })
                 .map(|e| e.node.1)
                 .collect();
-            let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
-            let reads_catcher = last.is_some_and(|run| {
-                run.reads
-                    .iter()
-                    .any(|r| r.0 == 0 && catchers.contains(&r.1))
-            });
+            let reads_catcher = !catchers.is_empty();
             if let (true, Some(run)) = (caught || reads_catcher, last) {
-                let verdict = self.closure_over_reads(label, prefix, p, i, q, run, &catchers);
+                // A root that caught the cycle itself keeps its exact reads.
+                let nested = if caught { HashSet::new() } else { catchers };
+                let verdict = self.closure_over_reads(label, prefix, p, i, q, run, &nested);
                 self.per_read.lock().unwrap().insert(i, verdict);
             }
         }
