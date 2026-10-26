@@ -526,16 +526,17 @@ pub(crate) struct Pending {
     /// frame, by the highest position one of their landings may have.
     by_top: BTreeSet<(u32, usize)>,
     /// The passed deliveries whose landings are all just above their frame,
-    /// by that position and each payload they stand for: only a walk's
-    /// entry there containing that payload retires them.
+    /// by that position and each payload they stand for: short of a copied
+    /// node's landing, only a walk's entry there containing that payload
+    /// retires them.
     by_payload: BTreeSet<(u32, PayloadKey, usize)>,
-    listed: HashMap<usize, Listed, FxBuildHasher>,
+    filed: HashMap<usize, Filed, FxBuildHasher>,
 }
 
-/// Where a passed delivery is listed for the events that retire its
+/// Where a passed delivery is filed for the events that retire its
 /// landings (`Pending::retire`).
 #[derive(Clone, Copy)]
-enum Listed {
+enum Filed {
     Deep(u32),
     Shallow(u32, [Option<PayloadKey>; 2]),
 }
@@ -601,7 +602,7 @@ impl Pending {
         let passed = d.passed;
         self.slots.push(Some(d));
         if passed {
-            self.list(i);
+            self.file_passed(i);
         }
         self.live += 1;
     }
@@ -628,7 +629,7 @@ impl Pending {
             }
             unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        self.unlist(i);
+        self.unfile_passed(i);
         self.live -= 1;
         // No index is held across a point where none is live.
         if self.live == 0 {
@@ -654,49 +655,49 @@ impl Pending {
         let d = self.get_mut(i);
         if !d.passed {
             d.passed = true;
-            self.list(i);
+            self.file_passed(i);
         }
     }
 
     /// Delivery `i`'s latest take raised a copy of its payload keyed `key`.
     pub(crate) fn resume(&mut self, i: usize, key: PayloadKey) {
-        self.unlist(i);
+        self.unfile_passed(i);
         let d = self.get_mut(i);
         d.resumed = Some(key);
         if d.passed {
-            self.list(i);
+            self.file_passed(i);
         }
     }
 
-    fn list(&mut self, i: usize) {
+    fn file_passed(&mut self, i: usize) {
         let d = self.get(i);
         let Delivered::Unwind { nodes, .. } = &d.what else {
             return;
         };
-        let top = d.key.cidx + 1;
-        let listed = match nodes.deepest() {
+        let above = d.key.cidx + 1;
+        let filed = match nodes.deepest() {
             None => return,
             Some(0) => {
                 let payloads = [nodes.source, d.resumed];
                 for p in payloads.into_iter().flatten() {
-                    self.by_payload.insert((top, p, i));
+                    self.by_payload.insert((above, p, i));
                 }
-                Listed::Shallow(top, payloads)
+                Filed::Shallow(above, payloads)
             }
             Some(depth) => {
-                self.by_top.insert((top + depth, i));
-                Listed::Deep(top + depth)
+                self.by_top.insert((above + depth, i));
+                Filed::Deep(above + depth)
             }
         };
-        self.listed.insert(i, listed);
+        self.filed.insert(i, filed);
     }
 
-    fn unlist(&mut self, i: usize) {
-        match self.listed.remove(&i) {
-            Some(Listed::Deep(top)) => {
+    fn unfile_passed(&mut self, i: usize) {
+        match self.filed.remove(&i) {
+            Some(Filed::Deep(top)) => {
                 self.by_top.remove(&(top, i));
             }
-            Some(Listed::Shallow(top, payloads)) => {
+            Some(Filed::Shallow(top, payloads)) => {
                 for p in payloads.into_iter().flatten() {
                     self.by_payload.remove(&(top, p, i));
                 }
@@ -722,7 +723,7 @@ impl Pending {
             for d in self.slots.iter_mut().flatten().filter(|d| d.passed) {
                 apply(d);
             }
-            self.listed.keys().copied().collect()
+            self.filed.keys().copied().collect()
         } else {
             // Short of a copied node's landing, an event retires only
             // landings of a frame below it that are above its position, or
@@ -742,11 +743,11 @@ impl Pending {
             deep.chain(shallow).collect()
         };
         for i in hit {
-            self.unlist(i);
+            self.unfile_passed(i);
             if !all {
                 apply(self.get_mut(i));
             }
-            self.list(i);
+            self.file_passed(i);
         }
     }
 
