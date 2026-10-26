@@ -2330,3 +2330,48 @@ data at 4).
   block (`7eedc225`, `46fa3232`) removed that.
 - Local pays nothing: `chain_local` is 6 per compute below base, from
   layout.
+
+## A replan restarts only on another thread's episodes
+
+`w/T10-34ec3-trial` (tip `32822615`, on `8b7f853e`) logs each episode's
+and release's slots under the episode-log lock, prunes a replanned walk
+only under other threads' episodes since its first plan, and restarts a
+released read only when the release reached the plan. Counts under
+cachegrind on GitHub runners (bench driver per iteration, n up to
+100000; scale tests as `gh-scale-icount.sh`).
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 100 / 193 | 100 / 193 | 0 |
+| `table_hit_local` / `_shared` | 155.12 / 218.12 | 155.12 / 218.12 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/100` | 113,771 | 114,574 | +803 |
+| `chain_shared/propagate/100` | 248,102.45 | 245,816.45 | -2,286 |
+| `shared_nested_caught_chain_stays_linear` (scale) | 1,862,612,212 | 2,061,676,980 | +10.7% |
+| `shared_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread` (scale) | 36,365,919,446 | 39,125,761,965 | +7.6% |
+
+Gate: every hard gate counts the same as the base. Every other bench row
+is within 1% (Local compute rows +0.2% to +0.7%, Shared compute rows
+-0.2% to -1.0%), and scale timing totals 1.003.
+
+- Both rises begin at `0029ca96`, which only deletes code (the walk's
+  `waited` field, `Computed::Replan`'s `waited`, the waits' flags);
+  `6eb0208e` before it counts as the base (113,771; 1,865,653,679).
+- Local, +8 per walk entry, all in `clean_walk` (per-instruction
+  callgrind joined to the disassembly, `6eb0208e` 549 hot instructions
+  per entry, `0029ca96` 557): after `walk.push` (`Walk::push`'s capacity
+  test) LLVM now duplicates the loop head's `work.pop()` length test
+  (`vec/mod.rs:2817`: two stack reloads, a test and a branch, 4) and
+  keeps a constant on the stack instead of in `r15` (+1); the other 3
+  are stack loads and stores reshuffled as `r12` and `r15` swap roles.
+  No field or inlining choice moves: it is block layout and register
+  allocation after the deletion, with no attribute that undoes it.
+- Shared `nested_caught` and `custom_payload`: the added instructions
+  are in the unwinder (unnamed code, +524M in `nested_caught`'s query
+  form, +2.7G in `custom_payload`), while `rust_eh_personality` and
+  `_Unwind_Find_FDE` stay flat, so a caught panic crosses the same
+  frames and does more work in each. `clean_walk`'s unwind tables grew
+  at `0029ca96`: two of its four instances from 80-byte FDEs to 920 and
+  912 bytes, the others from 1,156 to 1,256 and 888 to 1,156, so each
+  unwind through a walk frame runs a longer CFA program. The two
+  budget-1 `nested_caught` rows fall (0.98, 0.97).
