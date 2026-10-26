@@ -135,6 +135,7 @@ jobs:
           - { model: "loom_models::loom_cross_thread_cycle", bound: 2 }
           - { model: "loom_models::loom_wound_retry", bound: 2 }
           - { model: "loom_models::loom_wait_deregister", bound: 2 }
+          - { model: "loom_models::rested_reservation_owner_waits_in_the_engine", bound: 2 }
           - { model: "loom_models::table_miss_race_under_set", bound: 2 }
           - { model: "loom_models::table_hit_vs_publish", bound: 2 }
           - { model: "loom_models::table_hit_vs_remove_rehash", bound: 2 }

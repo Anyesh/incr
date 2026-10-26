@@ -7,7 +7,11 @@
 //! where the unbounded run's frame releases its claim, or until the
 //! thread's outermost context of that runtime, which outlives every
 //! context nested in it, is removed; the dooming thread's own claims and unrun releases
-//! of the node keep it. It is stored
+//! of the node keep it. Once the thread's frame of the node is left for a
+//! retry that reruns from the closure start, the reservation rests: it
+//! holds only ops begun before then, since a later op may be a reader the
+//! retry itself started. An op begun after the rest can still compute the
+//! node ahead of the retry. A reservation is stored
 //! before the release that publishes it, so a claim that reads the release
 //! sees it. A node generation has at most one reservation: reserving it
 //! needs its claim, and a claim waits out another thread's reservation.
@@ -28,13 +32,13 @@ use crate::waits::Claim;
 
 #[cfg(not(loom))]
 use std::sync::{
-    atomic::{AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Mutex,
 };
 
 #[cfg(loom)]
 use loom::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Mutex,
 };
 
@@ -42,8 +46,12 @@ use loom::sync::{
 #[cfg(not(loom))]
 const BUCKETS_LEN: usize = 1024;
 
-/// A reservation's node generation and its owner's token.
-type Entry = (u32, usize);
+/// A reservation's node generation, its owner's token, and the [`SEQ`]
+/// value its owner left its run at ([`AWAKE`] while every op waits on it).
+type Entry = (u32, usize, u64);
+
+/// The stamp of a reservation every other reader waits on.
+const AWAKE: u64 = u64::MAX;
 
 /// Entries in [`TABLE`], and per hash bucket of their claims, both stored
 /// under its lock: a claim that reads a release sees non-zero counts
@@ -57,10 +65,16 @@ static BUCKETS: [AtomicU32; BUCKETS_LEN] = [const { AtomicU32::new(0) }; BUCKETS
 #[cfg(not(loom))]
 static TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
 
+/// Orders the start of each op that leaves the Clean fast path against
+/// [`rest`]s.
+#[cfg(not(loom))]
+static SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[cfg(loom)]
 loom::lazy_static! {
     static ref LIVE: AtomicUsize = AtomicUsize::new(0);
     static ref TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
+    static ref SEQ: AtomicU64 = AtomicU64::new(1);
 }
 
 /// One context's reservations on this thread, as claim and generation.
@@ -141,6 +155,9 @@ thread_local! {
     static ROOT: Cell<u64> = const { Cell::new(0) };
     /// Claims the read-root group lists, so a read's end skips it empty.
     static ROOTS: Cell<u32> = const { Cell::new(0) };
+    /// [`SEQ`] as this thread's current op left the Clean fast path; 0
+    /// before its first.
+    static OP: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(loom)]
@@ -149,6 +166,7 @@ loom::thread_local! {
     static SCOPE: Cell<Option<u64>> = Cell::new(None);
     static ROOT: Cell<u64> = Cell::new(0);
     static ROOTS: Cell<u32> = Cell::new(0);
+    static OP: Cell<u64> = Cell::new(0);
 }
 
 /// The context of a doom's reservations until the doom has marked one.
@@ -325,8 +343,8 @@ fn list(context: u64, claim: Claim, generation: u32, again: bool) {
         let token = m.token();
         {
             let mut t = table();
-            match t.insert(claim, (generation, token)) {
-                Some(prev) if prev == (generation, token) && !again => return,
+            match t.insert(claim, (generation, token, AWAKE)) {
+                Some((g, owner, _)) if (g, owner) == (generation, token) && !again => return,
                 Some(_) => {}
                 None => {
                     #[cfg(not(loom))]
@@ -354,30 +372,67 @@ pub(crate) fn any() -> bool {
 }
 
 /// Whether `claim` is reserved at `generation`, and if so whether by this
-/// thread.
-fn reserved(claim: Claim, generation: u32) -> Option<bool> {
+/// thread and the reservation's stamp.
+fn reserved(claim: Claim, generation: u32) -> Option<(bool, u64)> {
     if !any() || !bucket_hit(claim) {
         return None;
     }
     let token = MINE.with(Listed::token);
     table()
         .get(&claim)
-        .filter(|&&(g, _)| g == generation)
-        .map(|&(_, owner)| owner == token)
+        .filter(|&&(g, _, _)| g == generation)
+        .map(|&(_, owner, stamp)| (owner == token, stamp))
 }
 
-/// Whether another thread reserved `claim` at `generation`.
+/// Whether another thread reserved `claim` at `generation` against this
+/// thread's op. A reservation at rest holds only ops begun before its
+/// owner left the node's run: a later op is a reader the owner's retry
+/// may itself have started, before that retry reads the node again.
 #[cold]
 #[inline(never)]
 pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
-    reserved(claim, generation) == Some(false)
+    matches!(reserved(claim, generation), Some((false, stamp)) if OP.with(Cell::get) <= stamp)
 }
 
 /// Whether this thread reserved `claim` at `generation`.
 #[cold]
 #[inline(never)]
 pub(crate) fn mine(claim: Claim, generation: u32) -> bool {
-    reserved(claim, generation) == Some(true)
+    matches!(reserved(claim, generation), Some((true, _)))
+}
+
+/// Starts this thread's op at the current [`SEQ`].
+#[inline]
+pub(crate) fn op_begin() {
+    OP.with(|o| o.set(SEQ.load(Ordering::SeqCst)));
+}
+
+/// Leaves this thread's reservation of `claim` at `generation` at rest:
+/// its owner's retry reads the node afresh once it has run what precedes
+/// that read again, so only ops begun before now still wait on it. A
+/// reservation already at rest keeps its stamp, so the readers an earlier
+/// retry started still pass; a read's reservation of its own node stays
+/// awake until the read has taken the value.
+#[cold]
+#[inline(never)]
+pub(crate) fn rest(claim: Claim, generation: u32) {
+    let Ok((token, root)) = MINE.try_with(|m| {
+        let root =
+            m.0.borrow()
+                .iter()
+                .any(|g| g.context == ROOT_READ && g.claims.contains(&(claim, generation)));
+        (m.token(), root)
+    }) else {
+        return;
+    };
+    if root {
+        return;
+    }
+    if let Some(e) = table().get_mut(&claim) {
+        if (e.0, e.1) == (generation, token) && e.2 == AWAKE {
+            e.2 = SEQ.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Ends `claims`, already out of their group. `shared` says another
@@ -386,7 +441,8 @@ pub(crate) fn mine(claim: Claim, generation: u32) -> bool {
 fn unlist(claims: impl IntoIterator<Item = (Claim, u32)>, token: usize, shared: bool) {
     let mut t = table();
     for (claim, generation) in claims {
-        if t.get(&claim) == Some(&(generation, token))
+        if t.get(&claim)
+            .is_some_and(|&(g, owner, _)| (g, owner) == (generation, token))
             && !(shared && still_listed(claim, generation))
         {
             t.remove(&claim);

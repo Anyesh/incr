@@ -1422,6 +1422,48 @@ fn loom_wound_retry() {
     });
 }
 
+/// Another thread computes Y, whose closure reads X, while this thread
+/// reserves X, rests the reservation once that op has begun, and reads Y.
+/// The rested reservation holds the earlier op, so the two wait on each
+/// other: a cycle wound-wait must see, because this thread's wait on Y
+/// lists its rested reservation as held. Both reads finish with the serial
+/// values.
+#[test]
+fn rested_reservation_owner_waits_in_the_engine() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let begun = Arc::new(AtomicU64::new(0));
+        let x = rt.create_query(|_: &Rt| 1_u64);
+        let y = {
+            let begun = Arc::clone(&begun);
+            rt.create_query(move |rt: &Rt| {
+                begun.store(1, Ordering::SeqCst);
+                rt.get(x) + 1
+            })
+        };
+        let claim = (rt.runtime_id, x.slot());
+        {
+            let _scope = crate::reserve::Scope::new(Some(5));
+            crate::reserve::note(claim, x.generation());
+        }
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(y))
+        };
+        while begun.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        crate::reserve::rest(claim, x.generation());
+        let mine = rt.get(y);
+        crate::reserve::end_contexts();
+        assert_eq!((mine, other.join().unwrap()), (2, 2));
+
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any());
+    });
+}
+
 /// D reads Q, which a second thread is computing: D's thread registers
 /// its wait while holding D's claim, and deregisters once Q lands, with
 /// no cycle and no wound.

@@ -320,6 +320,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn nested_shared_exit(&self) -> NestedSharedExit<'_, C> {
+        reserve::op_begin();
         NestedSharedExit {
             rt: self,
             cidx: self.dep_stack.next_cidx(),
@@ -368,7 +369,10 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         f: &mut impl FnMut() -> R,
     ) -> Result<R, Cycle> {
-        let _exit = (outermost && !C::SINGLE_THREADED).then(|| OutermostExit);
+        let _exit = (outermost && !C::SINGLE_THREADED).then(|| {
+            reserve::op_begin();
+            OutermostExit
+        });
         loop {
             if outermost {
                 cycle_state::reset_outermost();
