@@ -1063,3 +1063,98 @@ fn a_cycle_caught_under_a_local_root_holds_nothing_past_the_read() {
     assert!(!crate::hold::active(), "the thread holds past its exit");
     assert_eq!(crate::hold::held_count(), 0);
 }
+
+/// Waits for `flag`, or gives up after a few seconds so that a run the
+/// test did not plan for still ends.
+fn wait_for(flag: &AtomicBool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Thread 1's read of A holds A's cycle episode and then waits on B's b1,
+/// which thread 2 is running; b1 then reads the held member of A. Each
+/// thread waits on the other across two runtimes, so the wait registry
+/// must see thread 1's held landing of A while it waits in B.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wait_across_runtimes_on_a_held_episode_ends() {
+    crate::child_test::run_in_child(
+        "runtime::hold_tests::shared_wait_across_runtimes_on_a_held_episode_ends",
+        || {
+            let ra = Arc::new(Runtime::<Shared>::new());
+            let rb = Arc::new(Runtime::<Shared>::new());
+            let (c1, _) = two_cycle(&ra);
+            let (claimed, held) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let b1 = {
+                let (ra, claimed, held) = (ra.clone(), claimed.clone(), held.clone());
+                rb.create_query(move |_| {
+                    claimed.store(true, Ordering::SeqCst);
+                    wait_for(&held);
+                    ra.get(c1) + 1
+                })
+            };
+            let q = {
+                let (rb, held) = (rb.clone(), held.clone());
+                ra.create_query(move |rt| {
+                    let v = rt.get(c1);
+                    held.store(true, Ordering::SeqCst);
+                    v + rb.get(b1)
+                })
+            };
+            let t2 = {
+                let rb = rb.clone();
+                std::thread::spawn(move || rb.get(b1))
+            };
+            wait_for(&claimed);
+            assert_eq!(ra.get(q), 100 + 101);
+            assert_eq!(t2.join().unwrap(), 101);
+        },
+    )
+    .assert_clean();
+}
+
+/// A read of A holds `k` landings of A's two-node cycles, then reads `n`
+/// nodes of B, each a first entry of B inside A's entry. Prints the time
+/// of the read for the sizes given.
+#[test]
+#[ignore = "a timing probe"]
+fn shared_first_entries_under_held_landings_probe() {
+    for size in [1000usize, 2000, 4000, 8000] {
+        let ra = Runtime::<Shared>::new();
+        let rb = Arc::new(Runtime::<Shared>::new());
+        let cycles: Vec<Incr<i64>> = (0..size / 2).map(|_| two_cycle(&ra).0).collect();
+        let bs: Vec<Incr<i64>> = (0..size)
+            .map(|i| {
+                let input = rb.create_input(i as i64);
+                rb.create_query(move |rt| rt.get(input))
+            })
+            .collect();
+        let held = Arc::new(AtomicUsize::new(0));
+        let root = {
+            let (rb, held) = (rb.clone(), held.clone());
+            ra.create_query(move |rt| {
+                let mut sum = 0;
+                for &c in &cycles {
+                    sum += rt.get(c);
+                }
+                held.store(crate::hold::held_count(), Ordering::SeqCst);
+                for &b in &bs {
+                    sum += rb.get(b);
+                }
+                sum
+            })
+        };
+        let t = std::time::Instant::now();
+        ra.get(root);
+        println!(
+            "HELDPROBE size {size} held {} read {:.1} ms",
+            held.load(Ordering::SeqCst),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
