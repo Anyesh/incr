@@ -2489,16 +2489,28 @@ impl<C: Cells> Runtime<C> {
             let dirty = || state::load::<C>(node.state_cell()) == NodeState::Dirty;
             let dirty_before = frame.is_some() && dirty();
             let mut dirty_pinned = false;
-            // The value is pinned before the clone, which is user code and
-            // may wait on a thread that reads this node, so the read's
-            // reservation of its own node ends there.
-            let read = self.try_read_slot_then(handle, node, type_tag, arena_slot, || {
-                dirty_pinned = frame.is_some() && dirty();
-                drop(root.take());
-            });
+            // Under Shared the value is pinned before the clone, which is
+            // user code and may wait on a thread that reads this node, so the
+            // read's reservation of its own node ends there. Local holds no
+            // reservation and no other thread lands the node during the clone.
+            let read = if C::SINGLE_THREADED {
+                self.try_read_slot(handle, node, type_tag, arena_slot)
+            } else {
+                self.try_read_slot_then(handle, node, type_tag, arena_slot, || {
+                    dirty_pinned = frame.is_some() && dirty();
+                    drop(root.take());
+                })
+            };
             match read {
                 Some(value) => {
-                    if let Some(f) = frame.filter(|_| dirty_before || dirty_pinned) {
+                    let dirty_after = || {
+                        if C::SINGLE_THREADED {
+                            dirty()
+                        } else {
+                            dirty_pinned
+                        }
+                    };
+                    if let Some(f) = frame.filter(|_| dirty_before || dirty_after()) {
                         if !self.unchanged_stash(handle.slot(), handle.generation()) {
                             self.note_dirty_read(f, handle, &value);
                         }
@@ -2888,26 +2900,35 @@ impl<C: Cells> Runtime<C> {
         cycle_state::KeptUnwind::around(|| self.claim_input_kept(handle))
     }
 
+    /// A set from a closure that caught a discard, a doom's included, or
+    /// a wound raises it again as a read does: its run is discarded, and
+    /// the unbounded run never makes the write.
+    #[cold]
+    #[inline(never)]
+    fn raise_caught_unwind(&self) {
+        if std::thread::panicking() {
+            return;
+        }
+        match cycle_state::unwind_kind() {
+            Some(UnwindKind::Discard) => {
+                debug_assert!(
+                    C::SINGLE_THREADED || crate::attempt::in_flight(),
+                    "incr-core: a discard a closure caught is out of flight"
+                );
+                std::panic::resume_unwind(Box::new(cycle::DiscardUnwind))
+            }
+            Some(UnwindKind::Wound) => self.raise_wound(),
+            _ => {}
+        }
+    }
+
     #[inline(always)]
     fn claim_input_kept<T: Value>(
         &self,
         handle: Incr<T>,
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
-        // A set from a closure that caught a discard, a doom's included, or
-        // a wound raises it again as a read does: its run is discarded, and
-        // the unbounded run never makes the write.
-        if !std::thread::panicking() {
-            match cycle_state::unwind_kind() {
-                Some(UnwindKind::Discard) => {
-                    debug_assert!(
-                        C::SINGLE_THREADED || crate::attempt::in_flight(),
-                        "incr-core: a discard a closure caught is out of flight"
-                    );
-                    std::panic::resume_unwind(Box::new(cycle::DiscardUnwind))
-                }
-                Some(UnwindKind::Wound) => self.raise_wound(),
-                _ => {}
-            }
+        if value_code::thread_word() & value_code::UNWIND_MASK != 0 {
+            self.raise_caught_unwind();
         }
         let slot = handle.slot();
         let id = NodeId(slot);
