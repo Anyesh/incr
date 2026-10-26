@@ -1249,6 +1249,7 @@ pairs!(
     cross_runtime_read_records_nothing,
     foreign_reader_is_doomed_and_retried,
     foreign_ring_read_is_not_rerun,
+    foreign_caught_cycle_is_not_rerun,
 );
 
 /// A runtime that another runtime's closures read. Test-only: it outlives
@@ -1687,6 +1688,49 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
     for frames in [1, 2] {
         assert_eq!(run(frames), Ok(7777), "budget {frames}");
     }
+}
+
+/// Seed 0x985b shrunk: a replayable reader of runtime A catches the cycle
+/// its `get` of runtime B's c closes (c and d read each other), then is
+/// doomed by a read past the budget. The retry takes the caught cycle the
+/// first read kept instead of computing c again, so c runs as often as in
+/// the unbounded run.
+fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
+    let run = |frames: u32| {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_max_frames(frames);
+        r1.set_placeholder(0_u64);
+        let runs = Arc::new(AtomicU32::new(0));
+        let d = cell::<u64>();
+        let c = {
+            let (runs, d) = (runs.clone(), d.clone());
+            r2.create_query(move |rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                rt.get(*d.get().unwrap())
+            })
+        };
+        d.set(r2.create_query(move |rt| rt.get(c))).unwrap();
+        let dep = r1.create_query(|_| 1_u64);
+        let reader = {
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with(
+                move |rt| {
+                    catch_unwind(AssertUnwindSafe(|| r2.get(c))).unwrap_or(9999) + rt.get(dep)
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            )
+        };
+        let value = r1.get(reader);
+        let doomed = !r1.dooms.lock().unwrap().is_empty();
+        (value, runs.load(Ordering::Relaxed), doomed)
+    };
+    let (value, runs, doomed) = run(u32::MAX);
+    assert_eq!((value, doomed), (10000, false));
+    assert_eq!(run(1), (value, runs, true));
 }
 
 /// A replayable chain of `n` levels read top-down in runtime A, where every
