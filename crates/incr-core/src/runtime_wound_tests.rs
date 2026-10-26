@@ -293,6 +293,42 @@ fn shared_swallowed_wound_after_the_write() {
     .assert_clean();
 }
 
+/// A closure that swallowed its wound reads on into a cycle on its own
+/// stack, which a `try_get` below catches: the wound still unwinds to the
+/// outermost entry, which retries, so the thread leaves the read
+/// unwounded. Left wounded, its later reads would treat what their walks
+/// contain as a wounded attempt's (0x2902).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_swallowed_wound_outlives_a_caught_cycle() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_swallowed_wound_outlives_a_caught_cycle",
+        || {
+            let rt = Runtime::<Shared>::new();
+            let wound = Arc::new(AtomicBool::new(true));
+            let p_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+            let m = {
+                let wound = wound.clone();
+                let p_cell = p_cell.clone();
+                rt.create_query(move |rt| {
+                    if wound.swap(false, Ordering::Relaxed) {
+                        let _ = catch_unwind(AssertUnwindSafe(|| rt.raise_wound()));
+                    }
+                    rt.get(*p_cell.get().unwrap())
+                })
+            };
+            let p = rt.create_query(move |rt| rt.get(m));
+            p_cell.set(p).unwrap();
+            let q = rt.create_query(move |rt| rt.try_get(p).unwrap_or(99));
+            assert_eq!(rt.get(q), 99);
+            assert!(!wound.load(Ordering::Relaxed));
+            assert!(!crate::cycle_state::wounded());
+            rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
 /// The same on `q`'s first compute, swallowing to a value the retry does
 /// not compute: `q` ends with the retry's value and its reverse edges, so
 /// a later `set` reaches it.
