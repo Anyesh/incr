@@ -7,7 +7,7 @@ use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
-use crate::changes::Count;
+use crate::changes::{self, Count};
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::Placement;
@@ -1084,9 +1084,7 @@ impl<C: Cells> Runtime<C> {
             #[cfg(all(test, not(loom)))]
             THREAD_INHERITED_FOREIGN_COUNTS.with(|n| n.set(n.get() + foreign.counts.len()));
             for count in &foreign.counts {
-                if !counts.iter().any(|c| c.same(count)) {
-                    counts.push(count.clone());
-                }
+                changes::fold(counts, count);
             }
         }
         shared

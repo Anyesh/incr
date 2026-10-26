@@ -1600,8 +1600,13 @@ pub(crate) fn check_read(
     CHECKED_READS.with(|d| {
         let mut d = d.borrow_mut();
         d.retain(|e| e.rt != rt || e.cidx < cidx || !fresh && e.cidx == cidx && e.ctl == ctl);
-        let ours = |e: &&CheckedRead| e.rt == rt && e.cidx == cidx && e.ctl == ctl;
-        if !d.iter().rev().take_while(ours).any(|e| e.seen.same(&seen)) {
+        let ours = |e: &CheckedRead| e.rt == rt && e.cidx == cidx && e.ctl == ctl;
+        if !d
+            .iter_mut()
+            .rev()
+            .take_while(|e| ours(e))
+            .any(|e| e.seen.absorb(&seen))
+        {
             d.push(CheckedRead {
                 rt,
                 cidx,
@@ -1646,11 +1651,15 @@ pub(crate) fn take_checked_reads(
     ctl: *const crate::cycle::ComputeCtl,
 ) -> Vec<Count> {
     CHECKED_READS.with(|d| {
-        d.borrow_mut()
+        let mut counts = Vec::new();
+        for e in d
+            .borrow_mut()
             .extract_if(.., |e| e.rt == rt && e.cidx >= cidx)
             .filter(|e| e.cidx == cidx && e.ctl == ctl)
-            .map(|e| e.seen)
-            .collect()
+        {
+            crate::changes::fold(&mut counts, &e.seen);
+        }
+        counts
     })
 }
 
