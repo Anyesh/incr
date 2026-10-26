@@ -89,6 +89,9 @@ pub(crate) struct Held {
     /// for publication, which a delete of one meanwhile turns back
     /// ([`keep_read`]).
     pub(crate) read: Vec<(NodeId, u32)>,
+    /// For a Failed landing, the walked watermark its run read at: a
+    /// Failed landing raises no `verified_at` to compare its new deps to.
+    pub(crate) failed_at: Option<u64>,
     pub(crate) undo: Undo,
 }
 
@@ -479,6 +482,7 @@ pub(crate) fn open_even_taken(
             children: None,
             trace: Vec::new(),
             read: Vec::new(),
+            failed_at: None,
             undo: Undo {
                 first: cut.as_ref().map_or(first, |c| c.lands_new),
                 value: kept,
@@ -535,6 +539,15 @@ pub(crate) fn keep_read(cell: usize, installed: impl Iterator<Item = (NodeId, u3
                 let skip: Vec<NodeId> = skip.collect();
                 e.read.extend(installed.filter(|(d, _)| !skip.contains(d)));
             }
+        }
+    });
+}
+
+/// The walked watermark a held node's Failed landing read at.
+pub(crate) fn keep_failed_at(cell: usize, rev: u64) {
+    with(|h| {
+        if let Some(e) = h.get(cell) {
+            e.failed_at = Some(rev);
         }
     });
 }

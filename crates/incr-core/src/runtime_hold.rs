@@ -288,6 +288,25 @@ impl<C: Cells> Runtime<C> {
         debug_assert!(own.is_none(), "incr-core: an episode member keeps no value");
     }
 
+    /// Opens the entry of a user panic's landing, Failed or released: it
+    /// is held to the attempt's end, so a wound later in the attempt takes
+    /// it back before another thread plans from it. A run that wrote its
+    /// slot outside `HOLD` kept nothing to restore, so it retracts to New.
+    /// An entry opened already, a `HOLD` run's, stays as it is.
+    #[inline]
+    pub(super) fn hold_panic_landing(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        first: bool,
+        wrote: bool,
+        bag: &mut Deferred<C>,
+    ) {
+        if !C::SINGLE_THREADED {
+            self.open_hold(id, node, first || wrote, None, bag);
+        }
+    }
+
     /// Whether `c` has a dependent as `Local` would list it: a held
     /// reader's reverse edges change only at its publication, so its new
     /// deps count and the ones it dropped do not.
@@ -774,24 +793,30 @@ impl<C: Cells> Runtime<C> {
     /// What each held landing publishes as, by position. A set after the
     /// read could not reach a node through an edge that waited until now,
     /// so a Clean landing over a new dep not settled at publication lands
-    /// Dirty, and so does every Clean landing that reads one lowered so,
+    /// Dirty, as does a Failed one over a new dep moved since its run, and
+    /// so does every Clean landing that reads one lowered so,
     /// transitively: the set's walk reached none of them.
     fn publication_targets(&self, entries: &[Held]) -> Vec<NodeState> {
         let mut targets: Vec<NodeState> = entries.iter().map(|e| e.target).collect();
         let mut held: Option<Targets> = None;
         let mut lowered: Vec<usize> = Vec::new();
         for (i, e) in entries.iter().enumerate() {
-            if e.target != NodeState::Clean || e.read.is_empty() {
+            if e.read.is_empty() {
                 continue;
             }
+            let rev = match (e.target, e.failed_at) {
+                // A Clean landing's verified_at is the revision it read at.
+                (NodeState::Clean, _) => self.nodes.get(e.slot).verified_at(),
+                (NodeState::Failed, Some(rev)) => rev,
+                _ => continue,
+            };
             let held =
                 held.get_or_insert_with(|| entries.iter().map(|e| (e.slot, e.target)).collect());
-            // A Clean landing's verified_at is the revision it read at.
-            let rev = self.nodes.get(e.slot).verified_at();
-            if e.read
-                .iter()
-                .any(|&(d, _)| !self.settled_at_publication(d, held, rev))
-            {
+            let failed = e.target == NodeState::Failed;
+            if e.read.iter().any(|&(d, _)| {
+                !(self.settled_at_publication(d, held, rev)
+                    || (failed && self.failed_at_publication(d, held, rev)))
+            }) {
                 lowered.push(i);
             }
         }
@@ -864,8 +889,8 @@ impl<C: Cells> Runtime<C> {
         });
         let landed = self.land_now(id, node, target, e.flagged, e.unrun);
         *stopped = None;
-        // A set flagged the held Failed landing, as `land_failed` handles at
-        // an unheld one.
+        // A set flagged the held Failed landing, or moved a new dep of it,
+        // as `land_failed` handles at an unheld one.
         if let Some((token, mark)) = failed.filter(|_| landed != NodeState::Failed) {
             self.park(super::ParkPoint::FailedLandedOtherwise(id));
             self.leave_failed_target(id, e.generation, token, mark, bag);
@@ -903,6 +928,18 @@ impl<C: Cells> Runtime<C> {
             }
             _ => self.observed_clean(d, rev),
         }
+    }
+
+    /// A new dep of a published Failed landing that failed too, unmoved
+    /// since the landing's run read it: the run read it so.
+    fn failed_at_publication(&self, d: NodeId, held: &Targets, rev: u64) -> bool {
+        let dep = self.nodes.get(d.0);
+        let raw = state::load::<C>(dep.state_cell());
+        let failed = match held.get(&d.0) {
+            Some(&t) if is_computing(raw) => raw == NodeState::Computing && t == NodeState::Failed,
+            _ => raw == NodeState::Failed,
+        };
+        failed && dep.changed_at() <= rev
     }
 
     /// Every entry goes back to what it replaced, and its node lands as

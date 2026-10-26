@@ -5573,6 +5573,7 @@ impl<C: Cells> Runtime<C> {
         own_run: bool,
         bag: &mut Deferred<C>,
     ) {
+        self.hold_panic_landing(id, node, attempt.first, wrote, bag);
         let landing = match self.publish_deps(
             id,
             deps,
@@ -5600,6 +5601,12 @@ impl<C: Cells> Runtime<C> {
         if landing == NodeState::Failed {
             if !C::SINGLE_THREADED {
                 self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
+                if hold::active() {
+                    hold::keep_failed_at(
+                        state::cell_key::<C>(node.state_cell()),
+                        attempt.verify_rev,
+                    );
+                }
             }
             // A rerun can't take a held landing from Failed, as its word
             // stays Computing until the exit publishes it.
@@ -5681,6 +5688,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
+        self.hold_panic_landing(id, node, attempt.first, wrote, bag);
         // Any outcome lands New, which recomputes.
         self.publish_deps(
             id,
