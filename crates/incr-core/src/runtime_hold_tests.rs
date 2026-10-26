@@ -668,3 +668,34 @@ fn shared_under_local_reader_that_caught_a_wound_out_of_a_retracted_entry_still_
     assert_eq!(got, b_rt.get(x) + 7);
     assert_eq!(crate::hold::held_count(), 0);
 }
+
+/// B's `x` reads B's held cycle, then D's `z`, which reads that cycle
+/// back: D retracts at its exit and taints x, so B's exit, its first
+/// entry under `Local` A's reader, retracts B and taints the reader. A
+/// read of C follows. Nothing may stay held past A's outermost exit.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_reader_of_a_retracted_shared_entry_holds_nothing_at_its_exit() {
+    let b_rt = Arc::new(Runtime::<Shared>::new());
+    let (a, b) = two_cycle(&*b_rt);
+    let d_rt = Arc::new(Runtime::<Shared>::new());
+    let z = {
+        let b_rt = b_rt.clone();
+        d_rt.create_query(move |_| b_rt.get(a) + 1)
+    };
+    let x = {
+        let d_rt = d_rt.clone();
+        b_rt.create_query(move |rt| rt.get(a) + rt.get(b) + d_rt.get(z))
+    };
+    let c_rt = Arc::new(Runtime::<Shared>::new());
+    let q = c_rt.create_query(|_| 7_i64);
+    let rt = Runtime::<Local>::new();
+    let root = {
+        let (b_rt, c_rt) = (b_rt.clone(), c_rt.clone());
+        rt.create_query(move |_| b_rt.get(x) + c_rt.get(q))
+    };
+    let got = rt.get(root);
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(got, b_rt.get(x) + 7);
+}
