@@ -1250,6 +1250,7 @@ impl<C: Cells> Runtime<C> {
             }
         }
         if word & value_code::REGEN_BIT != 0 {
+            let observed = self.seen(self.nodes.get(handle.slot()).state_cell(), observed);
             self.regen_read(NodeId(handle.slot()), handle.generation(), observed);
         }
         if foreign {

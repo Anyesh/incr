@@ -4695,7 +4695,9 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 &[],
                 Some(&*payload),
-                !ctl.has(cycle::UNREGENERABLE),
+                // A `HOLD` run's Failed landing is held, so a rerun could
+                // not take it from Failed.
+                !ctl.has(cycle::UNREGENERABLE | cycle::HOLD),
                 bag,
             );
             self.end_reservation(id, node);
