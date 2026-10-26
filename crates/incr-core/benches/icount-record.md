@@ -2330,3 +2330,33 @@ data at 4).
   block (`7eedc225`, `46fa3232`) removed that.
 - Local pays nothing: `chain_local` is 6 per compute below base, from
   layout.
+
+## A walk rechecks a dep list a held run may have installed
+
+`w/T10-walk-held-deps` marks a held run's node in `dep_count` while its
+dep list may be unpublished, and counts retractions per runtime; under
+`Shared` a walk rereads a node's deps when the mark is set or the count
+moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
+`icount.sh` defaults; PT line diffs at 10 iterations.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 100 | 100 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_shared` | 218.14 | 218.14 | 0 |
+| `chain_local/propagate/100` | 114565.03 | 114483.02 | -82.01 |
+| `chain_shared/propagate/100` | 252950.60 | 254652.62 | +1702.02 |
+| `collection_insert_then_read/shared_incremental/1000` | 8356.17 | 8405.85 | +49.68 |
+| `early_cutoff_shared` | 4228.28 | 4261.28 | +33.00 |
+| `diamond_shared` | 8890.94 | 8945.93 | +54.99 |
+
+- The check after each expanded node's dep read costs about 17 per
+  walked node under `Shared` (`chain_shared` +1702 over 100 nodes): the
+  mark test and the counter's acquire load and compare at the check line
+  (+12, +7 in `shared_incremental/1000`); the rest is layout, moved code
+  netting to zero.
+- `Walk::visit_pending` first compiled as an outlined call, about 13 per
+  walked node under both cells (`chain_local/propagate/10` +130 of +140)
+  and over the 1 % bar on `shared_incremental`; `285b26d31` inlines it.
+- Local pays nothing: the checks are compiled out, `chain_local` is 82
+  per op below base, from layout.
