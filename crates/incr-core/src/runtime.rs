@@ -5108,24 +5108,27 @@ impl<C: Cells> Runtime<C> {
     /// landed Failed, `POISONED` otherwise.
     pub(super) fn unwound_poison(&self, kind: Option<UnwindKind>) -> u16 {
         let reading = self.dep_stack.unwound_read(self.runtime_id);
-        match reading {
-            Some((_, reading, _))
-                if self.nodes.get(reading as u32).generation() == (reading >> 32) as u32 =>
-            {
-                self.failed_poison(kind, reading as u32)
-            }
-            _ => cycle::POISONED,
-        }
+        self.read_poison(kind, reading.map(|(_, reading, _)| reading))
     }
 
-    /// [`Self::unwound_poison`] for an unwind out of node `slot`.
-    pub(super) fn failed_poison(&self, kind: Option<UnwindKind>, slot: u32) -> u16 {
-        let node = self.nodes.get(slot);
-        if kind.is_none() && self.seen_quietly(node.state_cell(), node.state()) == NodeState::Failed
-        {
-            cycle::HANDLED
-        } else {
-            cycle::POISONED
+    /// [`Self::unwound_poison`] for a reader blocked in `reading`, `slot |
+    /// generation << 32`. The node read decides, not a walk entry below it
+    /// whose run unwound: that entry can land Failed while the node read
+    /// stays Dirty, and a closure that caught the unwind has then handled
+    /// nothing that holds for the revision.
+    pub(super) fn read_poison(&self, kind: Option<UnwindKind>, reading: Option<u64>) -> u16 {
+        match reading {
+            Some(reading) if kind.is_none() => {
+                let node = self.nodes.get(reading as u32);
+                if node.generation() == (reading >> 32) as u32
+                    && self.seen_quietly(node.state_cell(), node.state()) == NodeState::Failed
+                {
+                    cycle::HANDLED
+                } else {
+                    cycle::POISONED
+                }
+            }
+            _ => cycle::POISONED,
         }
     }
 

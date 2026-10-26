@@ -4425,7 +4425,7 @@ impl<C: Cells> Runtime<C> {
         let poison = if continuation && self.episode_member(node) {
             0
         } else {
-            self.failed_poison(kind, node)
+            self.read_poison(kind, self.unwind_reading(id, v.cidx))
         };
         let replaced = replay::with(|c| match c.iter_mut().find(|x| x.id == id) {
             Some(x) => x.deliver_unwind(
@@ -4446,6 +4446,16 @@ impl<C: Cells> Runtime<C> {
         drop(replaced);
         bag.drain(self);
         VPop::Finished(node, Ended::Unwound)
+    }
+
+    /// The read the virtual frame that an unwind delivered at `cidx` in
+    /// context `id` goes to was blocked in ([`VFrame::reading`]).
+    fn unwind_reading(&self, id: u64, cidx: u32) -> Option<u64> {
+        replay::with(|c| {
+            (c.iter().find(|x| x.id == id))
+                .and_then(|x| x.unwind_target(cidx))
+                .map(|below| below.reading)
+        })
     }
 
     /// Lands held node `slot`, whose run at `cidx` ended in an unwind, as
@@ -4944,7 +4954,7 @@ impl<C: Cells> Runtime<C> {
         let poison = if self.episode_member(entry.node) {
             0
         } else {
-            self.failed_poison(kind, entry.node)
+            self.read_poison(kind, self.unwind_reading(id, boundary + level))
         };
         let (replaced, abandoned) = replay::with(|c| {
             let x = c
