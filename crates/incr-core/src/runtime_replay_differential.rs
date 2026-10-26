@@ -4648,6 +4648,17 @@ fn two_thread_contained_cycle_landing_seeds() {
     });
 }
 
+/// 0x308ab, two threads at budget 1: a walk entry's contained
+/// panic lands the walk's root New and the entry Dirty before the walk
+/// runs them again, and the context's end let the other thread, waiting
+/// since before, claim one of them first, so both reads took the Failed
+/// landing (Panic(failed)) where an order gives a value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_contained_walk_rerun_seeds() {
+    assert_runs_match_an_order(0x308ab, Some(1), 100);
+}
+
 /// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry,
 /// op 7's read came out as no order's in 80 of 80 runs on 562ebeed (of train
 /// B's branch tips only w/T10-ub-f2ad3443-wrong-values, 7e058de75, fails);

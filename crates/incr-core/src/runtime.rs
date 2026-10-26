@@ -5495,6 +5495,18 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Keeps `id`, which a user panic's unwind just landed New or Dirty, for
+    /// this thread's read ([`reserve::note_walk`]): a walk that contains the
+    /// panic runs it again after the context holding it has ended.
+    pub(super) fn note_unwound_landing(&self, id: NodeId, node: &NodeData<C>) {
+        if !C::SINGLE_THREADED
+            && self.budgeted()
+            && matches!(node.state(), NodeState::New | NodeState::Dirty)
+        {
+            reserve::note_walk((self.runtime_id, id.0), node.generation());
+        }
+    }
+
     /// Ends this thread's context reservation of `id`, whose run no retry
     /// follows. The context's untaken deliveries of the node's outcome
     /// stay: each stands for a read the unbounded frame made at this

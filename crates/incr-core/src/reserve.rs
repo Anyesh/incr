@@ -176,6 +176,15 @@ pub(crate) const PENDING: u64 = 0;
 /// context's end ends.
 const ROOT_READ: u64 = u64::MAX;
 
+/// The context bit of a read's walk group (`WALK | root_key`), which holds
+/// what the walk lands unsettled until the read ends.
+const WALK: u64 = 1 << 63;
+
+/// Whether a group of `context` lasts as long as a read, not a context.
+fn for_read(context: u64) -> bool {
+    context == ROOT_READ || context & WALK != 0
+}
+
 fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, Entry>> {
     #[cfg(not(loom))]
     {
@@ -227,7 +236,8 @@ impl Drop for Scope {
 
 /// Reserves `claim` at `generation` for the scope's context, if a
 /// [`Scope`] is open and no context of this thread reserves it already.
-/// Called before the release.
+/// Called before the release. A claim only a read group lists is listed
+/// again, awake: the one way a walk's listing at rest is woken.
 pub(crate) fn note(claim: Claim, generation: u32) {
     let Some(context) = SCOPE.with(Cell::get) else {
         return;
@@ -238,9 +248,9 @@ pub(crate) fn note(claim: Claim, generation: u32) {
         && MINE.with(|m| {
             let groups = m.0.borrow();
             let by = |root: bool| {
-                groups.iter().any(|g| {
-                    (g.context == ROOT_READ) == root && g.claims.contains(&(claim, generation))
-                })
+                groups
+                    .iter()
+                    .any(|g| for_read(g.context) == root && g.claims.contains(&(claim, generation)))
             };
             by(true) && !by(false)
         });
@@ -304,6 +314,59 @@ pub(crate) fn note_root(claim: Claim, generation: u32) {
     ROOTS.with(|n| n.set(n.get() + 1));
 }
 
+/// Reserves `claim`, which a user panic's unwind inside this thread's
+/// innermost read just landed New or Dirty, until that read ends, at rest
+/// from now. A walk entry's contained unwind lands claims its walk runs
+/// again outside any doom's scope, and the context whose end follows the
+/// containment no longer holds them. Ops begun before wait, as the
+/// unbounded run's claim would make them; later ones, which the read's own
+/// retry may spawn and join, pass. The read's own node is [`note_root`]'s.
+#[cold]
+#[inline(never)]
+pub(crate) fn note_walk(claim: Claim, generation: u32) {
+    let key = ROOT.with(Cell::get);
+    if key == 0 || key == root_key(claim) {
+        return;
+    }
+    let context = WALK | key;
+    if listed(context, claim, generation) {
+        return;
+    }
+    let listed = MINE.with(|m| {
+        let token = m.token();
+        {
+            let mut t = table();
+            match t.get(&claim) {
+                // Another thread's reservation stands for the node; at
+                // rest it holds fewer ops than this listing would, the known
+                // later-op gap.
+                Some(&(g, owner, _)) if g == generation && owner != token => return false,
+                Some(&(g, _, _)) if g == generation => {}
+                _ => {
+                    let stamp = SEQ.fetch_add(1, Ordering::SeqCst);
+                    if t.insert(claim, (generation, token, stamp)).is_none() {
+                        #[cfg(not(loom))]
+                        bucket(claim).fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            LIVE.store(t.len(), Ordering::Relaxed);
+        }
+        let mut groups = m.0.borrow_mut();
+        match groups.iter_mut().find(|g| g.context == context) {
+            Some(g) => g.claims.push((claim, generation)),
+            None => groups.push(Group {
+                context,
+                claims: Claims::one((claim, generation)),
+            }),
+        }
+        true
+    });
+    if listed {
+        ROOTS.with(|n| n.set(n.get() + 1));
+    }
+}
+
 /// Whether this thread's group of `context` lists `claim`.
 fn listed(context: u64, claim: Claim, generation: u32) -> bool {
     MINE.with(|m| {
@@ -319,16 +382,18 @@ fn end_root(key: u64) {
     let gone = MINE
         .try_with(|m| {
             let mut groups = m.0.borrow_mut();
-            let g = groups.iter_mut().find(|g| g.context == ROOT_READ)?;
-            let ended: Vec<_> = g
-                .claims
-                .0
-                .extract_if(|&(c, _)| root_key(c) == key)
-                .collect();
-            ROOTS.with(|n| n.set(n.get() - ended.len() as u32));
-            if g.claims.is_empty() {
-                groups.retain(|g| g.context != ROOT_READ);
+            let mut ended: Vec<_> = groups
+                .iter()
+                .position(|g| g.context == (WALK | key))
+                .map(|at| groups.swap_remove(at).claims.keys().collect())
+                .unwrap_or_default();
+            if let Some(g) = groups.iter_mut().find(|g| g.context == ROOT_READ) {
+                ended.extend(g.claims.0.extract_if(|&(c, _)| root_key(c) == key));
+                if g.claims.is_empty() {
+                    groups.retain(|g| g.context != ROOT_READ);
+                }
             }
+            ROOTS.with(|n| n.set(n.get() - ended.len() as u32));
             Some((ended, m.token()))
         })
         .ok()
@@ -441,16 +506,36 @@ pub(crate) fn rest(claim: Claim, generation: u32) {
 fn unlist(claims: impl IntoIterator<Item = (Claim, u32)>, token: usize, shared: bool) {
     let mut t = table();
     for (claim, generation) in claims {
-        if t.get(&claim)
-            .is_some_and(|&(g, owner, _)| (g, owner) == (generation, token))
-            && !(shared && still_listed(claim, generation))
-        {
-            t.remove(&claim);
-            #[cfg(not(loom))]
-            bucket(claim).fetch_sub(1, Ordering::Relaxed);
+        let Some(e) = t.get_mut(&claim) else {
+            continue;
+        };
+        if (e.0, e.1) != (generation, token) {
+            continue;
+        }
+        match shared.then(|| still_listed_by(claim, generation)).flatten() {
+            // Only a walk group keeps it: at rest from here, as listed.
+            Some(Lister::Walk) => {
+                if e.2 == AWAKE {
+                    e.2 = SEQ.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Some(Lister::Other) => {}
+            None => {
+                t.remove(&claim);
+                #[cfg(not(loom))]
+                bucket(claim).fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
     LIVE.store(t.len(), Ordering::Relaxed);
+}
+
+/// Which of this thread's groups still list a claim.
+enum Lister {
+    /// Walk groups only.
+    Walk,
+    /// A context or the read-root group.
+    Other,
 }
 
 /// Whether this thread's read-root group may list anything; true once
@@ -459,16 +544,25 @@ fn roots_listed() -> bool {
     ROOTS.try_with(Cell::get).ok().is_none_or(|n| n != 0)
 }
 
-/// Whether a group of this thread still lists `claim`, as a read of its
-/// own node and a context can both. False once the thread's reservations
-/// are being destroyed.
-fn still_listed(claim: Claim, generation: u32) -> bool {
+/// Which groups of this thread still list `claim`, as a read of its own
+/// node or its walk and a context can both. None once the thread's
+/// reservations are being destroyed.
+fn still_listed_by(claim: Claim, generation: u32) -> Option<Lister> {
     MINE.try_with(|m| {
-        m.0.borrow()
+        let groups = m.0.borrow();
+        let mut by = groups
             .iter()
-            .any(|g| g.claims.contains(&(claim, generation)))
+            .filter(|g| g.claims.contains(&(claim, generation)));
+        let first = by.next()?;
+        let walk = |c: u64| c & WALK != 0 && c != ROOT_READ;
+        Some(if walk(first.context) && by.all(|g| walk(g.context)) {
+            Lister::Walk
+        } else {
+            Lister::Other
+        })
     })
-    .unwrap_or(false)
+    .ok()
+    .flatten()
 }
 
 /// Whether a context of this thread reserves `claim` at `generation`.
@@ -476,7 +570,7 @@ pub(crate) fn in_context(claim: Claim, generation: u32) -> bool {
     MINE.try_with(|m| {
         m.0.borrow()
             .iter()
-            .any(|g| g.context != ROOT_READ && g.claims.contains(&(claim, generation)))
+            .any(|g| !for_read(g.context) && g.claims.contains(&(claim, generation)))
     })
     .unwrap_or(false)
 }
@@ -488,10 +582,10 @@ pub(crate) fn end_landed(claim: Claim, generation: u32) {
     let ended = MINE.try_with(|m| {
         let mut groups = m.0.borrow_mut();
         let mut found = false;
-        for g in groups.iter_mut().filter(|g| g.context != ROOT_READ) {
+        for g in groups.iter_mut().filter(|g| !for_read(g.context)) {
             found |= g.claims.remove(&(claim, generation));
         }
-        groups.retain(|g| !g.claims.is_empty() || g.context == ROOT_READ);
+        groups.retain(|g| !g.claims.is_empty() || for_read(g.context));
         found.then(|| m.token())
     });
     if let Ok(Some(token)) = ended {
@@ -562,7 +656,7 @@ pub(crate) fn end_contexts() {
     let (groups, token) = MINE.with(|m| {
         let mut groups = m.0.borrow_mut();
         let ended = groups
-            .extract_if(.., |g| g.context != ROOT_READ)
+            .extract_if(.., |g| !for_read(g.context))
             .collect::<Vec<_>>();
         (ended, m.token())
     });
