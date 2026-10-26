@@ -3279,6 +3279,29 @@ fn seed_198c2_retry_reads_the_foreign_set() {
     });
 }
 
+/// 0x16a03 at one frame: doomed 4 reads 12 after a placeholder for 5, so
+/// 12's entry is suspect. The speculative chain above it reaches 14, whose
+/// read of 12 is a virtual hit claiming 12 and 13; the stand-in run of 12
+/// reads a member of the outer episode, and passing that lowlink down
+/// joined 12 and 13 to the episode, which landed them Dirty with deps
+/// where the unbounded 4, reading 5 for real, never reads 12. Only the
+/// operations are compared: the seed's Native run counts differ for
+/// another reason.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_16a03_suspect_entry_frame_takes_no_virtual_hit() {
+    fn ops<C: Cells>(case: &Case) {
+        let unbounded = run::<C>(case, None, 0);
+        let bounded = run::<C>(case, Some(1), 0);
+        compare(case, &unbounded, &bounded, "seed 0x16a03, 1 frame");
+    }
+    let case = gen_case(0x1_6a03, true, false);
+    quiet(|| {
+        ops::<Local>(&case);
+        ops::<Shared>(&case);
+    });
+}
+
 /// 0xe126d92b8f, shrunk. 9 (Fallback) reads 4, which `try_get`s 5, and 5
 /// reaches 9 again through 6. In `Get(9)` the walk of Fixpoint member 2's
 /// run computes 9 twice at the same position and path, and at budget 3
