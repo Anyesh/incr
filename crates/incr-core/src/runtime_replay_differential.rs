@@ -4237,10 +4237,10 @@ fn two_thread_contained_cycle_landing_seeds() {
     });
 }
 
-/// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry
-/// (from 7e058de75, the bisect's first bad), op 7's read came out as no
-/// order's in 80 of 80 runs on 562ebeed; a cycle that reaches its reader,
-/// as on main, gives every order.
+/// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry,
+/// op 7's read came out as no order's in 80 of 80 runs on 562ebeed (of train
+/// B's branch tips only w/T10-ub-f2ad3443-wrong-values, 7e058de75, fails);
+/// a cycle that reaches its reader, as on main, gives every order.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_contained_cycle_read_seeds() {
