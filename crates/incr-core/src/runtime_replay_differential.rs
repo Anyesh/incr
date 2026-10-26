@@ -4648,6 +4648,23 @@ fn two_thread_read_builds_on_no_unfinished_attempts_caught_cycle() {
     .assert_clean();
 }
 
+/// 0x8b19 at a budget of one frame: op 5's retry of 1 catches the cycle
+/// {1, 2} as a delivered unwind, from its doomed run, and lands 1 Dirty
+/// with 7777. Unheld, that landing outlives op 5's wound, and op 4 walks
+/// it where every order computes 1 from New.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_budget_1_read_builds_on_no_unfinished_attempts_delivered_cycle() {
+    let case = gen_case(0x8b19, false, true);
+    let phases = phases(&case, 0x8b19);
+    let serial = Serial::new(&case, &phases);
+    quiet(|| {
+        for _ in 0..40 {
+            serial.differential("0x8b19", Some(1), 0, &|_| {});
+        }
+    });
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
