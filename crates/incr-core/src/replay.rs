@@ -3222,4 +3222,45 @@ mod tests {
             assert!(set.with(|s| s.borrow().contains(&(rt, (2, 0)))));
         }
     }
+
+    /// A passed delivery's landing just above its frame is a note at the
+    /// position of the frame's next read, which a walk's entry there
+    /// containing the same payload retires.
+    #[test]
+    fn a_containment_just_above_a_frame_retires_its_passed_landing() {
+        let payload: Box<dyn Any + Send> = Box::new("p");
+        let key = payload_key(&*payload);
+        let read = ReadKey {
+            node: 1,
+            generation: 0,
+            cidx: 3,
+            reading: 2,
+            ordinal: 1,
+            path: 0,
+            seq: 0,
+            episode: None,
+            foreign: None,
+        };
+        let what = Delivered::Unwind {
+            cycle: false,
+            poison: true,
+            attributed: false,
+            payload,
+            nodes: Landings::owned(Some(key), vec![((2, 0), 0)]),
+        };
+        let mut pending = Pending::default();
+        pending.push(Delivery::new(read, 0, what));
+        pending.pass(0);
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key,
+            },
+            false,
+        );
+        let Delivered::Unwind { nodes, .. } = &mut pending.get_mut(0).what else {
+            unreachable!()
+        };
+        assert!(!nodes.holds((2, 0)));
+    }
 }
