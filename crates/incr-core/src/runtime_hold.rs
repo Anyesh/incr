@@ -142,6 +142,9 @@ impl<C: Cells> Runtime<C> {
                     return None;
                 }
                 node.set_verified_at(0);
+                if target == NodeState::Cyclic {
+                    reserve::note_taken_cyclic((self.runtime_id, id.0), node.generation());
+                }
                 return Some(self.land_now(id, node, NodeState::Dirty, NodeState::Dirty, unrun));
             }
             if !hold::consulted() && !hold::cut_kept(self.runtime_id, id.0) {

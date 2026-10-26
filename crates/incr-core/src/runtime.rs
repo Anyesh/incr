@@ -2807,7 +2807,16 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != handle.generation() {
             self.stale_handle(handle);
         }
-        if matches!(state, NodeState::Cyclic | NodeState::New) {
+        // This thread's own landing of a taken claim for a Cyclic outcome
+        // is Dirty to every reader, but walking it again would land it so
+        // again, for good: its own read takes the cycle it landed.
+        let own_cyclic = || {
+            !C::SINGLE_THREADED
+                && reserve::taken_cyclic((self.runtime_id, handle.slot()), handle.generation())
+        };
+        if matches!(state, NodeState::Cyclic | NodeState::New)
+            || (state == NodeState::Dirty && own_cyclic())
+        {
             if let Some(cycle) = self.landed_cycle(handle) {
                 return Ok(cycle);
             }

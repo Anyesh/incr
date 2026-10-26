@@ -139,6 +139,9 @@ thread_local! {
     /// Claims waiters met as they took over this thread's attempts, which
     /// never doom again before its outermost entry exits.
     static TAKEN: RefCell<Vec<Claim>> = const { RefCell::new(Vec::new()) };
+    /// Taken claims this thread landed for a Cyclic outcome, at their
+    /// generations: published Dirty, with no value to read back.
+    static TAKEN_CYCLIC: RefCell<Vec<(Claim, u32)>> = const { RefCell::new(Vec::new()) };
     static MINE: Listed = const { Listed(RefCell::new(Vec::new())) };
     static SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
     /// The [`root_key`] of the innermost read's node, 0 outside reads.
@@ -150,6 +153,7 @@ thread_local! {
 #[cfg(loom)]
 loom::thread_local! {
     static TAKEN: RefCell<Vec<Claim>> = RefCell::new(Vec::new());
+    static TAKEN_CYCLIC: RefCell<Vec<(Claim, u32)>> = RefCell::new(Vec::new());
     static MINE: Listed = Listed(RefCell::new(Vec::new()));
     static SCOPE: Cell<Option<u64>> = Cell::new(None);
     static ROOT: Cell<u64> = Cell::new(0);
@@ -595,6 +599,19 @@ fn taken_slow(claim: Claim) -> bool {
     TAKEN.with(|t| t.borrow().contains(&claim))
 }
 
+/// A taken `claim` at `generation` landed for a Cyclic outcome, which
+/// this thread's read of it gives until its outermost entry exits.
+pub(crate) fn note_taken_cyclic(claim: Claim, generation: u32) {
+    TAKEN_CYCLIC.with(|t| t.borrow_mut().push((claim, generation)));
+}
+
+/// Whether this thread landed taken `claim` at `generation` for a Cyclic
+/// outcome in its outermost entry.
+pub(crate) fn taken_cyclic(claim: Claim, generation: u32) -> bool {
+    crate::cycle_state::any_taken()
+        && TAKEN_CYCLIC.with(|t| t.borrow().contains(&(claim, generation)))
+}
+
 #[cfg(all(test, not(loom)))]
 thread_local! {
     static TAKES: Cell<u32> = const { Cell::new(0) };
@@ -615,6 +632,7 @@ pub(crate) fn clear_taken() {
     TAKES.with(|n| n.set(0));
     crate::cycle_state::set_any_taken(false);
     TAKEN.with(|t| t.borrow_mut().clear());
+    TAKEN_CYCLIC.with(|t| t.borrow_mut().clear());
 }
 
 /// Whether this thread holds no reservation, as it must once its
