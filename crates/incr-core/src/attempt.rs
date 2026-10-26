@@ -307,7 +307,7 @@ pub(crate) fn in_flight() -> bool {
 /// This thread's attempt epoch, which moves on only at the outermost
 /// entry and its retries: a model tells a wound's retry from a replay
 /// retry by it.
-#[cfg(test)]
+#[cfg(all(test, loom))]
 pub(crate) fn epoch() -> u32 {
     MINE.with(|w| w.state.load(Ordering::Relaxed) & !FLAGS)
 }

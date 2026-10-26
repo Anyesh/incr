@@ -51,7 +51,10 @@ fn silence_expected_panics() {
     ONCE.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let expected = EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false);
+            // Outside a model, loom's thread-locals panic on access, and a
+            // panic in the hook aborts the process.
+            let expected =
+                IN_MODEL.with(Cell::get) && EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false);
             if !expected {
                 default(info);
             }
@@ -59,8 +62,30 @@ fn silence_expected_panics() {
     });
 }
 
+std::thread_local! {
+    static IN_MODEL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the thread as inside [`loom::model`] until dropped, unwinding
+/// included.
+struct InModel;
+
+impl InModel {
+    fn enter() -> Self {
+        IN_MODEL.with(|m| m.set(true));
+        Self
+    }
+}
+
+impl Drop for InModel {
+    fn drop(&mut self) {
+        IN_MODEL.with(|m| m.set(false));
+    }
+}
+
 pub(crate) fn run(f: impl Fn() + Sync + Send + 'static) {
     silence_expected_panics();
+    let _in = InModel::enter();
     loom::model(f);
 }
 
