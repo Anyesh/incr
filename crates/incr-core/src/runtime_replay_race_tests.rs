@@ -3972,6 +3972,129 @@ fn a_flip_after_another_forgets_the_record_of_the_failure_it_flips() {
     );
 }
 
+/// x landed Failed over d, which a caught panic left Dirty, and is noted
+/// under d (`note_past_sets`). A set's walk that takes the note while x
+/// is Computing again, as a regeneration of its payload makes it, flags x
+/// so that its landing goes Dirty instead of dropping the note.
+#[test]
+fn a_noted_failed_landing_still_computing_is_flagged_by_the_set() {
+    let (rt, i, _, x) = noted_failed_landing();
+    let cell = |n: crate::node::NodeId| rt.nodes.get(n.0).state_cell();
+    assert!(crate::state::try_transition::<Shared>(
+        cell(id(x)),
+        NodeState::Failed,
+        NodeState::Computing
+    )
+    .is_ok());
+    rt.set(i, 2);
+    assert_eq!(
+        rt.nodes.get(id(x).0).state(),
+        NodeState::ComputingDirty,
+        "the walk dropped x's note"
+    );
+    assert!(crate::state::try_transition::<Shared>(
+        cell(id(x)),
+        NodeState::ComputingDirty,
+        NodeState::Dirty
+    )
+    .is_ok());
+    assert_eq!(rt.failed_past.load(SeqCst), 0);
+}
+
+/// A delete of d drops the notes over it, so set walks stop looking.
+#[test]
+fn a_deleted_dep_drops_the_failed_landings_noted_over_it() {
+    let (rt, _, d, x) = noted_failed_landing();
+    rt.delete_node(x);
+    rt.delete_node(d);
+    assert!(
+        rt.failed_past.load(SeqCst) == 0,
+        "d's delete kept the notes over it"
+    );
+}
+
+/// Two deps 64 slots apart share a bit of `failed_past`: the walk that
+/// takes one's notes keeps the bit for the other's, whose set then flips
+/// its noted landing.
+#[test]
+fn a_taken_note_keeps_the_bit_of_a_dep_sharing_it() {
+    let (rt, i, d, x) = noted_failed_landing();
+    while id(rt.create_input(0_u64)).0 + 2 < id(d).0 + 64 {}
+    let (i2, d2, x2) = noted_over(&rt);
+    assert_eq!(id(d2).0, id(d).0 + 64);
+    rt.set(i, 2);
+    assert_eq!(rt.nodes.get(id(x).0).state(), NodeState::Dirty);
+    assert_eq!(
+        rt.failed_past.load(SeqCst),
+        super::contain_impl::past_bit(id(d2).0),
+        "d's take dropped d2's bit"
+    );
+    rt.set(i2, 2);
+    assert_eq!(rt.nodes.get(id(x2).0).state(), NodeState::Dirty);
+    assert_eq!(rt.failed_past.load(SeqCst), 0);
+}
+
+/// A walk that flips a Failed dep with notes over it takes them, as the
+/// Dirty arm does, so its bit clears (the dep's own expansion flips the
+/// noted landing either way).
+#[test]
+fn a_flipped_failed_dep_takes_the_landings_noted_over_it() {
+    let (rt, i, d, x) = noted_failed_landing();
+    let cell = rt.nodes.get(id(d).0).state_cell();
+    assert!(
+        crate::state::try_transition::<Shared>(cell, NodeState::Dirty, NodeState::Failed).is_ok()
+    );
+    rt.set(i, 2);
+    assert_eq!(rt.nodes.get(id(x).0).state(), NodeState::Dirty);
+    assert_eq!(rt.failed_past.load(SeqCst), 0);
+}
+
+/// A walk that flags a Computing dep with notes over it takes them too.
+#[test]
+fn a_flagged_computing_dep_takes_the_landings_noted_over_it() {
+    let (rt, i, d, _) = noted_failed_landing();
+    let cell = |n: crate::node::NodeId| rt.nodes.get(n.0).state_cell();
+    assert!(crate::state::try_transition::<Shared>(
+        cell(id(d)),
+        NodeState::Dirty,
+        NodeState::Computing
+    )
+    .is_ok());
+    rt.set(i, 2);
+    assert_eq!(rt.nodes.get(id(d).0).state(), NodeState::ComputingDirty);
+    assert_eq!(rt.failed_past.load(SeqCst), 0, "the walk kept d's notes");
+    assert!(crate::state::try_transition::<Shared>(
+        cell(id(d)),
+        NodeState::ComputingDirty,
+        NodeState::Dirty
+    )
+    .is_ok());
+}
+
+/// i -> d -> x, where x panics: x lands Failed over d, then d is made
+/// Dirty with no walk, as a caught panic leaves it, and x is noted.
+fn noted_failed_landing() -> (Rt, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let rt = Rt::new();
+    let (i, d, x) = noted_over(&rt);
+    (rt, i, d, x)
+}
+
+/// [`noted_failed_landing`]'s three nodes, created in `rt`.
+fn noted_over(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
+    let i = rt.create_input(1_u64);
+    let d = rt.create_query(move |rt: &Rt| rt.get(i));
+    let x = rt.create_query(move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(d))) });
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    assert_eq!(rt.nodes.get(id(x).0).state(), NodeState::Failed);
+    let cell = rt.nodes.get(id(d).0).state_cell();
+    assert!(
+        crate::state::try_transition::<Shared>(cell, NodeState::Clean, NodeState::Dirty).is_ok()
+    );
+    rt.note_past_sets(id(x), x.generation(), &[(id(d), 0)]);
+    assert_ne!(rt.failed_past.load(SeqCst), 0);
+    (i, d, x)
+}
+
 /// x's walk contains `failed`'s panic once x stops reading it, holding a
 /// ticket for `failed`. Thread B's read of q2 reruns q1, whose read of
 /// `failed` takes that ticket as lent and stops; a regeneration on thread A

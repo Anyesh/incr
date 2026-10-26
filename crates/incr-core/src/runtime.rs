@@ -1105,6 +1105,11 @@ pub struct Runtime<C: Cells> {
     pub(crate) provenance: provenance_impl::Table<C>,
     tickets: C::Lock<contain_impl::Tickets>,
     tickets_held: std::sync::atomic::AtomicBool,
+    /// The slots `tickets` notes Failed landings under, by `past_bit`,
+    /// written only under `tickets`'s lock so that writers keep each other's
+    /// bits. A walk's Relaxed load sees every note that happens before it;
+    /// one concurrent with the note may miss it either way.
+    failed_past: std::sync::atomic::AtomicU64,
     regens: C::Lock<replay_impl::Regens>,
     /// Set once `regens` holds a record, so a delete looks for one only then.
     regens_held: std::sync::atomic::AtomicBool,
@@ -1254,6 +1259,7 @@ impl<C: Cells> Runtime<C> {
             provenance: provenance_impl::table::<C>(),
             tickets: contain_impl::tickets::<C>(),
             tickets_held: std::sync::atomic::AtomicBool::new(false),
+            failed_past: std::sync::atomic::AtomicU64::new(0),
             regens: replay_impl::regens::<C>(),
             regens_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -3288,6 +3294,7 @@ impl<C: Cells> Runtime<C> {
         }
 
         let mut expanded_new: Option<HashSet<NodeId>> = None;
+        let past = self.failed_past.load(std::sync::atomic::Ordering::Relaxed);
         while let Some(id) = queue.pop() {
             let (node, flags) = self.nodes.get_with_flags(id.0);
             loop {
@@ -3297,6 +3304,9 @@ impl<C: Cells> Runtime<C> {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
                             .is_ok()
                         {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3309,6 +3319,9 @@ impl<C: Cells> Runtime<C> {
                     }
                     NodeState::Failed => {
                         if self.flip_failed(id) {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3333,6 +3346,9 @@ impl<C: Cells> Runtime<C> {
                         )
                         .is_ok()
                         {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3350,6 +3366,9 @@ impl<C: Cells> Runtime<C> {
                         // Former cycle members are New with edges on each
                         // other, so each is expanded once per walk.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             let list = &inner.dependents[id.0 as usize];
                             if !list.is_empty()
@@ -3366,6 +3385,9 @@ impl<C: Cells> Runtime<C> {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::New)
                             .is_ok()
                         {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3376,7 +3398,8 @@ impl<C: Cells> Runtime<C> {
                     }
                     NodeState::Dirty | NodeState::ComputingDirty => {
                         // Already flagged; the walk that flagged it also
-                        // covered its dependents. The visit must still be
+                        // covered its dependents, except Failed landings
+                        // since (`take_past_sets`). The visit must still be
                         // an RMW, not a plain load: this walk stores a
                         // dep's Dirty and then reaches the node, while a
                         // verifier claims the node and then loads its deps'
@@ -3387,6 +3410,9 @@ impl<C: Cells> Runtime<C> {
                         // reads from it (and sees the dep Dirty) or this CAS
                         // fails on the claim and the next pass flags it.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
+                            if past & contain_impl::past_bit(id.0) != 0 {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             break;
                         }
                     }
@@ -4928,7 +4954,8 @@ impl<C: Cells> Runtime<C> {
     /// the old and recorded deps is published, and the node lands Failed,
     /// or Dirty or New where publication says the panic may hide a change,
     /// or Dirty where a replay delivery raised the panic and its first take
-    /// landed the node Dirty (`retaken_landing`).
+    /// landed the node Dirty (`retaken_landing`). A Failed landing over a
+    /// dep a set's walk stops at is noted for the next one (`note_past_sets`).
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
     /// `own_run` says the node lands from the compute that just popped, not
@@ -4985,6 +5012,7 @@ impl<C: Cells> Runtime<C> {
                 regenerable,
                 bag,
             );
+            self.note_past_sets(id, node.generation(), deps);
         } else {
             self.unfailed_landing(id, node.generation(), attempt.cidx);
         }

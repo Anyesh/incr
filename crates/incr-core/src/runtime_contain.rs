@@ -60,6 +60,16 @@ pub(crate) struct Tickets {
     /// dropped once the delete, sweep or walk that released them holds no
     /// lock and has finished.
     buried: Vec<Ticket>,
+    /// By the slot of a dep a set's walk stops at, the Failed landings over
+    /// it (slot, generation) that no walk flagged; see `note_past_sets`.
+    past: BTreeMap<u32, Vec<(u32, u32)>>,
+}
+
+/// `slot`'s bit in `Runtime::failed_past`: a walk takes the tickets' lock
+/// only at a dep whose bit is set; notes under other residues never set it.
+#[inline(always)]
+pub(super) fn past_bit(slot: u32) -> u64 {
+    1 << (slot & 63)
 }
 
 #[derive(Clone, Copy)]
@@ -600,6 +610,80 @@ impl<C: Cells> Runtime<C> {
         defer(stale, bag);
     }
 
+    /// Before `id` lands Failed over `deps`. A set's walk stops at a Dirty
+    /// dep, whose dependents the walk that made it Dirty flagged; a dep a
+    /// caught panic left Dirty had no such walk. The landing is noted under
+    /// each such dep for the next walk that reaches it, so it lasts its
+    /// revision and not past the dep's next change, except under `Shared`
+    /// for a set whose walk passed the dep before the note was made. A dep
+    /// still Computing is not noted: on this thread it is an open cycle head
+    /// the landing belongs to, and a flip there reruns the caught cycle on
+    /// every read (0x1daa).
+    /// Speculative landings are noted too: the take checks the node.
+    #[inline(always)]
+    pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
+        let past = |&(dep, _): &(NodeId, u32)| {
+            matches!(
+                state::load::<C>(self.nodes.get(dep.0).state_cell()),
+                NodeState::Dirty | NodeState::ComputingDirty
+            )
+        };
+        if deps.iter().any(past) {
+            self.note_past(id, generation, deps.iter().filter(|d| past(d)));
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_past<'a>(
+        &self,
+        id: NodeId,
+        generation: u32,
+        deps: impl Iterator<Item = &'a (NodeId, u32)>,
+    ) {
+        let mut t = self.tickets.write();
+        for &(dep, _) in deps {
+            let notes = t.past.entry(dep.0).or_default();
+            if !notes.contains(&(id.0, generation)) {
+                notes.push((id.0, generation));
+            }
+            self.failed_past.fetch_or(past_bit(dep.0), Relaxed);
+        }
+    }
+
+    fn sync_past(&self, t: &Tickets) {
+        let bits = t.past.keys().fold(0, |bits, &slot| bits | past_bit(slot));
+        self.failed_past.store(bits, Relaxed);
+    }
+
+    /// A set's walk reached `dep`: queues the landings noted over it that
+    /// are still Failed, or still Computing toward a Failed landing, which
+    /// the walk then flags so that it lands Dirty.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn take_past_sets(&self, dep: NodeId, queue: &mut Vec<NodeId>) {
+        if !self.tickets.read().past.contains_key(&dep.0) {
+            return;
+        }
+        let mut t = self.tickets.write();
+        let Some(notes) = t.past.remove(&dep.0) else {
+            return;
+        };
+        self.sync_past(&t);
+        drop(t);
+        for (id, generation) in notes {
+            let node = self.nodes.get(id);
+            if node.generation() == generation
+                && matches!(
+                    state::load::<C>(node.state_cell()),
+                    NodeState::Failed | NodeState::Computing | NodeState::ComputingDirty
+                )
+            {
+                queue.push(NodeId(id));
+            }
+        }
+    }
+
     /// After a set's walk: drops the tickets its flips released.
     #[inline(always)]
     pub(super) fn drop_released_tickets(&self) {
@@ -639,6 +723,9 @@ impl<C: Cells> Runtime<C> {
         if self.tickets_held() {
             self.bury(slot, generation);
         }
+        if self.failed_past.load(Relaxed) & past_bit(slot) != 0 {
+            self.bury_past(slot);
+        }
         if self.regens_held.load(Relaxed) {
             self.forget_failed_run(slot, generation);
         }
@@ -650,6 +737,15 @@ impl<C: Cells> Runtime<C> {
         let mut t = self.tickets.write();
         let stale = release(&mut t, u64::MAX, (slot, generation)..=(slot, generation));
         t.buried.extend(stale);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bury_past(&self, slot: u32) {
+        let mut t = self.tickets.write();
+        if t.past.remove(&slot).is_some() {
+            self.sync_past(&t);
+        }
     }
 
     /// A delete's bag drains: drops the tickets its deletes buried, and
