@@ -1169,6 +1169,19 @@ pub(crate) fn wounded() -> bool {
     ENTRY.with(|e| e.wounded.get())
 }
 
+/// Checks, at an outermost entry's exit, that the thread carries no wound
+/// and holds no claim into its next entry.
+pub(crate) fn debug_assert_exit_clear() {
+    debug_assert!(
+        !wounded(),
+        "incr-core: an outermost entry exits with its thread still wounded"
+    );
+    debug_assert!(
+        !held_any() || held_keys().is_empty(),
+        "incr-core: an outermost entry exits holding claims"
+    );
+}
+
 /// Marks a `Shared` runtime's key; runtime ids stay far below 2^63.
 const SHARED_KEY: u64 = 1 << 63;
 

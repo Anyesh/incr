@@ -771,7 +771,10 @@ fn local_reader_of_a_retracted_shared_entry_holds_nothing_at_its_exit() {
 }
 
 thread_local! {
-    static LOCAL_RT: Runtime<Local> = Runtime::new();
+    /// Leaked, so no thread's exit drops it: a runtime dropped in TLS
+    /// teardown can reach `BudgetEntry`'s thread-locals after their
+    /// destruction while another test's runtime is unbudgeted.
+    static LOCAL_RT: &'static Runtime<Local> = Box::leak(Box::new(Runtime::new()));
 }
 
 /// x, under an outermost `Shared` read, reads its held cycle and then a
@@ -908,4 +911,155 @@ fn a_held_failed_landing_regenerates_its_payload_as_unheld() {
             }
         }
     }
+}
+
+/// a's `try_get(b)` catches the cycle that b's read of a closes.
+fn caught_cycle<C: Cells>(rt: &Runtime<C>) -> (Incr<i64>, Incr<i64>) {
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query(move |rt| rt.try_get(*bc.get().unwrap()).unwrap_or(7777))
+    };
+    let b = rt.create_query(move |rt| rt.get(a) + 1);
+    bc.set(b).unwrap();
+    (a, b)
+}
+
+/// c and d read each other with `get`, so a read of c raises their cycle.
+fn raised_cycle(rt: &Runtime<Shared>) -> Incr<i64> {
+    let dc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let c = {
+        let dc = dc.clone();
+        rt.create_query(move |rt| rt.get(*dc.get().unwrap()) + 1)
+    };
+    let d = rt.create_query(move |rt| rt.get(c) * 2);
+    dc.set(d).unwrap();
+    c
+}
+
+/// A caught cycle's value depends on the member the read entered it at, so
+/// its catcher a is held, and so is x, which read a, until the outermost
+/// exit publishes them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_caught_cycle_holds_its_catcher_and_its_readers() {
+    let rt = Runtime::<Shared>::new();
+    let (a, _) = caught_cycle(&rt);
+    let held = Arc::new(AtomicUsize::new(usize::MAX));
+    let x = {
+        let held = held.clone();
+        rt.create_query(move |rt| {
+            let v = rt.get(a);
+            held.store(crate::hold::held_count(), Ordering::SeqCst);
+            v + 1
+        })
+    };
+    assert_eq!(rt.get(x), 7778);
+    assert_eq!(
+        held.load(Ordering::SeqCst),
+        1,
+        "a is held when x has read it"
+    );
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
+/// a catches the cycle and then reads b with `get`, so its run ends in the
+/// cycle's unwind and opens no hold: the hold raised where the cycle closed
+/// still ends with the read.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_catcher_unwinding_after_its_catch_holds_nothing_past_the_read() {
+    let rt = Runtime::<Shared>::new();
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query(move |rt| {
+            let b = *bc.get().unwrap();
+            let _ = rt.try_get(b);
+            rt.get(b)
+        })
+    };
+    let b = rt.create_query(move |rt| rt.get(a) + 1);
+    bc.set(b).unwrap();
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(a)));
+    assert!(got.is_err(), "a's run ends in the cycle");
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
+/// x catches a cycle of another `Shared` runtime, which closes and unwinds
+/// inside that runtime's first entry: the entry's exit publishes, but x's
+/// value still depends on where the cycle was entered, so x stays held,
+/// and y, which read x, with it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_cycle_caught_across_runtimes_holds_its_catcher() {
+    let rt = Runtime::<Shared>::new();
+    let other = Arc::new(Runtime::<Shared>::new());
+    let c = raised_cycle(&other);
+    let x = {
+        let other = other.clone();
+        rt.create_query(move |_| other.try_get(c).unwrap_or(7777))
+    };
+    let held = Arc::new(AtomicUsize::new(usize::MAX));
+    let y = {
+        let held = held.clone();
+        rt.create_query(move |rt| {
+            let v = rt.get(x);
+            held.store(crate::hold::held_count(), Ordering::SeqCst);
+            v + 1
+        })
+    };
+    assert_eq!(rt.get(y), 7778);
+    assert_eq!(
+        held.load(Ordering::SeqCst),
+        1,
+        "x is held when y has read it"
+    );
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
+/// As above with a `Local` frame r between: r catches the cycle and lands
+/// at once, as no `Local` landing is held, and the hold goes to x, the
+/// nearest `Shared` frame below it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_cycle_caught_under_a_local_frame_holds_the_shared_reader() {
+    let rt = Runtime::<Shared>::new();
+    let other = Arc::new(Runtime::<Shared>::new());
+    let c = raised_cycle(&other);
+    let r = LOCAL_RT.with(|l| l.create_query(move |_| other.try_get(c).unwrap_or(7777)));
+    let x = rt.create_query(move |_| LOCAL_RT.with(|l| l.get(r)) + 1);
+    let held = Arc::new(AtomicUsize::new(usize::MAX));
+    let y = {
+        let held = held.clone();
+        rt.create_query(move |rt| {
+            let v = rt.get(x);
+            held.store(crate::hold::held_count(), Ordering::SeqCst);
+            v + 1
+        })
+    };
+    assert_eq!(rt.get(y), 7779);
+    assert_eq!(
+        held.load(Ordering::SeqCst),
+        1,
+        "x is held when y has read it"
+    );
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
+/// With no `Shared` frame below the `Local` catcher, nothing is held, and
+/// the inner entry's exit ends the hold its cycle raised.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_cycle_caught_under_a_local_root_holds_nothing_past_the_read() {
+    let other = Arc::new(Runtime::<Shared>::new());
+    let c = raised_cycle(&other);
+    let r = LOCAL_RT.with(|l| l.create_query(move |_| other.try_get(c).unwrap_or(7777)));
+    assert_eq!(LOCAL_RT.with(|l| l.get(r)), 7777);
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
 }

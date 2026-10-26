@@ -5060,6 +5060,11 @@ impl<C: Cells> Runtime<C> {
             self.note_delivered(nodes, &*payload);
             resume_unwind(payload);
         }
+        // The delivered cycle closed on this thread's stack in the doomed
+        // run, so what catches it is held as a natively caught one is.
+        if !C::SINGLE_THREADED {
+            self.hold_closed_cycle();
+        }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
         // passes on as an ordinary panic, as `entered` does, unless the read
@@ -5079,6 +5084,10 @@ impl<C: Cells> Runtime<C> {
                 payload
             }
         };
+        if cycle_state::wounded() && !std::thread::panicking() {
+            drop(payload);
+            self.raise_wound();
+        }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(payload)
     }

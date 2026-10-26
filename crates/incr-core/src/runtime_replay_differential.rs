@@ -4664,6 +4664,97 @@ fn two_thread_read_builds_on_no_unfinished_attempts_nested_episode() {
     .assert_clean();
 }
 
+/// 0x8b19's ops 4 (`TryGet(6)`, thread 0) and 5 (`TryGet(3)`, thread 1)
+/// overlap. Op 4's run of 4 reads 1, whose `try_get(2)` catches the cycle
+/// {1, 2} that op 4's own stack closes: 1 lands Dirty with 7777 and 4
+/// Dirty with 0. Op 4 then parks at its claim of 8 until op 5 finishes or
+/// waits. Op 5 reads 4 Dirty, walks 1's dep 2, lands 1 and 2 Failed and
+/// returns the op-4-first order's 9999; op 4 then reads 1 Failed and
+/// panics, which only the op-5-first order does. A caught cycle depends on
+/// the member the attempt entered at, so op 5 must wait on its landing.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_read_builds_on_no_unfinished_attempts_caught_cycle() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_read_builds_on_no_unfinished_attempts_caught_cycle",
+        || {
+            struct Park {
+                parked: AtomicBool,
+                b_started: AtomicBool,
+            }
+            let case = gen_case(0x8b19, false, true);
+            let phases = phases(&case, 0x8b19);
+            let overlap = phases.iter().position(|p| p.ops() == [4, 5]).unwrap();
+            assert_eq!(phases[overlap].of(0), Some(4));
+            quiet(|| {
+                for round in 0..10 {
+                    let park = Arc::new(Park {
+                        parked: AtomicBool::new(false),
+                        b_started: AtomicBool::new(false),
+                    });
+                    let rig = |live: &Live<Shared>| {
+                        let (park, world) = (park.clone(), live.world.clone());
+                        let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                        let (n3, n8) = (slot(3), slot(8));
+                        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                            if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                                return;
+                            }
+                            match TWO_THREAD.with(std::cell::Cell::get) {
+                                Some(0)
+                                    if p == ParkPoint::BeforeClaim(n8)
+                                        && !park.parked.swap(true, SeqCst) =>
+                                {
+                                    let three = world.rt(0).nodes.get(n3.0);
+                                    until(|| {
+                                        crate::waits::registered() > 0
+                                            || !matches!(three.state(), NodeState::New)
+                                                && !super::is_computing(three.state())
+                                    });
+                                }
+                                Some(1) if !park.b_started.swap(true, SeqCst) => {
+                                    until(|| park.parked.load(SeqCst));
+                                }
+                                _ => {}
+                            }
+                        });
+                        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                    };
+                    let serial = Serial::new(&case, &phases);
+                    let verdict = Mutex::new(None);
+                    let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+                        let v = serial.at_overlap("0x8b19", prefix, live);
+                        let stop = p == overlap || v.is_some();
+                        *verdict.lock().unwrap() = v;
+                        stop
+                    });
+                    assert!(park.parked.load(SeqCst), "round {round}: op 4 never claimed 8");
+                    serial.check("0x8b19", &got, verdict.into_inner().unwrap());
+                    assert_eq!(got[4].0, Out::Value(7781), "round {round}");
+                }
+            });
+        },
+    )
+    .assert_clean();
+}
+
+/// 0x8b19 at a budget of one frame: op 5's retry of 1 catches the cycle
+/// {1, 2} as a delivered unwind, from its doomed run, and lands 1 Dirty
+/// with 7777. Unheld, that landing outlives op 5's wound, and op 4 walks
+/// it where every order computes 1 from New.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_budget_1_read_builds_on_no_unfinished_attempts_delivered_cycle() {
+    let case = gen_case(0x8b19, false, true);
+    let phases = phases(&case, 0x8b19);
+    let serial = Serial::new(&case, &phases);
+    quiet(|| {
+        for _ in 0..40 {
+            serial.differential("0x8b19", Some(1), 0, &|_| {});
+        }
+    });
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
