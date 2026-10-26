@@ -2384,7 +2384,8 @@ pub(crate) fn note_took(rt: RuntimeId, reader: RunKey, reading: u64, payload: &(
     });
 }
 
-/// Whether this thread has noted reads of any runtime no landing took.
+/// Whether this thread noted a take in this engine call (`clear` resets
+/// it).
 #[inline(always)]
 pub(crate) fn takes_held() -> bool {
     value_code::thread_word() & value_code::TOOK_BIT != 0
