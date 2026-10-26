@@ -137,7 +137,7 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: see `Self::index_at`.
         let index = unsafe { &*index };
         let found = value_code::run(|| index.with(|s| s.find::<K, T, QUERY>(key)))?;
-        if self.is_alive(found) {
+        if self.alive(found) {
             return Some(Incr::new(found.slot(), found.generation(), self.runtime_id));
         }
         let unbound = value_code::run(|| index.with(|s| s.unbind::<K, T, QUERY>(key)));

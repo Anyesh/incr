@@ -683,7 +683,7 @@ impl<C: Cells> Runtime<C> {
         let slot = handle.slot();
         if observed == NodeState::Cyclic {
             return Some(Err(self
-                .cycle_of(handle)
+                .landed_cycle(handle)
                 .unwrap_or_else(|| Cycle::new(vec![handle.erase()]))));
         }
         let on_stack = self.dep_stack.with(|s| {

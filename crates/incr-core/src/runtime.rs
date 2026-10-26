@@ -2185,7 +2185,7 @@ impl<C: Cells> Runtime<C> {
         let mut inner = self.inner.write();
         for h in [owner, child] {
             assert!(
-                self.is_alive(h),
+                self.alive(h),
                 "incr-core: adopt of deleted node {}",
                 h.slot()
             );
@@ -2239,6 +2239,16 @@ impl<C: Cells> Runtime<C> {
     /// The answer is a snapshot: a concurrent delete can end the node
     /// right after it returns.
     pub fn is_alive(&self, handle: impl Into<ErasedIncr>) -> bool {
+        let handle = handle.into();
+        if handle.runtime_id() == self.runtime_id {
+            self.dep_stack.unrecorded_lookup();
+        }
+        self.alive(handle)
+    }
+
+    /// [`Self::is_alive`] for the engine's own checks, which do not mark
+    /// the running compute (see `DepStack::unrecorded_lookup`).
+    pub(crate) fn alive(&self, handle: impl Into<ErasedIncr>) -> bool {
         let handle = handle.into();
         if handle.runtime_id() != self.runtime_id {
             return false;
@@ -2482,6 +2492,15 @@ impl<C: Cells> Runtime<C> {
     /// landing of another thread's compute that has not finished.
     pub fn cycle_of(&self, handle: impl Into<ErasedIncr>) -> Option<Cycle> {
         let handle = handle.into();
+        if handle.runtime_id() == self.runtime_id {
+            self.dep_stack.unrecorded_lookup();
+        }
+        self.landed_cycle(handle)
+    }
+
+    /// [`Self::cycle_of`] for the engine's own reads.
+    pub(crate) fn landed_cycle(&self, handle: impl Into<ErasedIncr>) -> Option<Cycle> {
+        let handle = handle.into();
         if handle.runtime_id() != self.runtime_id {
             if handle.runtime_id() == RuntimeId::PENDING && !self.pending_in_reach(handle) {
                 self.pending_out_of_reach();
@@ -2708,7 +2727,7 @@ impl<C: Cells> Runtime<C> {
             self.stale_handle(handle);
         }
         if matches!(state, NodeState::Cyclic | NodeState::New) {
-            if let Some(cycle) = self.cycle_of(handle) {
+            if let Some(cycle) = self.landed_cycle(handle) {
                 return Ok(cycle);
             }
         }
@@ -2825,6 +2844,8 @@ impl<C: Cells> Runtime<C> {
     /// during this `get`.
     pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
         use crate::trace::TraceAction;
+        // The trace's counts are read with no dependency.
+        self.dep_stack.unrecorded_lookup();
 
         // Arm tracing: clear any prior log, then flip the gate so
         // compute_one starts appending events.
@@ -2880,7 +2901,7 @@ impl<C: Cells> Runtime<C> {
         let trace = crate::trace::PropagationTrace {
             target: NodeId(handle.slot()),
             node_traces,
-            total_nodes: self.node_count(),
+            total_nodes: self.live_nodes(),
             nodes_recomputed,
             nodes_cutoff,
             elapsed_ns,
@@ -2891,6 +2912,11 @@ impl<C: Cells> Runtime<C> {
     /// Number of live nodes in the runtime (deleted-and-not-yet-recycled
     /// slots excluded).
     pub fn node_count(&self) -> usize {
+        self.dep_stack.unrecorded_lookup();
+        self.live_nodes()
+    }
+
+    fn live_nodes(&self) -> usize {
         let free = self.inner.read().free_nodes.len();
         self.nodes.len() as usize - free
     }
@@ -2913,6 +2939,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Retrieve the label for a node slot, if any.
     pub fn label(&self, slot: u32) -> Option<String> {
+        self.dep_stack.unrecorded_lookup();
         self.inner.read().labels.get(&slot).cloned()
     }
 
@@ -2921,6 +2948,7 @@ impl<C: Cells> Runtime<C> {
     /// (read from the inner state).
     pub fn graph_snapshot(&self) -> Vec<crate::trace::NodeInfo> {
         use crate::trace::{NodeInfo, NodeKindInfo};
+        self.dep_stack.unrecorded_lookup();
         let inner = self.inner.read();
         let count = self.nodes.len();
         let mut out = Vec::with_capacity(count as usize);
@@ -2991,7 +3019,7 @@ impl<C: Cells> Runtime<C> {
     /// `None` unless the node is alive at the handle's generation through
     /// the read.
     pub(crate) fn changed_at_erased(&self, handle: ErasedIncr) -> Option<u64> {
-        if !self.is_alive(handle) {
+        if !self.alive(handle) {
             return None;
         }
         let node = self.nodes.get(handle.slot());
