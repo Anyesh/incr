@@ -2916,7 +2916,8 @@ fn lookup_ticket_shape<C: Cells>(
 
 /// Every budget gives what the unbounded run gives for
 /// `lookup_ticket_shape`, which takes the walk's payload: 205 for the
-/// table miss, and 201 for the other lookups, made before their flip.
+/// table and grid misses, and 201 for the other lookups, made before
+/// their flip.
 fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
     let mut differ = Vec::new();
     for (lookup, payload) in [
