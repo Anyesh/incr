@@ -1171,11 +1171,12 @@ fn loom_held_group_record_precedes_state() {
     });
 }
 
-/// c (Fallback) reads a and b, which read c: a landed group. Once i is 1, a
-/// no longer reads c, so the episode at c that o's read runs shrinks to
-/// {c, b}. Counts every closure run. The shrunk episode panics, as on main,
-/// where a fresh graph returns (21, 1) (board
-/// T10-shrunk-cut-incremental-cycle-panic), so models compare outcomes.
+/// c (Fallback) reads a and b, and a (while i is 0) and b (Fallback) read
+/// c: a landed group. Once i is 1, a no longer reads c, so the episode at c
+/// that o's read runs shrinks to {c, b} and o re-reads a, released from it,
+/// giving a fresh graph's (21, 1). Counts every closure run. Without b's
+/// fallback the shrunk episode panics, as on main (board
+/// T10-shrunk-cut-incremental-cycle-panic).
 fn shrunk_cut<C: crate::cells::Cells>(
     rt: &Runtime<C>,
     runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1209,10 +1210,13 @@ fn shrunk_cut<C: crate::cells::Cells>(
     };
     let b = {
         let runs = runs.clone();
-        rt.create_query(move |rt: &Runtime<C>| {
-            run(&runs);
-            rt.get(c) + 2
-        })
+        rt.create_query_with_fallback(
+            move |rt: &Runtime<C>| {
+                run(&runs);
+                rt.get(c) + 2
+            },
+            |cy: &crate::cycle::Cycle| 100 * cy.len() as i64,
+        )
     };
     let o = {
         let runs = runs.clone();
@@ -1238,6 +1242,7 @@ fn loom_own_landed_reread_matches_local() {
             panic_message(|| local.get(o)),
             panic_message(|| local.get(a)),
         );
+        assert_eq!(want, (Ok(21), Ok(1)), "Local differs from a fresh graph");
         let local_runs = local_runs.load(std::sync::atomic::Ordering::Relaxed);
         let local_b_first = {
             let rt = Runtime::<crate::cells::Local>::new();
