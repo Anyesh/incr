@@ -2538,3 +2538,29 @@ fn shared_group_leave_with_a_taken_claim_keeps_the_group() {
         "a claim left its group (record, IN_GROUP) for the untaken and the taken claim"
     );
 }
+
+/// d catches f's panic, sets f's input and reads f again: the set flips
+/// f's landing as it would a published one, so the second read reruns f.
+/// Returns both messages.
+fn set_after_a_caught_panic<C: Cells>() -> (String, String) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    let k = rt.create_input(0_i64);
+    let f = rt.create_query(move |rt: &Runtime<C>| -> i64 { panic!("f boom {}", rt.get(k)) });
+    let d = rt.create_query(move |rt: &Runtime<C>| {
+        let first = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err());
+        rt.set(k, 1);
+        let second = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err());
+        i64::from(first == "f boom 0") + 2 * i64::from(second == "f boom 1")
+    });
+    let v = rt.get(d);
+    let after = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err());
+    (v.to_string(), after)
+}
+
+#[test]
+fn shared_set_inside_the_attempt_flips_its_held_failed_landing() {
+    let local = set_after_a_caught_panic::<Local>();
+    assert_eq!(local.0, "3", "{local:?}");
+    assert_eq!(set_after_a_caught_panic::<Shared>(), local);
+}
