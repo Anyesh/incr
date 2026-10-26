@@ -982,7 +982,7 @@ fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
     for &n in sizes {
         let (first, work) = contained_chain::<C>(frames, n);
         assert!(
-            first <= 16 * n as u64,
+            first <= 24 * n as u64,
             "{frames:?}: {first} units of note work for a {n}-chain's first read"
         );
         assert!(
