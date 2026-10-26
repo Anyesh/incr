@@ -1874,28 +1874,33 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Counts a release of held claims, before they land, for the walks
-    /// other threads planned while they were held: a claim that reads one
-    /// of the landings also reads the count.
+    /// other threads planned while they were held.
     pub(super) fn count_release(&self, slots: impl IntoIterator<Item = u32>) {
         if !C::SINGLE_THREADED {
-            // The log is written under its lock with the count, so a walk
-            // that reads the count and then the log finds the slots.
-            let mut log = self.episode_log.write();
-            cycle_state::own_episode(self.runtime_id, RELEASED);
-            let before = C::u64_fetch_add(&self.episodes_landed, RELEASED);
-            log.push(true, ((before / RELEASED) as u32).wrapping_add(1), slots);
+            self.count_episodes(true, RELEASED, slots);
         }
     }
 
-    /// Counts `episodes` landed episodes, before their `slots` land, as
-    /// [`Self::count_release`] counts a release.
+    /// Counts `episodes` landed episodes, before their `slots` land.
     pub(super) fn count_landed(&self, episodes: u64, slots: impl IntoIterator<Item = u32>) {
-        let landed = episodes * super::LANDED;
+        self.count_episodes(false, episodes * super::LANDED, slots);
+    }
+
+    /// Adds `add` to the episode count before `slots` land, so a claim
+    /// that reads one of the landings also reads the count. The log is
+    /// written under its lock with the count, so a walk that reads the
+    /// count and then the log finds the slots.
+    fn count_episodes(&self, released: bool, add: u64, slots: impl IntoIterator<Item = u32>) {
         let log = (!C::SINGLE_THREADED).then(|| self.episode_log.write());
-        cycle_state::own_episode(self.runtime_id, landed);
-        let before = C::u64_fetch_add(&self.episodes_landed, landed);
+        cycle_state::own_episode(self.runtime_id, add);
+        let after = C::u64_fetch_add(&self.episodes_landed, add).wrapping_add(add);
         if let Some(mut log) = log {
-            log.push(false, before.wrapping_add(landed) as u32, slots);
+            let number = if released {
+                (after / RELEASED) as u32
+            } else {
+                after as u32
+            };
+            log.push(released, number, slots);
         }
     }
 

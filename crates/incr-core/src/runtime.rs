@@ -785,6 +785,10 @@ pub(crate) struct Walk {
     failed_from: usize,
     /// What the walk planned under, kept when a doom stashes it.
     planned: Planned,
+    /// What the walk first planned under: a prune counts every other
+    /// thread's episode since, one counted before its members landed
+    /// included.
+    first_planned: Planned,
 }
 
 #[derive(Default, Clone)]
@@ -826,6 +830,7 @@ impl Walk {
             root_failed_here: false,
             failed_from: 0,
             planned: Planned::default(),
+            first_planned: Planned::default(),
         }
     }
 
@@ -1288,7 +1293,8 @@ pub struct Runtime<C: Cells> {
     pub(crate) drop_unwinds: std::sync::atomic::AtomicU32,
     /// Speculative runs' withheld landings of this revision.
     pub(crate) stashes: OrderedLock<replay_impl::Stashes, C>,
-    /// The slots of the latest releases of held claims.
+    /// The slots the latest landed episodes and releases of held claims
+    /// landed.
     pub(crate) episode_log: OrderedLock<EpisodeLog, C>,
     /// How many stashes `stashes` holds, so a claim can skip its lock.
     pub(crate) stash_count: C::U32,
@@ -3672,6 +3678,7 @@ impl<C: Cells> Runtime<C> {
             let mut walk = Walk::new(id, gen, observed);
             if !C::SINGLE_THREADED {
                 walk.failed_from = cycle_state::failed_here_count();
+                walk.first_planned = planned;
             }
             walk
         });
@@ -3765,14 +3772,13 @@ impl<C: Cells> Runtime<C> {
                         && !cycle_state::holds(self.runtime_id, id.0)
                         && self.release_reached(&walk, cur, planned);
                     resumed = false;
-                    let since = std::mem::replace(&mut planned, self.planned());
-                    if !self.prune_settled(&mut walk, since) {
+                    planned = self.planned();
+                    if !self.prune_settled(&mut walk) {
                         if released {
                             // The plan expanded through a released claim's old
-                            // state, a node it ran perhaps included, so the
-                            // read starts again from its root's state now,
-                            // through the checks its entry made: the root may
-                            // be Computing by now.
+                            // state, so the read starts again from its root's
+                            // state now, through the checks its entry made:
+                            // the root may be Computing by now.
                             if self.nodes.get(id.0).generation() != gen {
                                 return Computed::Gone;
                             }
@@ -4095,19 +4101,18 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Drops the part of `walk`'s plan under its lowest pending node that
-    /// another thread's episode since `since` left Clean or Cyclic, as a
-    /// walk planned now would not expand it, and keeps the rest with what
-    /// the walk has learned. A node this thread or a plain landing settled
-    /// is one the plan goes on through, as with no episode. If the log has
-    /// dropped some of the episode's slots, any settled node counts. False
-    /// if no pending node has settled.
+    /// another thread's held publication with an episode, since the walk
+    /// first planned, left Clean or Cyclic, as a walk planned now would not
+    /// expand it, and keeps the rest with what the walk has learned. A node
+    /// this thread settled, or another thread's landing outside such a
+    /// publication, is one the plan goes on through, as with no episode. If
+    /// the log has dropped some of those slots, any settled node counts.
+    /// False if no pending node has settled.
     #[cold]
     #[inline(never)]
-    fn prune_settled(&self, walk: &mut Walk, since: Planned) -> bool {
-        let landed = self
-            .episode_log
-            .read()
-            .others_since(false, since.all as u32);
+    fn prune_settled(&self, walk: &mut Walk) -> bool {
+        let since = walk.first_planned.all as u32;
+        let landed = self.episode_log.read().others_since(false, since);
         let settled = walk.work.iter().position(|e| {
             e.is_pending()
                 && landed
