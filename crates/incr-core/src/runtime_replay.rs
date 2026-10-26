@@ -373,7 +373,7 @@ impl<C: Cells> Runtime<C> {
 
     /// A speculative entry's run stashes only Clean values: a node it would
     /// land Dirty, poisoned, over a dep that is neither Clean nor stashed, or
-    /// over a kept read its adoption can't check (`KEPT_UNCHECKED`), has a
+    /// over a read its adoption can't check (`KEPT_UNCHECKED`), has a
     /// history the unbounded run may never give it, and a later walk
     /// of its deps would differ from a first run of its closure. A kept
     /// Clean read of another runtime is checked: the stash keeps that runtime's

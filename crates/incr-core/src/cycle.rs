@@ -477,11 +477,12 @@ pub struct ComputeCtl {
     path: Cell<MaybeUninit<u64>>,
 }
 
-/// Lives inside its runtime and answers whether a frame of node `slot` of
-/// that runtime keeps other runtimes' Clean reads for its retry. The
-/// runtime's `keep_resolver_ptr` is good while one of its computes runs,
-/// since the compute borrows the runtime; a pointer taken from the field
-/// itself may not reach the rest of the runtime.
+/// Lives inside its runtime (a speculative frame's, beside its run) and
+/// answers whether a frame of node `slot` of that runtime keeps other
+/// runtimes' Clean reads for its retry. The runtime's `keep_resolver_ptr`
+/// is good while one of its computes runs, since the compute borrows the
+/// runtime; a pointer taken from the field itself may not reach the rest
+/// of the runtime.
 pub(crate) struct KeepResolver {
     pub(crate) keeps: unsafe fn(*const KeepResolver, u32) -> bool,
 }
