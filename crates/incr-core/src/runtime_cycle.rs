@@ -719,6 +719,9 @@ impl<C: Cells> Runtime<C> {
             .active_frame(rt)
             .filter(|_| !self.foreign_frame_above(p));
         let Some((ctl, at)) = active else {
+            if !C::SINGLE_THREADED {
+                self.hold_closed_cycle();
+            }
             return Some(Err(self.cycle_at(p)));
         };
         // SAFETY: the active frame is on the stack, so its control block
@@ -763,6 +766,9 @@ impl<C: Cells> Runtime<C> {
         // R3: an unseeded node on the stack has no value to give.
         if on_stack.is_some() {
             ctl.lower(p);
+            if !C::SINGLE_THREADED {
+                self.hold_closed_cycle();
+            }
             return Some(Err(self.cycle_at(p)));
         }
         let (anchor, _, buffered, ..) = held.expect("an unseeded node off the stack is held");

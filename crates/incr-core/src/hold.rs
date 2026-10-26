@@ -86,6 +86,9 @@ struct HoldSet {
     /// runtime whose frames are below them, or a retracted read), so their
     /// landings retract at the exit of their first entry.
     tainted: Vec<RuntimeId>,
+    /// Runtimes a cycle closed in on this thread's stack: what caught it is
+    /// held, so the hold stays until their first entry's exit.
+    closed: Vec<RuntimeId>,
     /// Records a cut replaced on claims it keeps ([`keep_cut_rec`]).
     cut_recs: Vec<CutRec>,
     /// Runtimes with a replaced record not yet taken by [`take_recs`],
@@ -469,10 +472,15 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
         }
         h.by_cell.retain(|_, at| h.entries[*at].is_some());
         h.tainted.retain(|r| *r != rt);
+        h.closed.retain(|r| *r != rt);
         h.recs.retain(|r| *r != rt);
         let cut_recs = take_cut_recs(h, rt);
         // A taint keeps the bit, so that the `HOLD` it raised passes up.
-        if h.by_cell.is_empty() && h.tainted.is_empty() && h.cut_recs.is_empty() {
+        if h.by_cell.is_empty()
+            && h.tainted.is_empty()
+            && h.closed.is_empty()
+            && h.cut_recs.is_empty()
+        {
             h.entries.clear();
             h.consulted = false;
             value_code::set_held_bit(false);
@@ -496,6 +504,7 @@ pub(crate) fn holds_runtime(rt: RuntimeId) -> bool {
     active()
         && with(|h| {
             h.tainted.contains(&rt)
+                || h.closed.contains(&rt)
                 || h.entries.iter().flatten().any(|e| e.rt == rt)
                 || h.cut_recs.iter().any(|c| c.rt == rt)
         })
@@ -509,6 +518,20 @@ pub(crate) fn taint(rt: RuntimeId) {
             h.tainted.push(rt);
         }
     });
+}
+
+/// A cycle closed in `rt` on this thread's stack.
+pub(crate) fn note_closed(rt: RuntimeId) {
+    value_code::set_held_bit(true);
+    with(|h| {
+        if !h.closed.contains(&rt) {
+            h.closed.push(rt);
+        }
+    });
+}
+
+pub(crate) fn closed(rt: RuntimeId) -> bool {
+    active() && with(|h| h.closed.contains(&rt))
 }
 
 pub(crate) fn tainted(rt: RuntimeId) -> bool {

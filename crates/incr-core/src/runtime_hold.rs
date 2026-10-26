@@ -390,10 +390,14 @@ impl<C: Cells> Runtime<C> {
                 self.retract_held();
                 self.taint_reader();
             } else {
+                let closed = hold::closed(self.runtime_id);
                 self.publish_own();
                 // The frames' pops passed their HOLD to the reader, but
-                // what it read is published now.
-                if !reader_held {
+                // what it read is published now, unless a cycle closed in
+                // the entry: the reader's value depends on where it entered.
+                if closed {
+                    self.hold_closed_cycle();
+                } else if !reader_held {
                     if let Some(c) = self.dep_stack.hold_reader() {
                         // SAFETY: the reading frame is below this entry on
                         // the stack, so its control block outlives it.
@@ -414,6 +418,17 @@ impl<C: Cells> Runtime<C> {
         self.dep_stack
             .hold_reader()
             .is_some_and(|c| unsafe { &*c }.has(flag))
+    }
+
+    /// A cycle closed on this thread's stack: what catches it depends on the
+    /// member the attempt entered it at, so the nearest `Shared` frame is
+    /// held, and its pops pass the hold down to the catcher and its readers.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn hold_closed_cycle(&self) {
+        if let Some(rt) = self.dep_stack.raise_hold() {
+            hold::note_closed(rt);
+        }
     }
 
     /// The reading frame's landing depends on state this attempt has not
