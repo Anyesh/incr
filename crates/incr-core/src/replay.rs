@@ -740,7 +740,10 @@ impl Pending {
             let shallow = contained.into_iter().flat_map(|(at, p)| {
                 (self.by_payload.range((at, p, 0)..=(at, p, usize::MAX))).map(|&(_, _, i)| i)
             });
-            deep.chain(shallow).collect()
+            let hit: Vec<usize> = deep.chain(shallow).collect();
+            #[cfg(all(test, not(loom)))]
+            self.check_unhit(ev, &hit);
+            hit
         };
         for i in hit {
             self.unfile_passed(i);
@@ -749,6 +752,34 @@ impl Pending {
             }
             self.file_passed(i);
         }
+    }
+
+    /// Checks that `ev` would leave as they are the landings of every
+    /// passed delivery `retire` does not visit, on a list small enough to
+    /// check whole.
+    #[cfg(all(test, not(loom)))]
+    fn check_unhit(&self, ev: &Retire, hit: &[usize]) {
+        if self.live > 64 {
+            return;
+        }
+        without_note_work(|| {
+            for (i, d) in self.slots.iter().enumerate() {
+                let reached = |d: &&Delivery| d.passed && d.key.cidx < ev.cidx();
+                let Some(d) = d.as_ref().filter(reached).filter(|_| !hit.contains(&i)) else {
+                    continue;
+                };
+                let Delivered::Unwind { nodes, .. } = &d.what else {
+                    continue;
+                };
+                let mut retired = nodes.clone();
+                retired.retire(d.key.cidx, ev, d.resumed);
+                assert!(
+                    nodes.clone().into_nodes() == retired.into_nodes(),
+                    "incr-core: an event at {} skipped delivery {i}",
+                    ev.cidx()
+                );
+            }
+        });
     }
 
     /// The deliveries for read `key`, oldest first.
@@ -1571,6 +1602,14 @@ pub(crate) fn note_work(units: usize) {
     NOTE_WORK.with(|n| n.set(n.get() + units as u64));
     #[cfg(not(all(test, not(loom))))]
     let _ = units;
+}
+
+/// Runs `f` without counting the note work it does.
+#[cfg(all(test, not(loom)))]
+fn without_note_work(f: impl FnOnce()) {
+    let counted = NOTE_WORK.with(Cell::get);
+    f();
+    NOTE_WORK.with(|n| n.set(counted));
 }
 
 /// The units [`note_work`] counted on this thread since the last call.
@@ -3329,6 +3368,39 @@ mod tests {
             },
             false,
         );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A delivery that loses its deeper landings is filed again as one
+    /// whose landings sit just above its frame, which a containment there
+    /// of its payload still reaches.
+    #[test]
+    fn a_delivery_left_just_above_its_frame_is_reached_there() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
+        pending.retire(&Retire::Above(4), false);
+        assert!(!holds(&mut pending, (5, 0)));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&P),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A later take's copy replaces the earlier one's as the payload a
+    /// containment must name.
+    #[test]
+    fn a_later_take_replaces_the_copy_a_containment_retires() {
+        static R: &str = "r";
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&Q));
+        pending.resume(0, key(&R));
+        let contained = |payload| Retire::Contained { cidx: 4, payload };
+        pending.retire(&contained(key(&Q)), false);
+        assert!(holds(&mut pending, (2, 0)));
+        pending.retire(&contained(key(&R)), false);
         assert!(!holds(&mut pending, (2, 0)));
     }
 
