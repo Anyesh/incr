@@ -2283,3 +2283,127 @@ fn flip_racing_a_contained_hold_releases_the_ticket() {
         rt.assert_invariant_i();
     });
 }
+
+/// Which outcomes a hand-over model's executions reached.
+struct HandOvers {
+    taken: std::sync::atomic::AtomicBool,
+    kept: std::sync::atomic::AtomicBool,
+}
+
+impl HandOvers {
+    const fn new() -> Self {
+        Self {
+            taken: std::sync::atomic::AtomicBool::new(false),
+            kept: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn note(&self, taken: bool) {
+        let flag = if taken { &self.taken } else { &self.kept };
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn assert_both(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        assert!(
+            self.taken.load(Relaxed),
+            "no execution handed the landing over"
+        );
+        assert!(
+            self.kept.load(Relaxed),
+            "every execution handed the landing over"
+        );
+    }
+}
+
+/// A waiter's claim wait on the held landing of `CELL`, for as many checks
+/// as a stuck owner needs, under loom's `STUCK_AFTER`.
+fn wait_to_hand_over(rt: crate::handle::RuntimeId) -> bool {
+    let mut patience = crate::attempt::Patience::default();
+    for _ in 0..4 {
+        if crate::hold::hand_over(HELD_CELL, (rt, HELD_SLOT), &mut patience).is_some() {
+            return true;
+        }
+        thread::yield_now();
+    }
+    false
+}
+
+const HELD_CELL: usize = 0x1000;
+const HELD_SLOT: u32 = 7;
+
+/// The owner opens and lands a held entry and makes no more progress, as
+/// one parked in a join, then publishes.
+fn hold_one(rt: crate::handle::RuntimeId) {
+    crate::attempt::begin();
+    let own = crate::hold::open(HELD_CELL, rt, HELD_SLOT, 0, true, None, None);
+    assert!(own.is_none());
+    crate::hold::land(HELD_CELL, NodeState::Clean, NodeState::Clean, false);
+}
+
+static PUBLISH_RACE: HandOvers = HandOvers::new();
+
+/// A waiter on a held landing races the owner's publication of it
+/// (`hold::hand_over` against `hold::take`): the entry is published or
+/// taken, never both and never neither, and the owner's take reports the
+/// wound exactly when the waiter took it, so a publication never rests on
+/// a landing a waiter retracted.
+#[test]
+fn hand_over_races_publication() {
+    run(|| {
+        let rt = crate::handle::RuntimeId::allocate();
+        hold_one(rt);
+        let waiter = thread::spawn(move || wait_to_hand_over(rt));
+        let taken = crate::hold::take(rt);
+        let handed = waiter.join().unwrap();
+        assert_eq!(taken.wounded, handed);
+        assert_eq!(taken.entries.len(), usize::from(!handed));
+        assert!(!crate::hold::active());
+        PUBLISH_RACE.note(handed);
+    });
+    PUBLISH_RACE.assert_both();
+}
+
+static RECLAIM_RACE: HandOvers = HandOvers::new();
+
+/// A waiter on a held landing races the owner claiming it again
+/// (`hold::reclaim`): an entry the owner computes again is never taken,
+/// and one taken is gone from the owner's view.
+#[test]
+fn hand_over_races_reclaim() {
+    run(|| {
+        let rt = crate::handle::RuntimeId::allocate();
+        hold_one(rt);
+        let waiter = thread::spawn(move || wait_to_hand_over(rt));
+        let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean);
+        let handed = waiter.join().unwrap();
+        assert!(!(reclaimed && handed), "a reclaimed entry was taken");
+        assert_eq!(crate::hold::holds(HELD_CELL), !handed);
+        let taken = crate::hold::take(rt);
+        assert_eq!(taken.wounded, handed);
+        RECLAIM_RACE.note(handed);
+    });
+    RECLAIM_RACE.assert_both();
+}
+
+static PROGRESS_RACE: HandOvers = HandOvers::new();
+
+/// A waiter's patience against a holder that keeps landing: each landing
+/// is engine progress and restarts it, so only a holder that stops is
+/// wounded, and the owner learns of it at the take that ends its hold.
+#[test]
+fn hand_over_waits_out_a_holder_that_progresses() {
+    run(|| {
+        let rt = crate::handle::RuntimeId::allocate();
+        hold_one(rt);
+        let waiter = thread::spawn(move || wait_to_hand_over(rt));
+        crate::hold::land(HELD_CELL, NodeState::Clean, NodeState::Clean, false);
+        let wounded = crate::attempt::hold_wounded();
+        let handed = waiter.join().unwrap();
+        let taken = crate::hold::take(rt);
+        assert_eq!(taken.wounded, handed);
+        assert!(!wounded || handed);
+        PROGRESS_RACE.note(handed);
+    });
+    PROGRESS_RACE.assert_both();
+}
