@@ -945,7 +945,30 @@ fn shared_contained_chain_stays_linear_at_budget_16() {
 /// the context's deliveries. `through` puts a query between each level and
 /// its panicking one, so each copy holds a landing a level deeper.
 fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
-    let n: u64 = if cfg!(miri) { 8 } else { 4000 };
+    if cfg!(miri) || !through {
+        let n = if cfg!(miri) { 8 } else { 4000 };
+        let work = nested_caught_chain_work::<C>(frames, through, n);
+        assert!(
+            work <= 24 * n,
+            "budget {frames}: {work} units of note work for a {n}-chain"
+        );
+        return;
+    }
+    // Each doomed level's retry catches its kept reads up on what up to
+    // `frames` levels above it did, so the work per level grows with the
+    // budget, never with the chain.
+    let (small, large) = (
+        nested_caught_chain_work::<C>(frames, through, 1000),
+        nested_caught_chain_work::<C>(frames, through, 4000),
+    );
+    assert!(
+        large <= 6 * small,
+        "budget {frames}: {small} and {large} units of note work for 1000- and 4000-chains"
+    );
+}
+
+/// The note work of a chain of `n` levels as [`nested_caught_chain`] builds it.
+fn nested_caught_chain_work<C: Cells>(frames: u32, through: bool, n: u64) -> u64 {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
@@ -971,11 +994,7 @@ fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
     }
     crate::replay::take_note_work();
     assert_eq!(rt.get(below), n + 7);
-    let work = crate::replay::take_note_work();
-    assert!(
-        work <= 24 * n,
-        "budget {frames}: {work} units of note work for a {n}-chain"
-    );
+    crate::replay::take_note_work()
 }
 
 #[test]

@@ -514,16 +514,17 @@ pub(crate) struct Pending {
     /// frame, by the highest position one of their landings may have.
     by_top: BTreeSet<(u32, usize)>,
     /// The passed deliveries whose landings are all just above their frame,
-    /// by that position and each payload they stand for: only a walk's
-    /// entry there containing that payload retires them.
+    /// by that position and each payload they stand for: short of a copied
+    /// node's landing, only a walk's entry there containing that payload
+    /// retires them.
     by_payload: BTreeSet<(u32, PayloadKey, usize)>,
-    listed: HashMap<usize, Listed, FxBuildHasher>,
+    filed: HashMap<usize, Filed, FxBuildHasher>,
 }
 
-/// Where a passed delivery is listed for the events that retire its
+/// Where a passed delivery is filed for the events that retire its
 /// landings (`Pending::retire`).
 #[derive(Clone, Copy)]
-enum Listed {
+enum Filed {
     Deep(u32),
     Shallow(u32, [Option<PayloadKey>; 2]),
 }
@@ -589,7 +590,7 @@ impl Pending {
         let passed = d.passed;
         self.slots.push(Some(d));
         if passed {
-            self.list(i);
+            self.file_passed(i);
         }
         self.live += 1;
     }
@@ -616,7 +617,7 @@ impl Pending {
             }
             unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        self.unlist(i);
+        self.unfile_passed(i);
         self.live -= 1;
         // No index is held across a point where none is live.
         if self.live == 0 {
@@ -642,49 +643,49 @@ impl Pending {
         let d = self.get_mut(i);
         if !d.passed {
             d.passed = true;
-            self.list(i);
+            self.file_passed(i);
         }
     }
 
     /// Delivery `i`'s latest take raised a copy of its payload keyed `key`.
     pub(crate) fn resume(&mut self, i: usize, key: PayloadKey) {
-        self.unlist(i);
+        self.unfile_passed(i);
         let d = self.get_mut(i);
         d.resumed = Some(key);
         if d.passed {
-            self.list(i);
+            self.file_passed(i);
         }
     }
 
-    fn list(&mut self, i: usize) {
+    fn file_passed(&mut self, i: usize) {
         let d = self.get(i);
         let Delivered::Unwind { nodes, .. } = &d.what else {
             return;
         };
-        let top = d.key.cidx + 1;
-        let listed = match nodes.deepest() {
+        let above = d.key.cidx + 1;
+        let filed = match nodes.deepest() {
             None => return,
             Some(0) => {
                 let payloads = [nodes.source, d.resumed];
                 for p in payloads.into_iter().flatten() {
-                    self.by_payload.insert((top, p, i));
+                    self.by_payload.insert((above, p, i));
                 }
-                Listed::Shallow(top, payloads)
+                Filed::Shallow(above, payloads)
             }
             Some(depth) => {
-                self.by_top.insert((top + depth, i));
-                Listed::Deep(top + depth)
+                self.by_top.insert((above + depth, i));
+                Filed::Deep(above + depth)
             }
         };
-        self.listed.insert(i, listed);
+        self.filed.insert(i, filed);
     }
 
-    fn unlist(&mut self, i: usize) {
-        match self.listed.remove(&i) {
-            Some(Listed::Deep(top)) => {
+    fn unfile_passed(&mut self, i: usize) {
+        match self.filed.remove(&i) {
+            Some(Filed::Deep(top)) => {
                 self.by_top.remove(&(top, i));
             }
-            Some(Listed::Shallow(top, payloads)) => {
+            Some(Filed::Shallow(top, payloads)) => {
                 for p in payloads.into_iter().flatten() {
                     self.by_payload.remove(&(top, p, i));
                 }
@@ -710,7 +711,7 @@ impl Pending {
             for d in self.slots.iter_mut().flatten().filter(|d| d.passed) {
                 apply(d);
             }
-            self.listed.keys().copied().collect()
+            self.filed.keys().copied().collect()
         } else {
             // Short of a copied node's landing, an event retires only
             // landings of a frame below it that are above its position, or
@@ -727,15 +728,46 @@ impl Pending {
             let shallow = contained.into_iter().flat_map(|(at, p)| {
                 (self.by_payload.range((at, p, 0)..=(at, p, usize::MAX))).map(|&(_, _, i)| i)
             });
-            deep.chain(shallow).collect()
+            let hit: Vec<usize> = deep.chain(shallow).collect();
+            #[cfg(all(test, not(loom)))]
+            self.check_unhit(ev, &hit);
+            hit
         };
         for i in hit {
-            self.unlist(i);
+            self.unfile_passed(i);
             if !all {
                 apply(self.get_mut(i));
             }
-            self.list(i);
+            self.file_passed(i);
         }
+    }
+
+    /// Checks that `ev` would leave as they are the landings of every
+    /// passed delivery `retire` does not visit, on a list small enough to
+    /// check whole.
+    #[cfg(all(test, not(loom)))]
+    fn check_unhit(&self, ev: &Retire, hit: &[usize]) {
+        if self.live > 64 {
+            return;
+        }
+        without_note_work(|| {
+            for (i, d) in self.slots.iter().enumerate() {
+                let reached = |d: &&Delivery| d.passed && d.key.cidx < ev.cidx();
+                let Some(d) = d.as_ref().filter(reached).filter(|_| !hit.contains(&i)) else {
+                    continue;
+                };
+                let Delivered::Unwind { nodes, .. } = &d.what else {
+                    continue;
+                };
+                let mut retired = nodes.clone();
+                retired.retire(d.key.cidx, ev, d.resumed);
+                assert!(
+                    nodes.clone().into_nodes() == retired.into_nodes(),
+                    "incr-core: an event at {} skipped delivery {i}",
+                    ev.cidx()
+                );
+            }
+        });
     }
 
     /// The deliveries for read `key`, oldest first.
@@ -1558,6 +1590,14 @@ pub(crate) fn note_work(units: usize) {
     NOTE_WORK.with(|n| n.set(n.get() + units as u64));
     #[cfg(not(all(test, not(loom))))]
     let _ = units;
+}
+
+/// Runs `f` without counting the note work it does.
+#[cfg(all(test, not(loom)))]
+fn without_note_work(f: impl FnOnce()) {
+    let counted = NOTE_WORK.with(Cell::get);
+    f();
+    NOTE_WORK.with(|n| n.set(counted));
 }
 
 /// The units [`note_work`] counted on this thread since the last call.
@@ -3316,6 +3356,39 @@ mod tests {
             },
             false,
         );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A delivery that loses its deeper landings is filed again as one
+    /// whose landings sit just above its frame, which a containment there
+    /// of its payload still reaches.
+    #[test]
+    fn a_delivery_left_just_above_its_frame_is_reached_there() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
+        pending.retire(&Retire::Above(4), false);
+        assert!(!holds(&mut pending, (5, 0)));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&P),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A later take's copy replaces the earlier one's as the payload a
+    /// containment must name.
+    #[test]
+    fn a_later_take_replaces_the_copy_a_containment_retires() {
+        static R: &str = "r";
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&Q));
+        pending.resume(0, key(&R));
+        let contained = |payload| Retire::Contained { cidx: 4, payload };
+        pending.retire(&contained(key(&Q)), false);
+        assert!(holds(&mut pending, (2, 0)));
+        pending.retire(&contained(key(&R)), false);
         assert!(!holds(&mut pending, (2, 0)));
     }
 
