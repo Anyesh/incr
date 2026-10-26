@@ -787,7 +787,8 @@ pub(crate) struct Walk {
     planned: Planned,
     /// What the walk first planned under: a prune counts every other
     /// thread's episode since, one counted before its members landed
-    /// included.
+    /// included. A plan afresh from the root keeps it, so an episode counted
+    /// before that plan whose members land after it still prunes.
     first_planned: Planned,
 }
 
