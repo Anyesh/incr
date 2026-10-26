@@ -6744,42 +6744,42 @@ fn high_range_clean_read_delivery_seeds() {
 /// same way under this harness (cycle [23]) and op 4 is main's cycle too.
 /// Ops 0 and 1 are each engine's own fresh and held reads: op 0 the fresh
 /// cycle, op 1 the read with node 4, which op 0 left Failed, held failing.
+/// With every query replayable a bounded run closes op 3's cycle as the
+/// unbounded run does, and the split moves to op 4, whose bounded read
+/// gives the fresh Value(9999).
 #[test]
 #[cfg_attr(miri, ignore)]
 fn stale_dep_split_seed_splits_as_on_main() {
     let case = gen_case(0x92_b175_80fc, false, false);
     let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
     let cycle = || Out::Panic("cycle".to_owned());
-    let with = |op3| {
-        vec![
-            cycle(),
-            Out::Value(43329),
-            Out::Done,
-            op3,
-            cycle(),
-            Out::Done,
-        ]
+    let with = |op3, op4| vec![cycle(), Out::Value(43329), Out::Done, op3, op4, Out::Done];
+    let unbounded = with(Out::Cycle(vec![17, 24]), cycle());
+    let bounded = if super::replay_defaults().1 {
+        with(Out::Cycle(vec![17, 24]), Out::Value(9999))
+    } else {
+        with(Out::Value(6), cycle())
     };
     quiet(|| {
         assert_eq!(
             outs(run::<Local>(&case, None, 0)),
-            with(Out::Cycle(vec![17, 24])),
+            unbounded,
             "Local unbounded"
         );
         assert_eq!(
             outs(run::<Shared>(&case, None, 0)),
-            with(Out::Cycle(vec![17, 24])),
+            unbounded,
             "Shared unbounded"
         );
         for frames in [1, 2, 3] {
             assert_eq!(
                 outs(run::<Local>(&case, Some(frames), 0)),
-                with(Out::Value(6)),
+                bounded,
                 "Local, budget {frames}"
             );
             assert_eq!(
                 outs(run::<Shared>(&case, Some(frames), 0)),
-                with(Out::Value(6)),
+                bounded,
                 "Shared, budget {frames}"
             );
         }
