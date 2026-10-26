@@ -2786,3 +2786,54 @@ fn shared_reader_of_a_held_failed_landing_is_not_rerun_by_another_thread() {
     assert_eq!(rt.state_of(f), NodeState::Failed);
     rt.assert_invariant_i();
 }
+
+/// f ran once at i = 1, so its edge to i is published. o catches f's
+/// panic at i = 2, so f's Failed landing is held with a regeneration
+/// record, and parks. B's set of i flags f's word through that edge; o's
+/// own set of i, once released, then flips f's held landing from the
+/// Dirty its view shows, as the set's walk would flip a published one.
+/// f publishes Dirty, and the record of its Failed landing goes with it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_flipped_held_failed_landing_drops_its_record() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(16);
+    let gate = Gate::new();
+    let i = rt.create_input(1_i64);
+    let f = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> i64 {
+            let v = rt.get(i);
+            assert!(v == 1, "f boom {v}");
+            v
+        },
+        replayable(),
+    );
+    let o = {
+        let gate = gate.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err();
+            gate.park();
+            rt.set(i, 3);
+            i64::from(caught)
+        })
+    };
+    assert_eq!(rt.get(f), 1);
+    rt.set(i, 2);
+    gate.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        std::thread::spawn(move || rt.get(o))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(f), NodeState::Computing);
+    {
+        let rt = Arc::clone(&rt);
+        std::thread::spawn(move || rt.set(i, 4)).join().unwrap();
+    }
+    gate.release();
+    assert_eq!(a.join().unwrap(), 1);
+    assert_ne!(rt.state_of(f), NodeState::Failed);
+    assert_eq!(rt.failed_run_token(f.slot(), f.generation()), None);
+    rt.assert_invariant_i();
+}
