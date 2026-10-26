@@ -384,8 +384,9 @@ impl Notes {
     /// the copy of the log noted last went to the same place, at an epoch
     /// no later, under the same cut, and no note has gone since, the
     /// entries it held are noted already, so only later ones are: a second
-    /// note of a node at the same place, or deeper than another, retires
-    /// with that one and adds no landing.
+    /// note of a node at the same place retires with the first, and one
+    /// deeper retires with its own frame, as each note of a whole renote
+    /// does.
     pub(crate) fn note_copy(
         &mut self,
         rt: RuntimeId,

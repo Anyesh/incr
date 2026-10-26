@@ -3938,9 +3938,15 @@ mod tests {
         let late = from.copy(rt, s, 0);
         let mut reused = Notes::new();
         reused.note_copy(rt, key(&P), 0, early.as_shared().unwrap());
+        take_note_work();
         reused.note_copy(rt, key(&P), 0, late.as_shared().unwrap());
+        let reusing = take_note_work();
         let mut whole = Notes::new();
         whole.note_copy(rt, key(&Q), 0, late.as_shared().unwrap());
+        assert!(
+            reusing < take_note_work(),
+            "the second renote reused the first"
+        );
         reused.forget_from(2, None);
         whole.forget_from(2, None);
         let reused = reused.copy(rt, key(&P), 0).into_nodes();
