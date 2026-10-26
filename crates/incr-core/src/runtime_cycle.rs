@@ -372,6 +372,9 @@ impl<C: Cells> Runtime<C> {
                     if outermost && !C::SINGLE_THREADED && hold::active() {
                         self.publish_held();
                     }
+                    if outermost {
+                        cycle_state::debug_assert_exit_clear();
+                    }
                     return Ok(r);
                 }
                 Err(payload) => {
@@ -430,6 +433,9 @@ impl<C: Cells> Runtime<C> {
         // its read's outcome, which every landing it made is part of.
         if outermost && !C::SINGLE_THREADED && hold::active() {
             self.publish_held();
+        }
+        if outermost {
+            cycle_state::debug_assert_exit_clear();
         }
         match cycle_state::take_unwind_kind() {
             Some(UnwindKind::Cycle) => {
