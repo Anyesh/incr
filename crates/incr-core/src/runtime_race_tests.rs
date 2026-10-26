@@ -2374,3 +2374,39 @@ fn an_observer_walk_replanned_with_its_root_held_here_reads_as_unreplanned() {
     assert!(unreplanned.is_some());
     assert_eq!(read, unreplanned);
 }
+
+/// r reads a, which reads x. Another thread releases held claims before
+/// each compute of a in the walk of r, as a budgeted read on another thread
+/// does when it discards a doomed cycle's round each time it retries
+/// (0x2997), so every plan of r is stale by the time it computes. The read
+/// still finishes while the releases go on: they stop only after
+/// `RELEASES`, far more than a bounded read waits out.
+#[test]
+fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
+    const RELEASES: usize = 1000;
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let a = rt.create_query(move |rt| rt.get(x) + 1);
+    let r = rt.create_query(move |rt| rt.get(a) + 1);
+    assert_eq!(rt.get(r), 3);
+    rt.set(x, 2);
+    let releases = Arc::new(AtomicUsize::new(0));
+    let hook_releases = releases.clone();
+    let hook_rt = Arc::downgrade(&rt);
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::BeforeComputeOne(id(a))
+            && hook_releases.fetch_add(1, Ordering::Relaxed) < RELEASES
+        {
+            let rt = hook_rt.upgrade().unwrap();
+            thread::spawn(move || rt.count_release()).join().unwrap();
+        }
+    }));
+    assert!(installed.is_ok());
+    assert_eq!(rt.get(r), 4);
+    let released = releases.load(Ordering::Relaxed);
+    assert!(
+        released < RELEASES / 10,
+        "the read restarted until the releases stopped: {released} releases, {} root replans",
+        rt.root_replans.load(Ordering::Relaxed)
+    );
+}
