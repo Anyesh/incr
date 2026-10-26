@@ -46,6 +46,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use crate::handle::ErasedIncr;
@@ -455,12 +456,17 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
+    /// Whether `path` holds the frame's path.
+    path_kept: Cell<bool>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
     /// The frame's runtime's [`KeepResolver`], or null for a frame that
     /// settles its keeping when it is pushed or keeps nothing.
     keep: *const KeepResolver,
+    /// The frame's path once found (`path_kept`), left unwritten until
+    /// then so a push pays nothing for it.
+    path: Cell<MaybeUninit<u64>>,
 }
 
 /// Lives inside its runtime and answers whether a frame of node `slot` of
@@ -485,8 +491,10 @@ impl ComputeCtl {
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
+            path_kept: Cell::new(false),
             children: Cell::new(std::ptr::null()),
             keep,
+            path: Cell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -500,6 +508,21 @@ impl ComputeCtl {
         // SAFETY: the caller's frame is running, so the runtime holding
         // the resolver is borrowed and in place.
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
+    }
+
+    /// The frame's path, if [`Self::keep_path`] kept it.
+    pub(crate) fn kept_path(&self) -> Option<u64> {
+        // SAFETY: `keep_path` writes `path` before it sets `path_kept`.
+        self.path_kept
+            .get()
+            .then(|| unsafe { self.path.get().assume_init() })
+    }
+
+    /// Keeps `path` as the frame's path, which the frames below it fix
+    /// while it is on the stack.
+    pub(crate) fn keep_path(&self, path: u64) {
+        self.path.set(MaybeUninit::new(path));
+        self.path_kept.set(true);
     }
 
     #[inline(always)]

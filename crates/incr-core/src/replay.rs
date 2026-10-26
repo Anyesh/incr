@@ -1616,6 +1616,7 @@ loom::thread_local! {
 thread_local! {
     static VINDEX_REPUSHES: Cell<u64> = const { Cell::new(0) };
     static NOTE_WORK: Cell<u64> = const { Cell::new(0) };
+    static PATH_STEPS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Counts `units` elements a pass over this thread's notes, their copies,
@@ -1633,6 +1634,21 @@ pub(crate) fn note_work(units: usize) {
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_note_work() -> u64 {
     NOTE_WORK.with(|n| n.replace(0))
+}
+
+/// Counts `frames` stack frames a frame's path was folded over.
+#[inline(always)]
+pub(crate) fn path_steps(frames: usize) {
+    #[cfg(all(test, not(loom)))]
+    PATH_STEPS.with(|n| n.set(n.get() + frames as u64));
+    #[cfg(not(all(test, not(loom))))]
+    let _ = frames;
+}
+
+/// The frames [`path_steps`] counted on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_path_steps() -> u64 {
+    PATH_STEPS.with(|n| n.replace(0))
 }
 
 /// Virtual frames pushed on this thread for a node that already had one
