@@ -9,7 +9,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use super::*;
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
-use crate::dep_stack::Placement;
+use crate::dep_stack::{Frame, Placement};
 use crate::locks::Lock;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::reserve;
@@ -2963,10 +2963,15 @@ impl<C: Cells> Runtime<C> {
         self.frames_below()
             .iter()
             .map(|f| {
-                assert_eq!(f.path, self.path_at(f.cidx), "frame at {}", f.cidx);
+                assert_eq!(
+                    f.path,
+                    self.reference_path_at(f.cidx),
+                    "frame at {}",
+                    f.cidx
+                );
                 assert_eq!(
                     replay::extend_path(f.path, f.step),
-                    self.path_at(f.cidx + 1),
+                    self.reference_path_at(f.cidx + 1),
                     "frame above {}",
                     f.cidx
                 );
@@ -4320,15 +4325,15 @@ impl<C: Cells> Runtime<C> {
             .path_above_run(cidx, depth)
             .unwrap_or_else(|| self.path_at(cidx));
         debug_assert_eq!(path, self.reference_path_at(cidx), "the path at {cidx}");
+        ctl.keep_path(path);
         replay::start_run(rt, ctl, depth, frame, path);
     }
 
     /// [`Self::path_at`] for the reading frame `f`, kept in its control
     /// block: the frames below a frame fix its path while it is on the
-    /// stack. Each frame above one with a kept path, as
-    /// [`Self::path_above_run`] relates them, finds its own from that one,
-    /// so the frames of a chain unwinding level by level fold the stack
-    /// once between them.
+    /// stack. A frame that [`Self::extends_below`] finds its own from the
+    /// frame below's, so the frames of a chain unwinding level by level
+    /// fold the stack once between them.
     fn frame_path(&self, f: ActiveRead) -> u64 {
         let rt = self.runtime_id;
         let Some(top) = (f.depth as usize).checked_sub(1) else {
@@ -4337,8 +4342,8 @@ impl<C: Cells> Runtime<C> {
         if self.dep_stack.with(|s| s.frames.get(top).map(|t| t.ctl)) != Some(f.ctl) {
             return self.path_at(f.cidx);
         }
-        // The frames from `f` down whose paths each extend the one below,
-        // over the lowest whose path is kept or folded.
+        // The frames from `f` down to the first with a kept path or one
+        // that does not extend the frame below, whose path is folded.
         let mut open = Vec::new();
         let mut i = top;
         let mut path = loop {
@@ -4348,7 +4353,7 @@ impl<C: Cells> Runtime<C> {
                 (
                     f.ctl,
                     f.cidx,
-                    below.is_some_and(|b| b.rt() == rt && b.cidx + 1 == f.cidx),
+                    below.is_some_and(|b| self.extends_below(b, f.cidx)),
                 )
             });
             // SAFETY: the frame is on the stack, so its control block is
@@ -4357,7 +4362,7 @@ impl<C: Cells> Runtime<C> {
             if let Some(path) = ctl.kept_path() {
                 break path;
             }
-            if !extends || self.virtual_at(cidx - 1) {
+            if !extends {
                 let path = self.path_at(cidx);
                 ctl.keep_path(path);
                 break path;
@@ -4386,22 +4391,19 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// [`Self::path_at`] for a frame at `cidx` that just popped off the
-    /// top frame of the stack: that frame's path extended by its step, as
-    /// [`Self::path_above_run`] relates them, when it is this runtime's
-    /// just below `cidx` with no virtual frame there.
+    /// top frame of the stack, from that frame's path where the popped one
+    /// [`Self::extends_below`] it.
     fn path_above_top(&self, cidx: u32) -> u64 {
         let rt = self.runtime_id;
         let top = self.dep_stack.with(|s| {
             let depth = s.frames.len() as u32;
             let t = s.frames.last()?;
-            (t.rt() == rt && t.cidx + 1 == cidx).then_some((t.node, t.ctl, t.cidx, depth))
+            self.extends_below(t, cidx)
+                .then_some((t.node, t.ctl, t.cidx, depth))
         });
         let Some((node, ctl, below, depth)) = top else {
             return self.path_at(cidx);
         };
-        if self.virtual_at(below) {
-            return self.path_at(cidx);
-        }
         let reader = ActiveRead {
             node,
             ctl,
@@ -4419,26 +4421,28 @@ impl<C: Cells> Runtime<C> {
         path
     }
 
-    /// Whether a context of this runtime has a virtual frame at `cidx`.
-    fn virtual_at(&self, cidx: u32) -> bool {
-        let rt = self.runtime_id;
-        replay::peek(|c| (c.iter().filter(|x| x.rt == rt)).any(|x| x.vframe_at(cidx).is_some()))
+    /// Whether the path of a frame at `cidx` is that of `below`, the frame
+    /// under it on the stack, extended by `below`'s step: `below` is this
+    /// runtime's, just below `cidx`, with no virtual frame standing there.
+    fn extends_below(&self, below: &Frame, cidx: u32) -> bool {
+        below.rt() == self.runtime_id && below.cidx + 1 == cidx && {
+            let rt = self.runtime_id;
+            !replay::peek(|c| {
+                (c.iter().filter(|x| x.rt == rt)).any(|x| x.vframe_at(below.cidx).is_some())
+            })
+        }
     }
 
     /// [`Self::path_at`] for a frame at `cidx`, `depth`, from the run of
-    /// the frame below it, when that frame is this runtime's at `cidx - 1`
-    /// and no virtual frame stands there: its path extended by its step.
+    /// the frame below it, where it [`Self::extends_below`] that frame.
     fn path_above_run(&self, cidx: u32, depth: u32) -> Option<u64> {
         let rt = self.runtime_id;
         let below = depth.checked_sub(1)?;
         let (ctl, mut step) = self.dep_stack.with(|s| {
             let f = s.frames.get(below.checked_sub(1)? as usize)?;
-            (f.rt() == rt && f.cidx + 1 == cidx).then(|| (f.ctl, f.step()))
+            self.extends_below(f, cidx).then(|| (f.ctl, f.step()))
         })?;
         let (seq, path) = replay::run_at(rt, ctl, below)?;
-        if self.virtual_at(cidx - 1) {
-            return None;
-        }
         step.seq = seq;
         Some(replay::extend_path(path, step))
     }
