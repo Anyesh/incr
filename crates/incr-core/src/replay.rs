@@ -13,7 +13,7 @@
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
@@ -23,7 +23,7 @@ use crate::deferred::Unbuilt;
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
-use crate::notes::{Landed, Log};
+use crate::notes::{Cut, CutLandings, Landed, Log, Marked};
 use crate::state::NodeState;
 use crate::taint_memo;
 use crate::value_code;
@@ -289,14 +289,15 @@ pub(crate) struct Landings {
 enum Nodes {
     Owned(Vec<Landed>),
     /// The notes of `log` the copy was taken of: its first `len` entries
-    /// but those gone before removal `epoch`, at their depths above
-    /// `base`, none deeper than `depth`.
+    /// but those gone before removal `epoch` and those `cut` took, at
+    /// their depths above `base`, none deeper than `depth`.
     Shared {
         log: Rc<RefCell<Log>>,
         len: usize,
         epoch: u64,
         base: u32,
         depth: u32,
+        cut: Option<Cut>,
     },
 }
 
@@ -304,6 +305,15 @@ impl Default for Nodes {
     fn default() -> Self {
         Nodes::Owned(Vec::new())
     }
+}
+
+/// The fields of a [`Nodes::Shared`] copy.
+pub(crate) struct SharedCopy<'a> {
+    pub(crate) log: &'a Rc<RefCell<Log>>,
+    pub(crate) len: usize,
+    pub(crate) epoch: u64,
+    pub(crate) base: u32,
+    pub(crate) cut: Option<&'a Cut>,
 }
 
 impl Landings {
@@ -332,6 +342,7 @@ impl Landings {
                 epoch,
                 base,
                 depth: top.saturating_sub(base),
+                cut: None,
             },
         }
     }
@@ -342,10 +353,11 @@ impl Landings {
             len,
             epoch,
             base,
+            cut,
             ..
         } = &self.nodes
         {
-            let nodes = log.borrow().landings(*len, *epoch, *base);
+            let nodes = log.borrow().landings(*len, *epoch, *base, cut.as_ref());
             self.nodes = Nodes::Owned(nodes);
         }
         match &mut self.nodes {
@@ -360,31 +372,59 @@ impl Landings {
         nodes.iter().any(|&(n, _, _)| n == node)
     }
 
-    pub(crate) fn into_nodes(mut self) -> Vec<Landed> {
-        std::mem::take(self.owned_nodes())
-    }
-
-    fn is_deep(&self) -> bool {
+    /// A copy that still shares its log, as [`Nodes::Shared`] holds it.
+    pub(crate) fn as_shared(&self) -> Option<SharedCopy<'_>> {
         match &self.nodes {
-            Nodes::Owned(nodes) => {
-                note_work(nodes.len());
-                nodes.iter().any(|&(_, depth, _)| depth > 0)
-            }
             Nodes::Shared {
                 log,
                 len,
                 epoch,
                 base,
+                cut,
                 ..
-            } => log
-                .borrow()
-                .landings(*len, *epoch, *base)
-                .iter()
-                .any(|&(_, depth, _)| depth > 0),
+            } => Some(SharedCopy {
+                log,
+                len: *len,
+                epoch: *epoch,
+                base: *base,
+                cut: cut.as_ref(),
+            }),
+            Nodes::Owned(_) => None,
         }
     }
 
-    /// At least the deepest landing's depth.
+    pub(crate) fn into_nodes(mut self) -> Vec<Landed> {
+        std::mem::take(self.owned_nodes())
+    }
+
+    /// The depth of the deepest landing the copy still holds, or `None`
+    /// once it holds none; a shared copy at depth 0 answers 0 unread.
+    fn deepest(&self) -> Option<u32> {
+        match &self.nodes {
+            Nodes::Owned(nodes) => {
+                note_work(nodes.len());
+                nodes.iter().map(|&(_, depth, _)| depth).max()
+            }
+            // No landing is deeper than `depth`.
+            Nodes::Shared { depth: 0, .. } => Some(0),
+            Nodes::Shared {
+                log,
+                len,
+                epoch,
+                base,
+                cut,
+                ..
+            } => log
+                .borrow()
+                .landings(*len, *epoch, *base, cut.as_ref())
+                .iter()
+                .map(|&(_, depth, _)| depth)
+                .max(),
+        }
+    }
+
+    /// A bound on the deepest landing's depth, without reading a shared
+    /// copy's log.
     fn depth(&self) -> u32 {
         match &self.nodes {
             Nodes::Owned(nodes) => {
@@ -484,9 +524,23 @@ pub(crate) struct Pending {
     /// The deliveries with a record, by the position of the lowest frame
     /// they stand for, which the pop of the virtual frame below extends.
     by_frontier: Index<u32, usize>,
-    /// The passed deliveries that carry a landing deeper than just above
-    /// their frame, which a pop can retire.
-    deep: Vec<usize>,
+    /// The passed deliveries with a landing deeper than just above their
+    /// frame, by the highest position one of their landings may have.
+    by_top: BTreeSet<(u32, usize)>,
+    /// The passed deliveries whose landings are all just above their frame,
+    /// by that position and each payload they stand for: short of a copied
+    /// node's landing, only a walk's entry there containing that payload
+    /// retires them.
+    by_payload: BTreeSet<(u32, PayloadKey, usize)>,
+    filed: HashMap<usize, Filed, FxBuildHasher>,
+}
+
+/// Where a passed delivery is filed for the events that retire its
+/// landings (`Pending::retire`).
+#[derive(Clone, Copy)]
+enum Filed {
+    Deep(u32),
+    Shallow(u32, [Option<PayloadKey>; 2]),
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -573,10 +627,11 @@ impl Pending {
             }
             list(&mut self.by_frontier, frontier(&d), i);
         }
-        if d.passed && d.is_deep() {
-            self.deep.push(i);
-        }
+        let passed = d.passed;
         self.slots.push(Some(d));
+        if passed {
+            self.file_passed(i);
+        }
         self.live += 1;
     }
 
@@ -584,6 +639,7 @@ impl Pending {
         let d = self.slots[i]
             .take()
             .expect("incr-core: a delivery is removed once");
+        self.unfile_passed(i);
         self.unindex(std::slice::from_ref(&d));
         d
     }
@@ -593,6 +649,7 @@ impl Pending {
         let out: Vec<Delivery> = is
             .into_iter()
             .map(|i| {
+                self.unfile_passed(i);
                 self.slots[i]
                     .take()
                     .expect("incr-core: a delivery is removed once")
@@ -643,10 +700,6 @@ impl Pending {
             unlist_all(&mut self.by_stand, stands, gone, many);
             unlist_all(&mut self.by_frontier, traced().map(frontier), gone, many);
         }
-        if out.iter().any(|d| d.passed) {
-            note_work(self.deep.len());
-            self.deep.retain(|j| !gone(j));
-        }
         for d in out {
             if awaits(d) {
                 self.count_taken(frame_of(&d.key));
@@ -676,18 +729,65 @@ impl Pending {
         let d = self.get_mut(i);
         if !d.passed {
             d.passed = true;
-            if d.is_deep() {
-                self.deep.push(i);
+            self.file_passed(i);
+        }
+    }
+
+    /// Delivery `i`'s latest take raised a copy of its payload keyed `key`.
+    pub(crate) fn resume(&mut self, i: usize, key: PayloadKey) {
+        let old = self.get_mut(i).resumed.replace(key);
+        // Only a shallow filing is keyed by the copy's payload.
+        if let Some(Filed::Shallow(above, payloads)) = self.filed.get_mut(&i) {
+            // A copy keyed as the source shares the source's entry.
+            if let Some(old) = old.filter(|&old| Some(old) != payloads[0]) {
+                self.by_payload.remove(&(*above, old, i));
             }
+            self.by_payload.insert((*above, key, i));
+            payloads[1] = Some(key);
+        }
+    }
+
+    fn file_passed(&mut self, i: usize) {
+        let d = self.get(i);
+        let Delivered::Unwind { nodes, .. } = &d.what else {
+            return;
+        };
+        let above = d.key.cidx + 1;
+        let filed = match nodes.deepest() {
+            None => return,
+            Some(0) => {
+                let payloads = [nodes.source, d.resumed];
+                for p in payloads.into_iter().flatten() {
+                    self.by_payload.insert((above, p, i));
+                }
+                Filed::Shallow(above, payloads)
+            }
+            Some(depth) => {
+                self.by_top.insert((above + depth, i));
+                Filed::Deep(above + depth)
+            }
+        };
+        self.filed.insert(i, filed);
+    }
+
+    fn unfile_passed(&mut self, i: usize) {
+        match self.filed.remove(&i) {
+            Some(Filed::Deep(top)) => {
+                self.by_top.remove(&(top, i));
+            }
+            Some(Filed::Shallow(above, payloads)) => {
+                for p in payloads.into_iter().flatten() {
+                    self.by_payload.remove(&(above, p, i));
+                }
+            }
+            None => {}
         }
     }
 
     /// Applies `ev` to the landings the passed deliveries carry: those of
     /// every passed delivery for a node's landing that a copy may hold,
-    /// else only the deeper ones, since an event at or below a frame
-    /// ends that frame's run.
+    /// else only those of deliveries with a landing the event can reach.
     fn retire(&mut self, ev: &Retire, all: bool) {
-        let slots = &mut self.slots;
         let apply = |d: &mut Delivery| {
             note_work(1);
             if d.key.cidx < ev.cidx() || all {
@@ -697,19 +797,66 @@ impl Pending {
                 }
             }
         };
-        if all {
-            for d in slots.iter_mut().flatten().filter(|d| d.passed) {
+        let hit: Vec<usize> = if all {
+            for d in self.slots.iter_mut().flatten().filter(|d| d.passed) {
                 apply(d);
             }
-        }
-        self.deep.retain(|&i| {
-            let d = slots[i]
-                .as_mut()
-                .expect("incr-core: a delivery's index is live");
+            self.filed.keys().copied().collect()
+        } else {
+            // Short of a copied node's landing, an event retires only
+            // landings of a frame below it that are above its position, or
+            // at it for a containment of the delivery's own payload, so a
+            // delivery none of whose landings reaches that high keeps them
+            // all.
+            let (from, contained) = match *ev {
+                Retire::Above(at) | Retire::Landing { cidx: at, .. } => {
+                    (at.saturating_add(1), None)
+                }
+                Retire::Contained { cidx: at, payload } => (at, Some((at, payload))),
+            };
+            let deep = self.by_top.range((from, 0)..).map(|&(_, i)| i);
+            let shallow = contained.into_iter().flat_map(|(at, p)| {
+                (self.by_payload.range((at, p, 0)..=(at, p, usize::MAX))).map(|&(_, _, i)| i)
+            });
+            let hit: Vec<usize> = deep.chain(shallow).collect();
+            #[cfg(all(test, not(loom)))]
+            self.check_unhit(ev, &hit);
+            hit
+        };
+        for i in hit {
+            self.unfile_passed(i);
             if !all {
-                apply(d);
+                apply(self.get_mut(i));
             }
-            d.is_deep()
+            self.file_passed(i);
+        }
+    }
+
+    /// Checks that `ev` would leave as they are the landings of every
+    /// passed delivery `retire` does not visit, on a list small enough to
+    /// check whole.
+    #[cfg(all(test, not(loom)))]
+    fn check_unhit(&self, ev: &Retire, hit: &[usize]) {
+        if self.slots.len() > 64 {
+            return;
+        }
+        without_note_work(|| {
+            for (i, d) in self.slots.iter().enumerate() {
+                let reached = |d: &&Delivery| d.passed && d.key.cidx < ev.cidx();
+                let Some(d) = d.as_ref().filter(reached).filter(|_| !hit.contains(&i)) else {
+                    continue;
+                };
+                let Delivered::Unwind { nodes, .. } = &d.what else {
+                    continue;
+                };
+                let mut retired = nodes.clone();
+                retired.retire(d.key.cidx, ev, d.resumed);
+                assert!(
+                    nodes.clone().into_nodes() == retired.into_nodes(),
+                    "incr-core: an event at {} skipped delivery {i}",
+                    ev.cidx()
+                );
+            }
         });
     }
 
@@ -921,10 +1068,6 @@ impl Delivery {
 
     pub(crate) fn taken(&self) -> bool {
         self.taken
-    }
-
-    fn is_deep(&self) -> bool {
-        matches!(&self.what, Delivered::Unwind { nodes, .. } if nodes.is_deep())
     }
 
     fn is_untaken_panic(&self) -> bool {
@@ -1471,7 +1614,7 @@ impl Context {
             nodes: nodes.clone(),
         };
         if let Delivered::Unwind { payload, .. } = &what {
-            self.pending.get_mut(i).resumed = Some(payload_key(&**payload));
+            self.pending.resume(i, payload_key(&**payload));
         }
         what
     }
@@ -1613,6 +1756,11 @@ thread_local! {
     static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
+    static KEPT_HELD: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
+    static KEPT_GEN: Cell<u64> = const { Cell::new(0) };
+    // A kept copy holds landings `KEPT_HELD` does not mark: every landing
+    // counts as one a kept copy may hold.
+    static KEPT_ALL: Cell<bool> = const { Cell::new(false) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static THREAD_TAG: Cell<u64> = const { Cell::new(0) };
@@ -1636,6 +1784,9 @@ loom::thread_local! {
     static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = Cell::new(0);
+    static KEPT_HELD: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
+    static KEPT_GEN: Cell<u64> = Cell::new(0);
+    static KEPT_ALL: Cell<bool> = Cell::new(false);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static THREAD_TAG: Cell<u64> = Cell::new(0);
@@ -1666,6 +1817,14 @@ pub(crate) fn note_work(units: usize) {
     NOTE_WORK.with(|n| n.set(n.get() + units as u64));
     #[cfg(not(all(test, not(loom))))]
     let _ = units;
+}
+
+/// Runs `f` without counting the note work it does.
+#[cfg(all(test, not(loom)))]
+fn without_note_work(f: impl FnOnce()) {
+    let counted = NOTE_WORK.with(Cell::get);
+    f();
+    NOTE_WORK.with(|n| n.set(counted));
 }
 
 /// The units [`note_work`] counted on this thread since the last call.
@@ -1712,17 +1871,21 @@ struct Logged {
     all: bool,
     /// The event may retire landings by position, short of the node.
     wide: bool,
+    /// The landing's node may be in a kept read's copy.
+    kept: bool,
 }
 
 /// The events logged while reads are kept, with the indexes of those that
-/// may retire landings by position and of each node's landings, so that
-/// a kept read's catch-up skips the landings of nodes its copy does not
-/// hold.
+/// may retire landings by position and of the landings of nodes a kept
+/// copy held, by node and in log order, so that a kept read's catch-up
+/// skips the landings of nodes its copy does not hold, and with none since
+/// it was kept, looks at no node of its copy.
 #[derive(Default)]
 struct Events {
     log: Vec<Logged>,
     wide: Vec<usize>,
     landed: HashMap<(RuntimeId, (u32, u32)), Vec<usize>, FxBuildHasher>,
+    kept: Vec<usize>,
 }
 
 impl Events {
@@ -1731,8 +1894,9 @@ impl Events {
         if l.wide {
             self.wide.push(i);
         }
-        if let Some(n) = l.ev.node() {
+        if let Some(n) = l.ev.node().filter(|_| l.kept) {
             self.landed.entry((l.rt, n)).or_default().push(i);
+            self.kept.push(i);
         }
         self.log.push(l);
     }
@@ -1740,6 +1904,7 @@ impl Events {
     fn clear(&mut self) {
         self.log.clear();
         self.wide.clear();
+        self.kept.clear();
         // As for the copied set, a clear costs the capacity.
         if self.landed.capacity() > COPIED_KEEP {
             self.landed = HashMap::default();
@@ -1854,6 +2019,14 @@ fn keep(mut read: KeptRead, fresh: bool, number: bool) {
     if let Delivered::Unwind { nodes, .. } = &read.what {
         let top = read.cidx + 1 + nodes.depth();
         KEPT_TOP.with(|k| k.set(k.get().max(top)));
+        // A shared copy marks only the notes no earlier copy of its log
+        // did; marking one taken apart would cost its size at every keep,
+        // so every landing counts as kept instead.
+        if nodes.as_shared().is_some() {
+            mark_in(Marks::Kept, read.rt, nodes);
+        } else if !matches!(&nodes.nodes, Nodes::Owned(n) if n.is_empty()) {
+            KEPT_ALL.with(|k| k.set(true));
+        }
     }
     let seen = KEPT_EVENTS.with(|v| v.borrow().log.len());
     let gone: Vec<(KeptRead, usize)> = KEPT_READS.with(|d| {
@@ -1924,10 +2097,32 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
     }
 }
 
-/// A shared copy marks only the notes its log's earlier copies did not.
 fn mark(rt: RuntimeId, nodes: &Landings) {
-    let generation = copied_generation();
-    COPIED.with(|c| {
+    mark_in(Marks::Copied, rt, nodes);
+}
+
+/// Which set of landings copies may hold: the contexts' deliveries'
+/// (`COPIED`) or the kept reads' (`KEPT_HELD`).
+#[derive(Clone, Copy)]
+enum Marks {
+    Copied,
+    Kept,
+}
+
+fn log_marks(log: &mut Log, marks: Marks) -> &mut Marked {
+    match marks {
+        Marks::Copied => &mut log.marked,
+        Marks::Kept => &mut log.kept_marked,
+    }
+}
+
+/// A shared copy marks only the notes its log's earlier copies did not.
+fn mark_in(marks: Marks, rt: RuntimeId, nodes: &Landings) {
+    let (generation, set) = match marks {
+        Marks::Copied => (copied_generation(), &COPIED),
+        Marks::Kept => (kept_generation(), &KEPT_HELD),
+    };
+    set.with(|c| {
         let mut c = c.borrow_mut();
         let mut mark = |n| {
             c.insert((rt, n));
@@ -1939,27 +2134,41 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
                     mark(n);
                 }
             }
+            // A cut copy holds less than its log up to `len`, so it marks
+            // only what it holds and leaves the watermark to uncut copies.
+            Nodes::Shared {
+                log,
+                len,
+                epoch,
+                base,
+                cut: Some(cut),
+                ..
+            } => {
+                for (n, _, _) in log.borrow().landings(*len, *epoch, *base, Some(cut)) {
+                    mark(n);
+                }
+            }
             Nodes::Shared {
                 log, len, epoch, ..
             } => {
                 let mut log = log.borrow_mut();
-                let from = match log.marked {
-                    (g, upto) if g == generation => upto.min(*len),
-                    _ => 0,
-                };
+                let from = log_marks(&mut log, marks).advance(generation, *len, *epoch);
                 note_work(len - from);
                 for e in log.entries[from..*len].iter().filter(|e| e.gone >= *epoch) {
                     match &e.lent {
                         None => mark(e.node),
+                        // A ticket's members outlive the kept set, so
+                        // marks on them would restart with every set: the
+                        // copy counts every landing instead.
+                        Some(_) if matches!(marks, Marks::Kept) => {
+                            KEPT_ALL.with(|k| k.set(true));
+                        }
                         // A ticket's members went into earlier copies of
                         // the notes that stood for it, so only its later
                         // members are new.
                         Some((members, len)) => {
                             let mut joined = members.lock();
-                            let from = match joined.marked {
-                                (g, upto) if g == generation => upto.min(*len),
-                                _ => 0,
-                            };
+                            let from = joined.marked.advance(generation, *len, *epoch);
                             note_work(len - from);
                             for m in joined.members[from..*len]
                                 .iter()
@@ -1967,11 +2176,9 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
                             {
                                 mark(m.node);
                             }
-                            joined.marked = (generation, (*len).max(from));
                         }
                     }
                 }
-                log.marked = (generation, (*len).max(from));
             }
         }
     });
@@ -1980,13 +2187,27 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
 /// This thread's copied set's generation, unique among every thread's, as
 /// a ticket's members are marked from any thread.
 fn copied_generation() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     COPIED_GEN.with(|g| {
         if g.get() == 0 {
-            g.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            g.set(new_generation());
         }
         g.get()
     })
+}
+
+/// As [`copied_generation`], for the kept reads' set.
+fn kept_generation() -> u64 {
+    KEPT_GEN.with(|g| {
+        if g.get() == 0 {
+            g.set(new_generation());
+        }
+        g.get()
+    })
+}
+
+fn new_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a kept read or a context's delivery may hold copied landings.
@@ -2004,21 +2225,25 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
         .is_some_and(|n| COPIED.with(|c| c.borrow().contains(&(rt, n))));
     // Short of a copied node, an event retires only landings above its
     // position, or at it for a contained payload; a landing also retires
-    // its node from the kept copies that hold it, which the copied set
-    // does not mark.
+    // its node from the kept copies that hold it, which the kept set
+    // marks and the copied set does not.
     let reach = match *ev {
         Retire::Contained { cidx, .. } => cidx,
         _ => ev.cidx() + 1,
     };
     if value_code::thread_word() & value_code::KEPT_BIT != 0 {
         let wide = all || KEPT_TOP.with(Cell::get) >= reach;
-        if wide || ev.node().is_some() {
+        let kept = ev.node().is_some_and(|n| {
+            KEPT_ALL.with(Cell::get) || KEPT_HELD.with(|k| k.borrow().contains(&(rt, n)))
+        });
+        if wide || kept {
             KEPT_EVENTS.with(|v| {
                 v.borrow_mut().push(Logged {
                     rt,
                     ev: *ev,
                     all,
                     wide,
+                    kept,
                 })
             });
         }
@@ -2043,7 +2268,7 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     let from = events.wide.partition_point(|&i| i < seen);
     // `(index, whether the copy held its node)`
     let mut todo: Vec<(usize, bool)> = events.wide[from..].iter().map(|&i| (i, false)).collect();
-    if events.log.len() > seen && !events.landed.is_empty() {
+    if events.kept.last().is_some_and(|&i| i >= seen) {
         let copy = nodes.owned_nodes();
         note_work(copy.len());
         for &(n, _, _) in copy.iter() {
@@ -2074,6 +2299,168 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     }
 }
 
+/// Catches up the kept reads of `rt`'s frame at `cidx`, each `(read,
+/// seen)`, on the events logged since it was kept. Every event only takes
+/// landings away, and the events a copy missed take the same in any order:
+/// the landings deeper than the shallowest position one of them takes, and
+/// the nodes landed since. So a copy that shares its log keeps sharing it,
+/// with those cut ([`Cut`]), and one backward pass over the events gives
+/// every copy its cut. A copy taken apart, or one a held landing below the
+/// frame may empty, takes the events one at a time ([`catch_up`]).
+fn catch_up_frame(rt: RuntimeId, cidx: u32, reads: &mut [(KeptRead, usize)], events: &Events) {
+    let shared = |e: &KeptRead| {
+        matches!(&e.what, Delivered::Unwind { nodes, .. }
+            if matches!(&nodes.nodes, Nodes::Shared { cut: None, .. }))
+    };
+    let Some(first) = reads
+        .iter()
+        .filter(|(e, _)| shared(e))
+        .map(|(_, s)| *s)
+        .min()
+    else {
+        for (e, seen) in reads.iter_mut() {
+            catch_up(e, *seen, events);
+        }
+        return;
+    };
+    let (landed, below) = landed_since(rt, cidx, first, events);
+    let landed = Rc::new(landed);
+    let mut order: Vec<usize> = (0..reads.len()).collect();
+    order.sort_unstable_by_key(|&k| std::cmp::Reverse(reads[k].1));
+    let wide = &events.wide[events.wide.partition_point(|&i| i < first)..];
+    note_work(wide.len());
+    let mut cuts = CutPositions::default();
+    let mut next = wide.len();
+    for k in order {
+        let (e, seen) = &mut reads[k];
+        if !shared(e) || below.is_some_and(|b| b >= *seen) {
+            catch_up(e, *seen, events);
+            continue;
+        }
+        while next > 0 && wide[next - 1] >= *seen {
+            next -= 1;
+            let l = &events.log[wide[next]];
+            if l.rt == rt && (cidx < l.ev.cidx() || l.all) {
+                cuts.add(&l.ev);
+            }
+        }
+        let Delivered::Unwind { nodes, .. } = &mut e.what else {
+            unreachable!()
+        };
+        let at = cuts.position(nodes.source);
+        if at <= i64::from(cidx) {
+            nodes.nodes = Nodes::Owned(Vec::new());
+            continue;
+        }
+        let Nodes::Shared { depth, cut, .. } = &mut nodes.nodes else {
+            unreachable!()
+        };
+        let keep = u32::try_from(at - i64::from(cidx) - 1).unwrap_or(u32::MAX);
+        if keep < *depth || landed.order.last().is_some_and(|&i| i >= *seen) {
+            *depth = (*depth).min(keep);
+            *cut = Some(Cut {
+                depth: keep,
+                seen: *seen,
+                landed: Rc::clone(&landed),
+            });
+        }
+    }
+}
+
+/// The landings of `rt`'s nodes kept copies held, logged from index
+/// `first` on, and the latest of them at or below the frame at `cidx`: a
+/// copy holding that node loses every landing of another payload.
+fn landed_since(
+    rt: RuntimeId,
+    cidx: u32,
+    first: usize,
+    events: &Events,
+) -> (CutLandings, Option<usize>) {
+    let mut landed = CutLandings::default();
+    let mut below = None;
+    let kept = &events.kept[events.kept.partition_point(|&i| i < first)..];
+    note_work(kept.len());
+    for &i in kept {
+        let l = &events.log[i];
+        if l.rt != rt {
+            continue;
+        }
+        if let Retire::Landing { cidx: at, node, .. } = l.ev {
+            landed.latest.insert(node, i);
+            landed.order.push(i);
+            if at <= cidx {
+                below = Some(i);
+            }
+        }
+    }
+    (landed, below)
+}
+
+/// The positions the events a backward pass has met take landings above,
+/// for a copy of the notes of a payload: an event takes those above its
+/// position, a containment of the copy's own payload also those at it, and
+/// a landing of another payload's those above it.
+#[derive(Default)]
+struct CutPositions {
+    any: Option<i64>,
+    /// Per payload, what its events take from a copy of another payload's
+    /// notes and from a copy of its own.
+    keyed: HashMap<PayloadKey, (i64, i64), FxBuildHasher>,
+    /// The two payloads with the lowest positions for others' copies.
+    best: [Option<(i64, PayloadKey)>; 2],
+}
+
+impl CutPositions {
+    fn add(&mut self, ev: &Retire) {
+        match *ev {
+            Retire::Above(at) => self.any = Some(self.any.map_or(at.into(), |a| a.min(at.into()))),
+            Retire::Contained { cidx: at, payload } => {
+                self.keyed_add(payload, i64::from(at), i64::from(at) - 1);
+            }
+            Retire::Landing {
+                cidx: at,
+                payload: Some(payload),
+                ..
+            } => self.keyed_add(payload, i64::from(at), i64::MAX),
+            Retire::Landing { payload: None, .. } => {}
+        }
+    }
+
+    fn keyed_add(&mut self, key: PayloadKey, others: i64, own: i64) {
+        let e = self.keyed.entry(key).or_insert((i64::MAX, i64::MAX));
+        e.0 = e.0.min(others);
+        e.1 = e.1.min(own);
+        let v = e.0;
+        if let Some(i) = self
+            .best
+            .iter()
+            .position(|b| b.is_some_and(|(_, k)| k == key))
+        {
+            self.best[i] = Some((v, key));
+        } else if self.best[1].is_none_or(|(b, _)| v < b) {
+            self.best[1] = Some((v, key));
+        }
+        if self.best[1].is_some_and(|(b1, _)| self.best[0].is_none_or(|(b0, _)| b1 < b0)) {
+            self.best.swap(0, 1);
+        }
+    }
+
+    /// The lowest position the events take landings above in a copy of
+    /// `source`'s notes; `i64::MAX` if none.
+    fn position(&self, source: Option<PayloadKey>) -> i64 {
+        let own = source
+            .and_then(|s| self.keyed.get(&s))
+            .map_or(i64::MAX, |e| e.1);
+        let others = self
+            .best
+            .iter()
+            .flatten()
+            .find(|(_, k)| Some(*k) != source)
+            .map_or(i64::MAX, |(v, _)| *v);
+        self.any.unwrap_or(i64::MAX).min(own).min(others)
+    }
+}
+
 /// Marks the kept reads' copies for a context that opens.
 fn mark_kept() {
     KEPT_READS.with(|d| {
@@ -2092,12 +2479,7 @@ pub(crate) fn take_kept_reads(
     ctl: *const crate::cycle::ComputeCtl,
 ) -> Vec<KeptRead> {
     let mut out = extract_kept(cidx, |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl);
-    KEPT_EVENTS.with(|v| {
-        let v = v.borrow();
-        for (e, seen) in &mut out {
-            catch_up(e, *seen, &v);
-        }
-    });
+    KEPT_EVENTS.with(|v| catch_up_frame(rt, cidx, &mut out, &v.borrow()));
     if value_code::thread_word() & value_code::KEPT_BIT == 0 {
         forget_events();
     }
@@ -2131,24 +2513,40 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
             "incr-core: a foreign read's count outlived its kept read"
         );
         value_code::set_kept_bit(!d.is_empty());
-        if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
-            COPIED.with(|c| {
-                let mut c = c.borrow_mut();
-                // A clear costs the capacity, which one big replay leaves
-                // behind for every later kept episode.
-                if c.capacity() > COPIED_KEEP {
-                    *c = CopiedSet::default();
-                } else {
-                    c.clear();
-                }
-            });
+        let word = value_code::thread_word();
+        if d.is_empty() && word & value_code::REPLAY_BIT == 0 {
+            COPIED.with(clear_set);
             COPIED_GEN.with(|g| g.set(0));
             if !speculative() {
                 CHECKED_READS.with(|c| c.borrow_mut().clear());
             }
+            if word & value_code::NOTES_BIT == 0 {
+                end_kept_marks();
+            }
         }
         out
     })
+}
+
+/// Clears the kept set once no read is kept, no context is open and the
+/// thread holds no notes. While notes stay, a later read may keep a longer
+/// copy of a log whose earlier entries are marked, and clearing then
+/// would mark them again for every read up a chain.
+pub(crate) fn end_kept_marks() {
+    KEPT_HELD.with(clear_set);
+    KEPT_GEN.with(|g| g.set(0));
+    KEPT_ALL.with(|k| k.set(false));
+}
+
+fn clear_set(set: &RefCell<CopiedSet>) {
+    let mut set = set.borrow_mut();
+    // A clear costs the capacity, which one big replay leaves behind for
+    // every later kept episode.
+    if set.capacity() > COPIED_KEEP {
+        *set = CopiedSet::default();
+    } else {
+        set.clear();
+    }
 }
 
 /// No read is kept, so no copy takes the logged events.
@@ -2768,7 +3166,7 @@ pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + S
 /// which stays put while the box unwinds. A closure can catch a box and
 /// raise a fresh one at the freed address with no engine call between, so
 /// the key also holds the type and the text of a `&str` or `String`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PayloadKey {
     /// Every zero-sized payload's box has its type's dangling address, so
     /// only the type tells two of them apart, the engine's own unwinds
@@ -3402,4 +3800,180 @@ fn note_earliest(
 /// The innermost context of `rt`, as an index into the stack.
 pub(crate) fn innermost(c: &[Context], rt: RuntimeId) -> Option<usize> {
     c.iter().rposition(|x| x.rt == rt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notes::Notes;
+
+    /// Copy `a` of a log is taken before a removal and copy `b` after it,
+    /// and `b` is marked first: `a` still holds the removed note, so its
+    /// mark must not stop at the watermark `b` left.
+    #[test]
+    fn an_earlier_copy_marks_the_notes_a_later_copy_left_out() {
+        for marks in [Marks::Kept, Marks::Copied] {
+            let rt = RuntimeId::for_test(7);
+            let payload: Box<dyn Any + Send> = Box::new("p");
+            let key = payload_key(&*payload);
+            let mut notes = Notes::new();
+            notes.push(rt, key, 1, ((1, 0), 0), false);
+            notes.push(rt, key, 2, ((2, 0), 0), false);
+            let a = notes.copy(rt, key, 0);
+            notes.forget_node(rt, (2, 0));
+            notes.push(rt, key, 3, ((3, 0), 0), false);
+            let b = notes.copy(rt, key, 0);
+            mark_in(marks, rt, &b);
+            mark_in(marks, rt, &a);
+            let set = match marks {
+                Marks::Kept => &KEPT_HELD,
+                Marks::Copied => &COPIED,
+            };
+            assert!(set.with(|s| s.borrow().contains(&(rt, (2, 0)))));
+        }
+    }
+
+    /// A pending list holding one passed delivery of the frame at 3 whose
+    /// payload is keyed `source`, with landings `nodes`.
+    fn passed_at_3(source: PayloadKey, nodes: Vec<((u32, u32), u32)>) -> Pending {
+        let read = ReadKey {
+            node: 1,
+            generation: 0,
+            cidx: 3,
+            reading: 2,
+            ordinal: 1,
+            path: 0,
+            seq: 0,
+            episode: None,
+            foreign: None,
+        };
+        let what = Delivered::Unwind {
+            cycle: false,
+            poison: crate::cycle::POISONED,
+            attributed: false,
+            payload: Box::new("p"),
+            nodes: Landings::owned(
+                Some(source),
+                nodes.into_iter().map(|(n, d)| (n, d, 0)).collect(),
+            ),
+        };
+        let mut pending = Pending::default();
+        pending.push(Delivery::new(read, 0, what));
+        pending.pass(0);
+        pending
+    }
+
+    fn holds(pending: &mut Pending, node: (u32, u32)) -> bool {
+        let Delivered::Unwind { nodes, .. } = &mut pending.get_mut(0).what else {
+            unreachable!()
+        };
+        nodes.holds(node)
+    }
+
+    static P: &str = "p";
+    static Q: &str = "q";
+
+    fn key(payload: &'static &'static str) -> PayloadKey {
+        payload_key(payload)
+    }
+
+    /// A passed delivery's landing just above its frame is a note at the
+    /// position of the frame's next read, which a walk's entry there
+    /// containing the same payload retires.
+    #[test]
+    fn a_containment_just_above_a_frame_retires_its_passed_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        let contained = |payload| Retire::Contained { cidx: 4, payload };
+        pending.retire(&contained(key(&Q)), false);
+        assert!(holds(&mut pending, (2, 0)));
+        pending.retire(&contained(key(&P)), false);
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// The copy a take raises stands for the delivery's payload as its
+    /// source does, so a containment of the copy retires the landing too.
+    #[test]
+    fn a_containment_of_a_resumed_copy_retires_its_passed_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&Q));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&Q),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A delivery that loses its deeper landings is filed again as one
+    /// whose landings sit just above its frame, which a containment there
+    /// of its payload still reaches.
+    #[test]
+    fn a_delivery_left_just_above_its_frame_is_reached_there() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
+        pending.retire(&Retire::Above(4), false);
+        assert!(!holds(&mut pending, (5, 0)));
+        assert!(pending.by_top.is_empty());
+        assert!(matches!(pending.filed.get(&0), Some(Filed::Shallow(4, _))));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&P),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A later take's copy replaces the earlier one's as the payload a
+    /// containment must name.
+    #[test]
+    fn a_later_take_replaces_the_copy_a_containment_retires() {
+        static R: &str = "r";
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&Q));
+        pending.resume(0, key(&R));
+        assert!(!pending.by_payload.contains(&(4, key(&Q), 0)));
+        let contained = |payload| Retire::Contained { cidx: 4, payload };
+        pending.retire(&contained(key(&Q)), false);
+        assert!(holds(&mut pending, (2, 0)));
+        pending.retire(&contained(key(&R)), false);
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A copy keyed as the source shares its entry, which a later take's
+    /// copy leaves to the source.
+    #[test]
+    fn a_take_after_a_copy_keyed_as_the_source_keeps_the_source_listed() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&P));
+        pending.resume(0, key(&Q));
+        assert!(pending.by_payload.contains(&(4, key(&P), 0)));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&P),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// Short of a node a copy holds, a landing of another payload retires
+    /// only the landings above its position.
+    #[test]
+    fn a_landing_retires_passed_landings_only_above_it() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
+        pending.retire(
+            &Retire::Landing {
+                cidx: 4,
+                payload: Some(key(&Q)),
+                node: (9, 0),
+            },
+            false,
+        );
+        assert!(holds(&mut pending, (2, 0)));
+        assert!(!holds(&mut pending, (5, 0)));
+    }
 }
