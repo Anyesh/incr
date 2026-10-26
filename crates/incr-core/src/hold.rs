@@ -365,6 +365,36 @@ pub(crate) fn reclaim(cell: usize, expected: NodeState) -> bool {
     })
 }
 
+/// The reverse edges of `rt`'s held landings that wait for publication
+/// ([`keep_read`]), as `(dep, reader)` slots.
+#[cold]
+#[inline(never)]
+pub(crate) fn pending_edges(rt: RuntimeId) -> Vec<(u32, u32)> {
+    with(|h| {
+        h.entries
+            .iter()
+            .flatten()
+            .filter(|e| e.rt == rt)
+            .flat_map(|e| e.read.iter().map(|&(d, _)| (d.0, e.slot)))
+            .collect()
+    })
+}
+
+/// A set's walk flips the owner's held node from `expected`, the target
+/// the view shows, to `Dirty`, as it would flip the published landing.
+#[cold]
+#[inline(never)]
+pub(crate) fn flip(cell: usize, expected: NodeState) -> bool {
+    active()
+        && with(|h| {
+            let Some(e) = h.get(cell).filter(|e| !e.reclaimed && e.target == expected) else {
+                return false;
+            };
+            e.target = NodeState::Dirty;
+            true
+        })
+}
+
 /// A delete of the owner's held node: [`view`], and the entry is marked
 /// claimed again so that no waiter takes it while the delete decides.
 /// [`unpin`] undoes the mark if the delete does not go ahead.
