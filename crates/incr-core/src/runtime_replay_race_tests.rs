@@ -4077,3 +4077,115 @@ fn a_finished_regeneration_keeps_the_mark_of_the_next_rerun() {
     rerun.release();
     assert!(c.join(), "the second regeneration made no payload");
 }
+
+/// What [`shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload`]
+/// builds: W reads X, X reads Y, which panics "y boom" and arms `gate`;
+/// with `switch` set, W first joins another thread's read of X.
+struct JoinedOverAPayload {
+    rt: Arc<Rt>,
+    gate: Gate,
+    y: Incr<u64>,
+    w: Incr<u64>,
+    switch: Arc<AtomicBool>,
+    joined: Arc<Mutex<Option<Result<u64, String>>>>,
+    stalled: Arc<AtomicBool>,
+}
+
+fn joined_over_a_payload() -> JoinedOverAPayload {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let gate = Gate::new();
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let switch = Arc::new(AtomicBool::new(false));
+    let joined = Arc::new(Mutex::new(None));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let w = {
+        let (switch, joined, stalled) = (switch.clone(), joined.clone(), stalled.clone());
+        let shared = Arc::downgrade(&rt);
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if switch.load(SeqCst) {
+                    let waits = rt.reservation_waits.load(SeqCst);
+                    let (tx, rx) = mpsc::channel();
+                    let rt2 = shared.upgrade().unwrap();
+                    thread::spawn(move || {
+                        let _ = tx.send(outcome(|| rt2.get(x)));
+                    });
+                    let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
+                    loop {
+                        if let Ok(read) = rx.try_recv() {
+                            *joined.lock().unwrap() = Some(read);
+                            break;
+                        }
+                        // Waiting here for a thread that waits on this one
+                        // would hang, so a wait ends the join.
+                        if rt.reservation_waits.load(SeqCst) != waits {
+                            stalled.store(true, SeqCst);
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the joined read neither returned nor waited"
+                        );
+                        thread::yield_now();
+                    }
+                }
+                rt.get(x) + 1
+            },
+            replayable(),
+        )
+    };
+    JoinedOverAPayload {
+        rt,
+        gate,
+        y,
+        w,
+        switch,
+        joined,
+        stalled,
+    }
+}
+
+/// At budget 2 this thread's `get(W)` dooms W and X, Y's entry lands
+/// Failed and Y's payload waits for X's virtual frame. W's switch, set
+/// while the driver is parked, makes W's retry join another thread's read
+/// of X before W reads X: the unbounded run with the switch set gives that
+/// read Y's panic, so it must neither wait on this thread nor read Y as
+/// Failed.
+#[test]
+fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
+    let s = joined_over_a_payload();
+    s.rt.set_max_frames(2);
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.w)), s.gate.clone())],
+    );
+    let first = {
+        let (rt, w) = (s.rt.clone(), s.w);
+        spawn(move || outcome(|| rt.get(w)))
+    };
+    s.gate.wait_parked();
+    assert_eq!(s.rt.state_of(s.y), NodeState::Failed);
+    s.switch.store(true, SeqCst);
+    s.gate.release();
+    let first = first.join();
+    let got = (first, s.joined.lock().unwrap().clone());
+    assert!(!s.stalled.load(SeqCst), "the joined read waited: {got:?}");
+
+    let u = joined_over_a_payload();
+    u.rt.set_max_frames(u32::MAX);
+    u.switch.store(true, SeqCst);
+    let want = (outcome(|| u.rt.get(u.w)), u.joined.lock().unwrap().clone());
+    assert_eq!(want.1, Some(Err("y boom".to_string())));
+    assert_eq!(got, want);
+}

@@ -753,18 +753,56 @@ fn shared_reservation_of_a_dirty_landing_ends_with_the_read() {
 /// run, so that read must rerun X rather than wait on the reservation.
 #[test]
 fn shared_reservation_ends_with_the_entry_that_reran_its_node() {
-    fn run(frames: u32) -> (Outcome, u32, bool, bool) {
+    entry_rerun_join(First::None);
+}
+
+/// As [`shared_reservation_ends_with_the_entry_that_reran_its_node`], with
+/// X first reading A, a node that lands or panics when I is not 1, so the
+/// doom holds A's outcome for X's frame while V's retry joins.
+#[test]
+fn shared_reservation_ends_with_the_entry_that_reran_its_node_over_an_outcome() {
+    entry_rerun_join(First::Lands);
+    entry_rerun_join(First::Caught);
+}
+
+/// X's first read, before it reads Y1 or Y2.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum First {
+    None,
+    /// A, which is I + 100.
+    Lands,
+    /// A, which panics when I is not 1, caught as 7.
+    Caught,
+}
+
+fn entry_rerun_join(first: First) {
+    fn run(frames: u32, first: First) -> (Outcome, u32, bool, bool) {
         let rt = Arc::new(Rt::new());
         rt.set_placeholder(0_u64);
         rt.set_max_frames(frames);
         let i = rt.create_input(1_u64);
         let y1 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
         let y2 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let a = rt.create_query_with(
+            move |rt: &Rt| {
+                let i = rt.get(i);
+                if i != 1 && first == First::Caught {
+                    panic!("a boom");
+                }
+                i + 100
+            },
+            replayable(),
+        );
         let (gx, gv) = (Gate::new(), Gate::new());
         let x = {
             let gx = gx.clone();
             rt.create_query_with(
                 move |rt: &Rt| {
+                    let a = match first {
+                        First::None => 0,
+                        First::Lands => rt.get(a),
+                        First::Caught => catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_or(7),
+                    };
                     let v = if rt.get(i) == 1 {
                         rt.get(y1)
                     } else {
@@ -773,7 +811,7 @@ fn shared_reservation_ends_with_the_entry_that_reran_its_node() {
                     if v != 0 {
                         gx.park();
                     }
-                    v + 1
+                    v + 1 + a
                 },
                 replayable(),
             )
@@ -834,22 +872,22 @@ fn shared_reservation_ends_with_the_entry_that_reran_its_node() {
         let doomed = !rt.dooms.lock().unwrap().is_empty();
         (read, joins.load(SeqCst), stalled.load(SeqCst), doomed)
     }
-    let (_, joins, stalled, doomed) = run(u32::MAX);
+    let (_, joins, stalled, doomed) = run(u32::MAX, first);
     assert_eq!(
         (joins, stalled, doomed),
         (1, false, false),
-        "the unbounded run"
+        "the unbounded run, {first:?}"
     );
-    let (read, joins, stalled, doomed) = run(2);
-    assert!(doomed, "no doom ran");
+    let (read, joins, stalled, doomed) = run(2, first);
+    assert!(doomed, "no doom ran, {first:?}");
     // A run that joins after the retry's may meet the doom again.
-    assert!(joins >= 2, "V's retry did not join");
+    assert!(joins >= 2, "V's retry did not join, {first:?}");
     assert!(
         matches!(read, Ok(v) if v < 1000),
-        "R's read or a joined read failed: {read:?}"
+        "R's read or a joined read failed, {first:?}: {read:?}"
     );
     assert!(
         !stalled,
-        "the joined read waited on R's reservation: {read:?}"
+        "the joined read waited on R's reservation, {first:?}: {read:?}"
     );
 }
