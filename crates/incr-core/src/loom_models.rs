@@ -3001,7 +3001,7 @@ fn hand_over_races_reclaim() {
         let rt = crate::handle::RuntimeId::allocate();
         hold_one(rt);
         let waiter = spawn_waiter(rt, 4);
-        let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean);
+        let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean, NodeState::Computing);
         let handed = waiter.join().unwrap();
         assert_ne!(reclaimed, handed, "reclaimed {reclaimed}, taken {handed}");
         assert_eq!(crate::hold::holds(HELD_CELL), !handed);

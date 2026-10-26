@@ -146,11 +146,19 @@ fn claim_own_held<C: Cells>(
     if matches!(seen, NodeState::Computing | NodeState::ComputingDirty) {
         let key = cell_key::<C>(cell);
         let own = match new {
-            NodeState::Computing => crate::hold::reclaim(key, expected),
-            NodeState::Dirty => crate::hold::flip(key, expected),
+            NodeState::Computing => crate::hold::reclaim(key, expected, seen),
+            NodeState::Dirty => crate::hold::flip(key, expected, seen),
             _ => false,
         };
         if own {
+            // The claim's run reads after the set that flagged the word.
+            if new == NodeState::Computing && seen == NodeState::ComputingDirty {
+                let cleared = C::state_try_transition(cell, raw, NodeState::Computing.as_u8());
+                debug_assert!(
+                    cleared.is_ok(),
+                    "incr-core: only the owner moves a held word"
+                );
+            }
             return Ok(());
         }
     }

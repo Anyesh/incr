@@ -95,6 +95,18 @@ pub(crate) struct Held {
     pub(crate) undo: Undo,
 }
 
+impl Held {
+    /// The state the landing publishes as over the node's word `raw`: a
+    /// set that flagged the word since lands it `flagged`.
+    fn shown(&self, raw: NodeState) -> NodeState {
+        if raw == NodeState::ComputingDirty {
+            self.flagged
+        } else {
+            self.target
+        }
+    }
+}
+
 #[derive(Default)]
 struct HoldSet {
     by_cell: HashMap<usize, usize, FxBuildHasher>,
@@ -328,19 +340,19 @@ pub(crate) fn active() -> bool {
 #[cold]
 #[inline(never)]
 /// [`view`] for engine bookkeeping that is no read: it marks nothing.
-pub(crate) fn peek(cell: usize) -> Option<NodeState> {
+pub(crate) fn peek(cell: usize, raw: NodeState) -> Option<NodeState> {
     if !active() {
         return None;
     }
-    with(|h| h.get(cell).filter(|e| !e.reclaimed).map(|e| e.target))
+    with(|h| h.get(cell).filter(|e| !e.reclaimed).map(|e| e.shown(raw)))
 }
 
-pub(crate) fn view(cell: usize) -> Option<NodeState> {
+pub(crate) fn view(cell: usize, raw: NodeState) -> Option<NodeState> {
     if !active() {
         return None;
     }
     with(|h| {
-        let t = h.get(cell).filter(|e| !e.reclaimed).map(|e| e.target)?;
+        let t = h.get(cell).filter(|e| !e.reclaimed).map(|e| e.shown(raw))?;
         h.consulted = true;
         h.looks += 1;
         Some(t)
@@ -351,12 +363,15 @@ pub(crate) fn view(cell: usize) -> Option<NodeState> {
 /// target the view shows it.
 #[cold]
 #[inline(never)]
-pub(crate) fn reclaim(cell: usize, expected: NodeState) -> bool {
+pub(crate) fn reclaim(cell: usize, expected: NodeState, raw: NodeState) -> bool {
     if !active() {
         return false;
     }
     with(|h| {
-        let Some(e) = h.get(cell).filter(|e| !e.reclaimed && e.target == expected) else {
+        let Some(e) = h
+            .get(cell)
+            .filter(|e| !e.reclaimed && e.shown(raw) == expected)
+        else {
             return false;
         };
         e.reclaimed = true;
@@ -384,10 +399,13 @@ pub(crate) fn pending_edges(rt: RuntimeId) -> Vec<(u32, u32)> {
 /// the view shows, to `Dirty`, as it would flip the published landing.
 #[cold]
 #[inline(never)]
-pub(crate) fn flip(cell: usize, expected: NodeState) -> bool {
+pub(crate) fn flip(cell: usize, expected: NodeState, raw: NodeState) -> bool {
     active()
         && with(|h| {
-            let Some(e) = h.get(cell).filter(|e| !e.reclaimed && e.target == expected) else {
+            let Some(e) = h
+                .get(cell)
+                .filter(|e| !e.reclaimed && e.shown(raw) == expected)
+            else {
                 return false;
             };
             e.target = NodeState::Dirty;

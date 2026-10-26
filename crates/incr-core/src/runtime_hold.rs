@@ -45,7 +45,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     pub(crate) fn seen_quietly(&self, cell: &C::State, raw: NodeState) -> NodeState {
         if !C::SINGLE_THREADED && is_computing(raw) {
-            hold::peek(state::cell_key::<C>(cell)).unwrap_or(raw)
+            hold::peek(state::cell_key::<C>(cell), raw).unwrap_or(raw)
         } else {
             raw
         }
@@ -56,7 +56,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn held_seen(&self, cell: &C::State, raw: NodeState) -> NodeState {
-        match hold::view(state::cell_key::<C>(cell)) {
+        match hold::view(state::cell_key::<C>(cell), raw) {
             Some(target) => {
                 self.dep_stack.raise_hold();
                 target
