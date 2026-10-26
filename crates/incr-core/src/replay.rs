@@ -3925,6 +3925,49 @@ mod tests {
         assert!(!holds(&mut pending, (2, 0)));
     }
 
+    /// A passed delivery's payload regenerated as `Q` counts as its source,
+    /// so a containment of `Q` just above its frame reaches its landings.
+    #[test]
+    fn a_containment_of_a_regenerated_payload_retires_its_passed_landing() {
+        unsafe fn parts(_: *const (), _: u32, _: u32, _: bool) -> KeyParts {
+            (0, 0, None, 0)
+        }
+        let target = Entry {
+            node: 0,
+            generation: 0,
+            suspect: false,
+            spec: false,
+            retry: Retry::Walk,
+            walked: false,
+            r5: false,
+        };
+        let keys = FrameKeys {
+            owner: std::ptr::null(),
+            parts,
+        };
+        let id = open(RuntimeId::for_test(7), 0, target, keys);
+        let context = |c: &mut Vec<Context>| c.iter_mut().position(|x| x.id == id).unwrap();
+        with(|c| {
+            let at = context(c);
+            c[at].pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        });
+        regenerated_at(id, 0, key(&Q));
+        let held = with(|c| {
+            let at = context(c);
+            let pending = &mut c[at].pending;
+            pending.retire(
+                &Retire::Contained {
+                    cidx: 4,
+                    payload: key(&Q),
+                },
+                false,
+            );
+            holds(pending, (2, 0))
+        });
+        drop(close(id));
+        assert!(!held);
+    }
+
     /// A delivery that loses its deeper landings is filed again as one
     /// whose landings sit just above its frame, which a containment there
     /// of its payload still reaches.
