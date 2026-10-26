@@ -104,7 +104,9 @@ impl<C: Cells> Runtime<C> {
 
     /// The node and control block of this runtime's running compute.
     fn creator(&self, what: &str) -> (NodeId, *const ComputeCtl) {
-        value_code::check();
+        if value_code::checked_word() & value_code::REGEN_BIT != 0 {
+            super::replay_impl::abort_regen();
+        }
         match self.dep_stack.active_compute(self.runtime_id) {
             Some(frame) => frame,
             None => panic!(
@@ -135,7 +137,7 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: see `Self::index_at`.
         let index = unsafe { &*index };
         let found = value_code::run(|| index.with(|s| s.find::<K, T, QUERY>(key)))?;
-        if self.is_alive(found) {
+        if self.alive(found) {
             return Some(Incr::new(found.slot(), found.generation(), self.runtime_id));
         }
         let unbound = value_code::run(|| index.with(|s| s.unbind::<K, T, QUERY>(key)));
@@ -239,6 +241,24 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(crate) fn land_children(
+        &self,
+        id: NodeId,
+        landing: ChildLanding,
+        opened: bool,
+        bag: &mut Deferred<C>,
+    ) {
+        if !C::SINGLE_THREADED && crate::hold::active() {
+            let cell = crate::state::cell_key::<C>(self.nodes.get(id.0).state_cell());
+            if crate::hold::holds(cell) {
+                crate::hold::defer_children(cell, landing, opened);
+                return;
+            }
+        }
+        self.land_children_now(id, landing, opened, bag);
+    }
+
+    /// [`Self::land_children`] past the hold.
+    pub(crate) fn land_children_now(
         &self,
         id: NodeId,
         landing: ChildLanding,

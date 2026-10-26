@@ -46,6 +46,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use crate::handle::ErasedIncr;
@@ -400,6 +401,48 @@ pub(crate) const FOREIGN_HOLD: u16 = 512;
 /// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
 /// make: its value is buffered and its landing withheld (`replay::Stash`).
 pub(crate) const SPECULATIVE: u16 = 1024;
+/// `ComputeCtl::flags`: a read in the frame gave an outcome that holds
+/// until the next set (the panic of a node that landed Failed, or a
+/// memo's value). Without `POISONED` the frame lands Dirty with a memo
+/// for the revision (`NodeData::set_memo`).
+pub(crate) const HANDLED: u16 = 2048;
+/// `ComputeCtl::flags`: the run read a value no rerun of its node reads
+/// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
+/// node, so its panic is not regenerated (`Runtime::regenerate`).
+pub(crate) const UNREGENERABLE: u16 = 4096;
+/// `ComputeCtl::flags`: the frame kept a read (`KEPT_READ`) whose stash
+/// adoption can't check: of its own runtime, or of another runtime's node
+/// that was not Clean or was read while that runtime was changing.
+pub(crate) const KEPT_UNCHECKED: u16 = 8192;
+
+/// `ComputeCtl::flags`: the frame read a landing this thread's attempt
+/// holds (`crate::hold`), so its own landing is held too, and so is its
+/// reader's.
+pub(crate) const HOLD: u16 = 16384;
+/// A `HOLD` frame's write kept what it displaced in `crate::hold`, keyed
+/// by this control block, until the landing's entry takes it or the frame
+/// ends (`crate::hold::KeptGuard`).
+pub(crate) const KEPT: u16 = 32768;
+pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
+
+const _: () = assert!(crate::bits::disjoint(&[
+    RECOMPUTE as u64,
+    BUFFERED as u64,
+    LOW as u64,
+    POISONED as u64,
+    DOOMED as u64,
+    PH_SEEN as u64,
+    KEPT_READ as u64,
+    NO_DOOM as u64,
+    WALKED as u64,
+    FOREIGN_HOLD as u64,
+    SPECULATIVE as u64,
+    HANDLED as u64,
+    UNREGENERABLE as u64,
+    KEPT_UNCHECKED as u64,
+    HOLD as u64,
+    KEPT as u64,
+]));
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -413,12 +456,17 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
+    /// Whether `path` holds the frame's path.
+    path_kept: Cell<bool>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
     /// The frame's runtime's [`KeepResolver`], or null for a frame that
     /// settles its keeping when it is pushed or keeps nothing.
     keep: *const KeepResolver,
+    /// The frame's path once found (`path_kept`), left unwritten until
+    /// then so a push pays nothing for it.
+    path: Cell<MaybeUninit<u64>>,
 }
 
 /// Lives inside its runtime and answers whether a frame of node `slot` of
@@ -443,8 +491,10 @@ impl ComputeCtl {
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
+            path_kept: Cell::new(false),
             children: Cell::new(std::ptr::null()),
             keep,
+            path: Cell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -460,14 +510,38 @@ impl ComputeCtl {
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
     }
 
+    /// The frame's path, if [`Self::keep_path`] kept it.
+    pub(crate) fn kept_path(&self) -> Option<u64> {
+        // SAFETY: `keep_path` writes `path` before it sets `path_kept`.
+        self.path_kept
+            .get()
+            .then(|| unsafe { self.path.get().assume_init() })
+    }
+
+    /// Keeps `path` as the frame's path, which the frames below it fix
+    /// while it is on the stack.
+    pub(crate) fn keep_path(&self, path: u64) {
+        self.path.set(MaybeUninit::new(path));
+        self.path_kept.set(true);
+    }
+
     #[inline(always)]
     pub(crate) fn has(&self, flag: u16) -> bool {
         self.flags.get() & flag != 0
     }
 
+    /// The frame's `POISONED` and `HANDLED` flags.
+    pub(crate) fn poison(&self) -> u16 {
+        self.flags.get() & (POISONED | HANDLED)
+    }
+
     #[inline(always)]
     pub(crate) fn raise(&self, flag: u16) {
         self.flags.set(self.flags.get() | flag);
+    }
+
+    pub(crate) fn clear(&self, flag: u16) {
+        self.flags.set(self.flags.get() & !flag);
     }
 
     /// Marks the frame part of an open cycle reaching down to `p`.

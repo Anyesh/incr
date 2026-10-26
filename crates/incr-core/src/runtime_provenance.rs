@@ -132,7 +132,7 @@ fn last_read(deps: &[(NodeId, u32)]) -> Option<(u64, u32)> {
 }
 
 /// The message of a read of node `slot` landed Failed.
-fn failed_read_message(slot: u32) -> String {
+pub(super) fn failed_read_message(slot: u32) -> String {
     format!(
         "incr-core: node {slot} read but its last compute panicked; it stays Failed until a \
          dependency changes (set an upstream input to retry)"
@@ -143,18 +143,22 @@ impl<C: Cells> Runtime<C> {
     /// `compute_attempts`' Failed arm: the read panics "last compute
     /// panicked", or takes the payload a walk contained for the landing it
     /// sees (`take_contained`). Returns when the node has left Failed since
-    /// the read saw it, to be read again. A payload a record owes the read
-    /// was taken after the load, by `owed_payload`.
+    /// the read saw it, or a delete recycled the slot past `generation`, to
+    /// be read again. A payload a record owes the read was taken after the
+    /// load, by `owed_payload`.
     #[cold]
     #[inline(never)]
-    pub(super) fn read_failed_node(&self, id: NodeId) {
-        let Ok(payload) = self.take_contained(id) else {
+    pub(super) fn read_failed_node(&self, id: NodeId, generation: Option<u32>) {
+        self.park(ParkPoint::FailedReadBeforeTake(id));
+        let Ok(payload) = self.take_contained(id, generation) else {
             return;
         };
-        // A closure that catches this panic has still read a node with no
-        // value, so it must not land Clean over it.
-        self.dep_stack.poison_current_frame(self.runtime_id);
+        // A closure that catches this panic has read a node with no value,
+        // which stays so until a set flips it.
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
         if let Some(payload) = payload {
+            self.park(ParkPoint::TookContained(id));
             self.note_ticket_read(id, &*payload);
             resume_unwind(payload);
         }
@@ -208,8 +212,29 @@ impl<C: Cells> Runtime<C> {
                 .expect("incr-core: the delivery's context is open")
                 .take_landed(i, at)
         });
+        // A payload no copy can stand for that an earlier take had: its
+        // node runs again, as for a retry's read (`regenerate`).
+        let payload = match payload.downcast::<replay::Regen>() {
+            Ok(regen) => {
+                let raised = self.regenerate(id, generation, regen.0)?;
+                replay::regenerated_at(context, i, replay::payload_key(&*raised));
+                raised
+            }
+            Err(payload) => payload,
+        };
         if attributed {
             cycle_state::count_failure();
+        }
+        // The read took the payload as from a ticket, and a payload no copy
+        // can stand for holds its frame as at `note_ticket_read`.
+        let reading = u64::from(id.0) | (u64::from(generation) << 32);
+        if let Some((f, read, _)) = self.dep_stack.unwound_read(rt) {
+            if read == reading {
+                let regenerable = self.note_took(f, reading, &*payload);
+                if !replay::copyable(&*payload) {
+                    self.hold_uncopied(f.ctl, regenerable);
+                }
+            }
         }
         Some(payload)
     }
@@ -220,7 +245,8 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn raise_owed(&self, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) -> ! {
-        self.dep_stack.poison_current_frame(self.runtime_id);
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
         bag.drain_carried(payload)
     }
 

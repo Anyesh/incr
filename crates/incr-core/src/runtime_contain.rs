@@ -1,9 +1,11 @@
 //! A walk's containment of what its cleaning raises. The dirty walk
 //! cleans every recorded dep of a node before rerunning it, so it can
 //! compute a dep the rerun no longer reads. A non-root walk entry whose
-//! compute panics or closes a cycle therefore lands as a changed dep and
-//! the walk goes on; a panic's payload stays with the Failed landings it
-//! made, as a ticket, for the first read of any of them.
+//! compute panics therefore lands as a changed dep and the walk goes on,
+//! while a cycle goes on to the reader. A panic's payload stays with the
+//! Failed landings it made, as a ticket, for the first read of any of
+//! them; a closure that panics after catching a cycle lands unwound,
+//! keeps no payload, and runs again for the next read.
 //!
 //! The entry's frame decides where it ends in the unwind, before its
 //! claims are released: the closure's panic arm, or the abort of the
@@ -58,6 +60,16 @@ pub(crate) struct Tickets {
     /// dropped once the delete, sweep or walk that released them holds no
     /// lock and has finished.
     buried: Vec<Ticket>,
+    /// By the slot of a dep a set's walk stops at, the Failed landings over
+    /// it (slot, generation) that no walk flagged; see `note_past_sets`.
+    past: BTreeMap<u32, Vec<(u32, u32)>>,
+}
+
+/// `slot`'s bit in `Runtime::failed_past`: a walk takes the tickets' lock
+/// only at a dep whose bit is set; notes under other residues never set it.
+#[inline(always)]
+pub(super) fn past_bit(slot: u32) -> u64 {
+    1 << (slot & 63)
 }
 
 #[derive(Clone, Copy)]
@@ -254,7 +266,14 @@ impl<C: Cells> Runtime<C> {
     /// ticket again. A speculative run's read takes none: a closure in
     /// the run can catch and drop the payload before the run's discard
     /// would hold it again, and the real run's read is owed it.
-    pub(super) fn take_contained(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
+    /// With tickets held, `Left` too when the slot no longer holds
+    /// `generation`'s node; with none, the read's panic is the one it would
+    /// have made before the delete.
+    pub(super) fn take_contained(
+        &self,
+        id: NodeId,
+        generation: Option<u32>,
+    ) -> Result<Option<Box<dyn Any + Send>>, Left> {
         if !self.tickets_held() || replay::speculative() {
             return Ok(None);
         }
@@ -263,8 +282,12 @@ impl<C: Cells> Runtime<C> {
         // Every Failed landing removes the node from the tickets before its
         // store, so under the lock a node still Failed at this generation
         // is in the latest landing's ticket, if any.
+        if self.seen(node.state_cell(), state::load::<C>(node.state_cell())) != NodeState::Failed {
+            return Err(Left);
+        }
+        // After the state, as a recycle bumps it before its new node lands.
         let landing = (id.0, node.generation());
-        if state::load::<C>(node.state_cell()) != NodeState::Failed {
+        if generation.is_some_and(|g| g != landing.1) {
             return Err(Left);
         }
         t.prune();
@@ -327,10 +350,12 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         cidx: u32,
         payload: Option<&(dyn Any + Send)>,
+        regenerable: bool,
         bag: &mut Deferred<C>,
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
+        self.note_failed_run(id, generation, cidx, regenerable);
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
@@ -429,7 +454,10 @@ impl<C: Cells> Runtime<C> {
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
-                && state::load::<C>(node.state_cell()) == NodeState::Failed
+                && self.in_failed_landing(
+                    slot,
+                    self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
+                )
                 && t.of((slot, generation))
                     .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
         });
@@ -492,8 +520,22 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Every landing a ticket keeps is Failed and indexed to it: every
-    /// change from that landing releases it.
+    /// Whether `slot`'s node, in `state` as this thread sees it, is in its
+    /// Failed landing: Failed, or Computing under a regenerating run, which
+    /// lands nothing and puts it back. Exact under the tickets lock, under
+    /// which a rerun moves it and marks it.
+    fn in_failed_landing(&self, slot: u32, state: NodeState) -> bool {
+        match state {
+            NodeState::Failed => true,
+            NodeState::Computing | NodeState::ComputingDirty => {
+                crate::replay::is_regen_running(self.runtime_id, slot)
+            }
+            _ => false,
+        }
+    }
+
+    /// Every landing a ticket keeps is in its Failed landing and indexed to
+    /// it: every change from that landing releases it.
     fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {
         let members = ticket.members.lock();
         let live = members.members.iter().filter(|m| m.gone == u64::MAX);
@@ -503,7 +545,10 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(m.node.0);
             assert!(
                 node.generation() == m.node.1
-                    && state::load::<C>(node.state_cell()) == NodeState::Failed
+                    && self.in_failed_landing(
+                        m.node.0,
+                        self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
+                    )
                     && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
@@ -519,17 +564,134 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn flip_failed(&self, id: NodeId) -> bool {
+        self.flip_failed_from(id, NodeState::Failed)
+    }
+
+    /// [`Self::flip_failed`] for a node in state `from`: a regenerating
+    /// run's node is Computing over its Failed landing.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn flip_failed_from(&self, id: NodeId, from: NodeState) -> bool {
         let node = self.nodes.get(id.0);
+        self.park(ParkPoint::FlipBeforeCas(id));
         let mut t = self.tickets.write();
-        if state::try_transition::<C>(node.state_cell(), NodeState::Failed, NodeState::Dirty)
-            .is_err()
-        {
+        let flipped = self.with_failed_run_token(id.0, node.generation(), |token| {
+            state::try_transition::<C>(node.state_cell(), from, NodeState::Dirty)
+                .is_ok()
+                .then_some(token)
+        });
+        let Some(token) = flipped else {
             return false;
+        };
+        if from != NodeState::Failed {
+            // With the flip, under the lock: a compute may take the node
+            // from Dirty once the lock goes.
+            crate::replay::regen_running(self.runtime_id, id.0, false);
         }
         let stale = release(&mut t, u64::MAX, slot_landings(id.0));
         t.buried.extend(stale);
         self.sync_held(&t);
+        drop(t);
+        self.park(ParkPoint::FlippedFailed(id));
+        self.forget_failed_run_if(id.0, node.generation(), token);
         true
+    }
+
+    /// A retraction lands the held Failed landings of `slots` unrun: their
+    /// tickets let go of them as a flip's do.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn release_retracted(&self, slots: &[u32], bag: &mut Deferred<C>) {
+        if slots.is_empty() || !self.tickets_held() {
+            return;
+        }
+        let mut t = self.tickets.write();
+        let mut stale = Vec::new();
+        for &slot in slots {
+            stale.extend(release(&mut t, u64::MAX, slot_landings(slot)));
+        }
+        self.sync_held(&t);
+        drop(t);
+        defer(stale, bag);
+    }
+
+    /// Before `id` lands Failed over `deps`. A set's walk stops at a Dirty
+    /// dep, whose dependents the walk that made it Dirty flagged; a dep a
+    /// caught panic left Dirty had no such walk. The landing is noted under
+    /// each such dep for the next walk that reaches it, so it lasts its
+    /// revision and not past the dep's next change, except under `Shared`
+    /// for a set whose walk passed the dep before the note was made. A dep
+    /// is judged as this thread sees it, so a landing it holds toward Dirty
+    /// is noted, and so is one a set flagged while held, which publishes
+    /// as flagged, not as its target. A dep still Computing is not noted: on
+    /// this thread it is an open cycle head the landing belongs to, and a
+    /// flip there reruns the caught cycle on every read (0x1daa).
+    /// Speculative landings are noted too: the take checks the node.
+    #[inline(always)]
+    pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
+        let past = |&(dep, _): &(NodeId, u32)| {
+            let cell = self.nodes.get(dep.0).state_cell();
+            let raw = state::load::<C>(cell);
+            raw == NodeState::ComputingDirty
+                || matches!(
+                    self.seen_quietly(cell, raw),
+                    NodeState::Dirty | NodeState::ComputingDirty
+                )
+        };
+        if deps.iter().any(past) {
+            self.note_past(id, generation, deps.iter().filter(|d| past(d)));
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_past<'a>(
+        &self,
+        id: NodeId,
+        generation: u32,
+        deps: impl Iterator<Item = &'a (NodeId, u32)>,
+    ) {
+        let mut t = self.tickets.write();
+        for &(dep, _) in deps {
+            let notes = t.past.entry(dep.0).or_default();
+            if !notes.contains(&(id.0, generation)) {
+                notes.push((id.0, generation));
+            }
+            self.failed_past.fetch_or(past_bit(dep.0), Relaxed);
+        }
+    }
+
+    fn sync_past(&self, t: &Tickets) {
+        let bits = t.past.keys().fold(0, |bits, &slot| bits | past_bit(slot));
+        self.failed_past.store(bits, Relaxed);
+    }
+
+    /// A set's walk reached `dep`: queues the landings noted over it that
+    /// are still Failed, or still Computing toward a Failed landing, which
+    /// the walk then flags so that it lands Dirty.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn take_past_sets(&self, dep: NodeId, queue: &mut Vec<NodeId>) {
+        if !self.tickets.read().past.contains_key(&dep.0) {
+            return;
+        }
+        let mut t = self.tickets.write();
+        let Some(notes) = t.past.remove(&dep.0) else {
+            return;
+        };
+        self.sync_past(&t);
+        drop(t);
+        for (id, generation) in notes {
+            let node = self.nodes.get(id);
+            if node.generation() == generation
+                && matches!(
+                    state::load::<C>(node.state_cell()),
+                    NodeState::Failed | NodeState::Computing | NodeState::ComputingDirty
+                )
+            {
+                queue.push(NodeId(id));
+            }
+        }
     }
 
     /// After a set's walk: drops the tickets its flips released.
@@ -571,6 +733,12 @@ impl<C: Cells> Runtime<C> {
         if self.tickets_held() {
             self.bury(slot, generation);
         }
+        if self.failed_past.load(Relaxed) & past_bit(slot) != 0 {
+            self.bury_past(slot);
+        }
+        if self.regens_held.load(Relaxed) {
+            self.forget_failed_run(slot, generation);
+        }
     }
 
     #[cold]
@@ -579,6 +747,15 @@ impl<C: Cells> Runtime<C> {
         let mut t = self.tickets.write();
         let stale = release(&mut t, u64::MAX, (slot, generation)..=(slot, generation));
         t.buried.extend(stale);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bury_past(&self, slot: u32) {
+        let mut t = self.tickets.write();
+        if t.past.remove(&slot).is_some() {
+            self.sync_past(&t);
+        }
     }
 
     /// A delete's bag drains: drops the tickets its deletes buried, and

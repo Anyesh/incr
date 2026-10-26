@@ -128,9 +128,12 @@ impl<C: Cells> Runtime<C> {
         let id = NodeId(d.dep.slot());
         let dep = self.nodes.get(id.0);
         self.park(ParkPoint::SeedBeforeTrust(id));
-        let cur = state::load::<C>(dep.state_cell());
+        let raw = state::load::<C>(dep.state_cell());
+        let cur = self.seen(dep.state_cell(), raw);
+        // A landing this thread holds is its own, so it needs no RMW to
+        // read from.
         let held = matches!(cur, NodeState::Clean | NodeState::Dirty)
-            && state::try_transition::<C>(dep.state_cell(), cur, cur).is_ok()
+            && (cur != raw || state::try_transition::<C>(dep.state_cell(), cur, cur).is_ok())
             && dep.changed_at() == stamp;
         self.park(ParkPoint::SeedAfterTrust(id));
         held

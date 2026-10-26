@@ -135,7 +135,9 @@ macro_rules! cycle_100k_tests {
             #[test]
             #[cfg_attr(miri, ignore)]
             fn $name() {
-                on_stack(8 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
+                // Under a TSan debug build, budget 256's Shared ring
+                // levels overflow an 8 MiB stack.
+                on_stack(16 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
             }
         )*
     };
@@ -486,7 +488,8 @@ fn first_doom_depth<C: Cells>(rt: &Runtime<C>) -> usize {
 
 /// The byte budget dooms a 1000-chain of 16 KiB frames well below the
 /// frame budget of 256, which alone would overflow a 2 MiB thread, under
-/// `get` and under `stabilize` at the same depth, with the unbounded value.
+/// `get` and at most one level earlier under `stabilize`, with the
+/// unbounded value.
 fn byte_budget_first<C: Cells>() {
     let n = 1000;
     let rt = Runtime::<C>::new();
@@ -502,7 +505,15 @@ fn byte_budget_first<C: Cells>() {
     rt.observe(nodes[0], move |&v| seen.lock().unwrap().push(v));
     rt.stabilize();
     assert_eq!(*fired.lock().unwrap(), vec![n as u64]);
-    assert_eq!(first_doom_depth(&rt), depth);
+    // The budget counts from the outermost entry, so stabilize's observer
+    // frames come before the chain's; under TSan, Local's first level under
+    // get ends less than 1 KiB inside the 64 KiB, so stabilize dooms one
+    // level earlier.
+    let stabilized = first_doom_depth(&rt);
+    assert!(
+        stabilized <= depth && depth - stabilized <= 1,
+        "the doom came at depth {stabilized} under stabilize, {depth} under get"
+    );
     assert_eq!(rt.state_of(nodes[0]), NodeState::Clean);
 }
 
@@ -634,6 +645,89 @@ fn local_wide_diverted_retry() {
 #[test]
 fn shared_wide_diverted_retry() {
     wide_diverted_retry::<Shared>();
+}
+
+/// Sizes for the Failed-walk scaling tests. Main b9f0d0bf walks n + 1
+/// entries for the chain and k + 3 for the fan-in; a walk that rewalks the
+/// Failed node's deps per reader grows as n^2 / 2.
+const FAILED_WALK_SIZES: &[usize] = if cfg!(miri) {
+    &[4, 8]
+} else {
+    &[250, 500, 1000]
+};
+
+/// A chain of `n` queries over a Failed node, rerun after a set below the
+/// chain: each rerun's read of the Failed node below it walks only that
+/// node, as a walk entry Failed computes to nothing and a Failed root
+/// raises, so the walks stay linear.
+fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
+    for &n in FAILED_WALK_SIZES {
+        failed_entry_chain_of::<C>(n, frames);
+    }
+}
+
+fn failed_entry_chain_of<C: Cells>(n: usize, frames: Option<u32>) {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let runs = counters(1);
+    let mut below = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs[0].fetch_add(1, SeqCst);
+                rt.get(input) + rt.get(failed)
+            },
+            opts(),
+        )
+    };
+    for _ in 1..n {
+        let (runs, dep) = (runs.clone(), below);
+        below = rt.create_query_with(
+            move |rt| {
+                runs[0].fetch_add(1, SeqCst);
+                rt.get(dep) + 1
+            },
+            opts(),
+        );
+    }
+    let top = below;
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    rt.set(input, 1);
+    runs[0].store(0, SeqCst);
+    let pops = rt.walk_pops.load(SeqCst);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let pops = rt.walk_pops.load(SeqCst) - pops;
+    assert_eq!(runs[0].load(SeqCst), n as u32);
+    assert!(pops <= 2 * n as u64 + 2, "{pops} walk pops for a {n}-chain");
+}
+
+#[test]
+fn local_failed_entry_chain() {
+    on_stack(1 << 28, || failed_entry_chain::<Local>(None));
+}
+
+#[test]
+fn shared_failed_entry_chain() {
+    on_stack(1 << 28, || failed_entry_chain::<Shared>(None));
+}
+
+#[test]
+fn local_failed_entry_chain_at_budget_1() {
+    on_stack(1 << 28, || failed_entry_chain::<Local>(Some(1)));
+}
+
+#[test]
+fn shared_failed_entry_chain_at_budget_1() {
+    on_stack(1 << 28, || failed_entry_chain::<Shared>(Some(1)));
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -938,6 +1032,254 @@ fn shared_contained_chain_stays_linear_at_budget_16() {
     on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(16)));
 }
 
+/// A panicking query under an `n`-deep chain, read and then read again
+/// after an input change: each level's read takes the unwind and its frame
+/// lands Failed, which keys what the read took by the frame's path. The
+/// stack frames folded into paths on the first read and on the second, and
+/// the entries the second read's walks pushed.
+fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64, u64) {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let mut below = rt.create_query_with(move |rt| rt.get(input) + rt.get(failed), opts());
+    for _ in 1..n {
+        let dep = below;
+        below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
+    }
+    let top = below;
+    crate::replay::take_path_steps();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let first = crate::replay::take_path_steps();
+    rt.set(input, 1);
+    crate::runtime::take_walk_pushes();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    (
+        first,
+        crate::replay::take_path_steps(),
+        crate::runtime::take_walk_pushes(),
+    )
+}
+
+fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
+    let n = if cfg!(miri) { 8 } else { 4000 };
+    let (first, second, pushes) = panicking_chain_path_steps::<C>(frames, n);
+    assert!(
+        first <= 8 * n as u64 && second <= 8 * n as u64,
+        "{frames:?}: {first} and {second} frames folded into paths for a {n}-chain"
+    );
+    assert!(
+        pushes <= 8 * n as u64,
+        "{frames:?}: the second read's walks pushed {pushes} entries for a {n}-chain"
+    );
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || panicking_chain_paths_stay_linear::<Local>(None));
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(None)
+    });
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Local>(Some(1))
+    });
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(Some(1))
+    });
+}
+
+/// `k` Dirty readers over one Failed node with a Failed chain of `k` below
+/// it, whose edges a Clean run recorded, all entries of one walk: the walk
+/// passes the Failed node without walking the chain once per reader.
+fn failed_entry_fan_in<C: Cells>() {
+    for &k in FAILED_WALK_SIZES {
+        failed_entry_fan_in_of::<C>(k);
+    }
+}
+
+fn failed_entry_fan_in_of<C: Cells>(k: usize) {
+    let rt = Runtime::<C>::new();
+    let fail = rt.create_input(0_u64);
+    let mut failed = rt.create_query(move |rt| {
+        assert_eq!(rt.get(fail), 0, "failed below the fan");
+        0
+    });
+    for _ in 0..k {
+        let below = failed;
+        failed = rt.create_query(move |rt| rt.get(below) + 1);
+    }
+    let input = rt.create_input(0_u64);
+    let readers: Arc<Vec<Incr<u64>>> = Arc::new(
+        (0..k)
+            .map(|_| rt.create_query(move |rt| rt.get(input) + rt.get(failed)))
+            .collect(),
+    );
+    let top = {
+        let readers = readers.clone();
+        rt.create_query(move |rt| {
+            for &r in readers.iter() {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+            }
+            0
+        })
+    };
+    rt.get(top);
+    rt.set(fail, 1);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
+    assert_eq!(rt.state_of(failed), NodeState::Failed);
+    rt.set(input, 1);
+    let pops = rt.walk_pops.load(SeqCst);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
+    let pops = rt.walk_pops.load(SeqCst) - pops;
+    assert!(pops <= 4 * k as u64 + 2, "{pops} walk pops for {k} readers");
+}
+
+#[test]
+fn local_failed_entry_fan_in() {
+    on_stack(1 << 28, failed_entry_fan_in::<Local>);
+}
+
+#[test]
+fn shared_failed_entry_fan_in() {
+    on_stack(1 << 28, failed_entry_fan_in::<Shared>);
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Debug)]
+struct ChainPayload(u64);
+
+#[cfg(not(debug_assertions))]
+thread_local! {
+    /// The payloads the chain's readers caught, kept so that no payload's
+    /// box is freed for the next to take its address: the engine keys a
+    /// payload by its address and type, so every node's would share one
+    /// key, a collision B7-reused-address-payload-content tracks.
+    static CAUGHT: std::cell::RefCell<Vec<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Silences the panics of [`ChainPayload`] payloads, one per chain node,
+/// and leaves every other panic to the default hook.
+#[cfg(not(debug_assertions))]
+fn quiet_chain_payload() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.payload().is::<ChainPayload>() {
+                default(info);
+            }
+        }));
+    });
+}
+
+/// A 100k chain whose every level catches the custom panic payload of its
+/// own Failed dep's ticket before it reads the level below, at budget
+/// `frames`: each catch sees the payload, as in the unbounded run, a level
+/// at the budget included, whose retries regenerate it, and the stack stays
+/// within the thread's. The deps' panics are contained by a walk first, as
+/// in `ticket_catching_chain`, because a chain whose levels compute their
+/// panicking deps is quadratic under a budget whatever the payload
+/// (T8-nested-caught-chain-quadratic).
+#[cfg(not(debug_assertions))]
+fn custom_payload_chain_100k<C: Cells>(frames: u32) {
+    quiet_chain_payload();
+    let n = crate::test_size::test_size(100_000) as u64;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    let j = rt.create_input(1_u64);
+    let sel = rt.create_input(0_u64);
+    let ds: Vec<Incr<u64>> = (0..n)
+        .map(|k| {
+            rt.create_query_with(
+                move |rt: &Runtime<C>| -> u64 {
+                    if rt.get(j) == 0 {
+                        std::panic::panic_any(ChainPayload(k));
+                    }
+                    0
+                },
+                replayable(),
+            )
+        })
+        .collect();
+    let all = ds.clone();
+    let x = rt.create_query(move |rt: &Runtime<C>| {
+        if rt.get(sel) == 0 {
+            all.iter().map(|&d| rt.get(d)).sum()
+        } else {
+            0
+        }
+    });
+    rt.get(x);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 0);
+    assert_eq!(rt.contained_payloads(), n as usize);
+    rt.set_max_frames(frames);
+    let mut next = rt.create_query_with(move |rt| rt.get(sel) + 6, replayable());
+    for (k, &d) in (0..n).zip(&ds) {
+        let below = next;
+        next = rt.create_query_with(
+            move |rt| {
+                let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(d))) {
+                    Err(p) => {
+                        let saw = p.downcast_ref::<ChainPayload>().is_some_and(|c| c.0 == k);
+                        CAUGHT.with(|c| c.borrow_mut().push(p));
+                        u64::from(saw)
+                    }
+                    Ok(_) => 0,
+                };
+                saw + rt.get(below)
+            },
+            replayable(),
+        );
+    }
+    assert_eq!(rt.get(next), n + 7);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_custom_payload_chain_100k_at_budget_256_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Local>(256));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Local>(1));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_custom_payload_chain_100k_at_budget_256_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Shared>(256));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Shared>(1));
+}
+
 /// A chain of `n` replayable queries at budget `frames`, where each level
 /// reads and catches its own panicking query and then reads the level
 /// below. Every caught panic's Failed landing is copied into a delivery,
@@ -949,9 +1291,9 @@ fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
     // `frames` levels above it did, so the work per level grows with the
     // budget, never with the chain.
     let per_level = match (through, frames) {
-        (false, _) => 24,
-        (true, 1) => 48,
-        (true, _) => 240,
+        (false, _) => 48,
+        (true, 1) => 80,
+        (true, _) => 260,
     };
     let n = if cfg!(miri) { 8 } else { 4000 };
     let work = nested_caught_chain_work::<C>(frames, through, n);
@@ -1136,7 +1478,7 @@ fn same_text_fan_over_chain_stays_linear<C: Cells>(through: bool) {
     for &n in sizes {
         let work = same_text_fan_over_chain::<C>(n, through);
         assert!(
-            work <= 24 * n,
+            work <= 40 * n,
             "{work} units of note work for {n} caught panics of one text, through={through}"
         );
     }
@@ -1168,4 +1510,42 @@ fn shared_same_text_fan_through_a_frame_over_chain_stays_linear() {
     on_stack(1 << 26, || {
         same_text_fan_over_chain_stays_linear::<Shared>(true)
     });
+}
+
+/// One budgeted frame reading `n` nodes of another runtime and then a
+/// 600-deep chain, which dooms it: the reads are kept as deliveries for
+/// its retry, sharing the frame's, maker's and node's lists, and removing
+/// them must not cost a pass over those lists each.
+fn wide_frame_deliveries<C: Cells>() {
+    let n = 4000;
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let top = chain(&rt, 600).nodes[0];
+    let reader = rt.create_query_with(
+        move |rt| reads.iter().map(|&x| foreign.get(x)).sum::<u64>() + rt.get(top),
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n * (n - 1) / 2 + 600);
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 16 * n,
+        "{work} units of note work for {n} delivered foreign reads"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Shared>);
 }

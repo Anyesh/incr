@@ -22,7 +22,7 @@
 //!   52     4     arena_slot    u32
 //!   56     2     type_tag      u16
 //!   58     1     state         Cells::State
-//!   59     1     dep_count     Cells::U8    (high bit: the unrun mark)
+//!   59     1     dep_count     Cells::U8    (0x80 the unrun mark, 0x40 the released mark)
 //!   60     4     generation    Cells::U32
 //! ```
 //!
@@ -161,6 +161,17 @@ pub struct NodeData<C: Cells> {
     dep_count: C::U8,
     pub(crate) generation: C::U32,
 }
+
+const _: () = assert!(crate::bits::disjoint(&[
+    NodeData::<crate::cells::Local>::MEMO,
+    NodeData::<crate::cells::Local>::SET_CLAIM,
+    NodeData::<crate::cells::Local>::DELETED,
+]));
+const _: () = assert!(crate::bits::disjoint(&[
+    NodeData::<crate::cells::Local>::COUNT_MASK as u64,
+    NodeData::<crate::cells::Local>::RELEASED as u64,
+    NodeData::<crate::cells::Local>::UNRUN as u64,
+]));
 
 impl<C: Cells> NodeData<C> {
     /// The `changed_at` of an input created, recycled or set at revision
@@ -311,7 +322,32 @@ impl<C: Cells> NodeData<C> {
     /// a change from a later verifier.
     #[inline(always)]
     pub fn max_verified_at(&self, v: u64) {
-        C::u64_fetch_max(&self.verified_at, v);
+        debug_assert!(v & !Self::REVISION_BITS == 0);
+        let cur = C::u64_load_relaxed(&self.verified_at);
+        // A memo's bit is above every revision, so a stamp that raises the
+        // word under Local is never over one.
+        if C::SINGLE_THREADED && v > cur {
+            C::u64_store_relaxed(&self.verified_at, v);
+        } else if cur & Self::MEMO != 0 {
+            self.stamp_over_memo(cur, v);
+        } else if !C::SINGLE_THREADED {
+            C::u64_fetch_max(&self.verified_at, v);
+        }
+    }
+
+    /// [`Self::max_verified_at`] over a memo, which the stamp ends. Only the
+    /// claim's holder sets a memo, so none appears between the load and
+    /// the max.
+    #[cold]
+    #[inline(never)]
+    fn stamp_over_memo(&self, mut cur: u64, v: u64) {
+        loop {
+            let new = (cur & !Self::MEMO).max(v);
+            match C::u64_compare_exchange(&self.verified_at, cur, new) {
+                Ok(_) => return,
+                Err(seen) => cur = seen,
+            }
+        }
     }
 
     /// Set on an input's `verified_at` while a `set` holds the input. The
@@ -324,7 +360,12 @@ impl<C: Cells> NodeData<C> {
     /// so a later set claim fails. Cleared only by the recycle's store.
     pub const DELETED: u64 = 1 << 63;
 
-    const REVISION_BITS: u64 = !(Self::SET_CLAIM | Self::DELETED);
+    /// Set on a Dirty query's `verified_at` while it holds a memo for the
+    /// revision in its `changed_at` (`set_memo`). Masked out of the stamp,
+    /// so verification reads 0, never verified; any later stamp ends it.
+    pub const MEMO: u64 = 1 << 61;
+
+    const REVISION_BITS: u64 = !(Self::SET_CLAIM | Self::DELETED | Self::MEMO);
 
     /// Take a `set`'s claim on this input. Returns the stamp it claimed
     /// over, for [`Self::release_set_claim`], or the word holding
@@ -372,9 +413,40 @@ impl<C: Cells> NodeData<C> {
     }
 
     /// Raise `changed_at` to `v` if `v` is larger. See [`Self::max_verified_at`].
+    /// Clears a memo first: a landing raises `changed_at` before it
+    /// rewrites `verified_at`, and the old memo must not read as one for
+    /// the new `changed_at`.
     #[inline(always)]
     pub fn max_changed_at(&self, v: u64) {
+        let cur = C::u64_load_relaxed(&self.verified_at);
+        if cur & Self::MEMO != 0 {
+            self.stamp_over_memo(cur, 0);
+        }
         C::u64_fetch_max(&self.changed_at, v);
+    }
+
+    /// Keep a Dirty query's value for the rest of revision `rev`: reads in
+    /// `rev` take it without a run, and the first read after a set runs
+    /// the closure. Raising `changed_at` to `rev` only makes the node
+    /// newer to its readers' verification. Before the landing's store, so
+    /// a reader that loads the Dirty state sees the memo.
+    #[inline(always)]
+    pub(crate) fn set_memo(&self, rev: u64) {
+        self.set_verified_at(Self::MEMO);
+        C::u64_fetch_max(&self.changed_at, rev);
+    }
+
+    /// Whether the query, loaded Dirty, holds a memo for the revision
+    /// `revision` loads, which only a memo's node loads.
+    #[inline(always)]
+    pub(crate) fn memo_at(&self, revision: impl FnOnce() -> u64) -> bool {
+        // Under Shared the bit is loaded again after `changed_at`: a
+        // `changed_at` from a later landing orders the clear before it.
+        C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && {
+            let changed = self.changed_at();
+            (C::SINGLE_THREADED || C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0)
+                && changed == revision()
+        }
     }
 
     /// Sentinel meaning "a set() is in flight on this input". Any
@@ -421,14 +493,10 @@ impl<C: Cells> NodeData<C> {
         Self::count_of(C::u8_load_relaxed(&self.dep_count))
     }
 
-    /// The count in a `dep_count` cell value, without the unrun bit.
+    /// The count in a `dep_count` cell value, without its marks.
     #[inline(always)]
     fn count_of(raw: u8) -> u8 {
-        if C::SINGLE_THREADED {
-            raw
-        } else {
-            raw & !Self::UNRUN
-        }
+        raw & Self::COUNT_MASK
     }
 
     #[inline(always)]
@@ -451,15 +519,35 @@ impl<C: Cells> NodeData<C> {
     /// claim's owner calls it, before the release that publishes it.
     #[inline(always)]
     pub(crate) fn set_unrun(&self, unrun: bool) {
-        if C::SINGLE_THREADED {
-            return;
+        if !C::SINGLE_THREADED {
+            self.set_mark(Self::UNRUN, unrun);
         }
+    }
+
+    /// Whether the runtime holds a released entry for the node
+    /// (`Inner::released_deps`). An install keeps it.
+    #[inline(always)]
+    pub(crate) fn released_mark(&self) -> bool {
+        C::u8_load_relaxed(&self.dep_count) & Self::RELEASED != 0
+    }
+
+    /// Only the claim's owner calls it, under the hold that sets or drops
+    /// the entry.
+    #[inline(always)]
+    pub(crate) fn set_released_mark(&self, released: bool) {
+        self.set_mark(Self::RELEASED, released);
+    }
+
+    /// The unrun and released marks, which an install keeps.
+    #[inline(always)]
+    fn marks(&self) -> u8 {
+        C::u8_load_relaxed(&self.dep_count) & !Self::COUNT_MASK
+    }
+
+    #[inline(always)]
+    fn set_mark(&self, bit: u8, on: bool) {
         let raw = C::u8_load_relaxed(&self.dep_count);
-        let marked = if unrun {
-            raw | Self::UNRUN
-        } else {
-            raw & !Self::UNRUN
-        };
+        let marked = if on { raw | bit } else { raw & !bit };
         if marked != raw {
             // Release like install_deps's, so a scan that reads this
             // value still sees the deps installed before it.
@@ -508,7 +596,7 @@ impl<C: Cells> NodeData<C> {
             // overflow marker before this store finds the null and
             // retries on the count stored next.
             let displaced = self.overflow_deps.replace(None);
-            C::u8_store_release(&self.dep_count, count as u8 | self.unrun_bit());
+            C::u8_store_release(&self.dep_count, count as u8 | self.marks());
             displaced
         } else {
             let list = Box::new(DepList {
@@ -519,7 +607,7 @@ impl<C: Cells> NodeData<C> {
             // marker and the DepList length is authoritative. This is
             // what lifts the old 255-dep ceiling: a query may read any
             // number of inputs.
-            C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER | self.unrun_bit());
+            C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER | self.marks());
             displaced
         }
     }
@@ -531,6 +619,12 @@ impl<C: Cells> NodeData<C> {
     /// `dep_count` bit for [`Self::unrun`], kept there because the
     /// claim's owner writes both and its release publishes both.
     const UNRUN: u8 = 0x80;
+
+    /// `dep_count` bit for [`Self::released_mark`]: `NodeData` fills its
+    /// line, and a publish already reads this cell.
+    const RELEASED: u8 = 0x40;
+
+    const COUNT_MASK: u8 = 0x0f;
 
     /// Iterate over the node's recorded dependencies. A scan may race an
     /// `install_deps` on another thread (the dirty walk scans without a
@@ -562,6 +656,18 @@ impl<C: Cells> NodeData<C> {
         } else {
             self.for_each_overflow_dep(&mut f);
         }
+    }
+
+    /// The deps as [`Self::for_each_dep`] scans them when they fit inline,
+    /// or `None` when they overflow. A caller's loop body over these stays
+    /// inline where a closure handed to `for_each_dep` may not, as its
+    /// overflow arm needs an out-of-line copy.
+    #[inline(always)]
+    pub fn inline_deps(&self) -> Option<impl Iterator<Item = NodeId> + '_> {
+        let count = Self::count_of(C::u8_load_acquire(&self.dep_count));
+        (count <= 7).then(move || {
+            (0..count as usize).map(move |i| NodeId(C::u32_load_acquire(&self.inline_deps[i])))
+        })
     }
 
     #[inline(always)]
@@ -615,6 +721,13 @@ impl<C: Cells> NodeData<C> {
     }
 }
 
+const _: () = {
+    type N = NodeData<crate::cells::Local>;
+    assert!(
+        N::OVERFLOW_MARKER & !N::COUNT_MASK == 0,
+        "dep_count's overflow marker lies outside its count bits"
+    );
+};
 const _: () = assert!(
     std::mem::size_of::<NodeData<crate::cells::Local>>() == 64,
     "NodeData<Local> must be exactly one 64-byte cache line"
@@ -685,9 +798,8 @@ mod tests {
         assert_eq!(n.dep_count(), 0);
     }
 
-    #[test]
-    fn max_stamps_are_monotonic() {
-        let n: NodeData<Shared> = NodeData::new_input(0, 0, 10);
+    fn max_stamps_are_monotonic<C: Cells>() {
+        let n: NodeData<C> = NodeData::new_input(0, 0, 10);
         n.max_verified_at(7);
         assert_eq!(n.verified_at(), 10);
         n.max_verified_at(12);
@@ -696,6 +808,40 @@ mod tests {
         assert_eq!(n.changed_at(), 11);
         n.max_changed_at(5);
         assert_eq!(n.changed_at(), 11);
+    }
+
+    #[test]
+    fn max_stamps_are_monotonic_local() {
+        max_stamps_are_monotonic::<Local>();
+    }
+
+    #[test]
+    fn max_stamps_are_monotonic_shared() {
+        max_stamps_are_monotonic::<Shared>();
+    }
+
+    fn memo_ends_at_a_changed_at_raise<C: Cells>() {
+        let n: NodeData<C> = NodeData::new_query(0, 99);
+        n.set_memo(5);
+        assert!(n.memo_at(|| 5));
+        assert_eq!(n.verified_at(), 0);
+        n.max_changed_at(6);
+        assert!(!n.memo_at(|| 6), "a landing's changed_at kept the old memo");
+        n.set_memo(6);
+        assert!(n.memo_at(|| 6));
+        n.max_verified_at(6);
+        assert!(!n.memo_at(|| 6));
+        assert_eq!(n.verified_at(), 6);
+    }
+
+    #[test]
+    fn memo_ends_at_a_changed_at_raise_local() {
+        memo_ends_at_a_changed_at_raise::<Local>();
+    }
+
+    #[test]
+    fn memo_ends_at_a_changed_at_raise_shared() {
+        memo_ends_at_a_changed_at_raise::<Shared>();
     }
 
     fn set_claim_and_delete_mark<C: Cells>() {
@@ -797,5 +943,34 @@ mod tests {
         n.set_unrun(true);
         assert!(!n.unrun(), "a single-threaded node keeps no mark");
         assert_eq!(n.dep_count(), 2);
+    }
+
+    #[test]
+    fn the_released_mark_leaves_the_deps_alone() {
+        fn check<C: crate::cells::Cells>() {
+            for len in [3, 20] {
+                let n: NodeData<C> = NodeData::new_query(0, 0);
+                let deps: Vec<NodeId> = (0..len).map(NodeId).collect();
+                drop(n.install_deps(&deps));
+                let count = n.dep_count();
+                n.set_released_mark(true);
+                n.set_unrun(true);
+                assert!(n.released_mark());
+                assert_eq!(n.dep_count(), count);
+                assert_eq!(collect_deps(&n), deps);
+                n.set_unrun(false);
+                assert!(n.released_mark(), "the unrun mark leaves it alone");
+                let fewer: Vec<NodeId> = (0..2).map(NodeId).collect();
+                drop(n.install_deps(&fewer));
+                assert!(n.released_mark(), "an install keeps it");
+                assert_eq!(collect_deps(&n), fewer);
+                drop(n.install_deps(&deps));
+                n.set_released_mark(false);
+                assert!(!n.released_mark());
+                assert_eq!(n.dep_count(), count);
+            }
+        }
+        check::<Local>();
+        check::<Shared>();
     }
 }

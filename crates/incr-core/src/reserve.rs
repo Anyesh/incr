@@ -3,10 +3,11 @@
 //! A doom releases claims whose nodes the dooming thread's replay contexts
 //! compute again, where the unbounded run keeps them claimed on that
 //! thread's stack. A reservation keeps every other thread from computing
-//! such a node until the thread's outermost context of that runtime, which
-//! outlives every context nested in it, is removed; the dooming thread's
-//! own claims, landings and releases of the node keep it, so a node a set
-//! dirties again meanwhile waits for that context too. It is stored
+//! such a node until the thread lands it settled from a finished run,
+//! where the unbounded run's frame releases its claim, or until the
+//! thread's outermost context of that runtime, which outlives every
+//! context nested in it, is removed; the dooming thread's own claims and unrun releases
+//! of the node keep it. It is stored
 //! before the release that publishes it, so a claim that reads the release
 //! sees it. A node generation has at most one reservation: reserving it
 //! needs its claim, and a claim waits out another thread's reservation.
@@ -16,10 +17,11 @@
 //! Dirty node would replace it with a value no serial order gives the read.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(not(loom))]
 use std::hash::{Hash, Hasher};
 
+use crate::fx::FxBuildHasher;
 #[cfg(not(loom))]
 use crate::fx::FxHasher;
 use crate::waits::Claim;
@@ -64,7 +66,51 @@ loom::lazy_static! {
 /// One context's reservations on this thread, as claim and generation.
 struct Group {
     context: u64,
-    claims: Vec<(Claim, u32)>,
+    claims: Claims,
+}
+
+/// The claims and generations a group lists: a set, so a landing ends
+/// one without a pass over a deep chain's reservations. No group lists
+/// one twice: `note` lists again only for a context with none, and
+/// `note_root` only when the read-root group has none.
+#[derive(Default)]
+struct Claims(HashSet<(Claim, u32), FxBuildHasher>);
+
+impl Claims {
+    fn one(c: (Claim, u32)) -> Self {
+        let mut claims = Self::default();
+        claims.push(c);
+        claims
+    }
+
+    fn push(&mut self, c: (Claim, u32)) {
+        self.0.insert(c);
+    }
+
+    fn contains(&self, c: &(Claim, u32)) -> bool {
+        self.0.contains(c)
+    }
+
+    fn remove(&mut self, c: &(Claim, u32)) -> bool {
+        self.0.remove(c)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(all(test, not(loom)))]
+    fn len(&self) -> u32 {
+        self.0.len() as u32
+    }
+
+    fn extend(&mut self, other: Claims) {
+        self.0.extend(other.0);
+    }
+
+    fn keys(&self) -> impl Iterator<Item = (Claim, u32)> + '_ {
+        self.0.iter().copied()
+    }
 }
 
 /// A thread's reservations. Its address is the owner token, unique among
@@ -82,7 +128,7 @@ impl Drop for Listed {
     fn drop(&mut self) {
         let token = self.token();
         for g in std::mem::take(self.0.get_mut()) {
-            unlist(&g.claims, token, false);
+            unlist(g.claims.keys(), token, false);
         }
     }
 }
@@ -258,7 +304,8 @@ fn end_root(key: u64) {
             let g = groups.iter_mut().find(|g| g.context == ROOT_READ)?;
             let ended: Vec<_> = g
                 .claims
-                .extract_if(.., |&mut (c, _)| root_key(c) == key)
+                .0
+                .extract_if(|&(c, _)| root_key(c) == key)
                 .collect();
             ROOTS.with(|n| n.set(n.get() - ended.len() as u32));
             if g.claims.is_empty() {
@@ -269,7 +316,7 @@ fn end_root(key: u64) {
         .ok()
         .flatten();
     if let Some((ended, token)) = gone {
-        unlist(&ended, token, true);
+        unlist(ended, token, true);
     }
 }
 
@@ -293,7 +340,7 @@ fn list(context: u64, claim: Claim, generation: u32, again: bool) {
             Some(g) => g.claims.push((claim, generation)),
             None => groups.push(Group {
                 context,
-                claims: vec![(claim, generation)],
+                claims: Claims::one((claim, generation)),
             }),
         }
     });
@@ -336,9 +383,9 @@ pub(crate) fn mine(claim: Claim, generation: u32) -> bool {
 /// Ends `claims`, already out of their group. `shared` says another
 /// group may list them too, which only a read's reservation of its own
 /// node makes possible.
-fn unlist(claims: &[(Claim, u32)], token: usize, shared: bool) {
+fn unlist(claims: impl IntoIterator<Item = (Claim, u32)>, token: usize, shared: bool) {
     let mut t = table();
-    for &(claim, generation) in claims {
+    for (claim, generation) in claims {
         if t.get(&claim) == Some(&(generation, token))
             && !(shared && still_listed(claim, generation))
         {
@@ -366,6 +413,34 @@ fn still_listed(claim: Claim, generation: u32) -> bool {
             .any(|g| g.claims.contains(&(claim, generation)))
     })
     .unwrap_or(false)
+}
+
+/// Whether a context of this thread reserves `claim` at `generation`.
+pub(crate) fn in_context(claim: Claim, generation: u32) -> bool {
+    MINE.try_with(|m| {
+        m.0.borrow()
+            .iter()
+            .any(|g| g.context != ROOT_READ && g.claims.contains(&(claim, generation)))
+    })
+    .unwrap_or(false)
+}
+
+/// Ends this thread's context reservations of `claim` at `generation`,
+/// whose run has landed for good. A read's reservation of its own node
+/// stays until the read has taken the value.
+pub(crate) fn end_landed(claim: Claim, generation: u32) {
+    let ended = MINE.try_with(|m| {
+        let mut groups = m.0.borrow_mut();
+        let mut found = false;
+        for g in groups.iter_mut().filter(|g| g.context != ROOT_READ) {
+            found |= g.claims.remove(&(claim, generation));
+        }
+        groups.retain(|g| !g.claims.is_empty() || g.context == ROOT_READ);
+        found.then(|| m.token())
+    });
+    if let Ok(Some(token)) = ended {
+        unlist([(claim, generation)], token, roots_listed());
+    }
 }
 
 /// Gives the reservations of a doom that marked no context to `context`.
@@ -409,8 +484,8 @@ pub(crate) fn end_context(context: u64) {
         .flatten();
     if let Some((g, token)) = gone {
         #[cfg(all(test, not(loom)))]
-        CONTEXT_ENDS.with(|n| n.set(n.get() + g.claims.len() as u32));
-        unlist(&g.claims, token, roots_listed());
+        CONTEXT_ENDS.with(|n| n.set(n.get() + g.claims.len()));
+        unlist(g.claims.keys(), token, roots_listed());
     }
 }
 
@@ -420,7 +495,7 @@ pub(crate) fn end_all() {
     ROOTS.with(|n| n.set(0));
     let (groups, token) = MINE.with(|m| (std::mem::take(&mut *m.0.borrow_mut()), m.token()));
     for g in groups {
-        unlist(&g.claims, token, false);
+        unlist(g.claims.keys(), token, false);
     }
 }
 
@@ -436,7 +511,7 @@ pub(crate) fn end_contexts() {
         (ended, m.token())
     });
     for g in groups {
-        unlist(&g.claims, token, roots_listed());
+        unlist(g.claims.keys(), token, roots_listed());
     }
 }
 
@@ -446,7 +521,7 @@ pub(crate) fn held() -> Vec<Claim> {
     MINE.with(|m| {
         m.0.borrow()
             .iter()
-            .flat_map(|g| g.claims.iter().map(|&(c, _)| c))
+            .flat_map(|g| g.claims.keys().map(|(c, _)| c))
             .collect()
     })
 }

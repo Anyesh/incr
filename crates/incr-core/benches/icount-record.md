@@ -2231,3 +2231,102 @@ Gate: the hard gates are exact (101/193, 218.14/87). `rc-sweep`
 against `34412289` changes no value and flags no run count, and the
 strict scan lists the same seeds as `34412289`'s. Replay scale timing
 and `scale-icount` run on the train that lands this branch.
+
+## A handled read keeps a memo for the revision
+
+- Base: spreadsheet-t10 ac199763. Tip: w/T8-caught-failed-read-lands 2cf9dc31, each in a detached worktree; one run of `icount.sh` at the default N per column. The attribution below comes from `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_local/propagate/4` and `chain_shared/propagate/4` at 03794a1a against adf57986, and from `icount.sh` runs of each review fix against 8ccd53c3. No workloads added.
+- Change: a compute's landing classifies its frame's `POISONED` and `HANDLED` flags (`ComputeCtl::poison`) and records a memo for `HANDLED` alone (`memo_landing`); a walk tests each Dirty node it plans for a memo, the node's compute tests again, and `max_verified_at` clears a memo bit (a store under `Local`, a load and a cold CAS under `Shared`). After review, `max_changed_at` clears a memo bit too, `memo_at` loads the bit again after `changed_at`, and a `Shared` claim tests for a memo again after its CAS.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/4` / `10` / `100` | 4,633 / 10,015 / 91,504.01 | 4,733 / 10,265 / 94,004 | +100 / +250 / +2,499.99 |
+| `chain_shared/propagate/4` / `10` / `100` | 9,599.20 / 20,974.82 / 192,628.06 | 9,683.20 / 21,184.82 / 194,727.05 | +84 / +210 / +2,098.99 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,461,211.84 / 4,800,758.55 | 3,479,229.25 / 4,808,762.31 | +18,017.41 / +8,003.76 |
+| `delete_cascade_local` / `_shared` | 3,246,570.95 / 4,581,756.20 | 3,264,570.20 / 4,589,765.05 | +17,999.25 / +8,008.85 |
+
+Gate: every hard gate counts the same as the base. Each propagating compute costs 25 more under `Local` and 21 under `Shared`: 24 / 13 from the memo as first built (below) and 1 / 8 from the review fixes. Of the fixes, the `changed_at` clear costs 1 under `Local` (a branch-free store) and 3 under `Shared` (a load and a bit test), and the `Shared` claim's second memo test costs 5; `Local` skips that test, since no other thread can land between its load and its claim. The memo as first built, by Intel PT per compute: the two memo tests' load and bit test (`node.rs:422` +7 Local, +6 Shared, and +1 at each guard), the stamp's memo clear (`node.rs:316` +3 Local; `node.rs:317` +3 and the atomics +7 Shared), the landing's flag mask and memo test (`cycle.rs:440`, `runtime.rs:4103`, +2), and code layout in `compute_attempts` (`Publish`'s compare out of line +3, `segmented_nodes.rs:191` +3, the landing target +4/-4). Testing only the root's compute for a memo would save 4 / 3 per compute, but a walk entry whose memo landed after the walk planned it then reruns and can compute another value (0x66a's Local op 2). Fan-out and delete workloads compute one leaf per step, and the workloads that compute a few nodes per step move by the same per-compute cost (`simple_count/*` +25 / +22, `children_*` +20 to +28, `early_cutoff_*` +34 / +26, `diamond_*` +75 / +62, `collection_insert_then_read/*_incremental/*` +61 / +52). The rest move by noise (`delete_owned_tree_*` -3,100 / -528, the others under 12).
+## Released claims' walk rule and the per-node released mark
+
+`w/T10-ub-f2ad3443-wrong-values` (tip `4a29dee5`, on `89d83e76`) keeps
+a read's walk to the deps a released claim's last finished run read
+(`Inner::released_deps`), and marks a node holding such an entry in bit
+0x40 of `NodeData::dep_count`, so the same-deps publish and the walk
+test the node instead of a runtime-wide count. Base `89d83e76`, same box,
+`icount.sh` defaults; "branch" is `c044a098`, the rule without the mark.
+
+| workload | base | branch | tip | delta |
+|---|---|---|---|---|
+| `get_clean_local` | 102 | | 102 | 0 |
+| `get_clean_shared` | 196 | | 196 | 0 |
+| `table_hit_shared` | 218.14 | | 218.14 | 0 |
+| `value_slot_read_shared` | 87 | | 87 | 0 |
+| `chain_local/propagate/4` | 4633 | 4697 | 4709 | +76 |
+| `chain_shared/propagate/4` | 9555.20 | 9611.20 | 9599.20 | +44 |
+| `fanout_local_4` | 17187.01 | 17330 | 17362 | +174.99 |
+| `delete_single_local` | 711 | 714 | 716 | +5 |
+
+- The rule costs 64 per `chain_local/propagate/4` iteration (Intel PT,
+  base against branch): the walk's kept-count expansion 28, the
+  same-deps publish's entry check 12, extra dep scans 20; the rest is
+  `compute_attempts` code moving between inlined sites, netting 0.
+- The mark adds 12 more under Local: `count_of` now masks the count
+  under both strategies (released entries exist under Local), about one
+  instruction per dep scan. Shared already masked for the unrun mark, and
+  its rows fall by up to 12.
+- A first version called `set_released` out of line and looked the node
+  up again by slot on every publish of new deps and every delete:
+  `delete_single_local` +4.8%, `fanout_local_4` +3.0%. Testing the mark
+  inline at the caller, with the node it holds, brought those to +0.7%
+  and +1.0%.
+- `released_hot` (Shared set+get on a static-dep node, one never-read
+  released entry present against none): +4.5% to +5.4% instructions per
+  op at 1, 4 and 8 threads with the runtime-wide count, +0.00% to +0.17%
+  with the mark.
+
+Gate: the hard gates are exact (102, 196, 218.14, 87). Replay scale by
+`strict-scan.sh`'s `scale-icount` on `8d006e54` against `89d83e76`: every ratio within
+0.4%.
+
+## Held landings under Shared (Widened H)
+
+`w/T8-two-40k-195f` holds an attempt's exposed landings under `Shared`
+until the read that made them returns (Variant V): the owner sees its
+held landings through a view, a rerun of a held node keeps what its
+write displaces, and a runtime's holds publish or retract at its first
+entry's exit. Base `164cbf2f`, tip `d3dec85b`, same box, `icount.sh`
+defaults; PT line diffs at 2 iterations (`chain_shared` traces lose AUX
+data at 4).
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 101 | 101 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_shared` | 218.14 | 218.14 | 0 |
+| `chain_local/propagate/100` | 98030.01 | 97439.01 | -591.00 |
+| `chain_shared/propagate/100` | 199512.33 | 202636.59 | +3124.26 |
+| `simple_count/local/1000` | 2221.56 | 2224.60 | +3.04 |
+| `simple_count/shared/1000` | 4285.93 | 4340.75 | +54.82 |
+| `fanout_local_4` | 17711 | 17702 | -9 |
+| `fanout_shared_4` | 24746.06 | 25378.05 | +631.99 |
+
+- `chain_shared` +29 per compute up to `faab661e` (the tree before the
+  first-entry fix), of which the named checks are: `seen`'s Computing
+  test at the three walk loads per compute (+14, the owner's view of its
+  held landings), `rerun_hold`'s `hold::active()` (+6), the landing's
+  `hold::active()` (+5), the view's held-bit test (+3) and `KeptGuard`'s
+  `KEPT` test (+2); the rest is spills around them.
+- The first-entry fix (`2f19ddd3..d3dec85b`) adds +2.1 per compute in
+  `chain_shared`. With the read wrapped in `first_entry` inline it also
+  cost `get_clean_shared` +4 (register allocation in `get`, frame 0x38
+  to 0x48) and `chain_shared` +3.7 per compute; `d3dec85b` moves that
+  entry into a cold `first_read`, which removed both.
+- `rerun_hold` and the kept value started inline in `compute_attempts`
+  and cost every compute in spills even when no hold was active (Local
+  +17, Shared +38 per compute against `276dafb2`); moving the
+  `holds`/`take_kept` calls into cold helpers that take the control
+  block (`7eedc225`, `46fa3232`) removed that.
+- Local pays nothing: `chain_local` is 6 per compute below base, from
+  layout.

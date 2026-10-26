@@ -11,12 +11,17 @@ use std::time::{Duration, Instant};
 
 use super::observe_impl::observed_is_clear;
 use super::race_tests::{id, park_at, Gate};
-use super::{NodeId, ParkPoint, Runtime};
-use crate::cells::Shared;
+use super::{GroupInfo, NodeId, ParkPoint, Runtime};
+use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
 use crate::handle::Incr;
 use crate::state::NodeState;
 use crate::waits;
+
+/// A poll for another thread's progress gives up within the 10 s a gated
+/// thread parks and a child test runs, so a failed poll reports itself
+/// instead of being killed.
+const POLL_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Asserts the cycle was resolved by wounds. Usually one: a retry that
 /// takes its released claims back before the older thread does, which
@@ -798,7 +803,7 @@ impl Released {
                 g.a_thread.set(thread::current().id()).unwrap();
                 g.read(g.r)
             });
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + POLL_DEADLINE;
             while waits::registered() == 0 {
                 match g
                     .visits
@@ -859,64 +864,90 @@ fn shared_tainted_group_verify_release_keeps_the_group() {
 /// Once `k` is 1, `r` (Fixpoint) reads `z`, and `y` when `z` is not 0;
 /// `z` (Fixpoint) reads `w`, and `y` when `w` is 0; `y` (unseeded) reads
 /// `w`, then `z` when `w` is 0 and `r` otherwise; `w` (Fixpoint) is 7.
-/// All four keep a record of one group. In an episode's first iteration
-/// the seeds are 0, so `r` reaches no other member: A's episode at `r`
-/// dissolves and releases `z`, `y` and `w` ungrouped, while B's at `y`
-/// keeps {y, z} and lets `r` join. B waits on A's claim of `y` first, so
-/// B is older; A parks in `z` after the dissolve until B, which took `y`,
-/// waits on `r`, and A's read of `y` closes the waits-for cycle. With
-/// `first_reads_y`, `z`'s run after the dissolve reads `y` first, so A is
-/// wounded before it lands a released member.
-struct Dissolve {
-    rt: Arc<Runtime<Shared>>,
+/// All four keep a record of one group, and `b` reads `y`. In an
+/// episode's first iteration the seeds are 0, so `r` reaches no other
+/// member: A's episode at `r` dissolves and releases `z`, `y` and `w`
+/// from the group, as under Local, but they stay A's claims until its
+/// read ends. B's read of `b` waits on
+/// A's claim of `y` holding `b`, so B is older; A parks in `z` after the
+/// dissolve until B waits, and its one read of `b` closes the waits-for
+/// cycle: from `z` before A lands a released member (`z_reads_b`), or
+/// from `r` once `z` and `w` have landed (`r_reads_b`).
+struct DissolveOn<C: Cells> {
+    rt: Arc<Runtime<C>>,
     r: Incr<i64>,
     z: Incr<i64>,
     y: Incr<i64>,
     w: Incr<i64>,
+    /// B's entry: a claim B holds while it waits on A's `y`.
+    b: Incr<i64>,
+    /// Reads `r`, then `b` once `top_reads_b` is set.
+    top: Incr<i64>,
     /// Parks `z`'s run in A's episode, with every member claimed.
     early: Gate,
-    /// Parks `z`'s run after the dissolve, A holding only `r` and `z`.
+    /// Parks `z`'s run after the dissolve.
     late: Gate,
-    first_reads_y: Arc<AtomicBool>,
+    z_reads_b: Arc<AtomicBool>,
+    r_reads_b: Arc<AtomicBool>,
+    top_reads_b: Arc<AtomicBool>,
+    /// `r`'s next run reads only `k`, so its landing rests on no held one.
+    r_alone: Arc<AtomicBool>,
+    /// `r`'s state as other threads see it when `top` reads `b`.
+    r_at_top: Arc<Mutex<Option<NodeState>>>,
 }
 
-impl Dissolve {
+type Dissolve = DissolveOn<Shared>;
+
+impl<C: Cells> DissolveOn<C> {
     fn new() -> Self {
-        let rt = Arc::new(Runtime::<Shared>::new());
+        let rt = Arc::new(Runtime::<C>::new());
         let k = rt.create_input(0_i64);
         let z_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
         let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
         let w_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let (z_reads_b, r_reads_b) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let fixpoint = || QueryOpts {
             cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).max_iterations(20)),
             ..QueryOpts::default()
         };
+        let r_alone = Arc::new(AtomicBool::new(false));
         let r = {
-            let (z_cell, y_cell) = (z_cell.clone(), y_cell.clone());
+            let (z_cell, y_cell, b_cell) = (z_cell.clone(), y_cell.clone(), b_cell.clone());
+            let (r_reads_b, r_alone) = (r_reads_b.clone(), r_alone.clone());
             rt.create_query_with(
                 move |rt| match rt.get(k) {
                     0 => 1,
+                    _ if r_alone.swap(false, Ordering::SeqCst) => 1,
                     _ if rt.get(*z_cell.get().unwrap()) == 0 => 1,
-                    _ => (rt.get(*y_cell.get().unwrap()) + 1).min(50),
+                    _ => {
+                        // B holds `b`, so this read wounds A and never returns.
+                        if r_reads_b.swap(false, Ordering::SeqCst) {
+                            rt.get(*b_cell.get().unwrap());
+                        }
+                        (rt.get(*y_cell.get().unwrap()) + 1).min(50)
+                    }
                 },
                 fixpoint(),
             )
         };
         let (early, late) = (Gate::new(), Gate::new());
-        let first_reads_y = Arc::new(AtomicBool::new(false));
         let z = {
-            let (y_cell, w_cell) = (y_cell.clone(), w_cell.clone());
+            let (y_cell, w_cell, b_cell) = (y_cell.clone(), w_cell.clone(), b_cell.clone());
             let (early, late) = (early.clone(), late.clone());
-            let first_reads_y = first_reads_y.clone();
+            let z_reads_b = z_reads_b.clone();
             rt.create_query_with(
                 move |rt| {
                     if rt.get(k) == 0 {
                         return 0;
                     }
                     late.park();
-                    // B holds `y`, so this read wounds A and never returns.
-                    if first_reads_y.load(Ordering::SeqCst) {
-                        rt.get(*y_cell.get().unwrap());
+                    // As in `r`: a read that wounds A and never returns.
+                    if z_reads_b.swap(false, Ordering::SeqCst) {
+                        rt.get(*b_cell.get().unwrap());
                     }
                     early.park();
                     match rt.get(*w_cell.get().unwrap()) {
@@ -936,22 +967,44 @@ impl Dissolve {
             })
         };
         let w = rt.create_query_with(move |rt| 7 * rt.get(k), fixpoint());
+        let b = rt.create_query(move |rt| rt.get(y));
+        let top_reads_b = Arc::new(AtomicBool::new(false));
+        let r_at_top = Arc::new(Mutex::new(None));
+        let top = {
+            let (top_reads_b, r_at_top) = (top_reads_b.clone(), r_at_top.clone());
+            rt.create_query(move |rt| {
+                let v = rt.get(r);
+                // As in `r`: a read that wounds A and never returns.
+                if top_reads_b.swap(false, Ordering::SeqCst) {
+                    *r_at_top.lock().unwrap() = Some(rt.nodes.get(r.slot()).state());
+                    rt.get(b);
+                }
+                v
+            })
+        };
         z_cell.set(z).unwrap();
         y_cell.set(y).unwrap();
         w_cell.set(w).unwrap();
+        b_cell.set(b).unwrap();
         assert!(r.slot() < z.slot() && z.slot() < y.slot() && y.slot() < w.slot());
         assert_eq!((rt.get(r), rt.get(z), rt.get(y), rt.get(w)), (1, 0, 0, 0));
         rt.force_group_for_test(&[r.erase(), z.erase(), y.erase(), w.erase()]);
         rt.set(k, 1);
-        Dissolve {
+        DissolveOn {
             rt,
             r,
             z,
             y,
             w,
+            b,
+            top,
             early,
             late,
-            first_reads_y,
+            z_reads_b,
+            r_reads_b,
+            top_reads_b,
+            r_alone,
+            r_at_top,
         }
     }
 
@@ -959,7 +1012,7 @@ impl Dissolve {
         catch_unwind(AssertUnwindSafe(|| self.rt.get(node))).map_err(panic_message)
     }
 
-    /// A's read of `r`, B's of `y`, then a read of every node.
+    /// A's read of `r`, B's read, then a read of every node.
     fn outcome(&self, a: Result<i64, String>, b: Result<i64, String>) -> Vec<Result<i64, String>> {
         vec![
             a,
@@ -970,19 +1023,22 @@ impl Dissolve {
             self.read(self.w),
         ]
     }
+}
 
+impl Dissolve {
     fn single_thread(a_first: bool) -> Vec<Result<i64, String>> {
         let g = Dissolve::new();
         if a_first {
             let a = g.read(g.r);
-            g.outcome(a, g.read(g.y))
+            g.outcome(a, g.read(g.b))
         } else {
-            let b = g.read(g.y);
+            let b = g.read(g.b);
             g.outcome(g.read(g.r), b)
         }
     }
 
-    fn concurrent(first_reads_y: bool) -> Vec<Result<i64, String>> {
+    /// The outcome, the runtime's `unwound_landings`, and `r`'s slot.
+    fn concurrent(z_reads_b: bool) -> Concurrent {
         let g = Dissolve::new();
         let wounds = waits::WOUNDS.load(Ordering::Relaxed);
         g.early.arm();
@@ -990,31 +1046,39 @@ impl Dissolve {
             let g = &g;
             let a = s.spawn(move || g.read(g.r));
             g.early.wait_parked();
-            let b = s.spawn(move || g.read(g.y));
+            let b = s.spawn(move || g.read(g.b));
             g.late.arm();
             g.early.release();
             g.late.wait_parked();
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !waits::waited_on((g.rt.runtime_id, g.r.slot())) {
-                assert!(Instant::now() < deadline, "B never waited on r");
+            let deadline = Instant::now() + POLL_DEADLINE;
+            while !waits::waited_on((g.rt.runtime_id, g.y.slot())) {
+                assert!(Instant::now() < deadline, "B never waited on y");
                 thread::sleep(Duration::from_millis(1));
             }
-            g.first_reads_y.store(first_reads_y, Ordering::SeqCst);
+            let flag = if z_reads_b {
+                &g.z_reads_b
+            } else {
+                &g.r_reads_b
+            };
+            flag.store(true, Ordering::SeqCst);
             g.late.release();
             (a.join().unwrap(), b.join().unwrap())
         });
         assert!(waits::WOUNDS.load(Ordering::Relaxed) > wounds, "no wound");
+        let landings = g.rt.unwound_landings.lock().unwrap().clone();
         let outcome = g.outcome(a, b);
         g.rt.assert_invariant_i();
-        outcome
+        (outcome, landings, g.r.slot())
     }
 }
 
-fn dissolve_keeps_the_released_members_grouped(first_reads_y: bool) {
+type Concurrent = (Vec<Result<i64, String>>, Vec<(u32, bool, bool, bool)>, u32);
+
+fn dissolve_keeps_the_released_members_grouped(z_reads_b: bool) {
     let a_first = Dissolve::single_thread(true);
     let b_first = Dissolve::single_thread(false);
     for round in 0..20 {
-        let got = Dissolve::concurrent(first_reads_y);
+        let (got, ..) = Dissolve::concurrent(z_reads_b);
         assert!(
             got == a_first || got == b_first,
             "round {round}: {got:?}, single-thread {a_first:?} or {b_first:?}"
@@ -1027,7 +1091,6 @@ fn dissolve_keeps_the_released_members_grouped(first_reads_y: bool) {
 /// `y` outside it, and `r`'s read of `y` meets the unseeded `y` on B's
 /// stack: a cycle error that no single-thread order raises.
 #[test]
-#[ignore = "T8-44e3-clean-landing-variant"]
 fn shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped",
@@ -1036,14 +1099,833 @@ fn shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped() {
     .assert_clean();
 }
 
-/// As above, with A landing `w` and `z` Clean outside the group before its
-/// wound: B's group verify fails on the Clean `z` and computes `y` alone.
+/// A's wound after its episode at `r` dissolved lands `r` as before its
+/// claim, back in its old group with `z`, `y` and `w`, which the cut
+/// released and the retraction puts back: a cut is an exposure, so the
+/// whole group retracts. Back in that group alone, `r` would be
+/// group-verified by B, who cannot claim a member on its own stack and
+/// computes `r` alone (seed 0x366148bf).
 #[test]
-#[ignore = "T8-44e3-clean-landing-variant: a wounded read's Clean landings of released members"]
+#[cfg_attr(miri, ignore)]
+fn shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left",
+        || {
+            for z_reads_b in [true, false] {
+                for round in 0..5 {
+                    let (_, landings, r) = Dissolve::concurrent(z_reads_b);
+                    assert!(
+                        landings.iter().any(|&(slot, dissolved, ..)| slot == r && dissolved),
+                        "round {round}: no wound landed r after its dissolve: {landings:?}"
+                    );
+                    assert!(
+                        landings
+                            .iter()
+                            .all(|&(slot, _, _, grouped)| slot != r || grouped),
+                        "round {round} z_reads_b {z_reads_b}: r landed out of its group: {landings:?}"
+                    );
+                    assert!(
+                        landings.iter().all(|&(_, _, stale, _)| !stale),
+                        "round {round} z_reads_b {z_reads_b}: {landings:?}"
+                    );
+                }
+            }
+        },
+    )
+    .assert_clean();
+}
+
+/// As above, with A's wound after it landed `w` and `z`: their landings
+/// retract with the read, so B verifies the group as a single thread
+/// would.
+#[test]
 fn shared_wound_after_clean_landings_of_released_members_keeps_their_group() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_wound_after_clean_landings_of_released_members_keeps_their_group",
         || dissolve_keeps_the_released_members_grouped(false),
     )
     .assert_clean();
+}
+
+/// [`stale_edge_waits_for_cycle`] with B's read of `q` made inside a
+/// `Local` runtime's query: the wound or cycle raised in the `Shared`
+/// read reaches the `Local` entry around it, which is the thread's
+/// outermost, and B gets the outcome it gets without the `Local` entry,
+/// holding no reservation afterwards. With A older, B is wounded under the
+/// `Local` entry and checks in its head start whether A took the claim,
+/// which is the `Shared` runtime's.
+fn stale_edge_waits_for_cycle_under_local(a_first: bool) {
+    let checks = waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed);
+    let g = StaleEdge::new(QReads::Plain, false);
+    let q = g.q;
+    let shared = Arc::clone(&g.rt);
+    let (thread_a, thread_b) = g.run(a_first, move |_| {
+        let local = Runtime::<crate::cells::Local>::new();
+        let n = local.create_query(move |_| shared.get(q));
+        let v = catch_unwind(AssertUnwindSafe(|| local.get(n)));
+        assert!(crate::reserve::none_held(), "B kept a reservation");
+        v.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    });
+    assert_eq!(thread_a.join().unwrap(), 4);
+    let b_result = thread_b.join().unwrap();
+    if a_first {
+        assert_eq!(b_result.unwrap(), 4);
+    } else {
+        let message = panic_message(b_result.unwrap_err());
+        assert!(message.contains("dependency cycle"), "{message}");
+        assert_eq!(g.rt.get(q), 4);
+    }
+    assert_wounded();
+    assert!(
+        !a_first || waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed) > checks,
+        "the wounded thread's head start never checked the claim its winner waited on"
+    );
+    g.rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stale_edge_under_local_with_a_older() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_stale_edge_under_local_with_a_older",
+        || stale_edge_waits_for_cycle_under_local(true),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stale_edge_under_local_with_b_older() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_stale_edge_under_local_with_b_older",
+        || stale_edge_waits_for_cycle_under_local(false),
+    )
+    .assert_clean();
+}
+
+/// A's read of `r`, then B's of `b`, on one thread.
+fn released_member_reads<C: Cells>() -> Vec<Result<i64, String>> {
+    let g = DissolveOn::<C>::new();
+    let a = g.read(g.r);
+    g.outcome(a, g.read(g.b))
+}
+
+/// **A cut's released members stay the owner's until its read returns.**
+/// A's read of `r` on [`Dissolve`] dissolves its episode, releases `z`,
+/// `y` and `w`, and parks. They are still A's, as in the unbounded run,
+/// where its episode holds them until it ends: B's read of `b` waits on
+/// A's `y` instead of computing `y` from a release A's attempt may still
+/// retract, and both reads match A's first, as a single thread or Local
+/// gives them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_released_member_waits_for_the_cut_owners_read() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_released_member_waits_for_the_cut_owners_read",
+        || {
+            let want = released_member_reads::<Local>();
+            assert_eq!(released_member_reads::<Shared>(), want);
+            let g = Dissolve::new();
+            let released = Gate::new();
+            park_at(
+                &g.rt,
+                vec![(ParkPoint::MembersReleased(id(g.r)), released.clone())],
+            );
+            released.arm();
+            let (states, b_waited, b_done_early, a, b) = thread::scope(|s| {
+                let g = &g;
+                let a = s.spawn(move || g.read(g.r));
+                released.wait_parked();
+                let states: Vec<NodeState> = [g.z, g.y, g.w]
+                    .map(|m| g.rt.nodes.get(m.slot()).state())
+                    .into();
+                let b = s.spawn(move || g.read(g.b));
+                let deadline = Instant::now() + POLL_DEADLINE;
+                let y = (g.rt.runtime_id, g.y.slot());
+                while !waits::waited_on(y) && !b.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let (b_waited, b_done_early) = (waits::waited_on(y), b.is_finished());
+                released.release();
+                (
+                    states,
+                    b_waited,
+                    b_done_early,
+                    a.join().unwrap(),
+                    b.join().unwrap(),
+                )
+            });
+            assert_eq!(
+                states,
+                [NodeState::Computing; 3],
+                "a released member left A's claim before A's read returned"
+            );
+            assert!(!b_done_early, "B read w while A's attempt was unpublished");
+            assert!(b_waited, "B never waited on y");
+            assert_eq!(g.outcome(a, b), want);
+            g.rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
+fn group_record<C: Cells>(rt: &Runtime<C>, node: Incr<i64>) -> Option<Arc<GroupInfo>> {
+    rt.inner.read().member_recs.get(&node.slot()).cloned()
+}
+
+/// A's read of `r` alone on [`DissolveOn`]: the records it leaves, whether
+/// `z`, `y` or `w` is still in the cut group, and the values.
+fn published_cut<C: Cells>() -> (Vec<String>, bool, Vec<Result<i64, String>>) {
+    let g = DissolveOn::<C>::new();
+    let cut = group_record(&g.rt, g.r).expect("r is forced into a group");
+    let a = g.read(g.r);
+    let in_cut = [g.z, g.y, g.w]
+        .into_iter()
+        .any(|m| group_record(&g.rt, m).is_some_and(|rec| Arc::ptr_eq(&rec, &cut)));
+    (
+        g.rt.stale_group_records(),
+        in_cut,
+        g.outcome(a, g.read(g.w)),
+    )
+}
+
+/// Where A's attempt at [`Dissolve`]'s `top` is wounded after its
+/// episode at `r` dissolved.
+#[derive(Clone, Copy, Debug)]
+enum CutWound {
+    /// In `z`'s run, before A lands a released member.
+    InZ,
+    /// In `r`'s run, after `z` and `w` landed.
+    InR,
+    /// In `top`, after `r`, rerun reading only `k`, landed.
+    AfterR,
+}
+
+/// **A cut's group exit publishes and retracts with the attempt.** On
+/// [`Dissolve`] A's episode at `r` dissolves and releases `z`, `y` and
+/// `w`, then B's read wounds A, at each [`CutWound`]. Right after the
+/// retraction all four are back in their old group, whole, as before A's
+/// read, so B's `group_verify` claims the group a single thread
+/// verifies: a cut is an exposure, so the claim it keeps, `r`, lands held
+/// even when its run read nothing held, and retracts with them. A read
+/// that publishes takes the released set out of the cut group with no
+/// record naming a node that left, as under Local.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_cut_group_exit_publishes_and_retracts_with_the_read() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_cut_group_exit_publishes_and_retracts_with_the_read",
+        || {
+            let local = published_cut::<Local>();
+            assert_eq!(local.0, Vec::<String>::new(), "Local leaves a stale record");
+            assert!(!local.1, "Local keeps a released member in the cut group");
+            assert_eq!(published_cut::<Shared>(), local);
+            for wound in [CutWound::InZ, CutWound::InR, CutWound::AfterR] {
+                cut_exit_retracts(wound);
+            }
+        },
+    )
+    .assert_clean();
+}
+
+fn cut_exit_retracts(wound: CutWound) {
+    let orders = [true, false].map(|a_first| {
+        let g = DissolveOn::<Local>::new();
+        if a_first {
+            let a = g.read(g.top);
+            g.outcome(a, g.read(g.b))
+        } else {
+            let b = g.read(g.b);
+            g.outcome(g.read(g.top), b)
+        }
+    });
+    let g = Dissolve::new();
+    let old = group_record(&g.rt, g.r).expect("r is forced into a group");
+    let (a_thread, b_thread) = (Arc::new(OnceLock::new()), Arc::new(OnceLock::new()));
+    let at_retraction: Arc<OnceLock<(Vec<String>, Vec<bool>)>> = Arc::new(OnceLock::new());
+    let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+    {
+        let rt = Arc::downgrade(&g.rt);
+        let members = [g.r, g.z, g.y, g.w];
+        let (a_thread, b_thread) = (a_thread.clone(), b_thread.clone());
+        let (at_retraction, old) = (at_retraction.clone(), old.clone());
+        let installed = g.rt.park_hook.set(Box::new(move |p| {
+            let me = Some(thread::current().id());
+            if p == ParkPoint::WoundRetracted && me == a_thread.get().copied() {
+                let rt = rt.upgrade().expect("the runtime outlives its reads");
+                let in_old = members
+                    .map(|m| group_record(&rt, m).is_some_and(|r| Arc::ptr_eq(&r, &old)))
+                    .into();
+                let _ = at_retraction.set((rt.stale_group_records(), in_old));
+            } else if me == b_thread.get().copied()
+                && waits::WOUNDS.load(Ordering::Relaxed) > wounds
+            {
+                // B holds still from A's wound until A's retraction is seen,
+                // so nothing B lands can hide or fake the retracted records.
+                let deadline = Instant::now() + POLL_DEADLINE;
+                while at_retraction.get().is_none() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }));
+        assert!(installed.is_ok(), "park hook installed twice");
+    }
+    let b_waits = |g: &Dissolve| {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        while !waits::waited_on((g.rt.runtime_id, g.y.slot())) {
+            assert!(Instant::now() < deadline, "{wound:?}: B never waited on y");
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+    g.early.arm();
+    let (a, b) = thread::scope(|s| {
+        let g = &g;
+        let a = s.spawn(|| {
+            a_thread.set(thread::current().id()).unwrap();
+            g.read(g.top)
+        });
+        g.early.wait_parked();
+        let b = s.spawn(|| {
+            b_thread.set(thread::current().id()).unwrap();
+            g.read(g.b)
+        });
+        if let CutWound::AfterR = wound {
+            b_waits(g);
+            g.r_alone.store(true, Ordering::SeqCst);
+            g.top_reads_b.store(true, Ordering::SeqCst);
+            g.early.release();
+        } else {
+            g.late.arm();
+            g.early.release();
+            g.late.wait_parked();
+            b_waits(g);
+            let flag = match wound {
+                CutWound::InZ => &g.z_reads_b,
+                _ => &g.r_reads_b,
+            };
+            flag.store(true, Ordering::SeqCst);
+            g.late.release();
+        }
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert!(
+        waits::WOUNDS.load(Ordering::Relaxed) > wounds,
+        "{wound:?}: no wound"
+    );
+    if let CutWound::AfterR = wound {
+        assert!(!g.r_alone.load(Ordering::SeqCst), "r never ran alone");
+        assert_eq!(
+            *g.r_at_top.lock().unwrap(),
+            Some(NodeState::Computing),
+            "r's landing after the cut was not held"
+        );
+    }
+    let (stale, in_old) = at_retraction
+        .get()
+        .cloned()
+        .unwrap_or_else(|| panic!("{wound:?}: A never retracted"));
+    assert_eq!(
+        stale,
+        Vec::<String>::new(),
+        "{wound:?}: a stale record after the retraction"
+    );
+    assert_eq!(
+        in_old, [true; 4],
+        "{wound:?}: r, z, y and w not back in their old group"
+    );
+    let outcome = g.outcome(a, b);
+    assert!(
+        orders.contains(&outcome),
+        "{wound:?}: {outcome:?}, Local's orders {orders:?}"
+    );
+    g.rt.assert_invariant_i();
+}
+
+/// **A frame's kept value stays with its node.** After `k` is set, `x`
+/// and `y` form a cycle, as do `u` and `v`, all four Fallback; `q`
+/// reads `y`, `q2` reads `v`, and `r` reads `x`, `p` and `u` and then
+/// `q2`. A's read of `r` holds the episode {x, y}; `p` reads `y` through
+/// the view, so its frame holds its write, then claims `e`, so its own
+/// landing consults nothing, and catches the wound its read of B's `q`
+/// raises: its write keeps what it displaced for an entry its rewritten
+/// pop never opens. A's retry holds the episode {u, v} and B2's `q2`
+/// wounds it again: right after that retraction `u`'s slot holds its own
+/// value from before the attempt, 5, not a value another write kept, and
+/// nothing panics.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_kept_value_of_a_swallowed_wound_stays_with_its_node() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_kept_value_of_a_swallowed_wound_stays_with_its_node",
+        || {
+            fn build<C: Cells>(rt: &Runtime<C>, gates: [Gate; 5]) -> [Incr<i64>; 9] {
+                let [gq, gq2, gp, gr, gh] = gates;
+                let k = rt.create_input(0_i64);
+                let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+                let v_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+                let x = {
+                    let y_cell = y_cell.clone();
+                    rt.create_query_with_fallback(
+                        move |rt| match rt.get(k) {
+                            0 => 1,
+                            _ => rt.get(*y_cell.get().unwrap()) + 1,
+                        },
+                        |_c: &crate::cycle::Cycle| 10,
+                    )
+                };
+                let y = rt.create_query_with_fallback(
+                    move |rt| match rt.get(k) {
+                        0 => 2,
+                        _ => rt.get(x) + 100,
+                    },
+                    |_c: &crate::cycle::Cycle| 20,
+                );
+                let u = {
+                    let v_cell = v_cell.clone();
+                    rt.create_query_with_fallback(
+                        move |rt| match rt.get(k) {
+                            0 => 5,
+                            _ => rt.get(*v_cell.get().unwrap()) + 1,
+                        },
+                        |_c: &crate::cycle::Cycle| 50,
+                    )
+                };
+                let v = rt.create_query_with_fallback(
+                    move |rt| match rt.get(k) {
+                        0 => 6,
+                        _ => rt.get(u) + 1,
+                    },
+                    |_c: &crate::cycle::Cycle| 60,
+                );
+                let e = rt.create_query(move |rt| rt.get(k) * 3);
+                let h = rt.create_query(move |rt| {
+                    gh.park();
+                    rt.get(k)
+                });
+                let q = rt.create_query(move |rt| match rt.get(k) {
+                    0 => 0,
+                    _ => {
+                        gq.park();
+                        rt.get(y) + 1
+                    }
+                });
+                let q2 = rt.create_query(move |rt| match rt.get(k) {
+                    0 => 0,
+                    _ => {
+                        rt.get(h);
+                        gq2.park();
+                        rt.get(v) + 1
+                    }
+                });
+                let p = rt.create_query(move |rt| match rt.get(k) {
+                    0 => 777,
+                    _ => {
+                        rt.get(y);
+                        rt.get(e);
+                        gp.park();
+                        let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+                        778
+                    }
+                });
+                let r = rt.create_query(move |rt| match rt.get(k) {
+                    0 => 0,
+                    _ => {
+                        let sum = rt.get(x) + rt.get(p) + rt.get(u);
+                        // A's retry, after the first wound, parks once here.
+                        if waits::WOUNDS.load(Ordering::Relaxed) > 0 {
+                            gr.park();
+                        }
+                        sum + rt.get(q2)
+                    }
+                });
+                y_cell.set(y).unwrap();
+                v_cell.set(v).unwrap();
+                assert_eq!([rt.get(r), rt.get(q), rt.get(q2), rt.get(u)], [0, 0, 0, 5]);
+                rt.set(k, 1);
+                [r, q, q2, x, y, u, v, p, h]
+            }
+
+            let local = Runtime::<Local>::new();
+            let [r, q, q2, ..] = build(&local, [(); 5].map(|_| Gate::new()));
+            let (lq, lq2) = (local.get(q), local.get(q2));
+            let want = (local.get(r), lq, lq2);
+
+            let rt = Arc::new(Runtime::<Shared>::new());
+            let [gq, gq2, gp, gr, gh] = [(); 5].map(|_| Gate::new());
+            let [r, q, q2, _, y, u, v, _, h] =
+                build(&rt, [&gq, &gq2, &gp, &gr, &gh].map(Gate::clone));
+            let a_thread = Arc::new(OnceLock::new());
+            let b2_thread = Arc::new(OnceLock::new());
+            let r_released = Arc::new(AtomicBool::new(false));
+            let u_retracted: Arc<OnceLock<Option<i64>>> = Arc::new(OnceLock::new());
+            let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+            {
+                let weak = Arc::downgrade(&rt);
+                let (a_thread, b2_thread) = (a_thread.clone(), b2_thread.clone());
+                let (r_released, seen) = (r_released.clone(), u_retracted.clone());
+                let installed = rt.park_hook.set(Box::new(move |p| {
+                    let me = Some(thread::current().id());
+                    if !r_released.load(Ordering::SeqCst) || seen.get().is_some() {
+                        return;
+                    }
+                    if p == ParkPoint::WoundRetracted && me == a_thread.get().copied() {
+                        let rt = weak.upgrade().expect("the runtime outlives its reads");
+                        let _ = seen.set(rt.slot_value_for_test(u));
+                        // A's retry would take u and v back before B2 reads v and
+                        // be wounded again, so A waits for B2's read to land.
+                        let deadline = Instant::now() + Duration::from_secs(4);
+                        while rt.nodes.get(q2.slot()).state() != NodeState::Clean
+                            && Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    } else if me == b2_thread.get().copied() {
+                        // B2 holds still until A's retraction is seen.
+                        let deadline = Instant::now() + Duration::from_secs(4);
+                        while seen.get().is_none() && Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }));
+                assert!(installed.is_ok(), "park hook installed twice");
+            }
+            let spawn = |id: Option<Arc<OnceLock<thread::ThreadId>>>, node: Incr<i64>| {
+                let rt = rt.clone();
+                thread::spawn(move || {
+                    if let Some(id) = id {
+                        id.set(thread::current().id()).unwrap();
+                    }
+                    catch_unwind(AssertUnwindSafe(|| rt.get(node))).map_err(panic_message)
+                })
+            };
+            let wait_on = |node: Incr<i64>, what: &str| {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while !waits::waited_on((rt.runtime_id, node.slot())) {
+                    assert!(Instant::now() < deadline, "{what}");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            };
+            let join = |h: thread::JoinHandle<Result<i64, String>>, who: &str| {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while !h.is_finished() {
+                    assert!(Instant::now() < deadline, "{who}'s read hung");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                h.join().unwrap()
+            };
+
+            gq.arm();
+            gq2.arm();
+            gp.arm();
+            gr.arm();
+            gh.arm();
+            // B2's wait on H's claim of h takes its ticket first, so A, whose
+            // ticket comes from its first wait, is the younger at both wounds.
+            let h_thread = spawn(None, h);
+            gh.wait_parked();
+            let b2 = spawn(Some(b2_thread.clone()), q2);
+            wait_on(h, "B2 never waited on h");
+            gh.release();
+            gq2.wait_parked();
+            let b = spawn(None, q);
+            gq.wait_parked();
+            let a = spawn(Some(a_thread.clone()), r);
+            gp.wait_parked();
+            gq.release();
+            wait_on(y, "B never waited on y");
+            gp.release();
+            gr.wait_parked();
+            assert!(
+                waits::WOUNDS.load(Ordering::Relaxed) > wounds,
+                "no first wound"
+            );
+            gq2.release();
+            wait_on(v, "B2 never waited on v");
+            r_released.store(true, Ordering::SeqCst);
+            gr.release();
+            let (a, b, b2) = (join(a, "A"), join(b, "B"), join(b2, "B2"));
+            join(h_thread, "H").unwrap();
+
+            assert_eq!(
+                u_retracted.get().copied(),
+                Some(Some(5)),
+                "u's slot after the second retraction"
+            );
+            assert_eq!((a, b, b2), (Ok(want.0), Ok(want.1), Ok(want.2)));
+            rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
+/// **A retraction restores the value a re-run overwrote.** Once `i` is
+/// 1, `c` and `b` (Fixpoint) read each other, `a` reads `c`, and `b`
+/// reads `a` only while it sees `c`'s seed. A's read of `o` runs the
+/// episode at `c`: its first round reaches `a`, its last does not, so the
+/// cut to {c, b} releases `a` unrun and `a`'s entry records no value. `o`
+/// then reads `a`, and A claims it again and computes it alone. B's `qb`,
+/// which reads `b`, then wounds A: right after the retraction `a`'s slot
+/// holds its value from before A's read, 30, not the 105 the wounded
+/// attempt wrote.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_retraction_restores_a_released_members_rerun() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_retraction_restores_a_released_members_rerun",
+        || {
+            fn build<C: Cells>(rt: &Runtime<C>, gates: [Gate; 3]) -> [Incr<i64>; 5] {
+                let [gh, gb, go] = gates;
+                let i = rt.create_input(0_i64);
+                let fixpoint = || QueryOpts {
+                    cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).max_iterations(20)),
+                    ..QueryOpts::default()
+                };
+                let a_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+                let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+                let c = {
+                    let b_cell = b_cell.clone();
+                    rt.create_query_with(
+                        move |rt| match rt.get(i) {
+                            0 => 7,
+                            _ => rt.get(*b_cell.get().unwrap()).min(5),
+                        },
+                        fixpoint(),
+                    )
+                };
+                let a = rt.create_query(move |rt| match rt.get(i) {
+                    0 => 30,
+                    _ => rt.get(c) + 100,
+                });
+                let b = {
+                    let a_cell = a_cell.clone();
+                    rt.create_query_with(
+                        move |rt| match rt.get(i) {
+                            0 => 8,
+                            _ => match rt.get(c) {
+                                0 => rt.get(*a_cell.get().unwrap()),
+                                seen => seen + 1,
+                            },
+                        },
+                        fixpoint(),
+                    )
+                };
+                let h = rt.create_query(move |rt| {
+                    gh.park();
+                    rt.get(i)
+                });
+                let qb = rt.create_query(move |rt| match rt.get(i) {
+                    0 => 0,
+                    _ => {
+                        rt.get(h);
+                        gb.park();
+                        rt.get(b) + 1000
+                    }
+                });
+                let o = rt.create_query(move |rt| match rt.get(i) {
+                    // c read last, so a walk of o enters the cycle at c.
+                    0 => rt.get(a) + rt.get(c),
+                    _ => {
+                        let read = rt.get(c) + rt.get(a);
+                        go.park();
+                        read + rt.get(qb)
+                    }
+                });
+                a_cell.set(a).unwrap();
+                b_cell.set(b).unwrap();
+                assert_eq!([rt.get(o), rt.get(a), rt.get(qb)], [37, 30, 0]);
+                rt.set(i, 1);
+                [o, qb, a, h, b]
+            }
+
+            let local = Runtime::<Local>::new();
+            let [o, qb, ..] = build(&local, [(); 3].map(|_| Gate::new()));
+            let lqb = local.get(qb);
+            let want = (local.get(o), lqb);
+
+            let rt = Arc::new(Runtime::<Shared>::new());
+            let [gh, gb, go] = [(); 3].map(|_| Gate::new());
+            let [o, qb, a, h, b_node] = build(&rt, [&gh, &gb, &go].map(Gate::clone));
+            let (a_thread, b_thread) = (Arc::new(OnceLock::new()), Arc::new(OnceLock::new()));
+            let o_released = Arc::new(AtomicBool::new(false));
+            let a_retracted: Arc<OnceLock<Option<i64>>> = Arc::new(OnceLock::new());
+            {
+                let weak = Arc::downgrade(&rt);
+                let (a_thread, b_thread) = (a_thread.clone(), b_thread.clone());
+                let (o_released, seen) = (o_released.clone(), a_retracted.clone());
+                let installed = rt.park_hook.set(Box::new(move |p| {
+                    let me = Some(thread::current().id());
+                    if !o_released.load(Ordering::SeqCst) || seen.get().is_some() {
+                        return;
+                    }
+                    if p == ParkPoint::WoundRetracted && me == a_thread.get().copied() {
+                        let rt = weak.upgrade().expect("the runtime outlives its reads");
+                        let _ = seen.set(rt.slot_value_for_test(a));
+                        // A's retry would take the cut back before B reads b.
+                        let deadline = Instant::now() + Duration::from_secs(4);
+                        while rt.nodes.get(qb.slot()).state() != NodeState::Clean
+                            && Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    } else if me == b_thread.get().copied() {
+                        // B holds still until A's retraction is seen.
+                        let deadline = Instant::now() + Duration::from_secs(4);
+                        while seen.get().is_none() && Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }));
+                assert!(installed.is_ok(), "park hook installed twice");
+            }
+            let spawn = |id: Option<Arc<OnceLock<thread::ThreadId>>>, node: Incr<i64>| {
+                let rt = rt.clone();
+                thread::spawn(move || {
+                    if let Some(id) = id {
+                        id.set(thread::current().id()).unwrap();
+                    }
+                    catch_unwind(AssertUnwindSafe(|| rt.get(node))).map_err(panic_message)
+                })
+            };
+            let wait_on = |slot: u32, what: &str| {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while !waits::waited_on((rt.runtime_id, slot)) {
+                    assert!(Instant::now() < deadline, "{what}");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            };
+            let join = |h: thread::JoinHandle<Result<i64, String>>, who: &str| {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while !h.is_finished() {
+                    assert!(Instant::now() < deadline, "{who}'s read hung");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                h.join().unwrap()
+            };
+
+            gh.arm();
+            gb.arm();
+            go.arm();
+            // B's wait on H's claim of h takes its ticket first, so A is the
+            // younger at the wound.
+            let h_thread = spawn(None, h);
+            gh.wait_parked();
+            let b = spawn(Some(b_thread.clone()), qb);
+            wait_on(h.slot(), "B never waited on h");
+            gh.release();
+            gb.wait_parked();
+            let a_read = spawn(Some(a_thread.clone()), o);
+            go.wait_parked();
+            gb.release();
+            wait_on(b_node.slot(), "B never waited on b");
+            o_released.store(true, Ordering::SeqCst);
+            go.release();
+            let (got_o, got_qb) = (join(a_read, "A"), join(b, "B"));
+            join(h_thread, "H").unwrap();
+
+            assert_eq!(
+                a_retracted.get().copied(),
+                Some(Some(30)),
+                "a's slot after the retraction"
+            );
+            assert_eq!((got_o, got_qb), (Ok(want.0), Ok(want.1)));
+            rt.assert_invariant_i();
+            rt.assert_released_entries_match_deps();
+        },
+    )
+    .assert_clean();
+}
+
+/// **A retraction restores a released claim's entry.** `x` reads `y`,
+/// which reads `x` once `j` is 0, while `m` is not 1; both are Fixpoint
+/// heads, so a walk enters the cycle at a head whichever it reaches
+/// first. Each set of `m` changes a dep of `x`, so the reads after it
+/// recompute `x` rather than settle it from `y`. With `k` at 1, `x`'s
+/// run panics inside the episode, and `y`'s claim is released New over
+/// `[j]` and the `x` its run read, with an entry keeping `[j]`. With `k`
+/// back at 0 and `m` at 2, B's `c` reads `x`: the episode reruns `y` from
+/// New and lands it held Clean, which drops the entry, and `c` then raises
+/// a wound. The retraction lands `y` New over the same two deps, so its
+/// entry is back and a walk still expands only `j`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_retraction_restores_a_released_claims_entry() {
+    let other = Arc::new(Runtime::<Shared>::new());
+    let j = other.create_input(1_i64);
+    let k = other.create_input(0_i64);
+    let m = other.create_input(1_i64);
+    let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let x = {
+        let y_cell = y_cell.clone();
+        other.create_query_with(
+            move |rt| {
+                if rt.get(m) == 1 {
+                    return 5;
+                }
+                let v = rt.get(*y_cell.get().unwrap());
+                assert!(rt.get(k) == 0, "x boom");
+                (v + 1).min(3)
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..QueryOpts::default()
+            },
+        )
+    };
+    let y = other.create_query_with(
+        move |rt| if rt.get(j) == 1 { 1 } else { rt.get(x) },
+        QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+            ..QueryOpts::default()
+        },
+    );
+    y_cell.set(y).unwrap();
+    assert_eq!((other.get(x), other.get(y)), (5, 1));
+
+    other.set(j, 0);
+    other.set(k, 1);
+    other.set(m, 0);
+    let err = catch_unwind(AssertUnwindSafe(|| other.get(x))).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
+    let kept =
+        move |rt: &Runtime<Shared>| rt.released_kept(NodeId(y.slot()), rt.nodes.get(y.slot()));
+    assert_eq!(other.state_of(y), NodeState::New);
+    assert_eq!(kept(&other), Some(1), "y's entry after the release");
+    other.assert_released_entries_match_deps();
+
+    other.set(k, 0);
+    other.set(m, 2);
+    let wounded = Arc::new(AtomicBool::new(false));
+    let c = {
+        let wounded = wounded.clone();
+        other.create_query(move |rt| {
+            let v = rt.get(x);
+            if !wounded.swap(true, Ordering::SeqCst) {
+                rt.raise_wound();
+            }
+            v
+        })
+    };
+    let rt = Runtime::<Shared>::new();
+    let retracted: Arc<OnceLock<(NodeState, Option<u32>)>> = Arc::new(OnceLock::new());
+    let root = {
+        let (other, retracted) = (other.clone(), retracted.clone());
+        rt.create_query(move |_| {
+            let first = catch_unwind(AssertUnwindSafe(|| other.get(c)));
+            if first.is_err() {
+                let _ = retracted.set((other.state_of(y), kept(&other)));
+            }
+            first.unwrap_or(0)
+        })
+    };
+    assert_eq!(rt.get(root), 3);
+    assert!(wounded.load(Ordering::SeqCst));
+    assert_eq!(
+        retracted.get().copied(),
+        Some((NodeState::New, Some(1))),
+        "y's state and entry right after the retraction"
+    );
+    assert_eq!(other.get(y), 3);
+    other.assert_released_entries_match_deps();
+    other.assert_invariant_i();
+    assert_eq!(crate::hold::held_count(), 0);
 }

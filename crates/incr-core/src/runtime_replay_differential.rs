@@ -17,13 +17,14 @@
 //! that a panic is one outcome kind whatever its text: which of two
 //! racing readers of a panicked node gets the closure's payload and which
 //! gets "last compute panicked" is not part of the result (the wiki
-//! decision "Shared panic payload contract"). A get whose thread's
-//! `try_get` got a cycle that the other read's get then landed is ordered
-//! per read: a cycle's result depends on the member a get enters at, so
-//! its run may mix both orders' outcomes, but each of its node's reads
-//! must be an order's outcome for that read and its value the closure
-//! over them. The Failed and Cyclic sets
-//! after two overlapping reads are history, as the states are: a walk
+//! decision "Shared panic payload contract"), nor is a later phase's read
+//! getting the payload a walk held for a retry the other thread's landing
+//! made unnecessary. A get whose thread's `try_get` got a cycle that the
+//! other read's get then landed is ordered per read: a cycle's result
+//! depends on the member a get enters at, so its run may mix both orders'
+//! outcomes, but each of its node's reads must be an order's outcome for
+//! that read and its value the closure over them. The Failed and Cyclic
+//! sets after two overlapping reads are history, as the states are: a walk
 //! computes from its plan, so it can land a node Failed from a dep the
 //! other thread landed Failed after the walk expanded it. Where no order
 //! gives those sets, each node the reads left settled must have a Failed
@@ -33,9 +34,9 @@
 //!
 //! A speculative run may compute a node the unbounded run does not, but
 //! lands nothing, so states compare exactly. Single-threaded, no Native
-//! closure may run speculatively twice in a revision (`REPLAY_NATIVE_COUNT`
-//! also compares its run counts with the unbounded run's). `REPLAY_FIRST`
-//! scans cases
+//! closure may run speculatively twice in a revision, and one the
+//! unbounded run runs at most once in a revision runs as often, or once
+//! more where a speculative run reached it. `REPLAY_FIRST` scans cases
 //! whose Native closures take `FirstLanded`, so a run of one that the
 //! engine does not treat as the node's first shows in its value.
 
@@ -1385,6 +1386,9 @@ impl<C: Cells> Live<C> {
         if !crate::replay::vindexes_empty() {
             return Err("a virtual frame is left indexed".to_owned());
         }
+        if !crate::reserve::none_held() {
+            return Err("an operation left this thread a doom reservation".to_owned());
+        }
         let held = crate::replay::take_held_drops();
         if held != 0 {
             return Err(format!(
@@ -1397,6 +1401,8 @@ impl<C: Cells> Live<C> {
     fn assert_invariants(&self) {
         self.world.rt(0).assert_invariant_i();
         self.world.rt(1).assert_invariant_i();
+        self.world.rt(0).assert_released_entries_match_deps();
+        self.world.rt(1).assert_released_entries_match_deps();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -1463,6 +1469,7 @@ fn reset_thread() {
     INTERNAL.with(|i| i.borrow_mut().take());
     crate::replay::take_vindex_repushes();
     crate::replay::take_held_drops();
+    crate::reserve::end_all();
 }
 
 fn run<C: Cells>(case: &Case, frames: Option<u32>, bytes: usize) -> Trace {
@@ -2803,23 +2810,11 @@ fn run_counted<C: Cells>(
     }
 }
 
-thread_local! {
-    /// Set by a test for [`compare_native`]'s full count on this thread.
-    static NATIVE_COUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Native runs by side, made order, revision and node: unbounded, bounded,
 /// and bounded speculative.
 type NativeCounts = HashMap<(usize, usize, u64, usize), (u32, u32, u32)>;
 
-/// Fails if a Native node runs speculatively more than once in a revision.
-/// With `REPLAY_NATIVE_COUNT` set, or [`NATIVE_COUNT`], also unless each
-/// runs in each revision as often as the unbounded run has it run, or once
-/// more where a speculative run reached it: retries under replay still
-/// rerun Native closures more often (T8-native-reruns-under-replay).
-fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
-    let full = NATIVE_COUNT.with(std::cell::Cell::get)
-        || std::env::var_os("REPLAY_NATIVE_COUNT").is_some();
+fn native_counts(want: &[NativeRun], got: &[NativeRun]) -> NativeCounts {
     let mut counts: NativeCounts = HashMap::new();
     for &(side, i, made, rev, _) in want {
         counts.entry((side, made, rev, i)).or_default().0 += 1;
@@ -2829,8 +2824,17 @@ fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
         c.1 += 1;
         c.2 += u32::from(speculative);
     }
-    let mut off: Vec<_> = (counts.into_iter())
-        .filter(|&(_, (u, b, s))| s > 1 || full && (b < u || b > u + u32::from(s > 0)))
+    counts
+}
+
+/// Fails unless each Native node runs speculatively at most once in a
+/// revision and, if the unbounded run runs it at most once there, runs as
+/// often as that, or once more where a speculative run reached it. A node
+/// the unbounded run runs more than once is a cycle member, which a retry
+/// may run more or less often (the README's cycle exception).
+fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
+    let mut off: Vec<_> = (native_counts(want, got).into_iter())
+        .filter(|&(_, (u, b, s))| s > 1 || u <= 1 && (b < u || b > u + u32::from(s > 0)))
         .collect();
     off.sort_unstable();
     assert!(
@@ -3189,6 +3193,7 @@ fn resuming_past_a_held_root_skips_no_cycle_read() {
     }
     fn check<C: Cells>() {
         let (want, none) = nine::<C>(None);
+        assert!(!want.is_empty());
         assert_eq!(none, [0, 0]);
         let (got, [skipped, taken]) = nine::<C>(Some(1));
         assert_eq!(got, want);
@@ -3733,8 +3738,8 @@ fn two_threads_hang() {
 fn cross_seeds() {
     for seed in [
         0x2, 0xb, 0xfa, 0xfb, 0xfe, 0x109, 0x135, 0x14a, 0x14d, 0x19a, 0x19e, 0x1b5, 0x1b6, 0x1e4,
-        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x401, 0x441, 0x4f9,
-        0x50d, 0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0x3f39,
+        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x441, 0x4f9, 0x50d,
+        0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0x3f39,
         0x432a,
     ] {
         let case = gen_case(seed, true, false);
@@ -3743,6 +3748,19 @@ fn cross_seeds() {
             differential::<Shared>(&case, seed);
         });
     }
+}
+
+/// 0x401 at budget 1: a read of runtime 2 reads runtime 1, which reads
+/// runtime 2 back while runtime 2's frames are virtual: runtime 2's open
+/// entry, not its frames, makes the read-back a re-entry that retracts.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_seed_reading_back_under_virtual_frames() {
+    let case = gen_case(0x401, true, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x401);
+        differential::<Shared>(&case, 0x401);
+    });
 }
 
 /// Two-thread seeds, with a second runtime when `.1`, whose reads pushed a
@@ -3768,6 +3786,153 @@ fn two_thread_repush_seeds() {
     ] {
         run_two_repeatedly(seed, cross, &[Some(1), Some(2), Some(3)]);
     }
+}
+
+/// Two-thread 0x4: op 3's walk expands 8's installed edges while 8 is New,
+/// then op 2's thread lands 8 Failed, and op 3's walk went on to compute
+/// 8's deps 4, 3, 2 and 7, leaving them Failed where both orders leave
+/// them Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_4_walk_root_failed_by_the_other_thread() {
+    let case = gen_case(4, false, true);
+    quiet(|| {
+        for _ in 0..5 {
+            differential_two(&case, 4);
+        }
+    });
+}
+
+fn map_reads(e: &Expr, to: &impl Fn(usize) -> usize) -> Expr {
+    let f = |x: &Expr| Box::new(map_reads(x, to));
+    match e {
+        Expr::Read(i, t) => Expr::Read(to(*i), *t),
+        Expr::Const(_) | Expr::ReadOther(..) => e.clone(),
+        Expr::Add(a, b) => Expr::Add(f(a), f(b)),
+        Expr::If(a, b, c) => Expr::If(f(a), f(b), f(c)),
+        Expr::PanicIf(a, w) => Expr::PanicIf(f(a), *w),
+        Expr::Catch(a) => Expr::Catch(f(a)),
+        Expr::FirstRun(a, b) => Expr::FirstRun(f(a), f(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(f(a), f(b)),
+    }
+}
+
+/// 0x1daa with `levels` queries between its cycle members 10 and 5, each
+/// reading the next three times, placed before the inputs.
+fn seed_1daa_with_levels(levels: usize) -> Case {
+    let base = gen_case(0x1daa, false, false);
+    let q = base.queries;
+    let shift = |i: usize| if i >= q { i + levels } else { i };
+    let mut specs: Vec<Spec> = (base.specs.iter())
+        .map(|s| match s {
+            Spec::Query {
+                expr,
+                replay,
+                bare,
+                strategy,
+            } => Spec::Query {
+                expr: map_reads(expr, &shift),
+                replay: *replay,
+                bare: *bare,
+                strategy: *strategy,
+            },
+            other => other.clone(),
+        })
+        .collect();
+    if levels > 0 {
+        if let Spec::Query { expr, .. } = &mut specs[10] {
+            *expr = map_reads(expr, &|i| if i == 5 { q } else { i });
+        }
+        let level = |j: usize| {
+            let next = if j + 1 == levels { 5 } else { q + j + 1 };
+            let read = || Box::new(Expr::Read(next, false));
+            Spec::Query {
+                expr: Expr::Add(Box::new(Expr::Add(read(), read())), read()),
+                replay: true,
+                bare: false,
+                strategy: Strat::None,
+            }
+        };
+        specs.splice(q..q, (0..levels).map(level));
+    }
+    let ops = (base.ops.iter())
+        .map(|op| match op {
+            Op::Set(n, v) => Op::Set(shift(*n), *v),
+            Op::Get(..) | Op::TryGet(..) => op.clone(),
+            other => panic!("0x1daa has no {other:?}"),
+        })
+        .collect();
+    Case {
+        specs,
+        queries: q + levels,
+        ops,
+        ..base
+    }
+}
+
+/// The closure runs of `case`'s op `op`, after the ops before it.
+fn op_runs<C: Cells>(case: &Case, frames: Option<u32>, op: usize) -> u32 {
+    RUNS.with(|r| *r.borrow_mut() = Some(HashMap::new()));
+    let rts = runtimes::<C>(frames, 0);
+    let live = Live::new(&rts, case);
+    reset_thread();
+    let total = || RUNS.with(|r| r.borrow().as_ref().map_or(0, |m| m.values().sum::<u32>()));
+    for o in &case.ops[..op] {
+        live.apply(o);
+    }
+    let before = total();
+    live.apply(&case.ops[op]);
+    let runs = total() - before;
+    RUNS.with(|r| *r.borrow_mut() = None);
+    runs
+}
+
+/// Asserts `op`'s runs in [`seed_1daa_with_levels`] at 0 to 4 levels, at
+/// every budget and under both cell kinds, stay within `bound_for(levels)`.
+fn bound_1daa_runs(op: usize, bound_for: impl Fn(u32) -> u32) {
+    quiet(|| {
+        for levels in 0..=4 {
+            let case = seed_1daa_with_levels(levels);
+            for frames in [None, Some(1), Some(2), Some(3)] {
+                let bound = bound_for(levels as u32);
+                for (kind, runs) in [
+                    ("Local", op_runs::<Local>(&case, frames, op)),
+                    ("Shared", op_runs::<Shared>(&case, frames, op)),
+                ] {
+                    assert!(
+                        runs <= bound,
+                        "op {op}, {kind}, {levels} levels, budget {frames:?}: {runs} runs, bound {bound}"
+                    );
+                }
+            }
+            differential::<Local>(&case, 0x1daa);
+            differential::<Shared>(&case, 0x1daa);
+        }
+    });
+}
+
+/// 0x1daa: op 3's walk of 7 reads 7 through its own cycle, which lands 7
+/// Failed while members 5, 9 and 10 are still queued. They are computed
+/// as on main: passed, they stayed unlanded, and every read of them in op
+/// 6's cycle opened a nested walk, so its runs tripled with each level.
+/// Op 6 runs 3 + L closures at every budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn walk_root_failed_by_its_own_read_computes_the_queued_entries() {
+    assert!(matches!(seed_1daa_with_levels(0).ops[6], Op::TryGet(9)));
+    bound_1daa_runs(6, |levels| 3 + levels);
+}
+
+/// 0x1daa: op 3's `Get(7)` closes a cycle that 5's Catch takes, below
+/// levels each reading the next three times. On t10 34412289 its runs
+/// tripled with each level; as on main b9f0d0bf, it runs 6 + L closures
+/// unbounded and at most 10 + 2L at a budget, held here to 20 + 4L so
+/// that CI's depth-1 replayable run fits too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_caught_cycle_under_levels_of_rereads_stays_linear() {
+    assert!(matches!(seed_1daa_with_levels(0).ops[3], Op::Get(7)));
+    bound_1daa_runs(3, |levels| 20 + 4 * levels);
 }
 
 /// Two-thread cases with panics and cycles in which a read's walk landed
@@ -3823,41 +3988,92 @@ fn two_thread_schedule_seeds() {
     }
 }
 
+/// Two-thread seeds whose outcomes hang on how a user panic's released
+/// claims land and walk: every run's outcomes must be some order's.
+/// 0x7c3a135a4 at frame budget 2: landing the claims New let the other
+/// thread's `Get(16)` return 1 where every order of the two reads panics,
+/// in about 1 run in 1000 with no budget and 2 in 5 at this one. 0x74f with
+/// no budget: a Failed first run that recorded a released entry of 0 kept
+/// deps let `Get(3)` panic "failed" where every order returns 3, in about 1
+/// run in 8. 0x9172 at frame budget 3: under the same rule op 3 reported
+/// `Cycle([5, 6, 10])`, a cycle no order enters, in about 9 runs in 10.
+/// 0x74f's op 12 can also get the payload of a panic a walk entry
+/// contained for a retry that never ran, as the other thread landed the
+/// recorder: a panic's text, which the oracle leaves open.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn released_claims_leave_two_threads_a_serial_outcome() {
+    for (seed, frames, bytes) in [
+        (0x7c3a135a4, Some(2), 16 * 1024),
+        (0x74f, None, 0),
+        (0x9172, Some(3), 0),
+    ] {
+        let case = gen_case(seed, false, true);
+        let phases = phases(&case, seed);
+        let label = format!(
+            "seed {seed:#x}, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
+        );
+        quiet(|| {
+            let serial = Serial::new(&case, &phases);
+            for _ in 0..60 {
+                serial.differential(&label, frames, bytes, &|_| {});
+            }
+        });
+    }
+}
+
 /// Two-thread seeds where, under a budget, the other thread computed a node
 /// a doom released for its context's retry: each run's outcomes must be
-/// some read order's unbounded outcomes.
+/// some read order's unbounded outcomes. In 0x36615207 the owner's run
+/// lands the node Dirty, which leaves it to a rerun its reservation keeps.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_doom_reservation_seeds() {
-    for (seed, frames) in [(0x11d, 1), (0x3661_4919, 1)] {
-        let case = gen_case(seed, false, true);
-        let phases = phases(&case, seed);
-        let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
-        let outcomes = |t: &Trace, of: &dyn Fn(usize) -> usize| -> Vec<String> {
-            (0..t.len()).map(|i| format!("{:?}", t[of(i)].0)).collect()
-        };
-        let mut serial = Vec::new();
-        let mut got = Vec::new();
-        quiet(|| {
-            for swaps in 0..1u64 << pairs {
-                let order = Order::new(&case, &phases, swaps);
-                let t = run::<Shared>(&order.case, None, 0);
-                let mut back = vec![0; t.len()];
-                for (j, &i) in order.of.iter().enumerate() {
-                    back[i] = j;
-                }
-                serial.push(outcomes(&t, &|i| back[i]));
-            }
-            for _ in 0..300 {
-                got.push(outcomes(&run_two(&case, &phases, Some(frames), 0), &|i| i));
-            }
-        });
-        let wrong = got.iter().filter(|g| !serial.contains(g)).count();
-        assert_eq!(
-            wrong, 0,
-            "seed {seed:#x}: {wrong} of 300 runs match no read order's outcomes"
-        );
+    for (seed, frames) in [(0x11d, 1), (0x3661_4919, 1), (0x3661_5207, 1)] {
+        assert_runs_match_an_order(seed, Some(frames), 300);
     }
+}
+
+/// 0x195f, with no budget: one thread's read of 6 records a group from an
+/// episode it aborts, the other thread's read of 9 grows that group to take
+/// in 6 and 7, and the first read's retry verified 6 in the grown group and
+/// returned a value where every order of the two reads panics "cycle".
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_retried_read_seeds() {
+    assert_runs_match_an_order(0x195f, None, 300);
+}
+
+/// Runs `seed`'s two-thread case `runs` times at `frames`: each run's
+/// outcomes must be some read order's unbounded outcomes.
+fn assert_runs_match_an_order(seed: u64, frames: Option<u32>, runs: usize) {
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
+    let outcomes = |t: &Trace, of: &dyn Fn(usize) -> usize| -> Vec<String> {
+        (0..t.len()).map(|i| format!("{:?}", t[of(i)].0)).collect()
+    };
+    let mut serial = Vec::new();
+    let mut got = Vec::new();
+    quiet(|| {
+        for swaps in 0..1u64 << pairs {
+            let order = Order::new(&case, &phases, swaps);
+            let t = run::<Shared>(&order.case, None, 0);
+            let mut back = vec![0; t.len()];
+            for (j, &i) in order.of.iter().enumerate() {
+                back[i] = j;
+            }
+            serial.push(outcomes(&t, &|i| back[i]));
+        }
+        for _ in 0..runs {
+            got.push(outcomes(&run_two(&case, &phases, frames, 0), &|i| i));
+        }
+    });
+    let wrong = got.iter().filter(|g| !serial.contains(g)).count();
+    assert_eq!(
+        wrong, 0,
+        "seed {seed:#x}: {wrong} of {runs} runs match no read order's outcomes"
+    );
 }
 
 /// 0x25e4, over several schedules: a read that panics in a member of a
@@ -4005,6 +4221,106 @@ fn two_thread_wait_ended_new_seeds() {
     });
 }
 
+/// 0x617e in the order with op 14 before op 13, one thread at a time, each
+/// op on its thread in the case: thread 0 lands episodes before thread 1's
+/// op 16 `Get(1)`, whose walk a doom stops and its retry resumes. The
+/// resumed walk must re-plan only for episodes landed since its plan;
+/// re-planning for thread 0's older ones skipped entry 23 (spec 2), which
+/// then recorded deps [22, 0] where the unbounded run records [22, 0, 22].
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_resumed_walk_replans_for_episodes_since_its_plan_seed() {
+    let seed = 0x617e;
+    let case = gen_case(seed, true, true);
+    let phases = phases(&case, seed);
+    let order = Order::new(&case, &phases, 0b10000);
+    assert_eq!(order.of[13..15], [14, 13]);
+    assert!(matches!(order.case.ops[16], Op::Get(1)));
+    let thread_of = |op: usize| {
+        phases
+            .iter()
+            .find_map(|p| match *p {
+                Phase::Mutate(i, t) => (i == op).then_some(t),
+                Phase::Read(reads) => (0..2).find(|&t| reads[t] == Some(op)),
+            })
+            .expect("every op is in a phase")
+    };
+    let one_at_a_time: Vec<Phase> = (0..order.case.ops.len())
+        .map(|k| Phase::Mutate(k, thread_of(order.of[k])))
+        .collect();
+    quiet(|| {
+        for (frames, bytes) in [(Some(1), 0), (None, 16 * 1024), (Some(1), 16 * 1024)] {
+            let label = format!("seed {seed:#x} op 14 first, one thread at a time, budget {frames:?} frames, {bytes} bytes");
+            Serial::new(&order.case, &one_at_a_time).differential(&label, frames, bytes, &|_| {});
+        }
+    });
+}
+
+/// 0x9a7d at budget 2: op 0 recorded the cycle group {8, 9, 19, 24} where
+/// the unbounded run records {9, 19, 24}, and phase 6's read of 16 walked
+/// that group and cleaned 1, 2 and 23, which the unbounded run leaves
+/// Dirty: a bounded run must record the cycle group the unbounded run
+/// does.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_budget_cycle_group_matches_unbounded_seed() {
+    let seed = 0x9a7d;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let label = format!("seed {seed:#x}, two threads {phases:?}, budget 2 frames");
+    quiet(|| {
+        for _ in 0..20 {
+            Serial::new(&case, &phases).differential(&label, Some(2), 0, &|_| {});
+        }
+    });
+}
+
+/// 0x6688, two threads at budgets 1 to 3: with a cycle contained at a walk
+/// entry, the bounded run landed the contained failure across eleven nodes
+/// (Panic(failed) for Value(10011)); a cycle that reaches its reader, as on
+/// main, gives every order.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_contained_cycle_landing_seeds() {
+    let case = gen_case(0x6688, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x6688);
+        }
+    });
+}
+
+/// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry,
+/// op 7's read came out as no order's in 80 of 80 runs on 562ebeed (of train
+/// B's branch tips only w/T10-ub-f2ad3443-wrong-values, 7e058de75, fails);
+/// a cycle that reaches its reader, as on main, gives every order.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_contained_cycle_read_seeds() {
+    let case = gen_case(0x3a96, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x3a96);
+        }
+    });
+}
+
+/// 0xad crossed: op 16's read of 1 waited on op 15's claim of it, and the
+/// revisit of 1 counted one more walk visit than the unbounded walk makes,
+/// so its walk entered the cycle {4, 5} of recorded deps at the member
+/// the unbounded walk does not. Without the walk's restart at its root,
+/// ops 15 and 16 failed 17 of 80 runs under 4-way load.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_entry_after_a_claim_wait_matches_unbounded_seed() {
+    let case = gen_case(0xad, true, true);
+    quiet(|| {
+        for _ in 0..20 {
+            differential_two(&case, 0xad);
+        }
+    });
+}
+
 /// Two-thread seeds with panics or cycles whose overlapping reads, at most
 /// budgets, come out as the unbounded run of the other order: which read
 /// lands a node both read first decides which gets a closure's payload,
@@ -4035,10 +4351,9 @@ fn failed_after(t: &Trace, i: usize) -> (Out, Vec<usize>) {
 /// Seed 0xe486019a1c945cce's op 1, `Get(4)`: member 8 of the cycle
 /// {4, 5, 7, 8} reads 9, whose walk computes 21, and 21's own code panics
 /// in the episode of {9, 21, 22, 23}, which marks it failed; 9 then passes
-/// that panic to 8. Unbounded, the mark falls inside 8's member run, so 8
-/// lands New. At a budget of 1 the driver runs that episode between doomed
-/// runs of 8, and the run finishing 8's frame counted marks from its own
-/// start only, so 8 landed Failed as well.
+/// that panic to 8. A fresh run and the unbounded run leave 9 and 21
+/// Failed and 8, 22 and 23 New, and budgets 1 to 3 the same Failed set.
+/// The mark count it was pinned for is now [`a_member_frame_counts_the_marks_of_its_earlier_runs`]'s.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
@@ -4173,6 +4488,54 @@ fn a_tainted_group_release_gives_a_clean_entry_orders_value() {
     });
 }
 
+/// Seed 0x39e2, unbounded: op 0's panic releases the claims of 0's reads,
+/// and they land New over the deps their runs recorded. Op 1's `Get(4)`
+/// walk expanded those deps and ran 3 first, so the cycle through 4 was
+/// entered at 3 and panicked "boom 0:3", where a fresh run of 4 enters it
+/// at 4 and gets 7777.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_leaves_a_new_nodes_deps_to_its_run() {
+    let mut case = gen_case(0x39e2, false, false);
+    case.ops.truncate(2);
+    assert!(matches!(case.ops[1], Op::Get(4)));
+    quiet(|| {
+        for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
+            assert!(matches!(trace[1].0, Out::Value(7777)), "{:?}", trace[1].0);
+        }
+    });
+}
+
+/// Seed 0x36618028's op 4, `Get(15)`, at a budget of 1: the run finishing
+/// a doomed member's frame counts the failure marks made since the
+/// frame's first run, or 15 and 16 land New where the unbounded run lands
+/// them Failed. 0xe486 no longer reaches that count.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
+    let mut case = gen_case(0x3661_8028, false, false);
+    case.ops.truncate(5);
+    assert!(matches!(case.ops[4], Op::Get(15)));
+    quiet(|| {
+        differential::<Local>(&case, 0x3661_8028);
+        differential::<Shared>(&case, 0x3661_8028);
+    });
+}
+
+/// Seed 0x66a, unbounded: a released claim's later finished run published
+/// deps without dropping its released entry, so its kept count outlived
+/// the list it counted. [`Live::assert_invariants`] finds an entry
+/// counting a list its node no longer has.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_finished_run_drops_its_released_entry() {
+    let case = gen_case(0x66a, false, false);
+    quiet(|| {
+        run::<Local>(&case, None, 0);
+        run::<Shared>(&case, None, 0);
+    });
+}
+
 /// [`differential`]'s runs, compared by their operations' outcomes alone.
 fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
@@ -4201,7 +4564,7 @@ fn a_dropped_chain_takes_its_member_runs_failure_counts() {
 
 /// The same truncation under two threads, seed 0x2b13.
 #[test]
-#[ignore = "T10-cmp-2b13-two-thread-boom: op 4 returns a panic no serial order gives"]
+#[cfg_attr(miri, ignore)]
 fn a_two_thread_dropped_chain_takes_its_member_runs_failure_counts() {
     quiet(|| {
         let case = gen_case(0x2b13, false, true);
@@ -4218,6 +4581,87 @@ fn until(done: impl Fn() -> bool) {
         assert!(start.elapsed().as_secs() < 20, "the schedule stalled");
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+/// 0x527's ops 0 (`Get(0)`) and 1 (`Get(4)`) overlap. Op 1's attempt runs
+/// a nested episode under its `try_get(8)` that lands 8 and 15 Dirty,
+/// then parks until op 0 has registered a wait. Without a hold, op 0 waits
+/// on another claim of op 1's, op 1 then waits on op 0 and is wounded, and
+/// op 0 finds 8 Dirty where either order has it New or op 1 finished: it
+/// lands 8 Failed alone, and op 1's retry reads that, `Panic("failed")`
+/// where every order gives a cycle panic. Another read must not build on
+/// an unfinished attempt's landings; with them held, op 0 waits on 8 or 15
+/// instead and no wound need happen.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_read_builds_on_no_unfinished_attempts_nested_episode() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_read_builds_on_no_unfinished_attempts_nested_episode",
+        || {
+            struct Hold {
+                on: AtomicBool,
+                landed: AtomicBool,
+                waited: AtomicBool,
+                b_started: AtomicBool,
+            }
+            let case = gen_case(0x527, false, true);
+            let phases = phases(&case, 0x527);
+            assert_eq!(phases[0].ops(), [0, 1]);
+            assert_eq!(phases[0].of(0), Some(1));
+            quiet(|| {
+                for round in 0..10 {
+                    let hold = Arc::new(Hold {
+                        on: AtomicBool::new(true),
+                        landed: AtomicBool::new(false),
+                        waited: AtomicBool::new(false),
+                        b_started: AtomicBool::new(false),
+                    });
+                    // Thread 0 runs op 1 and holds after its episode lands
+                    // 8 or 15 until op 0 waits; thread 1 runs op 0 and
+                    // starts only after that landing.
+                    let rig = |live: &Live<Shared>| {
+                        let (hold, world) = (hold.clone(), live.world.clone());
+                        let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                        let (n8, n15) = (slot(8), slot(15));
+                        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                            if !hold.on.load(SeqCst) {
+                                return;
+                            }
+                            match TWO_THREAD.with(std::cell::Cell::get) {
+                                Some(0) if matches!(p, ParkPoint::EpisodeLanded(id) if id == n8 || id == n15)
+                                    && !hold.landed.swap(true, SeqCst) =>
+                                {
+                                    until(|| crate::waits::registered() > 0);
+                                    hold.waited.store(true, SeqCst);
+                                }
+                                Some(1) if !hold.b_started.swap(true, SeqCst) => {
+                                    until(|| hold.landed.load(SeqCst));
+                                }
+                                _ => {}
+                            }
+                        });
+                        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                    };
+                    let serial = Serial::new(&case, &phases);
+                    let verdict = Mutex::new(None);
+                    let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+                        hold.on.store(false, SeqCst);
+                        let v = serial.at_overlap("0x527", prefix, live);
+                        let stop = p == 0 || v.is_some();
+                        *verdict.lock().unwrap() = v;
+                        stop
+                    });
+                    assert!(hold.landed.load(SeqCst), "round {round}: op 1 landed no episode of 8 or 15");
+                    assert!(
+                        hold.waited.load(SeqCst),
+                        "round {round}: op 0 registered no wait while op 1's episode was held"
+                    );
+                    serial.check("0x527", &got, verdict.into_inner().unwrap());
+                }
+            });
+        },
+    )
+    .assert_clean();
 }
 
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
@@ -4304,6 +4748,105 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
         let verdict = verdict.into_inner().unwrap();
         assert_eq!(verdict, None);
         serial.check("0x934", &got, verdict);
+    });
+}
+
+/// 0x88c0's ops 3 (`Get(7)`) and 2 (`Get(4)`) overlap on the cycle
+/// 6 -> 5 -> 6, which no strategy breaks. Here op 2's walk plans while
+/// op 3 holds 6, and waits on one of op 3's claims (7 under the
+/// released-deps walk, 6 before it); op 3's episode then aborts, leaving
+/// its members New or Dirty, and a walk that computed the rest of its old
+/// plan would read 4's fallback where every order panics with the cycle.
+/// In a child, since a stalled schedule unwinds op 3 from its park point
+/// with its claims still held, which hangs op 2.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_replans_after_an_aborted_episode() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_walk_replans_after_an_aborted_episode",
+        walk_replans_after_an_aborted_episode,
+    )
+    .assert_clean();
+}
+
+fn walk_replans_after_an_aborted_episode() {
+    struct Hold {
+        on: AtomicBool,
+        held6: AtomicBool,
+        reached: AtomicBool,
+    }
+    let case = gen_case(0x88c0, false, true);
+    let phases = phases(&case, 0x88c0);
+    let at = |i| phases.iter().position(|p| p.ops().contains(&i)).unwrap();
+    let (before, overlap) = (at(1), at(2));
+    assert_eq!(phases[overlap].of(0), Some(3));
+    assert_eq!(phases[overlap].of(1), Some(2));
+    quiet(|| {
+        let hold = Arc::new(Hold {
+            on: AtomicBool::new(false),
+            held6: AtomicBool::new(false),
+            reached: AtomicBool::new(false),
+        });
+        // Thread 0 runs op 3 and holds while it holds 6, until op 2's walk
+        // has planned and waits on a claim of op 3's; thread 1 runs op 2
+        // once 6 is held.
+        let rig = |live: &Live<Shared>| {
+            let (hold, world) = (hold.clone(), live.world.clone());
+            let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                if !hold.on.load(SeqCst) {
+                    return;
+                }
+                match (TWO_THREAD.with(std::cell::Cell::get), p) {
+                    (Some(0), _)
+                        if !hold.reached.load(SeqCst)
+                            && world.handle(0, 6).state(world.rt(0)) == NodeState::Computing =>
+                    {
+                        hold.held6.store(true, SeqCst);
+                        until(|| hold.reached.load(SeqCst));
+                    }
+                    (Some(1), ParkPoint::BeforeComputeOne(n))
+                        if hold.held6.load(SeqCst)
+                            && world.rt(0).nodes.get(n.0).state() == NodeState::Computing =>
+                    {
+                        hold.reached.store(true, SeqCst)
+                    }
+                    (Some(1), _) => until(|| hold.held6.load(SeqCst)),
+                    _ => {}
+                }
+            });
+            assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+        };
+        let serial = Serial::new(&case, &phases);
+        let (verdict, replans) = (Mutex::new(None), AtomicU32::new(0));
+        let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+            if p == overlap {
+                hold.on.store(false, SeqCst);
+                let n = live.world.rt(0).root_replans.load(SeqCst);
+                replans.store(n, SeqCst);
+            }
+            let rt = live.world.rt(0);
+            for slot in 0..rt.nodes.len() {
+                let state = rt.nodes.get(slot).state();
+                assert!(
+                    !matches!(state, NodeState::Computing | NodeState::ComputingDirty),
+                    "node {slot} is {state:?} after phase {p}, with both threads at the barrier"
+                );
+            }
+            let v = serial.at_overlap("0x88c0", prefix, live);
+            if p == before {
+                hold.on.store(true, SeqCst);
+            }
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+        assert!(
+            hold.reached.load(SeqCst),
+            "op 2's walk never reached a claim of op 3's"
+        );
+        assert!(replans.load(SeqCst) > 0, "op 2's walk never planned again");
+        let verdict = verdict.into_inner().unwrap();
+        serial.check("0x88c0", &got, verdict);
     });
 }
 
@@ -4579,7 +5122,7 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
 /// Failed while op 0's walk, planned before it, waits on a claim. Op 0's
 /// walk visits the nodes it waited on again, so every run leaves one
 /// order's Failed set: op 0 first enters a cycle and op 1 leaves {10},
-/// and op 1 first leaves {0, 2, 3, 4, 5, 9, 10, 11, 12}. None needs the
+/// and op 1 first leaves {0, 9, 10}. None needs the
 /// oracle's history, which a walk that went on with its old plan did.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -4594,10 +5137,7 @@ fn two_thread_walk_planned_before_an_episode_leaves_an_orders_failed_set() {
             .map(|&x| (x, NodeState::Failed))
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        orders,
-        [failed(&[10]), failed(&[0, 2, 3, 4, 5, 9, 10, 11, 12])]
-    );
+    assert_eq!(orders, [failed(&[10]), failed(&[0, 9, 10])]);
     quiet(|| {
         for _ in 0..300 {
             let serial = Serial::new(&case, &phases);
@@ -5327,6 +5867,234 @@ fn caught_cycle_then_clean_read() {
     });
 }
 
+/// n_i = n_{i+1} + n_{i+1} for i < k - 1, n_{k-1} catches the panic of its
+/// read of n_k, and n_k panics on the input it reads.
+fn caught_failed_chain(k: usize, ops: Vec<Op>) -> Case {
+    let read = |t| Box::new(Expr::Read(t, false));
+    let mut specs: Vec<Spec> = (0..k - 1)
+        .map(|i| replayable(Expr::Add(read(i + 1), read(i + 1)), Strat::None))
+        .collect();
+    specs.push(replayable(Expr::Catch(read(k)), Strat::None));
+    specs.push(replayable(Expr::PanicIf(read(k + 1), 0), Strat::None));
+    specs.push(Spec::Input(0));
+    Case {
+        specs,
+        panics: true,
+        cycles: false,
+        queries: k + 1,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    }
+}
+
+/// [`caught_failed_chain`] with the catching node in a cycle: n_{k-1}
+/// catches n_{k+1}'s panic and reads n_k, which reads n_{k-1} back, both
+/// with a fallback.
+fn caught_failed_cycle_chain(k: usize, ops: Vec<Op>) -> Case {
+    let read = |t| Box::new(Expr::Read(t, false));
+    let mut specs: Vec<Spec> = (0..k - 1)
+        .map(|i| replayable(Expr::Add(read(i + 1), read(i + 1)), Strat::None))
+        .collect();
+    specs.push(replayable(
+        Expr::Add(Box::new(Expr::Catch(read(k + 1))), read(k)),
+        Strat::Fallback(1),
+    ));
+    specs.push(replayable(Expr::Read(k - 1, false), Strat::Fallback(2)));
+    specs.push(replayable(Expr::PanicIf(read(k + 2), 0), Strat::None));
+    specs.push(Spec::Input(0));
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: k + 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    }
+}
+
+/// A closure that catches the panic of a dep that landed Failed keeps its
+/// value as a memo for the revision, and a later read in the revision
+/// takes it. It ran again on every read, so the chain above it ran 2^k
+/// computes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn caught_failed_read_keeps_its_value_for_the_revision() {
+    let k = 10;
+    let value = Out::Value(9999 << (k - 1));
+    quiet(|| {
+        let fresh = caught_failed_chain(k, vec![Op::Get(0)]);
+        let twice = caught_failed_chain(k, vec![Op::Get(k - 1), Op::Get(k - 1)]);
+        for shared in [false, true] {
+            let run_of = |case: &Case| {
+                if shared {
+                    run_logged::<Shared>(case, None, 0, true)
+                } else {
+                    run_logged::<Local>(case, None, 0, true)
+                }
+            };
+            let (trace, runs) = run_of(&fresh);
+            assert_eq!(trace[0].0, value, "shared {shared}");
+            assert_eq!(runs[0].len(), k + 1, "shared {shared}: one run per node");
+            let (trace, runs) = run_of(&twice);
+            assert_eq!(trace[0].0, trace[1].0, "shared {shared}");
+            assert!(
+                runs[1].is_empty(),
+                "shared {shared}: the second get ran {:?}",
+                runs[1]
+            );
+        }
+        for case in [&fresh, &twice] {
+            differential::<Local>(case, 0);
+            differential::<Shared>(case, 0);
+        }
+        let deep = caught_failed_chain(20, vec![Op::Get(0), Op::Get(0)]);
+        for (trace, runs) in [
+            run_logged::<Local>(&deep, None, 0, true),
+            run_logged::<Shared>(&deep, None, 0, true),
+        ] {
+            assert_eq!(trace[0].0, Out::Value(9999 << 19));
+            assert_eq!(trace[1].0, trace[0].0);
+            assert_eq!(runs[0].len(), 21, "one run per node");
+            assert!(runs[1].is_empty(), "the second get ran {:?}", runs[1]);
+        }
+    });
+}
+
+/// As [`caught_failed_read_keeps_its_value_for_the_revision`], with the
+/// catching node a member of a cycle the episode lands: the chain above
+/// it runs each node once.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_episode_over_a_caught_failed_read_keeps_its_value_for_the_revision() {
+    let k = 20;
+    let case = caught_failed_cycle_chain(k, vec![Op::Get(0), Op::Get(0)]);
+    quiet(|| {
+        for (trace, runs) in [
+            run_logged::<Local>(&case, None, 0, true),
+            run_logged::<Shared>(&case, None, 0, true),
+        ] {
+            assert_eq!(trace[1].0, trace[0].0);
+            for n in 0..k - 1 {
+                let ran = runs[0].iter().filter(|e| e.node == (0, n)).count();
+                assert_eq!(ran, 1, "node {n} ran {ran} times");
+            }
+            assert!(runs[1].is_empty(), "the second get ran {:?}", runs[1]);
+        }
+        let short = caught_failed_cycle_chain(6, vec![Op::Get(0), Op::Get(0)]);
+        differential::<Local>(&short, 0);
+        differential::<Shared>(&short, 0);
+    });
+}
+
+/// 0x3cb3: op 2's `Get(15)` lands 14 Failed inside the cycle 15 -> ... ->
+/// 11 -> 12 -> 13 -> 14 -> 15, and op 3's `Get(11)`, in the same revision,
+/// reads 12 -> 13 = `Catch(Read(14))` over that failure. The value is the
+/// one a fresh `Get(11)` gives with 14 held failing; a fresh read that
+/// recomputes 14 closes the cycle instead, which is not the revision's
+/// history.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_3cb3_reads_a_failed_dep_as_the_revision_left_it() {
+    let case = gen_case(0x3cb3, false, false);
+    assert!(matches!(case.ops[3], Op::Get(11)));
+    let mut held = case.clone();
+    let Spec::Query { expr, .. } = &mut held.specs[14] else {
+        panic!("14 is a query");
+    };
+    *expr = Expr::PanicIf(Box::new(Expr::Const(4)), 4);
+    held.specs[23] = Spec::Input(3);
+    held.ops = vec![Op::Get(11)];
+    quiet(|| {
+        let want = run::<Local>(&held, None, 0)[0].0.clone();
+        assert_eq!(want, Out::Value(20004));
+        assert_eq!(run::<Shared>(&held, None, 0)[0].0, want);
+        assert_eq!(run::<Local>(&case, None, 0)[3].0, want);
+        assert_eq!(run::<Shared>(&case, None, 0)[3].0, want);
+    });
+}
+
+/// 0x32d4: op 3's `Get(7)` reaches spec 3 = `Catch(Add(Read(10), Read(4,
+/// true)))`, whose read of 10 `try_get`s 14 inside the cycle 14 -> 5 -> 6
+/// -> 7 -> 8 -> 9 -> 10 -> 14. Unbounded, 10's `try_get` meets the cycle in
+/// 10's own frame and 3 goes on to read 4. Every budget must leave 3 with
+/// the same recorded deps; at 16 KiB its rerun used to record only 10.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_32d4_bounded_rerun_records_the_unbounded_deps() {
+    let case = gen_case(0x32d4, false, false);
+    assert!(matches!(case.ops[3], Op::Get(7)));
+    quiet(|| {
+        differential::<Local>(&case, 0x32d4);
+        differential::<Shared>(&case, 0x32d4);
+    });
+}
+
+/// The same rule inside one read: 0x15b3's op 10 `Get(19)` lands 20 Failed
+/// (`PanicIf(3, 3)` over input 21 = 2), and 19 catches it; 0x264a's op 17
+/// `Get(9)` reads 2 = 4 + `Catch(Read(3))` over 3 and 4, which landed
+/// Failed in an earlier revision and stay failed with input 19 = 3. Each
+/// value is a fresh read's with those nodes held failing; a fresh read
+/// that recomputes them closes a cycle through their recorded edges.
+/// 0x2501's op 4 `TryGet(7)` reads 8 over 4 and 5, Failed earlier in the
+/// revision. 0x66a's op 3 `Get(4)` follows op 2's episode, which landed
+/// 4 at its fallback over a cycle through 10, 1 and 0, all of which failed
+/// in that episode: with them held failing no cycle closes, so 4 is no
+/// strategy value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seeds_read_failed_deps_as_the_revision_left_them() {
+    fn held(seed: u64, failing: &[usize], at: u64, input: (usize, u64), read: Op) -> Case {
+        let mut held = gen_case(seed, false, false);
+        for &q in failing {
+            let Spec::Query { expr, .. } = &mut held.specs[q] else {
+                panic!("{q} is a query");
+            };
+            *expr = Expr::PanicIf(Box::new(Expr::Const(at)), at);
+        }
+        held.specs[input.0] = Spec::Input(input.1);
+        held.ops = vec![read];
+        held
+    }
+    let cases = [
+        (
+            0x15b3,
+            10,
+            held(0x15b3, &[20], 3, (21, 2), Op::Get(19)),
+            9999,
+        ),
+        (
+            0x264a,
+            17,
+            held(0x264a, &[3, 4], 4, (19, 3), Op::Get(9)),
+            10009,
+        ),
+        (
+            0x2501,
+            4,
+            held(0x2501, &[4, 5], 4, (9, 3), Op::TryGet(7)),
+            1,
+        ),
+        (
+            0x66a,
+            3,
+            held(0x66a, &[0, 1, 10], 4, (15, 3), Op::Get(4)),
+            6,
+        ),
+    ];
+    for (seed, op, held, value) in cases {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            let want = run::<Local>(&held, None, 0)[0].0.clone();
+            assert_eq!(want, Out::Value(value), "{seed:#x}");
+            assert_eq!(run::<Shared>(&held, None, 0)[0].0, want, "{seed:#x}");
+            assert_eq!(run::<Local>(&case, None, 0)[op].0, want, "{seed:#x}");
+            assert_eq!(run::<Shared>(&case, None, 0)[op].0, want, "{seed:#x}");
+        });
+    }
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped
@@ -5668,10 +6436,12 @@ fn strict_dirty_for_clean_seeds() {
     }
 }
 
-/// Seeds that differ under the strict comparator where the unbounded run
-/// computes nodes the bounded run leaves New.
+/// 0xd4f2: a retry's Clean read of a node whose walk a doom stopped takes
+/// the stashed walk, so the walk's New entries land as the unbounded run
+/// lands them (`a_walk_stashed_for_a_clean_read_lands_its_new_entries` is
+/// its shrunk case).
 #[test]
-#[ignore = "T8-strict-computed-left-new"]
+#[cfg_attr(miri, ignore)]
 fn strict_computed_left_new_seeds() {
     let case = gen_base(0xd4f2);
     quiet(|| {
@@ -5832,42 +6602,37 @@ fn a_speculative_recompute_to_the_same_value_keeps_its_reader_verified() {
     });
 }
 
-/// Seeds whose Native closures run more often in a revision under replay
-/// than unbounded, by retries rather than speculative runs, run with
-/// [`compare_native`]'s full count; the base seeds are from
-/// [`replay_seeds`], and 0x88f7 is
-/// [`wave8_seed_88f7_released_claims_replay_as_unbounded`].
+/// The README's exception for Native queries on a cycle: one may run more
+/// often under a frame budget than unbounded, which [`compare_native`]
+/// allows only on a node the unbounded run itself runs more than once in
+/// the revision. In 0x12b74 a doom in an episode discards its reader's
+/// member run, and with it the buffered round value of the Native member
+/// run nested in it, so the retry runs that member again; in 0x597 a
+/// speculative drop unwinds through a Native member's run. Both still add
+/// runs at budget 1 until B7-native-member-buffer-adoption.
 #[test]
-#[ignore = "T8-native-reruns-under-replay"]
-fn native_reruns_under_replay_seeds() {
-    NATIVE_COUNT.with(|c| c.set(true));
-    let mut failed: Vec<u64> = [
-        0x597,
-        0x934,
-        0xbc2,
-        0x2997,
-        0x4654,
-        0x0001_2b74,
-        0x00e8_d4a5_33fa,
-        0x551d_e2c5_404a_84b1,
-    ]
-    .into_iter()
-    .filter(|&seed| {
-        let case = gen_base(seed);
-        catch_unwind(AssertUnwindSafe(|| {
-            quiet(|| {
-                differential::<Local>(&case, seed);
-                differential::<Shared>(&case, seed);
-            })
-        }))
-        .is_err()
-    })
-    .collect();
-    if catch_unwind(wave8_seed_88f7_released_claims_replay_as_unbounded).is_err() {
-        failed.push(0x88f7);
+#[cfg_attr(miri, ignore)]
+fn native_cycle_members_rerun_under_replay() {
+    // INCR_TEST_ALL_REPLAYABLE replays Native specs, so no run is Native.
+    if super::replay_defaults().1 {
+        return;
     }
-    NATIVE_COUNT.with(|c| c.set(false));
-    assert!(failed.is_empty(), "{failed:x?}");
+    for seed in [0x0001_2b74, 0x597] {
+        let case = gen_base(seed);
+        let mut counts = NativeCounts::new();
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+            let (_, want) = run_counted::<Local>(&case, None, 0);
+            let (_, got) = run_counted::<Local>(&case, Some(1), 0);
+            counts = native_counts(&want, &got);
+        });
+        assert!(
+            (counts.values()).any(|&(u, b, s)| u > 1 && b > u + u32::from(s > 0)),
+            "seed {seed:#x}: no Native cycle member reran at budget 1; if the episode buffer \
+             adoption landed, drop the README's cycle exception and this test"
+        );
+    }
 }
 
 /// Seeds whose speculative continuations landed nodes Clean that the
@@ -6055,12 +6820,13 @@ fn seed_783_at_budget_3() {
     });
 }
 
-/// A query whose run read the node being deleted keeps that dependency,
-/// so the delete is refused at every budget. In 0x2343 node 15's run
-/// completes with the read; in 0xc17 node 7's claim, released by another
-/// node's user panic, lands New over the deps its run read.
+/// A delete of a node that a query's unwound run read gives the unbounded
+/// outcome at every budget: the run's cycle reached its reader, so the run
+/// kept no dependency on the node and the delete succeeds, as on main
+/// (0x2343 op 9; 0xc17 op 5, where node 7's claim was released by another
+/// node's user panic).
 #[test]
-fn delete_of_a_node_a_query_read_is_refused() {
+fn delete_after_an_unwound_read_gives_the_unbounded_outcome() {
     for (seed, op) in [(0x2343, 9), (0xc17, 5)] {
         let mut case = gen_case(seed, false, false);
         assert!(matches!(case.ops[op], Op::Delete(_)));
@@ -6072,7 +6838,7 @@ fn delete_of_a_node_a_query_read_is_refused() {
                 for trace in [&local, &shared] {
                     assert_eq!(
                         trace[op].0,
-                        Out::Deleted(Err("HasDependents".into())),
+                        Out::Deleted(Ok(())),
                         "seed {seed:#x} at {frames:?}/{bytes}"
                     );
                 }
@@ -6154,18 +6920,64 @@ fn paired_clean_read_delivery_seeds() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn high_range_clean_read_delivery_seeds() {
-    for seed in [
-        0x92_b175_80fc,
-        0x92_b175_83ef,
-        0x92_b175_829f,
-        0x92_b175_8479,
-    ] {
+    for seed in [0x92_b175_83ef, 0x92_b175_829f, 0x92_b175_8479] {
         let case = gen_case(seed, false, false);
         quiet(|| {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);
         });
     }
+}
+
+/// 0x92b17580fc, whose op 3 is the stale-dep split main shares (CHANGELOG
+/// known limitation): the unbounded walk cleans a recorded dep the reader
+/// no longer reads and its run closes a cycle, where a bounded run reruns
+/// the reader first and gives the fresh Value(6). Main splits op 3 the
+/// same way under this harness (cycle [23]) and op 4 is main's cycle too.
+/// Ops 0 and 1 are each engine's own fresh and held reads: op 0 the fresh
+/// cycle, op 1 the read with node 4, which op 0 left Failed, held failing.
+/// With every query replayable a bounded run closes op 3's cycle as the
+/// unbounded run does, and the split moves to op 4, whose bounded read
+/// gives the fresh Value(9999); main still splits op 3 in that mode, so
+/// op 4's split is this engine's, accepted under the same known
+/// limitation by the integrator's ruling of 26 Oct.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stale_dep_split_seed_keeps_its_known_split() {
+    let case = gen_case(0x92_b175_80fc, false, false);
+    let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
+    let cycle = || Out::Panic("cycle".to_owned());
+    let with = |op3, op4| vec![cycle(), Out::Value(43329), Out::Done, op3, op4, Out::Done];
+    let unbounded = with(Out::Cycle(vec![17, 24]), cycle());
+    let bounded = if super::replay_defaults().1 {
+        with(Out::Cycle(vec![17, 24]), Out::Value(9999))
+    } else {
+        with(Out::Value(6), cycle())
+    };
+    quiet(|| {
+        assert_eq!(
+            outs(run::<Local>(&case, None, 0)),
+            unbounded,
+            "Local unbounded"
+        );
+        assert_eq!(
+            outs(run::<Shared>(&case, None, 0)),
+            unbounded,
+            "Shared unbounded"
+        );
+        for frames in [1, 2, 3] {
+            assert_eq!(
+                outs(run::<Local>(&case, Some(frames), 0)),
+                bounded,
+                "Local, budget {frames}"
+            );
+            assert_eq!(
+                outs(run::<Shared>(&case, Some(frames), 0)),
+                bounded,
+                "Shared, budget {frames}"
+            );
+        }
+    });
 }
 
 /// 0xa02 (see [`cross_seeds`]): a speculative landing read the second
@@ -6248,7 +7060,8 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean, T8-strict-computed-left-new"]
+    #[cfg_attr(miri, ignore)]
+    #[ignore = "T8-strict-group-c-dirty-for-clean"]
     fn replay_differential_shared_two_threads(seed in any::<u64>()) {
         quiet(|| differential_two(&gen_case(seed, false, true), seed));
     }
@@ -7066,6 +7879,10 @@ fn scan(seeds: impl Iterator<Item = u64>, all: bool, check: impl Fn(u64)) {
         }
     });
     eprintln!("smallest failing: {best:?}");
+    eprintln!(
+        "readers held past the budget for a payload no retry can regenerate: {}",
+        super::replay_impl::PAST_BUDGET_HOLDS.load(Relaxed)
+    );
     if let Some((_, smallest)) = best {
         let skipped = if all {
             ""
@@ -7227,102 +8044,213 @@ fn two_thread_oracle_rejects_a_made_up_cycle() {
     assert!(!cycle_from_own_frames(|c| c.clear()));
 }
 
-/// Seed 0x3904's first phase at a budget of 1 frame: op 0 `Get(0)` on one
-/// thread, op 1 `Get(6)` on the other. Some runs give 1's `try_get(2)` a
-/// cycle that 6 then reads as 7777, so 5 is 2 and 4 panics, which no order
-/// does; the members 4's claims released, read again in the phase, fail
-/// through 4, and the phase leaves 1 to 6 Failed. In the first such run,
-/// `patch` edits the phase's recorded closure runs before the oracle sees
-/// them; returns whether the oracle took the run, every run before it
-/// checked as usual, and whether 4's history grounds it.
-fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> (bool, bool) {
-    let case = gen_case(0x3904, false, true);
-    let phases = phases(&case, 0x3904);
-    assert_eq!(phases[0].ops(), [0, 1]);
-    let mut took = None;
+/// A read phase judged on a hand-made history instead of on an interleaving
+/// some engine version happens to produce, so no engine change can take the
+/// fixture away. Y1 (4) and Z1 (5) read each other, as do Y2 (6) and Z2
+/// (7), and only the Ys have a Fallback, so a `try_get` that enters a
+/// cycle at its Z gets `Err(Cycle)` (7777) while a Z read after the cycle
+/// resolved is 4. Op 0 `Get(0)` first: W (3) enters both cycles at their
+/// Zs and is 15554. Op 1 `Get(8)` first: U (8) resolves both cycles from
+/// their Ys and W is 8. Either way X (2, `PanicIf` 4 mod 7), V (1) and 0
+/// compute, nothing is Failed, and op 0 gives 1 and op 1 gives 6. The
+/// history's W entered cycle 1 at Z1 but read Z2 after U resolved cycle 2,
+/// each a read some order's W makes, and gave 7781; X panicked over it, V
+/// unwound from X, and 0's `Catch` took V's panic, so the phase leaves X
+/// and V Failed, which no order does. The history holds the runs the
+/// oracle reads, not the cycles' own, so [`Serial::per_read`] finds no
+/// landing on the other thread to order a caught cycle by. `patch` edits
+/// them before the oracle
+/// sees them; returns whether [`Serial::check`] took the phase, whether
+/// X's history grounds it, and [`Serial::at_overlap`]'s verdict.
+fn history_failed_set(
+    patch: impl FnOnce(&mut HashMap<usize, Vec<Eval>>, &dyn Fn(usize, usize) -> ReadOut),
+) -> (bool, bool, Option<Result<(), String>>) {
+    let query = |expr, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy,
+    };
+    let read = |n, try_| Box::new(Expr::Read(n, try_));
+    let one = || Box::new(Expr::Const(1));
+    let case = Case {
+        specs: vec![
+            query(
+                Expr::If(Box::new(Expr::Catch(read(1, false))), one(), one()),
+                Strat::None,
+            ),
+            query(Expr::Read(2, false), Strat::None),
+            query(Expr::PanicIf(read(3, false), 4), Strat::None),
+            query(Expr::Add(read(5, true), read(7, true)), Strat::None),
+            query(Expr::Add(read(5, false), one()), Strat::Fallback(3)),
+            query(Expr::Add(read(4, false), one()), Strat::None),
+            query(Expr::Add(read(7, false), one()), Strat::Fallback(3)),
+            query(Expr::Add(read(6, false), one()), Strat::None),
+            query(Expr::Add(read(4, true), read(6, true)), Strat::None),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 9,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(8)],
+    };
+    let phases = vec![Phase::Read([Some(0), Some(1)])];
+    let mut result = None;
     quiet(|| {
-        for _ in 0..2000 {
-            let serial = Serial::new(&case, &phases);
-            let verdict = Mutex::new(None);
-            let hit = AtomicBool::new(false);
-            let grounded = AtomicBool::new(false);
-            let got = run_two_until(&case, &phases, Some(1), 0, &|_| {}, &|_, prefix, live| {
-                let states = &prefix.last().unwrap().1 .0;
-                if prefix.len() == 2 && (1..=6).all(|x| states[x] == NodeState::Failed) {
-                    hit.store(true, SeqCst);
-                    patch(&mut live.evals.lock().unwrap());
-                    grounded.store(serial.history_cause("0x3904", prefix, live, 4), SeqCst);
-                }
-                let v = serial.at_overlap("0x3904", prefix, live);
-                let stop = v.is_some();
-                *verdict.lock().unwrap() = v;
-                stop
-            });
-            let verdict = verdict.into_inner().unwrap();
-            if !hit.load(SeqCst) {
-                serial.check("0x3904", &got, verdict);
-                continue;
-            }
-            took = Some((
-                catch_unwind(AssertUnwindSafe(|| serial.check("0x3904", &got, verdict))).is_ok(),
-                grounded.load(SeqCst),
-            ));
-            return;
-        }
+        let runs = [0, 1].map(|m| run::<Shared>(&Order::new(&case, &phases, m).case, None, 0));
+        let outs = |t: &Trace| t.iter().map(|o| o.0.clone()).collect::<Vec<_>>();
+        assert_eq!(outs(&runs[0]), [Out::Value(1), Out::Value(6)]);
+        assert_eq!(outs(&runs[1]), [Out::Value(6), Out::Value(1)]);
+        assert!(runs.iter().all(|t| settled(&t[1].1 .0).is_empty()));
+        let mut snap = runs[0][1].1.clone();
+        snap.0[1] = NodeState::Failed;
+        snap.0[2] = NodeState::Failed;
+        let prefix: Trace = vec![(Out::Value(1), snap.clone()), (Out::Value(6), snap)];
+
+        let rts = runtimes::<Shared>(None, 0);
+        let live = Live::new(&rts, &case);
+        // A caught cycle's participants, which `Cycle` sorts by slot.
+        let cycle = |x: usize, y: usize| {
+            let mut slots = [x, y].map(|x| live.world.handle(0, x).erased().slot());
+            slots.sort_unstable();
+            ReadOut::Cycle(slots.to_vec())
+        };
+        let run = |node, reads: Vec<Read>, value, end, caught, returned| Eval {
+            node: (0, node),
+            first: true,
+            reads,
+            value,
+            end,
+            caught,
+            returned,
+            closing: Vec::new(),
+        };
+        let value = ReadOut::Value;
+        let mut evals = HashMap::from([
+            (
+                0,
+                vec![
+                    run(
+                        3,
+                        vec![(0, 5, true, cycle(4, 5)), (0, 7, true, value(4))],
+                        Some(7781),
+                        6,
+                        vec![(0, 1)],
+                        vec![(1, 5)],
+                    ),
+                    run(
+                        2,
+                        vec![(0, 3, false, value(7781))],
+                        None,
+                        8,
+                        vec![],
+                        vec![(0, 7)],
+                    ),
+                    run(
+                        1,
+                        vec![(0, 2, false, ReadOut::Unwound)],
+                        None,
+                        9,
+                        vec![],
+                        vec![],
+                    ),
+                    run(
+                        0,
+                        vec![(0, 1, false, ReadOut::Unwound)],
+                        Some(1),
+                        10,
+                        vec![],
+                        vec![],
+                    ),
+                ],
+            ),
+            (
+                1,
+                vec![run(
+                    8,
+                    vec![(0, 4, true, value(3)), (0, 6, true, value(3))],
+                    Some(6),
+                    4,
+                    vec![],
+                    vec![(0, 2), (1, 3)],
+                )],
+            ),
+        ]);
+        patch(&mut evals, &cycle);
+        *live.evals.lock().unwrap() = evals;
+
+        let serial = Serial::new(&case, &phases);
+        let grounded = serial.history_cause("history fixture", &prefix, &live, 2);
+        let verdict = serial.at_overlap("history fixture", &prefix, &live);
+        let took = catch_unwind(AssertUnwindSafe(|| {
+            serial.check("history fixture", &prefix, verdict.clone())
+        }))
+        .is_ok();
+        result = Some((took, grounded, verdict));
     });
-    took.expect("no run of 0x3904 left 1 to 6 Failed")
+    result.expect("the fixture ran")
+}
+
+/// Node `x`'s run in op 0 of [`history_failed_set`], to patch.
+fn run_of(evals: &mut HashMap<usize, Vec<Eval>>, x: usize) -> &mut Eval {
+    (evals.get_mut(&0).into_iter().flatten())
+        .find(|e| e.node == (0, x))
+        .expect("op 0 ran it")
+}
+
+/// Asserts the oracle rejected the fixture because X, no longer grounded,
+/// does not land Failed when the phase's reads replay.
+fn rejected_as_ungrounded((took, grounded, verdict): (bool, bool, Option<Result<(), String>>)) {
+    assert!(!took && !grounded, "took {took}, grounded {grounded}");
+    match verdict {
+        Some(Err(m)) => assert!(
+            m.contains("node 2 Failed: a replay of the phase's reads landed it"),
+            "{m}"
+        ),
+        v => panic!("verdict {v:?}"),
+    }
 }
 
 #[test]
-#[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
+#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_failed_set_grounded_in_its_history() {
-    assert_eq!(cascade_from_a_history_panic(|_| {}), (true, true));
+    assert_eq!(history_failed_set(|_, _| {}), (true, true, Some(Ok(()))));
 }
 
+/// W's recorded 7781 is not its closure over its reads once it read Z1 =
+/// 4, and X's read of 7788 (still 4 mod 7) follows from no run of W:
+/// either way X's panic follows from no run the oracle takes.
 #[test]
-#[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
+#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_history_grounding_over_a_wrong_value() {
-    assert_eq!(
-        cascade_from_a_history_panic(|evals| {
-            for e in evals.values_mut().flatten() {
-                if e.node == (0, 5) && e.value == Some(2) {
-                    e.value = Some(3);
-                }
-            }
-        }),
-        (false, false)
-    );
+    rejected_as_ungrounded(history_failed_set(|evals, _| {
+        let w = run_of(evals, 3);
+        w.reads[0].3 = ReadOut::Value(4);
+        w.caught.clear();
+        w.returned.insert(0, (0, 1));
+    }));
+    rejected_as_ungrounded(history_failed_set(|evals, _| {
+        run_of(evals, 2).reads[0].3 = ReadOut::Value(7788);
+    }));
 }
 
-/// As above with every value kept but 1's caught cycle naming no
-/// participant, which no order's read of 2 gives: 7777 still follows from
-/// it, but 6, 5 and 4 ground through a read the oracle does not take.
+/// As above with every value kept but W's caught cycle naming cycle 2's
+/// members, which no order's read of Z1 gives: 7777 still follows from
+/// it, but W, X and V ground through a read the oracle does not take.
 #[test]
-#[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
+#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_history_grounding_over_an_untaken_read() {
-    assert_eq!(
-        cascade_from_a_history_panic(|evals| {
-            for e in evals.values_mut().flatten() {
-                if e.node == (0, 1) && e.value == Some(7777) {
-                    for r in &mut e.reads {
-                        if let ReadOut::Cycle(c) = &mut r.3 {
-                            c.clear();
-                        }
-                    }
-                }
-            }
-        }),
-        (false, false)
-    );
+    rejected_as_ungrounded(history_failed_set(|evals, cycle| {
+        run_of(evals, 3).reads[0].3 = cycle(6, 7);
+    }));
 }
 
 /// Seed 0x55ac771450d16c5b's op 0, `Get(0)` on a fresh runtime: node 8 lands
 /// Failed with the union of its deps, which keeps 10 from an earlier
-/// cycle-iteration run. Unbounded, 11's walk of Failed 12 memoizes 8 under
-/// 0's frame, so 7's rerun reads 8 directly. At a budget of 1 those entries
-/// are 0's virtual frame's, a doom in the driver's pop of that frame
-/// restarted the driver and dropped them, and 7's retry walked Failed 8 and
-/// computed New 10, which landed Failed too.
+/// cycle-iteration run. No walk computes New 10 through Failed 8, neither
+/// the unbounded run's nor, at a budget of 1, 7's retry's, so 10 stays out
+/// of the Failed set.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_failed_union_dep_is_not_computed_by_a_retry_walk() {
@@ -7417,6 +8345,32 @@ fn shared_seed_77d_unread_walk_entry() {
     quiet(|| differential::<Shared>(&gen_case(0x77d, false, true), 0x77d));
 }
 
+/// A Failed landing over a dep a set's walk stops at outlasted the dep's
+/// next change. Seed 0x2897c4266833a03: op 1's walk reruns spec 1 over
+/// spec 2, which a caught panic left Dirty, and spec 1 panics; the sets of
+/// 21 stop at spec 2, so ops 14 and 22 read "failed" where a fresh read
+/// gives 0. Bounded runs give the unbounded run's outcomes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failed_landing_stays_in_reach_of_sets() {
+    let seed = 0x0289_7c42_6683_3a03;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+        let trace = run::<Local>(&case, None, 0);
+        for i in [14, 22] {
+            let fresh = fresh_read(&case, i, &trace).expect("a read");
+            assert!(
+                fresh_agrees(&trace[i].0, &fresh),
+                "seed {seed:#x} op {i} {:?} gave {:?}, a fresh read {fresh:?}",
+                case.ops[i],
+                trace[i].0
+            );
+        }
+    });
+}
+
 /// Seed 0x922f4fd7cf058ec: at budget 1, a walk's entry dooms with a
 /// repeat pending entry of its node beneath it. The replayed compute must
 /// not pop that repeat from the stashed walk: unbounded, the repeat
@@ -7496,10 +8450,11 @@ fn wave8_seed_d6e1_released_new_walked_fresh() {
     });
 }
 
-/// Seed 0x148c's base case, shrunk. Unbounded, `Get(7)` leaves node 9 New:
-/// no run reads it. At budgets 2 and 3 a stand-in's Dirty landing,
-/// reported to its walk as `Unsettled`, must not lead the bounded run to
-/// compute node 9.
+/// Seed 0x148c's base case, shrunk. At budgets 2 and 3 a stand-in's Dirty
+/// landing is reported to its walk as `Unsettled`, which must not lead the
+/// bounded run to compute a node the unbounded run leaves New: after
+/// `Get(7)`, nodes 1, 4, 5 and 14. Budgets 2 and 3 hold at least one
+/// landing as unsettled.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
@@ -7574,9 +8529,18 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
     };
     quiet(|| {
         let unbounded = states(run::<Local>(&case, None, 0));
-        assert_eq!(unbounded[3].1[9], NodeState::New, "unbounded");
+        let new: Vec<usize> = (0..unbounded[3].1.len())
+            .filter(|&n| unbounded[3].1[n] == NodeState::New)
+            .collect();
+        assert_eq!(new, [1, 4, 5, 14], "unbounded");
+        let holds = || super::replay_impl::UNSETTLED_HOLDS.with(|n| n.replace(0));
         for frames in [1, 2, 3] {
+            holds();
             let local = states(run::<Local>(&case, Some(frames), 0));
+            assert!(
+                frames < 2 || holds() > 0,
+                "budget {frames}: no Unsettled landing"
+            );
             assert_eq!(local, unbounded, "Local, budget {frames}");
             let shared = states(run::<Shared>(&case, Some(frames), 0));
             assert_eq!(shared, unbounded, "Shared, budget {frames}");
@@ -7584,7 +8548,8 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
     });
 }
 
-/// Seed 0x9ab9's base case, shrunk. Unbounded, `TryGet(12)` reads 0. At
+/// Seed 0x9ab9's base case, shrunk. Unbounded, `TryGet(12)` gets the cycle
+/// [5, 6, 13, 14] that a walk entry closes, as on main. At
 /// budget 1 a speculative run of node 3 (slot 20) writes its slot and is
 /// discarded, so `discard_target` takes the value back and lands the node
 /// New where the unbounded run leaves it Dirty; the claim releases and
@@ -7705,7 +8670,7 @@ fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
     let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
     quiet(|| {
         let unbounded = outs(run::<Local>(&case, None, 0));
-        assert_eq!(unbounded[2], Out::Value(0), "unbounded");
+        assert_eq!(unbounded[2], Out::Cycle(vec![5, 6, 13, 14]), "unbounded");
         for frames in [1, 2, 3] {
             let local = outs(run::<Local>(&case, Some(frames), 0));
             assert_eq!(local, unbounded, "Local, budget {frames}");
@@ -8195,16 +9160,16 @@ fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
 
 /// Seed 0x56cdd78's op 9, `Get(8)`: its read of 4 runs 4's cycle episode,
 /// which releases 4, 8, 9 and 10 Dirty with no value, so the read walks 4
-/// again and the walk contains the cycle at its entries until 10's
-/// strategy closes it, reading 0. At a budget of 3 a doom stops the first
-/// walk; after the release, the frame reading 4 must walk again rather
-/// than take the `Direct` delivery made for the first walk.
+/// again, and the cycle a walk entry closes reaches the read, as on main.
+/// At a budget of 3 a doom stops the first walk; after the release, the
+/// frame reading 4 must walk again rather than take the `Direct` delivery
+/// made for the first walk, and so gives the unbounded outcome.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
     let seed = 0x56c_dd78;
     assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(8)));
-    let want = (Out::Value(0), Vec::new());
+    let want = (Out::Panic("cycle".into()), Vec::new());
     quiet(|| {
         let local = op9_at_budget_3::<Local>(seed);
         let shared = op9_at_budget_3::<Shared>(seed);
