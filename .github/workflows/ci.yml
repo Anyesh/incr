@@ -169,6 +169,7 @@ jobs:
           - { model: "loom_models::hand_over_races_publication", bound: 2 }
           - { model: "loom_models::hand_over_races_reclaim", bound: 2 }
           - { model: "loom_models::hand_over_waits_out_a_holder_that_progresses", bound: 2 }
+          - { model: "loom_models::a_read_joining_a_reader_of_a_cycle_below_it_finishes", bound: 2 }
           - { model: "loom_seed_models::seed_vs_set", bound: 2 }
           - { model: "loom_seed_models::seed_vs_dep_recompute", bound: 2 }
           - { model: "loom_seed_models::seed_vs_reader", bound: 2 }

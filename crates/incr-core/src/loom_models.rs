@@ -2806,3 +2806,72 @@ fn hand_over_waits_out_a_holder_that_progresses() {
     });
     PROGRESS_RACE.assert_both();
 }
+
+/// A read `r` that, before reading `c`, joins a thread reading `n`, where
+/// `n` and `c` read each other with `try_get` below `r`. The unbounded run
+/// finishes: the joined reader computes `n` itself, as `r` has not read
+/// below itself yet. With
+/// `reaches_r`, `n` also reads `r`, and the joined reader waits on `r`'s
+/// claim while `r` waits on the join, a deadlock in any engine.
+fn cycle_join(reaches_r: bool) {
+    run(move || {
+        type Handles = (std::sync::Weak<Rt>, Incr<u64>, Incr<u64>, Incr<u64>);
+        let cell: std::sync::Arc<std::sync::OnceLock<Handles>> = std::sync::Arc::default();
+        let rt = std::sync::Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let n = {
+            let cell = std::sync::Arc::clone(&cell);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let (_, _, c, r) = cell.get().unwrap().clone();
+                    let up = if reaches_r {
+                        rt.try_get(r).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    rt.try_get(c).unwrap_or(0) + up + rt.get(i)
+                },
+                replayable(),
+            )
+        };
+        let c = rt.create_query_with(
+            move |rt: &Rt| rt.try_get(n).map_or(0, |v| v + 1),
+            replayable(),
+        );
+        let r = {
+            let cell = std::sync::Arc::clone(&cell);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(i);
+                    if v == 2 {
+                        let (w, n, _, _) = cell.get().unwrap().clone();
+                        let rt = w.upgrade().unwrap();
+                        let _ = thread::spawn(move || rt.try_get(n)).join().unwrap();
+                    }
+                    rt.try_get(c).unwrap_or(0) + v
+                },
+                replayable(),
+            )
+        };
+        assert!(cell.set((std::sync::Arc::downgrade(&rt), n, c, r)).is_ok());
+        let _ = rt.try_get(r);
+        rt.set(i, 2);
+        let _ = rt.try_get(r);
+    });
+}
+
+/// A held landing of `n` would make the joined reader wait on a holder
+/// blocked in the join; the hand-over gives the reader the landing, as the
+/// unbounded run lets it compute `n` itself.
+#[test]
+fn a_read_joining_a_reader_of_a_cycle_below_it_finishes() {
+    cycle_join(false);
+}
+
+/// Not a CI model: loom reports the branch limit, because the unbounded run
+/// deadlocks too. Kept as a probe of the deadlocking shape.
+#[test]
+#[ignore]
+fn a_read_joining_a_reader_of_a_cycle_through_it_deadlocks() {
+    cycle_join(true);
+}
