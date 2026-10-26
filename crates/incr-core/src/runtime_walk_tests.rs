@@ -2211,7 +2211,7 @@ fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
 /// The chain at 2000 to 64000 with a ticket per caught read, every read's
 /// ticket taken while the frames below hold theirs: the tickets' work
 /// stays linear in the reads. A retry's read of a regenerable payload keeps
-/// a copy of its notes, about 20 units a read.
+/// a copy of its notes and unlists its deliveries, about 31 units a read.
 fn ticket_catching_chain_work<C: Cells>() {
     for n in [2000, 4000, 16000, test_size(64_000)] {
         let work = thread::Builder::new()
@@ -2225,7 +2225,7 @@ fn ticket_catching_chain_work<C: Cells>() {
             .join()
             .unwrap();
         assert!(
-            work <= 24 * n as u64,
+            work <= 48 * n as u64,
             "{work} units of note work for {n} reads"
         );
     }
