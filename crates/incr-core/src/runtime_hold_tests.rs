@@ -2657,3 +2657,34 @@ fn shared_reread_of_a_held_landing_its_own_set_flagged_runs_it_again() {
     let local = reread_of_a_landing_its_own_set_flagged::<Local>();
     assert_eq!(reread_of_a_landing_its_own_set_flagged::<Shared>(), local);
 }
+
+/// d reads a, which a Fallback cycle with b lands Cyclic and held, then
+/// sets a's input k and reads a again: the set's walk meets a's held
+/// Cyclic landing through the view and must take it to New, as it would
+/// a published one, not spin on the node's word. Returns d's value.
+fn set_over_a_held_cycle<C: Cells>(rt: &Runtime<C>) -> i64 {
+    let k = rt.create_input(0_i64);
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt| rt.get(k) + rt.get(*bc.get().unwrap()),
+            |_c: &Cycle| 100,
+        )
+    };
+    let b = rt.create_query(move |rt| rt.get(a) * 2);
+    bc.set(b).unwrap();
+    let d = rt.create_query(move |rt: &Runtime<C>| {
+        let v = rt.get(a);
+        rt.set(k, 1);
+        v * 1000 + rt.get(a)
+    });
+    rt.get(d)
+}
+
+#[test]
+fn shared_set_inside_the_attempt_over_its_held_cycle_finishes() {
+    let local = set_over_a_held_cycle(&Runtime::<Local>::new());
+    let shared = within_10s(|| set_over_a_held_cycle(&Runtime::<Shared>::new()));
+    assert_eq!(shared, Some(local));
+}
