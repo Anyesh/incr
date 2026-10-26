@@ -240,9 +240,6 @@ pub(crate) enum ParkPoint {
     /// In `hold_landing`, before it loads the state of `NodeId`, which a
     /// replay entry's run just landed.
     HoldLanding(NodeId),
-    /// In `publish_own`, after its episodes are counted and before the
-    /// held landing of `NodeId` publishes.
-    BeforePublish(NodeId),
     /// In `compute_one`, on finding the node claimed by another thread,
     /// before its first wait on that claim.
     ComputeWaits(NodeId),
@@ -573,9 +570,6 @@ pub(crate) struct EpisodeLog {
     /// The highest landed episode and release numbers whose slots the log
     /// no longer holds.
     evicted: [Option<u32>; 2],
-    /// The threads and numbers of landed episodes whose members are still
-    /// publishing.
-    publishing: Vec<(u32, u32)>,
 }
 
 impl EpisodeLog {
@@ -594,26 +588,6 @@ impl EpisodeLog {
                 released,
             });
         }
-    }
-
-    /// Marks this thread's landed episode `number` as publishing until
-    /// [`Self::published`].
-    fn publish(&mut self, number: u32) {
-        self.publishing.push((cycle_state::thread_key(), number));
-    }
-
-    fn published(&mut self, number: u32) {
-        let me = (cycle_state::thread_key(), number);
-        self.publishing.retain(|&p| p != me);
-    }
-
-    /// Whether `slot` is a member of another thread's landed episode that
-    /// is still publishing.
-    fn is_publishing(&self, slot: u32) -> bool {
-        !self.publishing.is_empty()
-            && (self.entries.iter()).any(|e| {
-                !e.released && e.slot == slot && self.publishing.contains(&(e.by, e.number))
-            })
     }
 
     #[cfg(all(test, not(loom)))]
@@ -4141,9 +4115,6 @@ impl<C: Cells> Runtime<C> {
     fn prune_settled(&self, walk: &mut Walk) -> bool {
         let since = walk.first_planned.all as u32;
         let landed = self.episode_log.read().others_since(false, since);
-        if let Some(landed) = &landed {
-            self.wait_for_landings(walk, landed);
-        }
         let settled = walk.work.iter().position(|e| {
             e.is_pending()
                 && landed
@@ -4163,32 +4134,6 @@ impl<C: Cells> Runtime<C> {
                 true
             }
             None => false,
-        }
-    }
-
-    /// Waits out the claims on `walk`'s pending entries in `landed` whose
-    /// episode is still publishing: it is counted before its members land,
-    /// so a replan can meet them still held, by a thread that runs only
-    /// engine code until they land. The wait ends with the publication, so
-    /// a later compute that claims the node is never waited on here.
-    fn wait_for_landings(&self, walk: &Walk, landed: &HashSet<u32, FxBuildHasher>) {
-        let held: Vec<(NodeId, u32)> = (walk.work.iter())
-            .filter(|e| e.is_pending() && landed.contains(&e.id.0))
-            .map(|e| (e.id, e.generation))
-            .collect();
-        for (id, generation) in held {
-            let node = self.nodes.get(id.0);
-            let cell = node.state_cell();
-            let waiting = || {
-                node.generation() == generation
-                    && is_computing(self.seen(cell, state::load::<C>(cell)))
-                    && self.own_claim_owner(id).is_none()
-                    && self.episode_log.read().is_publishing(id.0)
-            };
-            let mut spins = 0;
-            while waiting() {
-                self.spin_on(id, &mut spins, || !waiting());
-            }
         }
     }
 

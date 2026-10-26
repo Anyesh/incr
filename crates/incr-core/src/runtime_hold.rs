@@ -17,7 +17,7 @@ use crate::node::{NodeData, NodeId};
 use crate::segmented_nodes::IN_GROUP;
 use crate::state::{self, NodeState};
 
-use super::{is_computing, ChildLanding, GroupInfo, Inner, ParkPoint, Runtime, SingleClaim};
+use super::{is_computing, ChildLanding, GroupInfo, Inner, Runtime, SingleClaim};
 use crate::dep_stack::DepStack;
 use crate::dependent_list::DependentList;
 use crate::handle::ErasedIncr;
@@ -446,10 +446,11 @@ impl<C: Cells> Runtime<C> {
         let hold::Taken {
             entries, episodes, ..
         } = hold::take(self.runtime_id);
-        // Before the members land, so a read of one of their landings also
-        // reads the count.
-        let publishing =
-            (episodes != 0).then(|| self.count_landed(episodes, entries.iter().map(|e| e.slot)));
+        if episodes != 0 {
+            // Before the members land, so a read of one of their landings
+            // also reads the count.
+            self.count_landed(episodes, entries.iter().map(|e| e.slot));
+        }
         // A release counted when its claims landed held: a walk planned
         // since then expanded through their held states, and must see the
         // count move when they publish.
@@ -460,21 +461,16 @@ impl<C: Cells> Runtime<C> {
         let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
         let mut rest = entries.into_iter();
         let published = catch_unwind(AssertUnwindSafe(|| {
-            while let Some(slot) = rest.as_slice().first().map(|e| e.slot) {
-                self.park(ParkPoint::BeforePublish(NodeId(slot)));
-                if let Some(e) = rest.next() {
-                    self.publish_one(e, &held, &mut bag);
-                }
+            for e in rest.by_ref() {
+                self.publish_one(e, &held, &mut bag);
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
         // what is left goes back as on a wound (G9).
         if let Err(payload) = published {
             self.retract_entries(rest.collect(), Vec::new());
-            self.landed(publishing.flatten());
             bag.drain_carried(payload);
         }
-        self.landed(publishing.flatten());
         bag.drain(self);
     }
 
