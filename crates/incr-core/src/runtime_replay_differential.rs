@@ -17,13 +17,14 @@
 //! that a panic is one outcome kind whatever its text: which of two
 //! racing readers of a panicked node gets the closure's payload and which
 //! gets "last compute panicked" is not part of the result (the wiki
-//! decision "Shared panic payload contract"). A get whose thread's
-//! `try_get` got a cycle that the other read's get then landed is ordered
-//! per read: a cycle's result depends on the member a get enters at, so
-//! its run may mix both orders' outcomes, but each of its node's reads
-//! must be an order's outcome for that read and its value the closure
-//! over them. The Failed and Cyclic sets
-//! after two overlapping reads are history, as the states are: a walk
+//! decision "Shared panic payload contract"), nor is a later phase's read
+//! getting the payload a walk held for a retry the other thread's landing
+//! made unnecessary. A get whose thread's `try_get` got a cycle that the
+//! other read's get then landed is ordered per read: a cycle's result
+//! depends on the member a get enters at, so its run may mix both orders'
+//! outcomes, but each of its node's reads must be an order's outcome for
+//! that read and its value the closure over them. The Failed and Cyclic
+//! sets after two overlapping reads are history, as the states are: a walk
 //! computes from its plan, so it can land a node Failed from a dep the
 //! other thread landed Failed after the walk expanded it. Where no order
 //! gives those sets, each node the reads left settled must have a Failed
@@ -3985,6 +3986,9 @@ fn two_thread_schedule_seeds() {
 /// deps let `Get(3)` panic "failed" where every order returns 3, in about 1
 /// run in 8. 0x9172 at frame budget 3: under the same rule op 3 reported
 /// `Cycle([5, 6, 10])`, a cycle no order enters, in about 9 runs in 10.
+/// 0x74f's op 12 can also get the payload of a panic a walk entry
+/// contained for a retry that never ran, as the other thread landed the
+/// recorder: a panic's text, which the oracle leaves open.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn released_claims_leave_two_threads_a_serial_outcome() {
@@ -3995,25 +3999,13 @@ fn released_claims_leave_two_threads_a_serial_outcome() {
     ] {
         let case = gen_case(seed, false, true);
         let phases = phases(&case, seed);
-        let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
+        let label = format!(
+            "seed {seed:#x}, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
+        );
         quiet(|| {
-            let orders: Vec<Vec<Out>> = (0..1u64 << pairs)
-                .map(|swaps| {
-                    let order = Order::new(&case, &phases, swaps);
-                    let t = run::<Shared>(&order.case, None, 0);
-                    let mut at = vec![0; t.len()];
-                    for (j, &i) in order.of.iter().enumerate() {
-                        at[i] = j;
-                    }
-                    at.iter().map(|&j| t[j].0.clone()).collect()
-                })
-                .collect();
+            let serial = Serial::new(&case, &phases);
             for _ in 0..60 {
-                let got: Vec<Out> = run_two(&case, &phases, frames, bytes)
-                    .into_iter()
-                    .map(|(out, _)| out)
-                    .collect();
-                assert!(orders.contains(&got), "{seed:#x}: {got:?} is no order's");
+                serial.differential(&label, frames, bytes, &|_| {});
             }
         });
     }

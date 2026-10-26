@@ -887,6 +887,50 @@ fn walked_dep_panic_reaches_the_rerun_that_reads_it<C: Cells>() {
     assert_no_notes();
 }
 
+/// A dep the walk cleans panics and the rerun no longer reads it, so the
+/// payload its ticket holds is owed to no read; the set that flips the dep
+/// Dirty again drops it. Over many such revisions at most one is held.
+fn unread_walked_dep_payload_is_dropped_by_its_next_flip<C: Cells>() {
+    quiet_ticket_booms();
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v % 2 == 1, "ticket boom");
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(f) } else { 0 });
+    for k in 0..test_size(10_000) as i64 {
+        rt.set(j, 2 * k + 1);
+        assert_eq!(rt.contained_payloads(), 0, "revision pair {k}");
+        rt.set(sel, 0);
+        assert_eq!(rt.get(x), 2 * k + 1);
+        assert_eq!(rt.contained_payloads(), 0, "revision pair {k}");
+
+        rt.set(j, 2 * k + 2);
+        rt.set(sel, 1);
+        assert_eq!(rt.get(x), 0);
+        assert_eq!(rt.contained_payloads(), 1, "revision pair {k}");
+    }
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err();
+    assert_eq!(panic_message(err), "ticket boom");
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_no_notes();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_unread_walked_dep_payload_is_dropped_by_its_next_flip() {
+    unread_walked_dep_payload_is_dropped_by_its_next_flip::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unread_walked_dep_payload_is_dropped_by_its_next_flip() {
+    unread_walked_dep_payload_is_dropped_by_its_next_flip::<Shared>();
+}
+
 /// No unwind is in flight, so this thread keeps no landing for one.
 fn assert_no_notes() {
     assert_eq!(value_code::thread_word() & value_code::NOTES_BIT, 0);
