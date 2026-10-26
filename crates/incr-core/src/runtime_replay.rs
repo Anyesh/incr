@@ -4347,21 +4347,17 @@ impl<C: Cells> Runtime<C> {
         let mut open = Vec::new();
         let mut i = top;
         let mut path = loop {
-            let (ctl, cidx, extends) = self.dep_stack.with(|s| {
-                let f = &s.frames[i];
-                let below = i.checked_sub(1).map(|b| &s.frames[b]);
-                (
-                    f.ctl,
-                    f.cidx,
-                    below.is_some_and(|b| self.extends_below(b, f.cidx)),
-                )
-            });
+            let (ctl, cidx) = self.dep_stack.with(|s| (s.frames[i].ctl, s.frames[i].cidx));
             // SAFETY: the frame is on the stack, so its control block is
             // live (see `Frame::ctl`).
             let ctl = unsafe { &*ctl };
             if let Some(path) = ctl.kept_path() {
                 break path;
             }
+            let extends = self.dep_stack.with(|s| {
+                let below = i.checked_sub(1).map(|b| &s.frames[b]);
+                below.is_some_and(|b| self.extends_below(b, cidx))
+            });
             if !extends {
                 let path = self.path_at(cidx);
                 ctl.keep_path(path);
