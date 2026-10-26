@@ -779,10 +779,8 @@ impl Walk {
         self.work = grown;
     }
 
-    /// Pushes the pending entry of `id`. False if the switch to exact mode
-    /// dropped it, in which case the caller expands nothing.
     #[inline]
-    fn visit(&mut self, id: NodeId, generation: u32, new: bool) -> bool {
+    fn visit(&mut self, id: NodeId, generation: u32, new: bool) {
         self.push(Entry {
             id,
             taint: if new { NO_TAINT_NEW } else { NO_TAINT },
@@ -790,25 +788,19 @@ impl Walk {
         });
         self.first_visits += 1;
         if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
-            return self.visit_exact(id);
+            self.visit_exact(id);
         }
-        true
     }
 
     #[cold]
     #[inline(never)]
-    fn visit_exact(&mut self, id: NodeId) -> bool {
+    fn visit_exact(&mut self, id: NodeId) {
         match &mut self.visited {
             Some(visited) => {
                 visited.insert(id);
-                true
             }
             None => {
-                // This visit goes too if it lies in a repeat's subtree, as
-                // in exact mode from the start, so where the walk enters a
-                // cycle of recorded deps does not depend on the visit count.
-                let len = self.work.len();
-                self.drop_repeats(len);
+                self.drop_repeats(self.work.len() - 1);
                 self.visited = Some(
                     self.work
                         .iter()
@@ -816,17 +808,7 @@ impl Walk {
                         .map(|e| e.id)
                         .collect(),
                 );
-                self.work.len() == len
             }
-        }
-    }
-
-    /// Forgets the New expansion of `id` whose visit the switch dropped.
-    #[cold]
-    #[inline(never)]
-    fn unexpand_new(&mut self, id: NodeId) {
-        if let Some(expanded) = &mut self.expanded {
-            expanded.new.remove(&id);
         }
     }
 
@@ -918,6 +900,18 @@ impl Walk {
         if !gone.is_empty() {
             self.forget(|id| gone.contains(id));
         }
+    }
+
+    /// Plans afresh from the root, whose claim the walk waited out, as the
+    /// read would after the other thread's landing: where the walk enters a
+    /// cycle of recorded deps depends on its visit count at the switch to
+    /// exact mode.
+    #[cold]
+    #[inline(never)]
+    fn restart(&mut self) {
+        self.first_visits = 0;
+        self.visited = None;
+        self.expanded = None;
     }
 
     /// Visits `id` again as a walk that never met it would, past a first
@@ -3635,6 +3629,9 @@ impl<C: Cells> Runtime<C> {
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
+                    if is_root {
+                        walk.restart();
+                    }
                     walk.revisit(cur, generation);
                     continue;
                 }
@@ -3751,10 +3748,7 @@ impl<C: Cells> Runtime<C> {
                 // A Failed entry's compute does nothing and a Failed root's
                 // raises, so neither needs its deps cleaned first.
                 NodeState::Failed if !is_root => continue,
-                // The root's entry is the only one, so no switch drops it.
-                NodeState::Failed => {
-                    walk.visit(cur, generation, false);
-                }
+                NodeState::Failed => walk.visit(cur, generation, false),
                 // A memo stands for the node's run in this revision, so its
                 // deps are not expanded; the root's compute reads it.
                 NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
@@ -3844,15 +3838,10 @@ impl<C: Cells> Runtime<C> {
                         // would enter its cycle where its own run does not.
                         kept = self.released_kept(cur, node);
                     }
-                    if !walk.visit(cur, generation, observed == NodeState::New) {
-                        if observed == NodeState::New {
-                            walk.unexpand_new(cur);
-                        }
-                        continue;
-                    }
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    walk.visit(cur, generation, observed == NodeState::New);
                     let kept = kept.map_or(usize::MAX, |k| k as usize);
                     if let Some(deps) = node.inline_deps() {
                         for dep in deps.take(kept) {
@@ -4031,15 +4020,10 @@ impl<C: Cells> Runtime<C> {
             return true;
         }
         groups.push(group.clone());
-        if !walk.visit(cur, generation, false) {
-            if let Some(expanded) = &mut walk.expanded {
-                expanded.groups.pop();
-            }
-            return true;
-        }
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        walk.visit(cur, generation, false);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group

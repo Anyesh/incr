@@ -698,8 +698,8 @@ struct Eval {
     returned: Vec<(usize, u64)>,
     /// The reads, by index, whose target was an open run on this thread.
     closing: Vec<usize>,
-    /// Whether the run ended in a doomed frame, which read a placeholder,
-    /// lands nothing and runs again.
+    /// Whether the run's frame was doomed (it or a frame it ran under read
+    /// a placeholder), so it lands nothing and runs again.
     doomed: bool,
 }
 
@@ -4260,6 +4260,21 @@ fn two_thread_contained_cycle_landing_seeds() {
     });
 }
 
+/// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry
+/// (f2ad3443), op 7's read came out as no order's in 80 of 80 runs on
+/// 562ebeed; a cycle that reaches its reader, as on main, gives every
+/// order.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_contained_cycle_read_seeds() {
+    let case = gen_case(0x3a96, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x3a96);
+        }
+    });
+}
+
 /// 0xad crossed: op 16's read of 1 waited on op 15's claim of it, and the
 /// revisit of 1 counted one more walk visit than the unbounded walk makes,
 /// so its walk entered the cycle {4, 5} of recorded deps at the member
@@ -6895,10 +6910,12 @@ fn high_range_clean_read_delivery_seeds() {
 /// cycle, op 1 the read with node 4, which op 0 left Failed, held failing.
 /// With every query replayable a bounded run closes op 3's cycle as the
 /// unbounded run does, and the split moves to op 4, whose bounded read
-/// gives the fresh Value(9999).
+/// gives the fresh Value(9999); main still splits op 3 in that mode, so
+/// op 4's split is this engine's, accepted under the same known
+/// limitation by the integrator's ruling of 26 Oct.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn stale_dep_split_seed_splits_as_on_main() {
+fn stale_dep_split_seed_keeps_its_known_split() {
     let case = gen_case(0x92_b175_80fc, false, false);
     let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
     let cycle = || Out::Panic("cycle".to_owned());
