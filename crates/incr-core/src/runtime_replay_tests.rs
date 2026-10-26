@@ -246,10 +246,7 @@ fn wide_node_runs_twice<C: Cells>(rt: &Runtime<C>) {
         replayable(),
     );
     assert_eq!(rt.get(wide), (0..64).sum::<u64>());
-    // A Shared doomed frame raises its discard at its next read past the
-    // placeholder, so it dooms once per leaf instead of pushing the rest.
-    let want = if C::SINGLE_THREADED { 2 } else { 65 };
-    assert_eq!(runs.load(SeqCst), want);
+    assert_eq!(runs.load(SeqCst), 2);
 }
 local_and_shared!(
     wide_node_runs_twice,
@@ -828,10 +825,7 @@ fn shared_speculative_compute_leaves_new() {
 fn speculative_native_runs_once_per_revision<C: Cells>(rt: &Runtime<C>) {
     let s = side_read(rt, false);
     assert_eq!(rt.get(s.r), 5);
-    // A Shared doomed frame raises its discard at its next read
-    // after b's placeholder, so no speculative run computes `c`.
-    let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
-    assert_eq!(s.runs.load(SeqCst), speculative);
+    assert_eq!(s.runs.load(SeqCst), 1);
     assert_eq!(rt.get(s.c), 11);
     assert_eq!(s.runs.load(SeqCst), 1, "c ran twice in one revision");
     rt.set(s.input, 2);
@@ -1084,21 +1078,10 @@ fn failed_nested_adoption_keeps_the_tried_mark<C: Cells>(rt: &Runtime<C>) {
         replayable(),
     );
     assert_eq!(rt.get(r), 5);
-    // A Shared doomed frame raises its discard at its next read
-    // after b's placeholder, so no speculative run computes `p`
-    // and nothing is stashed.
-    let local = C::SINGLE_THREADED;
-    assert_eq!(
-        C::u32_load_relaxed(&rt.stash_count),
-        if local { 2 } else { 0 }
-    );
+    assert_eq!(C::u32_load_relaxed(&rt.stash_count), 2);
     assert_eq!(rt.try_delete_node(d), Ok(()));
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err());
-    assert_eq!(
-        C::u32_load_relaxed(&rt.stash_count),
-        if local { 1 } else { 0 },
-        "n lost its mark"
-    );
+    assert_eq!(C::u32_load_relaxed(&rt.stash_count), 1, "n lost its mark");
 }
 
 #[test]
@@ -1146,10 +1129,7 @@ fn speculative_panic_is_raised_once<C: Cells>(replay: bool) {
         replayable(),
     );
     assert_eq!(rt.get(r), 5);
-    // A Shared doomed frame raises its discard at its next read
-    // after b's placeholder, so no speculative run computes `c`.
-    let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
-    assert_eq!(runs.load(SeqCst), speculative);
+    assert_eq!(runs.load(SeqCst), 1);
     assert_eq!(rt.state_of(c), NodeState::New);
     let payload = catch_unwind(AssertUnwindSafe(|| rt.get(c))).expect_err("c panics");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"c boom"));
@@ -1243,9 +1223,9 @@ fn adopted_write_panic_lands_failed<C: Cells>(replay: bool) {
     assert_eq!(rt.get(x).v, 1);
     rt.set(input, 2);
     assert_eq!(rt.get(r), 5);
-    // A Shared doomed frame raises its discard at its next read
-    // after b's placeholder, so no speculative run recomputes `x`
-    // and the real claim runs it.
+    // A Shared doomed frame raises its discard at a read that would
+    // compute, so no speculative run recomputes `x` and the real claim
+    // runs it.
     let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
     assert_eq!(runs.load(SeqCst), 1 + speculative);
     boom.store(true, SeqCst);
@@ -1324,15 +1304,13 @@ fn native_creator_runs_once_as_unbounded<C: Cells>() {
             "(c, c's runs, node count) at budget 1 vs unbounded, panics {panics}"
         );
         // The unbounded run never reaches `c`; one run ahead of need is
-        // the bound. A Shared doomed frame raises its discard at its next
-        // read after b's placeholder, so it never runs `c` ahead of need.
+        // the bound.
         let (v, runs, nodes) = native_creator_runs_once::<C>(1, false, panics);
         let (_, unbounded_runs, unbounded_nodes) =
             native_creator_runs_once::<C>(u32::MAX, false, panics);
-        let ahead = u32::from(C::SINGLE_THREADED);
         assert_eq!(
             (v, runs, nodes),
-            (None, unbounded_runs + ahead, unbounded_nodes),
+            (None, unbounded_runs + 1, unbounded_nodes),
             "(c, c's runs, node count) at budget 1, no adoption, panics {panics}"
         );
     }
@@ -1470,8 +1448,8 @@ fn doomed_value_drops<C: Cells>(frames: u32) -> (u32, u32, bool) {
 /// reaches no read.
 fn replay_builds_and_drops<C: Cells>() {
     // A Shared doomed frame runs on past its placeholder and builds its
-    // value, but its next read raises the discard, so no speculative run
-    // follows it.
+    // value, but raises its discard at a read that would compute, so no
+    // speculative run follows it.
     let speculative = |n: u32| if C::SINGLE_THREADED { n } else { 0 };
     assert_eq!(doomed_value_drops::<C>(u32::MAX), (2, 0, false));
     assert_eq!(doomed_value_drops::<C>(1), (3, 1, false));
@@ -1543,8 +1521,10 @@ fn local_dropped_creator_stash_discards_its_child() {
     dropped_creator_stash_discards_its_child::<Local>();
 }
 
-// No Shared variant: a Shared doomed frame raises its discard at its next
-// read past the placeholder, so c's speculative run is never made.
+#[test]
+fn shared_dropped_creator_stash_discards_its_child() {
+    dropped_creator_stash_discards_its_child::<Shared>();
+}
 
 /// How the speculative run of `c` in [`native_rerun_exception`] reads
 /// `p`, a query that panics.
@@ -1615,9 +1595,7 @@ fn native_rerun_exceptions<C: Cells>() {
         RerunShape::DroppedChain,
     ] {
         let (v, runs) = native_rerun_exception::<C>(u32::MAX, shape);
-        // A Shared doomed frame raises its discard at its next read
-        // after b's placeholder, so only the real read runs `c`.
-        let rerun = u32::from(C::SINGLE_THREADED && shape != RerunShape::Doomed);
+        let rerun = u32::from(shape != RerunShape::Doomed);
         assert_eq!(
             native_rerun_exception::<C>(1, shape),
             (v, runs + rerun),
@@ -1684,8 +1662,11 @@ fn local_unadopted_stash_is_freed() {
     unadopted_stash_is_freed::<Local>(false);
 }
 
-// No Shared variant: a Shared doomed frame raises its discard at its next
-// read after b's placeholder, so c is never stashed.
+#[test]
+fn shared_unadopted_stash_is_freed() {
+    unadopted_stash_is_freed::<Shared>(true);
+    unadopted_stash_is_freed::<Shared>(false);
+}
 
 /// `r`'s read of `q` dooms at budget 1, so its doomed run reads `q`'s
 /// placeholder 0 and goes on to `c`, a Native node that panics if it sees

@@ -407,6 +407,12 @@ fn virtual_hit_then_panic_in_a_speculative_entry<C: Cells>() {
         matches!(s_state, NodeState::New | NodeState::Dirty),
         "S is {s_state:?} after the swallow"
     );
+    for state in &bounded.states[1..] {
+        assert!(
+            matches!(state, NodeState::New | NodeState::Dirty),
+            "a speculative node is {state:?}"
+        );
+    }
 }
 local_and_shared!(
     virtual_hit_then_panic_in_a_speculative_entry,
@@ -1393,12 +1399,12 @@ where
     let (rt, value, bounded_created, minted) = run(Some(1));
     assert_eq!(value, unbounded);
     assert_eq!(bounded_created, created, "the doomed run creates nothing");
-    let (base, real, _) = minted[minted.len() - 1];
-    assert_eq!(base, 100);
-    assert!(real.iter().all(|&h| rt.is_alive(h)), "{minted:?}");
     let (base, doomed, got) = minted[0];
     assert_eq!((base, got), (0, 0), "pending handles read the placeholder");
     assert!(doomed.iter().all(|&h| h == doomed[0] && !rt.is_alive(h)));
+    let (base, real, _) = minted[minted.len() - 1];
+    assert_eq!(base, 100);
+    assert!(real.iter().all(|&h| rt.is_alive(h)), "{minted:?}");
     let text = match catch_unwind(AssertUnwindSafe(|| rt.get(doomed[0]))) {
         Ok(v) => panic!("an escaped pending handle read {v}"),
         Err(p) => message(p),
