@@ -542,11 +542,7 @@ impl<C: Cells> Runtime<C> {
         });
         holds.extend(also.map(|x| (self.runtime_id, x.0)));
         holds.extend(cycle_state::held_keys());
-        holds.extend(
-            hold::keys(self.runtime_id)
-                .into_iter()
-                .map(|s| (self.runtime_id, s)),
-        );
+        holds.extend(hold::claims());
         holds.extend(set_stack::claims());
         holds.extend(
             reserve::held()

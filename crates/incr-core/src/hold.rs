@@ -359,7 +359,17 @@ pub(crate) fn note_episode(rt: RuntimeId) {
     });
 }
 
-/// The slots `rt`'s held landings occupy, for the waits registry.
+/// Every held landing, of every runtime, for the waits registry: a thread
+/// waiting in one runtime may hold another's landings that its owner
+/// waits on.
+pub(crate) fn claims() -> Vec<(RuntimeId, u32)> {
+    if !active() {
+        return Vec::new();
+    }
+    with(|h| h.entries.iter().flatten().map(|e| (e.rt, e.slot)).collect())
+}
+
+/// The slots `rt`'s held landings occupy.
 pub(crate) fn keys(rt: RuntimeId) -> Vec<u32> {
     if !active() {
         return Vec::new();
