@@ -1872,6 +1872,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn stale_handle<T: Value>(&self, handle: Incr<T>) -> ! {
+        self.dep_stack.stale_read();
         panic!(
             "incr-core: stale Incr<{}> handle: the node at slot {} was deleted (handle \
              generation {}, slot generation {})",
@@ -4679,7 +4680,7 @@ impl<C: Cells> Runtime<C> {
                         if ctl.has(cycle::DOOMED) {
                             return self.discard_doomed(id, attempt, &ctl, None, bag);
                         }
-                        if !ctl.has(cycle::LOW) {
+                        if ctl.flags.get() & cycle::UNSTASHED == 0 {
                             return self.stash_speculative(id, g, attempt, &ctl, deps, bag);
                         }
                         match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
