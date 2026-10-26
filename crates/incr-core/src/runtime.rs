@@ -4564,11 +4564,17 @@ impl<C: Cells> Runtime<C> {
                 // runtime's, and the Failed transition plus the frame pop
                 // below restore every invariant the unwind could have
                 // interrupted; no lock is held while user code runs.
+                let speculative_keep;
                 let ctl = ComputeCtl::resolved_by(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
                         | if speculative { cycle::SPECULATIVE } else { 0 },
-                    self.keep_resolver_ptr(),
+                    if speculative {
+                        speculative_keep = self.speculative_keep();
+                        std::ptr::from_ref(&speculative_keep).cast()
+                    } else {
+                        self.keep_resolver_ptr()
+                    },
                 );
                 self.rerun_hold(id, node, &ctl);
                 let _kept = (!C::SINGLE_THREADED).then_some(hold::KeptGuard(&ctl));

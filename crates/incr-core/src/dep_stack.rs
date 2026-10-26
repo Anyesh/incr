@@ -387,9 +387,9 @@ pub trait DepStack: sealed::Sealed + 'static {
     /// The top frame's runtime, control block and position, when it is
     /// another runtime's than `rt` and keeps `rt`'s Clean reads (see
     /// [`FrameRt`]). A frame still untested is settled here,
-    /// by its runtime, once. Another runtime's frame that does not keep
-    /// them reads `rt` unrecorded, so a `SPECULATIVE` one is marked
-    /// `KEPT_UNCHECKED`: its stash could not see `rt` change.
+    /// by its runtime, once: a `SPECULATIVE` frame that settles keeping
+    /// none reads `rt` unrecorded, so its resolver marks it
+    /// `KEPT_UNCHECKED`.
     fn foreign_keeper(&self, rt: RuntimeId) -> Option<(RuntimeId, *const ComputeCtl, u32)> {
         let (tagged, node, ctl, cidx) = self.with(|s| {
             s.frames
@@ -399,14 +399,8 @@ pub trait DepStack: sealed::Sealed + 'static {
         })?;
         // SAFETY: the frame is on the stack, so it is running and its
         // control block is live.
-        let control = unsafe { &*ctl };
-        if self.top_keeps_foreign(tagged, node, control) {
-            return Some((tagged.rt(), ctl, cidx));
-        }
-        if control.has(SPECULATIVE) {
-            control.raise(KEPT_UNCHECKED);
-        }
-        None
+        self.top_keeps_foreign(tagged, node, unsafe { &*ctl })
+            .then(|| (tagged.rt(), ctl, cidx))
     }
 
     /// Whether the top frame, read as `tagged`, `node` and `ctl`, keeps
