@@ -1655,11 +1655,12 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Gate) {
 
 /// The episode that `x`'s read of `a` runs, as that read's walk root,
 /// lands `a` Dirty with the memo `b`'s caught panic keeps for the
-/// revision. Until the read has taken the value, another thread's read of
-/// `a` takes that memo and runs nothing, so it cannot reland `a` under the
-/// read (seed 0x74f's race needs a rerun of `a` that the memo excludes).
+/// revision, and holds the landing until the read ends, so another
+/// thread's read of `a` waits instead of claiming it under the read (seed
+/// 0x74f's race). Once the read has published, that read takes the memo
+/// and runs nothing.
 #[test]
-fn reader_of_group_episode_root_shares_its_memo_until_the_read_takes_the_value() {
+fn reader_of_group_episode_root_holds_it_then_shares_its_memo() {
     let rt = Arc::new(Rt::new());
     let (x, a, t, in_a) = poisoned_episode(&rt);
     rt.get(x);
@@ -1672,12 +1673,19 @@ fn reader_of_group_episode_root_shares_its_memo_until_the_read_takes_the_value()
         thread::spawn(move || rt.get(x))
     };
     walked.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    assert_eq!(rt.state_of(a), NodeState::Computing);
     in_a.arm();
     let claimer = {
         let rt = Arc::clone(&rt);
         thread::spawn(move || rt.get(a))
     };
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !claimer.is_finished(),
+        "the claimer read `a` while the read held it"
+    );
+    walked.release();
+    let x_value = reader.join().unwrap();
     let deadline = std::time::Instant::now() + PARK_TIMEOUT;
     while !claimer.is_finished() && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1));
@@ -1685,11 +1693,8 @@ fn reader_of_group_episode_root_shares_its_memo_until_the_read_takes_the_value()
     let ran = in_a.0.reached_rx.lock().unwrap().try_recv().is_ok();
     // A release sent ahead lets a later armed park of `a` pass at once.
     in_a.release();
-    assert!(!ran, "the claimer ran `a` under the read");
-    assert!(claimer.is_finished(), "the claimer waited on the read");
-    let a_value = claimer.join().unwrap();
-    walked.release();
-    assert_eq!(reader.join().unwrap(), a_value + 101);
+    assert!(!ran, "the claimer ran `a` after the read");
+    assert_eq!(x_value, claimer.join().unwrap() + 101);
     rt.assert_invariant_i();
 }
 
