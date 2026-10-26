@@ -4203,6 +4203,41 @@ fn two_thread_wait_ended_new_seeds() {
     });
 }
 
+/// 0x617e in the order with op 14 before op 13, one thread at a time, each
+/// op on its thread in the case: thread 0 lands episodes before thread 1's
+/// op 16 `Get(1)`, whose walk a doom stops and its retry resumes. The
+/// resumed walk must re-plan only for episodes landed since its plan;
+/// re-planning for thread 0's older ones skipped entry 23 (spec 2), which
+/// then recorded deps [22, 0] where the unbounded run records [22, 0, 22].
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_resumed_walk_replans_for_episodes_since_its_plan_seed() {
+    let seed = 0x617e;
+    let case = gen_case(seed, true, true);
+    let phases = phases(&case, seed);
+    let order = Order::new(&case, &phases, 0b10000);
+    assert_eq!(order.of[13..15], [14, 13]);
+    assert!(matches!(order.case.ops[16], Op::Get(1)));
+    let thread_of = |op: usize| {
+        phases
+            .iter()
+            .find_map(|p| match *p {
+                Phase::Mutate(i, t) => (i == op).then_some(t),
+                Phase::Read(reads) => (0..2).find(|&t| reads[t] == Some(op)),
+            })
+            .expect("every op is in a phase")
+    };
+    let one_at_a_time: Vec<Phase> = (0..order.case.ops.len())
+        .map(|k| Phase::Mutate(k, thread_of(order.of[k])))
+        .collect();
+    quiet(|| {
+        for (frames, bytes) in [(Some(1), 0), (None, 16 * 1024), (Some(1), 16 * 1024)] {
+            let label = format!("seed {seed:#x} op 14 first, one thread at a time, budget {frames:?} frames, {bytes} bytes");
+            Serial::new(&order.case, &one_at_a_time).differential(&label, frames, bytes, &|_| {});
+        }
+    });
+}
+
 /// 0x9a7d at budget 2: op 0 recorded the cycle group {8, 9, 19, 24} where
 /// the unbounded run records {9, 19, 24}, and phase 6's read of 16 walked
 /// that group and cleaned 1, 2 and 23, which the unbounded run leaves
