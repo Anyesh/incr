@@ -3734,46 +3734,28 @@ impl<C: Cells> Runtime<C> {
             let ran = {
                 let _speculating = entry.spec.then(replay::Speculating::enter);
                 catch_unwind(AssertUnwindSafe(|| {
-                    if level == 0 {
+                    let id = NodeId(entry.node);
+                    let visit = match entry.retry {
                         // The target is the walk entry whose compute was
                         // discarded, and the walk has cleaned its deps, so
                         // it computes as that entry would, not as a new
                         // walk's root.
-                        let visit = if entry.retry == Retry::Direct {
-                            Visit::Direct
-                        } else {
-                            visit
-                        };
-                        self.compute_one::<VIRT>(
-                            NodeId(entry.node),
-                            visit,
-                            Some(entry.generation),
-                            entry.walked,
-                            None,
-                            Seen::Unwalked,
-                        )
-                    } else {
-                        let (id, generation) = (NodeId(entry.node), Some(entry.generation));
-                        match entry.retry {
-                            Retry::Walk => self.ensure_clean_virt(id, entry.generation),
-                            Retry::Compute => self.compute_one::<VIRT>(
-                                id,
-                                Visit::Full,
-                                generation,
-                                entry.walked,
-                                None,
-                                Seen::Unwalked,
-                            ),
-                            Retry::Direct => self.compute_one::<VIRT>(
-                                id,
-                                Visit::Direct,
-                                generation,
-                                entry.walked,
-                                None,
-                                Seen::Unwalked,
-                            ),
-                        }
-                    }
+                        Retry::Walk | Retry::Compute if level == 0 => visit,
+                        Retry::Walk => return self.ensure_clean_virt(id, entry.generation),
+                        Retry::Compute => Visit::Full,
+                        Retry::Direct => Visit::Direct,
+                    };
+                    // One call site, so the compute inlines once into this
+                    // frame, which every panic of a replayed run unwinds
+                    // through.
+                    self.compute_one::<VIRT>(
+                        id,
+                        visit,
+                        Some(entry.generation),
+                        entry.walked,
+                        None,
+                        Seen::Unwalked,
+                    )
                 }))
             };
             self.dep_stack.restore_placement(placement);
