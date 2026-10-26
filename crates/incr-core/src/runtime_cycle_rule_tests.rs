@@ -1695,9 +1695,10 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
 /// doomed by a read past the budget. The retry takes the caught cycle the
 /// first read kept instead of computing c again, so c runs as often as in
 /// the unbounded run. The same holds when c catches the cycle and panics
-/// on its own, which unwinds with the cycle's kind.
+/// on its own, which unwinds with the cycle's kind, and when the reader
+/// reads c by `try_get`.
 fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
-    let run = |frames: u32, own_panic: bool| {
+    let run = |frames: u32, own_panic: bool, try_get: bool| {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_max_frames(frames);
@@ -1722,7 +1723,14 @@ fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
             let r2 = OtherRt(&*r2);
             r1.create_query_with(
                 move |rt| {
-                    catch_unwind(AssertUnwindSafe(|| r2.get(c))).unwrap_or(9999) + rt.get(dep)
+                    let read = || {
+                        if try_get {
+                            r2.try_get(c).unwrap_or(9999)
+                        } else {
+                            r2.get(c)
+                        }
+                    };
+                    catch_unwind(AssertUnwindSafe(read)).unwrap_or(9999) + rt.get(dep)
                 },
                 QueryOpts {
                     replay: Replay::Allowed,
@@ -1734,14 +1742,11 @@ fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
         let doomed = !r1.dooms.lock().unwrap().is_empty();
         (value, runs.load(Ordering::Relaxed), doomed)
     };
-    for own_panic in [false, true] {
-        let (value, runs, doomed) = run(u32::MAX, own_panic);
-        assert_eq!((value, doomed), (10000, false), "own panic {own_panic}");
-        assert_eq!(
-            run(1, own_panic),
-            (value, runs, true),
-            "own panic {own_panic}"
-        );
+    for (own_panic, try_get) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("own panic {own_panic}, try_get {try_get}");
+        let (value, runs, doomed) = run(u32::MAX, own_panic, try_get);
+        assert_eq!((value, doomed), (10000, false), "{case}");
+        assert_eq!(run(1, own_panic, try_get), (value, runs, true), "{case}");
     }
 }
 
