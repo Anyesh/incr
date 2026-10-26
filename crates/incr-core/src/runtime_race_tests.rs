@@ -2473,6 +2473,69 @@ fn a_recompute_leaves_the_episode_log_empty() {
     assert_eq!(rt.episode_log.read().len(), 0);
 }
 
+/// A replan waits on a pending entry's claim only while another thread's
+/// episode with it is publishing. Here the episode ends while a later
+/// compute of the same node holds its claim in user code: the wait must
+/// end with the publication, not with that compute.
+#[test]
+fn a_replan_stops_waiting_when_the_publication_ends() {
+    let rt = Arc::new(Rt::new());
+    let (entered_tx, entered) = mpsc::channel::<()>();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let e = rt.create_query(move |_: &Rt| {
+        entered_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+        1_u64
+    });
+    let holder = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(e))
+    };
+    entered.recv().unwrap();
+
+    let (end_tx, end_rx) = mpsc::channel::<()>();
+    let (marked_tx, marked) = mpsc::channel::<()>();
+    let publisher = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            {
+                let mut log = rt.episode_log.write();
+                log.push(false, 1, [id(e).0]);
+                log.publish(1);
+            }
+            marked_tx.send(()).unwrap();
+            end_rx.recv().unwrap();
+            rt.episode_log.write().published(1);
+        })
+    };
+    marked.recv().unwrap();
+
+    let (done_tx, done) = mpsc::channel::<()>();
+    let waiter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            let mut walk = Walk::new(id(e), 0, NodeState::Dirty);
+            walk.push(Entry {
+                id: id(e),
+                taint: NO_TAINT,
+                generation: 0,
+            });
+            let landed = [id(e).0].into_iter().collect();
+            rt.wait_for_landings(&walk, &landed);
+            done_tx.send(()).unwrap();
+        })
+    };
+    assert!(done.recv_timeout(Duration::from_millis(200)).is_err());
+    end_tx.send(()).unwrap();
+    publisher.join().unwrap();
+    let ended = done.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    assert_eq!(holder.join().unwrap(), 1);
+    waiter.join().unwrap();
+    assert!(ended.is_ok(), "the wait outlasted the publication");
+}
+
 #[test]
 fn a_plan_is_reached_only_through_the_nodes_it_met() {
     let entry = |id, taint| Entry {
