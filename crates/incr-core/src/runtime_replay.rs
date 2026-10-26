@@ -2739,7 +2739,17 @@ impl<C: Cells> Runtime<C> {
                 payload: Box::new(cycle::CycleUnwind(c.clone())),
                 nodes: replay::Landings::default(),
             }),
-            // An engine unwind, a wound, leaves the reader's run too.
+            // A cycle `get` raised, which the reader may catch.
+            Err(payload) if cycle_state::unwind_kind() == Some(UnwindKind::Cycle) => payload
+                .downcast_ref::<cycle::CycleUnwind>()
+                .map(|c| Delivered::Unwind {
+                    cycle: true,
+                    poison: 0,
+                    attributed: false,
+                    payload: Box::new(cycle::CycleUnwind(c.0.clone())),
+                    nodes: replay::Landings::default(),
+                }),
+            // A wound or a discard leaves the reader's run too.
             Err(_) if cycle_state::unwind_kind().is_some() => None,
             Err(payload) => {
                 let copy = replay::copy_payload(&**payload);
