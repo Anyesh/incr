@@ -318,9 +318,9 @@ fn shared_held_publication_panic_rereads_over_a_given_back_landing() {
     );
 }
 
-/// g reads x while t is 1 and p otherwise; p (Fallback) reads g. Once t is
-/// 2 the two form a cycle that lands p, created first, before g, and g's
-/// dep list before it read p was t and x.
+/// g (Fallback) reads x while t is 1 and p otherwise; p reads g. Once t is
+/// 2 a read of g forms a cycle that lands p, created first, before g, and
+/// g's dep list before it read p was t and x.
 struct Formed {
     t: Incr<i64>,
     p: Incr<i64>,
@@ -333,14 +333,17 @@ fn formed_cycle<C: Cells>(rt: &Runtime<C>) -> Formed {
     let gc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
     let p = {
         let gc = gc.clone();
-        rt.create_query_with_fallback(move |rt| rt.get(*gc.get().unwrap()), |_c: &Cycle| 100)
+        rt.create_query(move |rt| rt.get(*gc.get().unwrap()))
     };
-    let g = rt.create_query(move |rt| if rt.get(t) == 1 { rt.get(x) } else { rt.get(p) });
+    let g = rt.create_query_with_fallback(
+        move |rt| if rt.get(t) == 1 { rt.get(x) } else { rt.get(p) },
+        |_c: &Cycle| 100,
+    );
     gc.set(g).unwrap();
     Formed { t, p, g }
 }
 
-/// Reads `f.p` at t = 2, its publication panicking right after p lands, so
+/// Reads `f.g` at t = 2, its publication panicking right after p lands, so
 /// g goes back to x's value with its held `changed_at`.
 fn panic_after_p(
     rt: &Runtime<Shared>,
