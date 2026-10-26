@@ -3903,8 +3903,9 @@ fn a_superseded_landing_keeps_the_next_runs_failed_record() {
     );
 }
 
-/// x's run on thread A, from the walk of A's read of p, panics after a set
-/// flagged it, so its Failed landing lands Dirty and A's claim goes; thread
+/// x's run on thread A, from the walk of A's read of p, panics, and a set
+/// flags x as A publishes the held Failed landing, so it lands Dirty and
+/// A's claim goes (a set during the run would have A rerun x); thread
 /// B then runs x, which panics with `Custom(12)` and lands Failed with its
 /// own record. A's landing, forgetting the record it wrote, must not
 /// forget B's.
@@ -3913,26 +3914,24 @@ fn a_flagged_failed_landing_keeps_the_next_runs_record() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(3);
-    let in_x = Gate::new();
+    let publishing = Gate::new();
     let landed = Gate::new();
     let i = rt.create_input(0_u64);
-    let x_gate = in_x.clone();
     let x = rt.create_query_with(
         move |rt: &Rt| -> u64 {
             let v = rt.get(i);
             if v == 0 {
                 return 0;
             }
-            if v == 1 {
-                x_gate.park();
-            }
             std::panic::panic_any(Custom(v + 10))
         },
         replayable(),
     );
-    let at_landing = landed.clone();
+    let (at_publish, at_landing) = (publishing.clone(), landed.clone());
     let installed = rt.park_hook.set(Box::new(move |point| {
-        if point == ParkPoint::FailedLandedOtherwise(id(x)) {
+        if point == ParkPoint::HeldLanding(id(x)) {
+            at_publish.park();
+        } else if point == ParkPoint::FailedLandedOtherwise(id(x)) {
             at_landing.park();
         }
     }));
@@ -3940,15 +3939,15 @@ fn a_flagged_failed_landing_keeps_the_next_runs_record() {
     let p = rt.create_query_with(move |rt: &Rt| rt.get(x), replayable());
     assert_eq!(rt.get(p), 0);
     rt.set(i, 1);
-    in_x.arm();
+    publishing.arm();
     landed.arm();
     let a = {
         let rt = Arc::clone(&rt);
         spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err())
     };
-    in_x.wait_parked();
+    publishing.wait_parked();
     rt.set(i, 2);
-    in_x.release();
+    publishing.release();
     landed.wait_parked();
     let a_record = rt.failed_run_token(id(x).0, x.generation());
     let b = {
