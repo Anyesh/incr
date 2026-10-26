@@ -871,14 +871,14 @@ impl Walk {
             .insert(id)
     }
 
-    /// The nodes whose states the plan has expanded through: its pending
-    /// entries, `cur`, and every member of a group it expanded whole. A
-    /// queued visit has not been expanded yet.
+    /// The nodes of the plan: its entries, `cur`, and every member of a
+    /// group it expanded whole. A queued visit counts: a release that lands
+    /// one unrun can leave the plan's other entries planned through it
+    /// (0x88c0's aborted episode).
     #[cold]
-    fn expanded_slots(&self, cur: NodeId) -> impl Iterator<Item = u32> + '_ {
+    fn plan_slots(&self, cur: NodeId) -> impl Iterator<Item = u32> + '_ {
         let groups = self.expanded.iter().flat_map(|x| &x.groups);
         (self.work.iter())
-            .filter(|e| e.is_pending())
             .map(|e| e.id.0)
             .chain([cur.0])
             .chain(groups.flat_map(|g| g.members.iter().map(|&(slot, _)| slot)))
@@ -4085,9 +4085,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn release_reached(&self, walk: &Walk, cur: NodeId, planned: Planned) -> bool {
         let since = (planned.all / RELEASED) as u32;
-        self.episode_log
-            .read()
-            .reached(since, walk.expanded_slots(cur))
+        self.episode_log.read().reached(since, walk.plan_slots(cur))
     }
 
     /// After a claim CAS of `id` at `generation` succeeded: whether another

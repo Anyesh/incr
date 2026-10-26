@@ -2537,7 +2537,7 @@ fn a_replan_stops_waiting_when_the_publication_ends() {
 }
 
 #[test]
-fn a_plan_is_reached_only_through_the_nodes_it_expanded() {
+fn a_plan_is_reached_through_its_entries_and_expanded_groups() {
     let entry = |id, taint| Entry {
         id: NodeId(id),
         taint,
@@ -2548,9 +2548,9 @@ fn a_plan_is_reached_only_through_the_nodes_it_expanded() {
     let mut walk = Walk::new(NodeId(0), 0, NodeState::Dirty);
     walk.push(entry(1, NO_TAINT));
     walk.push(entry(2, VISIT));
-    let mut slots: Vec<u32> = walk.expanded_slots(NodeId(3)).collect();
+    let mut slots: Vec<u32> = walk.plan_slots(NodeId(3)).collect();
     slots.sort_unstable();
-    assert_eq!(slots, [1, 3]);
+    assert_eq!(slots, [0, 1, 2, 3]);
     walk.expanded = Some(Box::new(Expanded {
         new: Default::default(),
         groups: vec![Arc::new(GroupInfo {
@@ -2558,9 +2558,9 @@ fn a_plan_is_reached_only_through_the_nodes_it_expanded() {
             cycle: crate::cycle::Cycle::new(vec![member]),
         })],
     }));
-    let mut slots: Vec<u32> = walk.expanded_slots(NodeId(3)).collect();
+    let mut slots: Vec<u32> = walk.plan_slots(NodeId(3)).collect();
     slots.sort_unstable();
-    assert_eq!(slots, [1, 3, 5, 6]);
+    assert_eq!(slots, [0, 1, 2, 3, 5, 6]);
 }
 
 /// r reads m, which reads a0..a3, which read x. In each plan of r another
