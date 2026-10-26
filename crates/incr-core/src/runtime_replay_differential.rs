@@ -698,9 +698,6 @@ struct Eval {
     returned: Vec<(usize, u64)>,
     /// The reads, by index, whose target was an open run on this thread.
     closing: Vec<usize>,
-    /// Whether the run's frame was doomed (it or a frame it ran under read
-    /// a placeholder), so it lands nothing and runs again.
-    doomed: bool,
 }
 
 thread_local! {
@@ -732,10 +729,10 @@ fn record<R>(f: impl FnOnce() -> R) -> (R, Vec<Eval>) {
 }
 
 /// A closure run, open while it runs if the thread records.
-struct Running<'a, C: Cells>(bool, &'a Runtime<C>);
+struct Running(bool);
 
-impl<'a, C: Cells> Running<'a, C> {
-    fn start(rt: &'a Runtime<C>, node: (usize, usize), first: bool) -> Self {
+impl Running {
+    fn start(node: (usize, usize), first: bool) -> Self {
         let on = EVALS.with(|e| e.borrow().is_some());
         if on {
             OPEN.with(|o| {
@@ -748,11 +745,10 @@ impl<'a, C: Cells> Running<'a, C> {
                     caught: Vec::new(),
                     returned: Vec::new(),
                     closing: Vec::new(),
-                    doomed: false,
                 })
             });
         }
-        Running(on, rt)
+        Running(on)
     }
 
     fn returned(&self, v: u64) {
@@ -762,7 +758,7 @@ impl<'a, C: Cells> Running<'a, C> {
     }
 }
 
-impl<C: Cells> Drop for Running<'_, C> {
+impl Drop for Running {
     fn drop(&mut self) {
         if !self.0 {
             return;
@@ -771,7 +767,6 @@ impl<C: Cells> Drop for Running<'_, C> {
             .with(|o| o.borrow_mut().pop())
             .expect("the run is open");
         e.end = EVAL_CLOCK.fetch_add(1, SeqCst);
-        e.doomed = self.1.computing_doomed();
         EVALS.with(|l| {
             if let Some(l) = l.borrow_mut().as_mut() {
                 l.push(e);
@@ -1035,7 +1030,7 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                     at: i,
                     first,
                 };
-                let running = Running::start(rt, (side, i), node.first);
+                let running = Running::start((side, i), node.first);
                 let v = eval(&node, &expr);
                 running.returned(v);
                 v
@@ -3170,8 +3165,7 @@ fn seed_16d87_takes_no_speculative_memo() {
 /// 0x56cd8c2's read of held 8 goes past `cycle_read` only to resume its
 /// walk: each skip is a resume `clean_walk` then takes, so no read skips
 /// twice, and the resumed entry 9 still reads held 8 as the unbounded run
-/// does, a cycle unwind and then the in-cycle value. A doomed run of 9,
-/// which reads 8's placeholder, lands nothing and is not compared.
+/// does, a cycle unwind and then the in-cycle value.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn resuming_past_a_held_root_skips_no_cycle_read() {
@@ -3185,7 +3179,7 @@ fn resuming_past_a_held_root_skips_no_cycle_read() {
             let (_, ran) = record(|| live.apply(op));
             reads = ran
                 .into_iter()
-                .filter(|e| e.node == (0, 9) && !e.doomed)
+                .filter(|e| e.node == (0, 9))
                 .map(|e| e.reads)
                 .collect();
         }
@@ -3199,6 +3193,7 @@ fn resuming_past_a_held_root_skips_no_cycle_read() {
     }
     fn check<C: Cells>() {
         let (want, none) = nine::<C>(None);
+        assert!(!want.is_empty());
         assert_eq!(none, [0, 0]);
         let (got, [skipped, taken]) = nine::<C>(Some(1));
         assert_eq!(got, want);
@@ -4226,6 +4221,41 @@ fn two_thread_wait_ended_new_seeds() {
     });
 }
 
+/// 0x617e in the order with op 14 before op 13, one thread at a time, each
+/// op on its thread in the case: thread 0 lands episodes before thread 1's
+/// op 16 `Get(1)`, whose walk a doom stops and its retry resumes. The
+/// resumed walk must re-plan only for episodes landed since its plan;
+/// re-planning for thread 0's older ones skipped entry 23 (spec 2), which
+/// then recorded deps [22, 0] where the unbounded run records [22, 0, 22].
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_resumed_walk_replans_for_episodes_since_its_plan_seed() {
+    let seed = 0x617e;
+    let case = gen_case(seed, true, true);
+    let phases = phases(&case, seed);
+    let order = Order::new(&case, &phases, 0b10000);
+    assert_eq!(order.of[13..15], [14, 13]);
+    assert!(matches!(order.case.ops[16], Op::Get(1)));
+    let thread_of = |op: usize| {
+        phases
+            .iter()
+            .find_map(|p| match *p {
+                Phase::Mutate(i, t) => (i == op).then_some(t),
+                Phase::Read(reads) => (0..2).find(|&t| reads[t] == Some(op)),
+            })
+            .expect("every op is in a phase")
+    };
+    let one_at_a_time: Vec<Phase> = (0..order.case.ops.len())
+        .map(|k| Phase::Mutate(k, thread_of(order.of[k])))
+        .collect();
+    quiet(|| {
+        for (frames, bytes) in [(Some(1), 0), (None, 16 * 1024), (Some(1), 16 * 1024)] {
+            let label = format!("seed {seed:#x} op 14 first, one thread at a time, budget {frames:?} frames, {bytes} bytes");
+            Serial::new(&order.case, &one_at_a_time).differential(&label, frames, bytes, &|_| {});
+        }
+    });
+}
+
 /// 0x9a7d at budget 2: op 0 recorded the cycle group {8, 9, 19, 24} where
 /// the unbounded run records {9, 19, 24}, and phase 6's read of 16 walked
 /// that group and cleaned 1, 2 and 23, which the unbounded run leaves
@@ -4260,10 +4290,10 @@ fn two_thread_contained_cycle_landing_seeds() {
     });
 }
 
-/// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry
-/// (f2ad3443), op 7's read came out as no order's in 80 of 80 runs on
-/// 562ebeed; a cycle that reaches its reader, as on main, gives every
-/// order.
+/// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry,
+/// op 7's read came out as no order's in 80 of 80 runs on 562ebeed (of train
+/// B's branch tips only w/T10-ub-f2ad3443-wrong-values, 7e058de75, fails);
+/// a cycle that reaches its reader, as on main, gives every order.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_contained_cycle_read_seeds() {
@@ -4278,17 +4308,15 @@ fn two_thread_contained_cycle_read_seeds() {
 /// 0xad crossed: op 16's read of 1 waited on op 15's claim of it, and the
 /// revisit of 1 counted one more walk visit than the unbounded walk makes,
 /// so its walk entered the cycle {4, 5} of recorded deps at the member
-/// the unbounded walk does not.
+/// the unbounded walk does not. Without the walk's restart at its root,
+/// ops 15 and 16 failed 17 of 80 runs under 4-way load.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_walk_entry_after_a_claim_wait_matches_unbounded_seed() {
-    let seed = 0xad;
-    let case = gen_case(seed, true, true);
-    let phases = phases(&case, seed);
-    let label = format!("seed {seed:#x}, two threads {phases:?}");
+    let case = gen_case(0xad, true, true);
     quiet(|| {
         for _ in 0..20 {
-            Serial::new(&case, &phases).differential(&label, None, 0, &|_| {});
+            differential_two(&case, 0xad);
         }
     });
 }
@@ -7365,7 +7393,6 @@ fn disagreements_count_one_run_and_one_revision() {
         caught: Vec::new(),
         returned: Vec::new(),
         closing,
-        doomed: false,
     };
     let read = |target, out| (0, target, true, out);
     let ops = vec![Op::Get(13), Op::Get(15), Op::Set(0, 1), Op::Get(2)];
@@ -8098,7 +8125,6 @@ fn history_failed_set(
             caught,
             returned,
             closing: Vec::new(),
-            doomed: false,
         };
         let value = ReadOut::Value;
         let mut evals = HashMap::from([
