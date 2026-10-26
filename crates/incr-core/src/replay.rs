@@ -936,6 +936,8 @@ impl Delivery {
 /// live while some delivery holds it.
 pub(crate) trait Provenance {
     fn record(&self) -> u64;
+    /// The read the record names was answered by taking its delivery.
+    fn spend(&self);
 }
 
 /// This thread's Failed read that a provenance record names: the
@@ -1388,6 +1390,9 @@ impl Context {
     /// over once, its delivery keeping a [`Regen`] marker in its place.
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
         let key = self.pending.get(i).key;
+        if let Some(p) = &self.pending.get(i).provenance {
+            p.spend();
+        }
         self.pending.take_keyed(&key);
         self.pending.pass(i);
         let Delivered::Unwind {

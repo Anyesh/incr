@@ -4548,3 +4548,71 @@ fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
         (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.w))
     );
 }
+
+/// X catches Y's panic and then reads Z, so at budget 1 its retry takes
+/// Y's held payload and is doomed again at Z, which arms `gate`.
+fn take_then_doom_shape() -> (Arc<Rt>, Gate, Incr<u64>) {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let gate = Gate::new();
+    let y = rt.create_query_with(|_: &Rt| -> u64 { panic!("y boom") }, replayable());
+    let z = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| {
+                gate.arm();
+                1_u64
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            let read = catch_unwind(AssertUnwindSafe(|| rt.get(y)));
+            let z = rt.get(z);
+            match read {
+                Err(e) => std::panic::resume_unwind(e),
+                Ok(v) => v + z,
+            }
+        },
+        replayable(),
+    );
+    (rt, gate, x)
+}
+
+/// A's retry of X takes Y's delivery and is then doomed at Z, which hands
+/// the delivery back untaken. Parked before its redo claims X, A still
+/// reserves X, since the redo owes it, so B's read of X waits and cannot
+/// stand for the delivery's read while the record is spent; the reads end
+/// as an unbounded run's, one of them with the payload.
+#[test]
+fn a_delivery_handed_back_by_a_doom_keeps_its_reader_reserved() {
+    let (rt, gate, x) = take_then_doom_shape();
+    rt.set_max_frames(1);
+    hook(&rt, vec![(ParkPoint::BeforeClaim(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
+    assert_eq!(
+        rt.state_of(x),
+        NodeState::New,
+        "the other thread computed a reserved node"
+    );
+    gate.release();
+    let (first, other) = (first.join(), other.join());
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+
+    let (u, _, ux) = take_then_doom_shape();
+    u.set_max_frames(u32::MAX);
+    let want = [outcome(|| u.get(ux)), outcome(|| u.get(ux))];
+    assert_racing_reads([&first, &other], [&want[0], &want[1]]);
+}

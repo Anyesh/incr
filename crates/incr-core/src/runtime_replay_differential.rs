@@ -10398,3 +10398,20 @@ fn seed_381_first_run_state() {
         differential::<Shared>(&case, 0x381);
     });
 }
+
+/// 0x1e6f4 under Shared matches the unbounded run at every byte budget
+/// from 4K to 32K. The byte window moves with codegen, so every width runs.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_rerun_reader_takes_no_spent_record_at_any_byte_width() {
+    let seed = 0x0001_e6f4;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        let unbounded = run::<Shared>(&case, None, 0);
+        for bytes in (4 * 1024..=32 * 1024).step_by(512) {
+            let label = budget_label(seed, None, bytes);
+            let bounded = labelled(&label, || run::<Shared>(&case, None, bytes));
+            compare(&case, &unbounded, &bounded, &label);
+        }
+    });
+}
