@@ -4562,8 +4562,17 @@ impl<C: Cells> Runtime<C> {
                 return Computed::Gone;
             }
             // After the load, so a landing that passed the held payload's
-            // failure on is seen whatever state it left the node in since.
-            if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
+            // failure on is seen in the state it left the node in, unless
+            // the load saw another thread's claim: that landing passes it
+            // on before the node reads landed (its store, or a held
+            // landing's publication), and a reader raising it then would
+            // publish the node as an unsettled dep, so it waits for it.
+            if MODE & VIRT != 0
+                && !C::SINGLE_THREADED
+                && !walked
+                && (!matches!(observed, NodeState::Computing | NodeState::ComputingDirty)
+                    || cycle_state::holds(self.runtime_id, id.0))
+            {
                 if let Some(payload) = self.owed_payload(id, g0.unwrap_or(node.generation())) {
                     self.raise_owed(payload, bag);
                 }
