@@ -1858,6 +1858,51 @@ fn give_back_wait_ends_on_a_landing() {
     give_back_wait(true);
 }
 
+/// A read's walk listing of a Dirty node N ([`crate::reserve::note_walk`])
+/// in the a06beeee9 shape: before the read ends, its thread spawns a reader
+/// of N and joins it. That reader's op begins after the listing, so it
+/// passes the listing at rest and the join returns. With `early`, a reader
+/// spawned before the listing is joined only after the read ends: if its
+/// op began first it waits on the listing until then, and no listing
+/// outlives the read.
+fn walk_listing_join(early: bool) {
+    run(move || {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let n = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let q = rt.create_query_with(move |rt: &Rt| rt.get(i) + 2, replayable());
+        assert_eq!(rt.get(n), 2);
+        rt.set(i, 2);
+        let reader = |rt: &Arc<Rt>| {
+            let rt = Arc::clone(rt);
+            thread::spawn(move || rt.get(n))
+        };
+        let before = early.then(|| reader(&rt));
+        {
+            let _read = crate::reserve::Root::arm(true, (rt.runtime_id, q.slot()));
+            crate::reserve::note_walk((rt.runtime_id, n.slot()), n.generation());
+            if !early {
+                assert_eq!(reader(&rt).join().unwrap(), 3);
+            }
+        }
+        if let Some(r) = before {
+            assert_eq!(r.join().unwrap(), 3);
+        }
+        assert!(!crate::reserve::any(), "a walk listing outlived its read");
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+#[test]
+fn walk_listing_passes_a_reader_its_read_joins() {
+    walk_listing_join(false);
+}
+
+#[test]
+fn walk_listing_holds_an_earlier_reader_until_its_read_ends() {
+    walk_listing_join(true);
+}
+
 /// [`doom_reservations_cross`] on F <-> X at budget 1: each read dooms on
 /// the other thread's entry node.
 #[test]

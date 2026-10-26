@@ -146,6 +146,8 @@ jobs:
           - { model: "loom_models::virtual_hit_claim_race", bound: 2 }
           - { model: "loom_models::doom_reservations_cross_direct", bound: 2 }
           - { model: "loom_models::doom_reservations_cross_held", bound: 2 }
+          - { model: "loom_models::walk_listing_passes_a_reader_its_read_joins", bound: 2 }
+          - { model: "loom_models::walk_listing_holds_an_earlier_reader_until_its_read_ends", bound: 2 }
           - { model: "loom_models::discard_under_set", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance_relanded", bound: 2 }
