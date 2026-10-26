@@ -369,6 +369,21 @@ pub(crate) fn open(
         });
         return kept.flatten();
     }
+    open_even_taken(cell, rt, slot, generation, first, verified_at, kept)
+}
+
+/// [`open`] for a claim taken in this outermost entry that lands in an
+/// episode held anyway, since another member carries hold state from
+/// earlier in the attempt.
+pub(crate) fn open_even_taken(
+    cell: usize,
+    rt: RuntimeId,
+    slot: u32,
+    generation: u32,
+    first: bool,
+    verified_at: Option<u64>,
+    kept: Option<Option<Box<dyn Any>>>,
+) -> Option<Box<dyn Any>> {
     value_code::set_held_bit(true);
     with(|h| {
         if let Some(e) = h.get(cell) {

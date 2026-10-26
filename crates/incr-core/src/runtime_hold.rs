@@ -126,23 +126,24 @@ impl<C: Cells> Runtime<C> {
         if cycle_state::wounded() {
             self.retract_held_records();
         }
-        // A waiter took this claim's landing over in this outermost entry:
-        // it is never held again, or the waiter's next read could be held
-        // up and take it again, so a read could restart without bound. It
-        // publishes at once, as a landing no other thread may trust: Dirty
-        // and never verified, so another reader runs it again.
-        if reserve::taken((self.runtime_id, id.0)) {
-            if !matches!(
-                target,
-                NodeState::Clean | NodeState::Failed | NodeState::Cyclic
-            ) {
-                return None;
-            }
-            node.set_verified_at(0);
-            return Some(self.land_now(id, node, NodeState::Dirty, NodeState::Dirty, unrun));
-        }
         let cell = state::cell_key::<C>(node.state_cell());
         if !hold::holds(cell) {
+            // A waiter took this claim's landing over in this outermost
+            // entry: it is never held again, or the waiter's next read could
+            // be held up and take it again, so a read could restart without
+            // bound. It publishes at once, as a landing no other thread may
+            // trust: Dirty and never verified, so another reader runs it
+            // again. One with an entry still lands into it.
+            if reserve::taken((self.runtime_id, id.0)) {
+                if !matches!(
+                    target,
+                    NodeState::Clean | NodeState::Failed | NodeState::Cyclic
+                ) {
+                    return None;
+                }
+                node.set_verified_at(0);
+                return Some(self.land_now(id, node, NodeState::Dirty, NodeState::Dirty, unrun));
+            }
             if !hold::consulted() && !hold::cut_kept(self.runtime_id, id.0) {
                 return None;
             }
@@ -192,6 +193,24 @@ impl<C: Cells> Runtime<C> {
         ) {
             bag.push_erased(own);
         }
+    }
+
+    /// [`Self::open_hold`] of a member of an episode held although a waiter
+    /// took one of its members over.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn open_hold_even_taken(&self, id: NodeId, node: &NodeData<C>, first: bool) {
+        let cell = state::cell_key::<C>(node.state_cell());
+        let own = hold::open_even_taken(
+            cell,
+            self.runtime_id,
+            id.0,
+            node.generation(),
+            first,
+            Some(node.verified_at()),
+            None,
+        );
+        debug_assert!(own.is_none(), "incr-core: an episode member keeps no value");
     }
 
     /// Whether `c` has a dependent as `Local` would list it: a held

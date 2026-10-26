@@ -2424,20 +2424,35 @@ impl<C: Cells> Runtime<C> {
         // (`crate::hold`), which counts it then, unless a waiter took one of
         // its members over in this outermost entry: a taken claim is never
         // held again, and the members land together, so each lands as a
-        // taken claim does (`held_landing`), counted now.
-        let held = !C::SINGLE_THREADED
-            && !entries
+        // taken claim does (`held_landing`), counted now. A member with an
+        // entry or a cut's record from earlier in the attempt keeps the
+        // episode held, taken members too, this once: every member is taken
+        // from here on, so a retry after another take-over lands it unheld.
+        let taken = !C::SINGLE_THREADED
+            && entries
                 .iter()
                 .any(|(m, _)| reserve::taken((self.runtime_id, *m)));
+        let carried = taken
+            && entries.iter().any(|(m, _)| {
+                hold::holds(state::cell_key::<C>(self.nodes.get(*m).state_cell()))
+                    || hold::cut_kept(self.runtime_id, *m)
+            });
+        let held = !C::SINGLE_THREADED && (!taken || carried);
         if held {
             hold::note_episode(self.runtime_id);
             for (m, e) in &entries {
-                self.open_hold(NodeId(*m), self.nodes.get(*m), e.first, None, bag);
+                if carried {
+                    self.open_hold_even_taken(NodeId(*m), self.nodes.get(*m), e.first);
+                } else {
+                    self.open_hold(NodeId(*m), self.nodes.get(*m), e.first, None, bag);
+                }
             }
         } else if !C::SINGLE_THREADED {
-            reserve::mark_claims_taken(entries.iter().map(|(m, _)| (self.runtime_id, *m)));
             cycle_state::own_episode(self.runtime_id, super::LANDED);
             C::u64_fetch_add(&self.episodes_landed, super::LANDED);
+        }
+        if taken {
+            reserve::mark_claims_taken(entries.iter().map(|(m, _)| (self.runtime_id, *m)));
         }
         let mut superseded = false;
         for (m, e) in &entries {
