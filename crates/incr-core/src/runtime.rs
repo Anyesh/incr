@@ -4472,10 +4472,10 @@ impl<C: Cells> Runtime<C> {
     /// The `Err` arm of a compute: the closure panicked, or an engine
     /// unwind passed through it. Lands the node and every claim this
     /// thread held above its frame, then resumes the unwind. A walk's entry
-    /// (`walked`) contains a panic and returns `Unsettled`: the recorder's
-    /// rerun reads the node
-    /// again if it still does, and the payload stays with the Failed node
-    /// for that read.
+    /// (`walked`) contains a panic ([`Self::containable`]) and returns
+    /// `Unsettled`. If the recorder's rerun still reads the node, a Failed
+    /// node gives that read its held payload, while one whose closure
+    /// panicked after catching a cycle landed unwound and runs again.
     #[cold]
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]

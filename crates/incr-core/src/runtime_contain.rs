@@ -1,9 +1,11 @@
 //! A walk's containment of what its cleaning raises. The dirty walk
 //! cleans every recorded dep of a node before rerunning it, so it can
 //! compute a dep the rerun no longer reads. A non-root walk entry whose
-//! compute panics or closes a cycle therefore lands as a changed dep and
-//! the walk goes on; a panic's payload stays with the Failed landings it
-//! made, as a ticket, for the first read of any of them.
+//! compute panics therefore lands as a changed dep and the walk goes on,
+//! while a cycle goes on to the reader. A panic's payload stays with the
+//! Failed landings it made, as a ticket, for the first read of any of
+//! them; a closure that panics after catching a cycle lands unwound,
+//! keeps no payload, and runs again for the next read.
 //!
 //! The entry's frame decides where it ends in the unwind, before its
 //! claims are released: the closure's panic arm, or the abort of the
