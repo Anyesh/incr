@@ -34,9 +34,9 @@
 //!
 //! A speculative run may compute a node the unbounded run does not, but
 //! lands nothing, so states compare exactly. Single-threaded, no Native
-//! closure may run speculatively twice in a revision (`REPLAY_NATIVE_COUNT`
-//! also compares its run counts with the unbounded run's). `REPLAY_FIRST`
-//! scans cases
+//! closure may run speculatively twice in a revision, and one the
+//! unbounded run runs at most once in a revision runs as often, or once
+//! more where a speculative run reached it. `REPLAY_FIRST` scans cases
 //! whose Native closures take `FirstLanded`, so a run of one that the
 //! engine does not treat as the node's first shows in its value.
 
@@ -2810,23 +2810,11 @@ fn run_counted<C: Cells>(
     }
 }
 
-thread_local! {
-    /// Set by a test for [`compare_native`]'s full count on this thread.
-    static NATIVE_COUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Native runs by side, made order, revision and node: unbounded, bounded,
 /// and bounded speculative.
 type NativeCounts = HashMap<(usize, usize, u64, usize), (u32, u32, u32)>;
 
-/// Fails if a Native node runs speculatively more than once in a revision.
-/// With `REPLAY_NATIVE_COUNT` set, or [`NATIVE_COUNT`], also unless each
-/// runs in each revision as often as the unbounded run has it run, or once
-/// more where a speculative run reached it: retries under replay still
-/// rerun Native closures more often (T8-native-reruns-under-replay).
-fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
-    let full = NATIVE_COUNT.with(std::cell::Cell::get)
-        || std::env::var_os("REPLAY_NATIVE_COUNT").is_some();
+fn native_counts(want: &[NativeRun], got: &[NativeRun]) -> NativeCounts {
     let mut counts: NativeCounts = HashMap::new();
     for &(side, i, made, rev, _) in want {
         counts.entry((side, made, rev, i)).or_default().0 += 1;
@@ -2836,8 +2824,17 @@ fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
         c.1 += 1;
         c.2 += u32::from(speculative);
     }
-    let mut off: Vec<_> = (counts.into_iter())
-        .filter(|&(_, (u, b, s))| s > 1 || full && (b < u || b > u + u32::from(s > 0)))
+    counts
+}
+
+/// Fails unless each Native node runs speculatively at most once in a
+/// revision and, if the unbounded run runs it at most once there, runs as
+/// often as that, or once more where a speculative run reached it. A node
+/// the unbounded run runs more than once is a cycle member, which a retry
+/// may run more or less often (the README's cycle exception).
+fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
+    let mut off: Vec<_> = (native_counts(want, got).into_iter())
+        .filter(|&(_, (u, b, s))| s > 1 || u <= 1 && (b < u || b > u + u32::from(s > 0)))
         .collect();
     off.sort_unstable();
     assert!(
@@ -6378,42 +6375,37 @@ fn a_speculative_recompute_to_the_same_value_keeps_its_reader_verified() {
     });
 }
 
-/// Seeds whose Native closures run more often in a revision under replay
-/// than unbounded, by retries rather than speculative runs, run with
-/// [`compare_native`]'s full count; the base seeds are from
-/// [`replay_seeds`], and 0x88f7 is
-/// [`wave8_seed_88f7_released_claims_replay_as_unbounded`].
+/// The README's exception for Native queries on a cycle: one may run more
+/// often under a frame budget than unbounded, which [`compare_native`]
+/// allows only on a node the unbounded run itself runs more than once in
+/// the revision. In 0x12b74 a doom in an episode discards its reader's
+/// member run, and with it the buffered round value of the Native member
+/// run nested in it, so the retry runs that member again; in 0x597 a
+/// speculative drop unwinds through a Native member's run. Both still add
+/// runs at budget 1 until B7-native-member-buffer-adoption.
 #[test]
-#[ignore = "T8-native-reruns-under-replay"]
-fn native_reruns_under_replay_seeds() {
-    NATIVE_COUNT.with(|c| c.set(true));
-    let mut failed: Vec<u64> = [
-        0x597,
-        0x934,
-        0xbc2,
-        0x2997,
-        0x4654,
-        0x0001_2b74,
-        0x00e8_d4a5_33fa,
-        0x551d_e2c5_404a_84b1,
-    ]
-    .into_iter()
-    .filter(|&seed| {
-        let case = gen_base(seed);
-        catch_unwind(AssertUnwindSafe(|| {
-            quiet(|| {
-                differential::<Local>(&case, seed);
-                differential::<Shared>(&case, seed);
-            })
-        }))
-        .is_err()
-    })
-    .collect();
-    if catch_unwind(wave8_seed_88f7_released_claims_replay_as_unbounded).is_err() {
-        failed.push(0x88f7);
+#[cfg_attr(miri, ignore)]
+fn native_cycle_members_rerun_under_replay() {
+    // INCR_TEST_ALL_REPLAYABLE replays Native specs, so no run is Native.
+    if super::replay_defaults().1 {
+        return;
     }
-    NATIVE_COUNT.with(|c| c.set(false));
-    assert!(failed.is_empty(), "{failed:x?}");
+    for seed in [0x0001_2b74, 0x597] {
+        let case = gen_base(seed);
+        let mut counts = NativeCounts::new();
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+            let (_, want) = run_counted::<Local>(&case, None, 0);
+            let (_, got) = run_counted::<Local>(&case, Some(1), 0);
+            counts = native_counts(&want, &got);
+        });
+        assert!(
+            (counts.values()).any(|&(u, b, s)| u > 1 && b > u + u32::from(s > 0)),
+            "seed {seed:#x}: no Native cycle member reran at budget 1; if the episode buffer \
+             adoption landed, drop the README's cycle exception and this test"
+        );
+    }
 }
 
 /// Seeds whose speculative continuations landed nodes Clean that the
