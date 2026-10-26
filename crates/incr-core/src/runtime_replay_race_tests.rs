@@ -3955,6 +3955,20 @@ fn a_taken_note_keeps_the_bit_of_a_dep_sharing_it() {
     assert_eq!(rt.failed_past.load(SeqCst), 0);
 }
 
+/// A walk that flips a Failed dep with notes over it takes them, as the
+/// Dirty arm does: the noted landing goes Dirty and the bit clears.
+#[test]
+fn a_flipped_failed_dep_takes_the_landings_noted_over_it() {
+    let (rt, i, d, x) = noted_failed_landing();
+    let cell = rt.nodes.get(id(d).0).state_cell();
+    assert!(
+        crate::state::try_transition::<Shared>(cell, NodeState::Dirty, NodeState::Failed).is_ok()
+    );
+    rt.set(i, 2);
+    assert_eq!(rt.nodes.get(id(x).0).state(), NodeState::Dirty);
+    assert_eq!(rt.failed_past.load(SeqCst), 0);
+}
+
 /// i -> d -> x, where x panics: x lands Failed over d, then d is made
 /// Dirty with no walk, as a caught panic leaves it, and x is noted.
 fn noted_failed_landing() -> (Rt, Incr<u64>, Incr<u64>, Incr<u64>) {

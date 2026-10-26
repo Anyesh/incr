@@ -64,8 +64,7 @@ pub(crate) struct Tickets {
 }
 
 /// `slot`'s bit in `Runtime::failed_past`: a walk takes the tickets' lock
-/// only at a dep whose bit is set, which notes under slots of other
-/// residues, even ones no walk will reach again, never set.
+/// only at a dep whose bit is set; notes under other residues never set it.
 #[inline(always)]
 pub(super) fn past_bit(slot: u32) -> u64 {
     1 << (slot & 63)
