@@ -913,8 +913,9 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn Any + Send>,
     ) -> (Box<dyn Any + Send>, bool) {
         // A panic stash's adoption raises it unchecked, so none stands over
-        // a checked read, its own or a stashed dep's.
-        if ctl.flags.get() & (cycle::DOOMED | cycle::POISONED | cycle::KEPT_READ) != 0
+        // a checked read, its own or a stashed dep's, or over a provisional
+        // read of an open cycle, whose dep may settle to another value.
+        if ctl.flags.get() & (cycle::DOOMED | cycle::POISONED | cycle::KEPT_READ | cycle::LOW) != 0
             || !replay::speculative()
             || !self.inherited_none(deps)
         {

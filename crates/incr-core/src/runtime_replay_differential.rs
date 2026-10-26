@@ -2956,6 +2956,79 @@ fn seed_56cd8c2_keeps_the_failed_set() {
     });
 }
 
+/// 0x289ae, shrunk. 8 (Fixpoint, initial 3) reads 9, 10 and 11, and 10
+/// reads 2 only when its read of 11 gives a placeholder. At budget 1,
+/// `Get(8)`'s speculative run of 10 reads 2, whose chain 3, 5 reads 8
+/// while 8 is open, takes its initial 3 and panics on 3 + 4. `Get(6)`
+/// reaches 5 through 7, 2 and 3, where the unbounded run computes 5 from
+/// 8's settled 0.
+fn seed_289ae_case() -> Case {
+    let query = |expr, replay, bare, strategy| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    Case {
+        specs: vec![
+            query(Expr::Const(1), true, false, Strat::None),
+            query(Expr::Const(0), true, false, Strat::None),
+            query(Expr::Read(3, false), true, false, Strat::None),
+            query(Expr::Read(5, false), false, false, Strat::None),
+            query(Expr::Const(0), true, false, Strat::None),
+            query(
+                Expr::PanicIf(Box::new(Expr::Add(read(8), read(14))), 0),
+                true,
+                false,
+                Strat::None,
+            ),
+            query(Expr::Read(7, false), true, true, Strat::None),
+            query(Expr::Read(2, false), true, false, Strat::None),
+            query(
+                Expr::Read(9, false),
+                true,
+                false,
+                Strat::Fixpoint {
+                    initial: 3,
+                    limit: 3,
+                },
+            ),
+            query(Expr::Read(10, false), true, true, Strat::None),
+            query(
+                Expr::If(
+                    Box::new(Expr::Add(Box::new(Expr::Const(1)), read(11))),
+                    Box::new(Expr::Const(0)),
+                    read(2),
+                ),
+                true,
+                false,
+                Strat::None,
+            ),
+            query(Expr::Const(1), false, false, Strat::None),
+            Spec::Input(3),
+            Spec::Input(4),
+            Spec::Input(4),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 12,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(8), Op::Get(6)],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_289ae_raises_no_panic_of_an_open_cycle_read() {
+    let case = seed_289ae_case();
+    quiet(|| {
+        differential::<Local>(&case, 0x289ae);
+        differential::<Shared>(&case, 0x289ae);
+    });
+}
+
 /// 0x198c2, shrunk (cross): 9 reads the chain 16 to 18 only at budget 1's
 /// depth, so its doomed run reads 18's foreign dep, the other runtime's 0,
 /// Clean; a set of that runtime's input follows, and the next `Get(0)`
