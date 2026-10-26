@@ -11,6 +11,7 @@ use crate::changes::{self, Count};
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::{Frame, Placement};
+use crate::hold;
 use crate::locks::Lock;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::reserve;
@@ -2788,8 +2789,16 @@ impl<C: Cells> Runtime<C> {
         }
         let mut flipped = true;
         let t = self.tickets.read();
-        let back =
-            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed);
+        let cell = state::cell_key::<C>(node.state_cell());
+        // The owner claimed its own held Failed landing back from the view,
+        // its word Computing throughout: the entry stays as it was, to
+        // publish with the attempt.
+        let back = if !C::SINGLE_THREADED && hold::holds(cell) {
+            hold::unpin(cell);
+            Ok(())
+        } else {
+            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed)
+        };
         if back.is_ok() {
             replay::regen_running(self.runtime_id, id.0, false);
         }
