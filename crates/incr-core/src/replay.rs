@@ -403,21 +403,9 @@ impl Landings {
                 note_work(nodes.len());
                 nodes.iter().map(|&(_, depth)| depth).max()
             }
-            // No landing is deeper than `depth`.
-            Nodes::Shared { depth: 0, .. } => Some(0),
-            Nodes::Shared {
-                log,
-                len,
-                epoch,
-                base,
-                cut,
-                ..
-            } => log
-                .borrow()
-                .landings(*len, *epoch, *base, cut.as_ref())
-                .iter()
-                .map(|&(_, depth)| depth)
-                .max(),
+            // No landing is deeper than `depth`, and finding the deepest
+            // would take each delivery of a deep chain's copy apart.
+            Nodes::Shared { depth, .. } => Some(*depth),
         };
         deepest
     }
