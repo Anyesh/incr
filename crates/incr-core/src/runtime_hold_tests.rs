@@ -159,8 +159,13 @@ fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
 
 /// Reads `p`, whose landing is held, with its publication panicking at the
 /// first other landing it publishes, where a child sweep's caught panic
-/// resumes. Returns that landing's slot.
-fn panic_publishing_before(rt: &Runtime<Shared>, p: Incr<i64>) -> u32 {
+/// resumes, and `also` sees every other park point. Returns that landing's
+/// slot.
+fn panic_publishing_before(
+    rt: &Runtime<Shared>,
+    p: Incr<i64>,
+    also: impl Fn(super::ParkPoint) + Send + Sync + 'static,
+) -> u32 {
     let armed = Arc::new(AtomicBool::new(true));
     let p_first = Arc::new(AtomicBool::new(false));
     let at = Arc::new(AtomicUsize::new(usize::MAX));
@@ -168,6 +173,7 @@ fn panic_publishing_before(rt: &Runtime<Shared>, p: Incr<i64>) -> u32 {
         let (armed, p_first, at) = (armed.clone(), p_first.clone(), at.clone());
         Box::new(move |point| {
             let super::ParkPoint::HeldPublished(id) = point else {
+                also(point);
                 return;
             };
             if !armed.load(Ordering::SeqCst) {
@@ -221,7 +227,7 @@ fn shared_held_publication_panic_gives_back_the_moved_edges() {
     rt.get(p);
     rt.set(s, true);
     rt.set(t, 2);
-    panic_publishing_before(&rt, p);
+    panic_publishing_before(&rt, p, |_| {});
     assert!(rt.has_reverse_edge(o, p), "o lost its edge to p");
     assert!(!rt.has_reverse_edge(n, p), "phantom edge on n");
     rt.assert_invariant_i();
@@ -291,7 +297,7 @@ fn shared_held_publication_panic_rereads_over_a_given_back_landing() {
         let p = rt.create_query(move |rt| rt.get(a) + rt.get(b));
         rt.get(p);
         rt.set(t, 2);
-        let published = panic_publishing_before(&rt, p);
+        let published = panic_publishing_before(&rt, p, |_| {});
         let t_reader = if t_in_a { a.slot() } else { b.slot() };
         over_given |= published != t_reader;
         rt.assert_invariant_i();
@@ -310,6 +316,91 @@ fn shared_held_publication_panic_rereads_over_a_given_back_landing() {
         over_given,
         "no shape published the member that reads t through the other"
     );
+}
+
+/// g reads x while t is 1 and p otherwise; p (Fallback) reads g. Once t is
+/// 2 the two form a cycle that lands p, created first, before g, and g's
+/// dep list before it read p was t and x.
+struct Formed {
+    t: Incr<i64>,
+    p: Incr<i64>,
+    g: Incr<i64>,
+}
+
+fn formed_cycle<C: Cells>(rt: &Runtime<C>) -> Formed {
+    let t = rt.create_input(1_i64);
+    let x = rt.create_input(5_i64);
+    let gc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let p = {
+        let gc = gc.clone();
+        rt.create_query_with_fallback(move |rt| rt.get(*gc.get().unwrap()), |_c: &Cycle| 100)
+    };
+    let g = rt.create_query(move |rt| if rt.get(t) == 1 { rt.get(x) } else { rt.get(p) });
+    gc.set(g).unwrap();
+    Formed { t, p, g }
+}
+
+/// Reads `f.p` at t = 2, its publication panicking right after p lands, so
+/// g goes back to x's value with its held `changed_at`.
+fn panic_after_p(
+    rt: &Runtime<Shared>,
+    f: &Formed,
+    also: impl Fn(super::ParkPoint) + Send + Sync + 'static,
+) {
+    assert_eq!(rt.get(f.p), 5);
+    rt.set(f.t, 2);
+    let published = panic_publishing_before(rt, f.g, also);
+    assert_eq!(published, f.p.slot(), "g published before p");
+}
+
+/// A cycle formed in the hold publishes p over g, then panics and gives g
+/// back. With t back at 1, g recomputes to the value it went back to, so
+/// its `changed_at` stays the held one: p must recompute rather than
+/// verify against it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_reader_of_a_formed_cycle_recomputes() {
+    let rt = Runtime::<Shared>::new();
+    let f = formed_cycle(&rt);
+    panic_after_p(&rt, &f, |_| {});
+    rt.set(f.t, 1);
+    assert_eq!(rt.get(f.g), 5);
+    assert_eq!(rt.get(f.p), 5, "p verified over the given-back g");
+    rt.assert_invariant_i();
+}
+
+/// As above, with another thread reverting t and reading p between g's
+/// give-back and the publication's unverifying of p.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_reader_read_during_the_give_back() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let f = formed_cycle(&*rt);
+    let during: Arc<OnceLock<i64>> = Arc::new(OnceLock::new());
+    let also = {
+        let (weak, during, (t, p)) = (Arc::downgrade(&rt), during.clone(), (f.t, f.p));
+        move |point| {
+            if point != super::ParkPoint::GaveBack || during.get().is_some() {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            let read = std::thread::spawn(move || {
+                rt.set(t, 1);
+                rt.get(p)
+            })
+            .join()
+            .unwrap();
+            during.set(read).unwrap();
+        }
+    };
+    panic_after_p(&rt, &f, also);
+    assert_eq!(
+        during.get(),
+        Some(&5),
+        "a read during the give-back saw p over g's held value"
+    );
+    assert_eq!(rt.get(f.p), 5);
+    rt.assert_invariant_i();
 }
 
 /// a (Fallback) and b read each other, counting their runs.

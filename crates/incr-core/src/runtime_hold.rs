@@ -556,6 +556,7 @@ impl<C: Cells> Runtime<C> {
             let rest: Vec<Held> = rest.collect();
             let given: Vec<u32> = rest.iter().map(|e| e.slot).collect();
             self.retract_entries(rest, Vec::new(), true, true);
+            self.park(super::ParkPoint::GaveBack);
             self.unverify_readers(&given);
             bag.drain_carried(payload);
         }
