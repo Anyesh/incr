@@ -508,7 +508,7 @@ fn a_waiter_on_an_awake_walk_listing_takes_no_owner_over() {
     user_code(outside(&rt));
     assert!(!reserved_elsewhere(n));
     drop(read);
-    assert!(leave_hold());
+    assert!(!leave_hold(), "a waiter wounded the attempt while it held");
 }
 
 /// A context that also reserves the node and ends before the walk's
