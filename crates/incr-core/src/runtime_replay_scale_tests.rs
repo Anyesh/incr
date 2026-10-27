@@ -1738,3 +1738,65 @@ fn shared_same_text_fan_through_a_frame_over_chain_stays_linear() {
         same_text_fan_over_chain_stays_linear::<Shared>(true)
     });
 }
+
+/// A speculative run of a fan over 100k leaves, stashed under a one-frame
+/// budget, then the real read of the fan, which adopts every stash: each
+/// node runs at most twice, and the stash reads cost the fan linear time.
+#[cfg(not(debug_assertions))]
+fn speculative_fan_100k<C: Cells>() {
+    let n = 100_000;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let runs = counters(n + 1);
+    let input = rt.create_input(1_u64);
+    let leaves: Vec<Incr<u64>> = (0..n)
+        .map(|i| {
+            let runs = runs.clone();
+            rt.create_query_with(
+                move |rt: &Runtime<C>| {
+                    runs[i].fetch_add(1, SeqCst);
+                    rt.get(input) + i as u64
+                },
+                replayable(),
+            )
+        })
+        .collect();
+    let fan = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                runs[n].fetch_add(1, SeqCst);
+                leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
+            },
+            replayable(),
+        )
+    };
+    let b = rt.create_query(|_: &Runtime<C>| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(fan)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(reader), 5);
+    assert_eq!(rt.get(fan), (1..=n as u64).sum::<u64>());
+    assert!(max_of(&runs) <= 2);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_speculative_fan_100k_adopts_its_stashes() {
+    speculative_fan_100k::<Local>();
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_speculative_fan_100k_adopts_its_stashes() {
+    speculative_fan_100k::<Shared>();
+}
