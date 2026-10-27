@@ -3856,6 +3856,23 @@ fn speculative_member_run_leaves_no_buffer() {
     });
 }
 
+/// Seeds where a cycle member's run inside a doomed frame was made under
+/// speculation and the frame's real look reran it: at budget 1 the
+/// member's Native query ran twice where the unbounded run runs it once.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_member_run_of_unchanged_reads_is_not_rerun() {
+    let seeds = [
+        0x3ce9, 0xf10, 0x1e262, 0x20764, 0x2389c, 0x23d9f, 0x1a063, 0x16a03,
+    ];
+    quiet(|| {
+        for seed in seeds {
+            differential::<Local>(&gen_case(seed, false, false), seed);
+        }
+        differential::<Shared>(&gen_case(0x20764, false, false), 0x20764);
+    });
+}
+
 /// 0x1dd5_ac14_6f19_4569 with every query bare and [`Bare`] given a
 /// placeholder, whose `Drop` panics on a value only a speculative run
 /// builds. At budget 1 a speculative run buffers 9999 on a member, and
