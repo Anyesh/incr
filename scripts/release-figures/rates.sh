@@ -9,6 +9,9 @@ spec=$(awk -F'\t' -v r="$row" 'NR > 1 && $1 == r' "$here/rates/rates.tsv")
 [[ -n $spec ]] || { echo "rates.tsv: no row $row" >&2; exit 2; }
 IFS=$'\t' read -r _ seed mode profile runs trees match _ <<<"$spec"
 runs=${RATE_RUNS:-$runs}
+for t in ${trees//,/ }; do
+  [[ -n ${sha[$t]:-} || $t =~ ^[0-9a-f]{40}$ ]] || { echo "rates.tsv: $row tree $t is neither rel, b5, main nor a full sha (fetch by sha needs all 40)" >&2; exit 2; }
+done
 case $mode in
   two) envs="REPLAY_SHARED=1 REPLAY_TWO=1" ;;
   crosstwo) envs="REPLAY_SHARED=1 REPLAY_TWO=1 REPLAY_CROSS=1" ;;
