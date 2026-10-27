@@ -1934,13 +1934,21 @@ impl<C: Cells> Runtime<C> {
     /// other threads planned while they were held.
     pub(super) fn count_release(&self, slots: impl IntoIterator<Item = u32>) {
         if !C::SINGLE_THREADED {
-            self.count_episodes(true, true, RELEASED, slots);
+            self.count_episodes(true, true, false, RELEASED, slots);
+        }
+    }
+
+    /// [`Self::count_release`] by the publication that ends the read
+    /// whose claims it releases.
+    pub(super) fn count_published_release(&self, slots: impl IntoIterator<Item = u32>) {
+        if !C::SINGLE_THREADED {
+            self.count_episodes(true, true, true, RELEASED, slots);
         }
     }
 
     /// Counts `episodes` landed episodes, before their `slots` land.
     pub(super) fn count_landed(&self, episodes: u64, slots: impl IntoIterator<Item = u32>) {
-        self.count_episodes(false, true, episodes * super::LANDED, slots);
+        self.count_episodes(false, true, true, episodes * super::LANDED, slots);
     }
 
     /// Adds `add` to the episode count before `slots` land, so a claim
@@ -1953,6 +1961,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         released: bool,
         own: bool,
+        ended: bool,
         add: u64,
         slots: impl IntoIterator<Item = u32>,
     ) {
@@ -1968,14 +1977,14 @@ impl<C: Cells> Runtime<C> {
                 after as u32
             };
             let by = if own { cycle_state::thread_key() } else { 0 };
-            log.push(released, number, by, slots);
+            log.push_as(released, ended, number, by, slots);
         }
     }
 
     /// [`Self::count_release`] of another thread's claims.
     pub(super) fn count_foreign_release(&self, slots: impl IntoIterator<Item = u32>) {
         if !C::SINGLE_THREADED {
-            self.count_episodes(true, false, RELEASED, slots);
+            self.count_episodes(true, false, false, RELEASED, slots);
         }
     }
 

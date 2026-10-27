@@ -623,6 +623,8 @@ struct Logged {
     slot: u32,
     by: u32,
     released: bool,
+    /// Logged by a publication, which ends its read.
+    ended: bool,
 }
 
 /// The slots the latest landed episodes and releases of held claims
@@ -637,9 +639,22 @@ pub(crate) struct EpisodeLog {
 }
 
 impl EpisodeLog {
-    /// `by` is 0 for a release this thread made of another thread's
-    /// claims, which no thread's walks count as their own.
+    #[cfg(all(test, not(loom)))]
     fn push(&mut self, released: bool, number: u32, by: u32, slots: impl IntoIterator<Item = u32>) {
+        self.push_as(released, !released, number, by, slots);
+    }
+
+    /// `by` is 0 for a release this thread made of another thread's
+    /// claims, which no thread's walks count as their own. `ended` marks
+    /// what a publication, which ends its read, logs.
+    fn push_as(
+        &mut self,
+        released: bool,
+        ended: bool,
+        number: u32,
+        by: u32,
+        slots: impl IntoIterator<Item = u32>,
+    ) {
         for slot in slots {
             if self.entries.len() == EPISODE_LOG_LEN {
                 if let Some(old) = self.entries.pop_front() {
@@ -651,6 +666,7 @@ impl EpisodeLog {
                 slot,
                 by,
                 released,
+                ended,
             });
         }
     }
@@ -675,6 +691,25 @@ impl EpisodeLog {
                 .map(|e| e.slot)
                 .collect(),
         )
+    }
+
+    /// Whether another thread's publication, which ends its read, logged
+    /// `slot` after `landed` episodes or `released` releases, or may have,
+    /// its entries being evicted.
+    fn ended_with(&self, landed: u32, released: u32, slot: u32) -> bool {
+        let after = |n: u32, since: u32| n.wrapping_sub(since) as i32 > 0;
+        if self.evicted[0].is_some_and(|n| after(n, landed))
+            || self.evicted[1].is_some_and(|n| after(n, released))
+        {
+            return true;
+        }
+        let me = cycle_state::thread_key();
+        self.entries.iter().any(|e| {
+            e.ended
+                && e.slot == slot
+                && e.by != me
+                && after(e.number, if e.released { released } else { landed })
+        })
     }
 
     /// Whether another thread's release numbered after `since` landed one
@@ -3928,7 +3963,6 @@ impl<C: Cells> Runtime<C> {
         } else {
             self.planned()
         };
-        let mut root_revisits = 0;
         let mut walk = resume.unwrap_or_else(|| {
             let mut walk = Walk::new(id, gen, observed);
             if !C::SINGLE_THREADED {
@@ -3997,13 +4031,8 @@ impl<C: Cells> Runtime<C> {
                     visit,
                     Some(generation),
                     !is_root,
-                    (!C::SINGLE_THREADED
-                        && if is_root {
-                            root_revisits < ROOT_RESTARTS
-                        } else {
-                            unchecked.take() != Some(cur)
-                        })
-                    .then_some(planned),
+                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur)))
+                        .then_some(planned),
                     seen,
                 );
                 ran_unsettled |= computed == Computed::Unsettled;
@@ -4011,9 +4040,8 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     revisited.push(cur);
                     if is_root {
-                        // A read's root claim checks its plan at most
-                        // `ROOT_RESTARTS` times, as its replans restart.
-                        root_revisits += 1;
+                        // Each restart follows another read's publication of
+                        // the root since the plan, which ended that read.
                         walk.restart();
                         planned = self.planned();
                     }
@@ -4373,17 +4401,17 @@ impl<C: Cells> Runtime<C> {
         all != planned.all && self.others_landed(planned, all)
     }
 
-    /// Whether another thread's episode or release since `planned` landed
-    /// `root`, or may have, its slots being evicted.
+    /// Whether another thread's publication since `planned` landed `root`,
+    /// or may have, its slots being evicted. Only a publication ends a
+    /// read; a release before it is an attempt's that goes on.
     #[cold]
     #[inline(never)]
     fn root_reached(&self, planned: Planned, root: NodeId) -> bool {
-        let log = self.episode_log.read();
-        let reached = |released: bool, since: u32| {
-            log.others_since(released, since)
-                .is_none_or(|slots| slots.contains(&root.0))
-        };
-        reached(false, planned.all as u32) || reached(true, (planned.all / RELEASED) as u32)
+        self.episode_log.read().ended_with(
+            planned.all as u32,
+            (planned.all / RELEASED) as u32,
+            root.0,
+        )
     }
 
     #[cold]
