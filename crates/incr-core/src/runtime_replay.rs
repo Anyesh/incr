@@ -433,7 +433,8 @@ impl<C: Cells> Runtime<C> {
     /// alone can't check: a read `KEPT_UNCHECKED` or a stash, whose reads
     /// go with the frame.
     pub(super) fn stand_in_unchecked(&self, cidx: u32, ctl: &ComputeCtl) -> bool {
-        !self.take_spec_reads(cidx, ctl).is_empty() || ctl.has(cycle::KEPT_UNCHECKED)
+        let took = !self.take_spec_reads(cidx, ctl).is_empty();
+        took || ctl.read_stashes() || ctl.has(cycle::KEPT_UNCHECKED)
     }
 
     /// The popping frame's reads of other stashes, for its own stash.
