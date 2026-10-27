@@ -580,13 +580,20 @@ fn add_deletes(case: &mut Case, rng: &mut Rng, skip: usize, paired: bool) {
 }
 
 impl Strat {
-    fn build<T: Value>(self, wrap: fn(u64) -> T) -> CycleStrategy<T> {
+    fn build<T: Value>(self, at: (usize, usize), wrap: fn(u64) -> T) -> CycleStrategy<T> {
         match self {
             Strat::None => CycleStrategy::None,
-            Strat::Fallback(v) => CycleStrategy::fallback(move |_| wrap(v)),
-            Strat::Fixpoint { initial, limit } => {
-                CycleStrategy::Fixpoint(Fixpoint::new(move || wrap(initial)).max_iterations(limit))
-            }
+            Strat::Fallback(v) => CycleStrategy::fallback(move |_| {
+                called(at);
+                wrap(v)
+            }),
+            Strat::Fixpoint { initial, limit } => CycleStrategy::Fixpoint(
+                Fixpoint::new(move || {
+                    called(at);
+                    wrap(initial)
+                })
+                .max_iterations(limit),
+            ),
         }
     }
 }
@@ -717,6 +724,20 @@ thread_local! {
     /// While set, how many closure runs start on this thread, by side and
     /// node index, for [`replay_run_counts`].
     static RUNS: std::cell::RefCell<Option<HashMap<(usize, usize), u32>>> = const { std::cell::RefCell::new(None) };
+    /// While set, called with the side and node index as each closure run
+    /// starts on this thread, for a forced schedule.
+    static ENTERED: std::cell::RefCell<Option<EnteredHook>> = const { std::cell::RefCell::new(None) };
+    /// While set, called with the side and node index as each cycle
+    /// callback starts on this thread, for a forced schedule.
+    static CALLED: std::cell::RefCell<Option<EnteredHook>> = const { std::cell::RefCell::new(None) };
+}
+
+fn called((side, i): (usize, usize)) {
+    CALLED.with(|c| {
+        if let Some(f) = &mut *c.borrow_mut() {
+            f(side, i);
+        }
+    });
 }
 
 /// A Native closure's run: its node by side, index and the order it was
@@ -1002,6 +1023,11 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             let (expr, world) = (expr.clone(), world.clone());
             let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
             let compute = move |rt: &Runtime<C>| {
+                ENTERED.with(|e| {
+                    if let Some(f) = &mut *e.borrow_mut() {
+                        f(side, i);
+                    }
+                });
                 RUNS.with(|r| {
                     if let Some(runs) = &mut *r.borrow_mut() {
                         *runs.entry((side, i)).or_default() += 1;
@@ -1052,7 +1078,7 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                     erased(
                         pinned,
                         QueryOpts {
-                            cycle: strategy.build(|v| Bare(v, false)),
+                            cycle: strategy.build((side, i), |v| Bare(v, false)),
                             replay,
                         },
                     ),
@@ -1063,7 +1089,7 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                     erased(
                         pinned,
                         QueryOpts {
-                            cycle: strategy.build(|v| v),
+                            cycle: strategy.build((side, i), |v| v),
                             replay,
                         },
                     ),
@@ -1311,6 +1337,19 @@ struct History<'a> {
     allowed: HashMap<(usize, usize), HashSet<Read>>,
     taken: HashMap<(u64, Option<u64>), bool>,
 }
+
+/// A forced schedule's call at each closure run start, with the side and
+/// node index.
+type EnteredHook = Box<dyn FnMut(usize, usize)>;
+
+/// [`callback_join`]'s result: whether B returned while the callback
+/// waited, A's walk listings before the callback, and A's and B's
+/// outcomes.
+type Joined = (
+    bool,
+    u32,
+    (Result<Out, String>, Option<Result<Out, String>>),
+);
 
 /// A run's two runtimes, its node tables, and the handles recreates
 /// replaced.
@@ -1588,6 +1627,8 @@ thread_local! {
     static TWO_THREAD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// The phase a two-thread run's thread is in.
     static TWO_PHASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The speculative wait drops of the two-thread runs this thread made.
+    static TWO_WAIT_DROPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Thread 0's call at the end of each read phase with two reads, by the
@@ -1618,10 +1659,11 @@ fn run_two_until(
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let stop = AtomicBool::new(false);
     let barrier = Barrier::new(2);
+    let drops = AtomicU32::new(0);
     std::thread::scope(|s| {
         for t in 0..2 {
-            let (live, outs, snaps, failures, stop, barrier) =
-                (&live, &outs, &snaps, &failures, &stop, &barrier);
+            let (live, outs, snaps, failures, stop, barrier, drops) =
+                (&live, &outs, &snaps, &failures, &stop, &barrier, &drops);
             s.spawn(move || {
                 reset_thread();
                 TWO_THREAD.with(|c| c.set(Some(t)));
@@ -1695,9 +1737,11 @@ fn run_two_until(
                     }
                 }
                 TWO_THREAD.with(|c| c.set(None));
+                drops.fetch_add(crate::replay::take_speculative_wait_drops(), Relaxed);
             });
         }
     });
+    TWO_WAIT_DROPS.with(|d| d.set(d.get() + drops.into_inner()));
     let failures = failures.into_inner().unwrap();
     assert!(failures.is_empty(), "{failures:#?}");
     let (outs, snaps) = (outs.into_inner().unwrap(), snaps.into_inner().unwrap());
@@ -4644,6 +4688,27 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
     });
 }
 
+/// 0x7b5e6, two threads: at one frame op 0's `Get(0)` gives 10004 where
+/// every order of the overlapping reads panics "boom 0:6". The speculative
+/// entry a lazy doomed frame pushed for a read the unbounded run never makes
+/// waited on the other thread, closed a waits-for cycle, and the wound
+/// retried the attempt that had seen the panic; its run drops instead.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_lazy_doomed_frame_placeholder_seeds() {
+    TWO_WAIT_DROPS.with(|d| d.set(0));
+    let case = gen_case(0x7b5e6, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x7b5e6);
+        }
+    });
+    assert!(
+        TWO_WAIT_DROPS.with(|d| d.get()) > 0,
+        "no speculative run dropped at a wait"
+    );
+}
+
 /// 0x761 and 0x8c2, two-thread cases on one thread, Shared at one frame:
 /// a wound at any claim gives the unbounded run's outcome, as its
 /// retraction puts each held landing back as its claim found it.
@@ -4930,6 +4995,287 @@ fn two_thread_contained_cycle_landing_seeds() {
 #[cfg_attr(miri, ignore)]
 fn two_thread_contained_walk_rerun_seeds() {
     assert_runs_match_an_order(0x308ab, Some(1), 100);
+}
+
+/// A read B that began before a walk listing and that the lister's user
+/// code joins: C (0) reads R (1), which catches N (2); N and M (3) form a
+/// fixpoint cycle in which N reads E (4), which panics once input 5 is 3.
+/// B reads M and waits after its op began; R's closure lets it go and
+/// joins it. At budget 1 the walk lists M when E's panic unwinds the cycle
+/// and enters R's closure after that, where the unbounded run holds no
+/// frame of M, so B returns as it does unbounded. In a child, since a held
+/// B hangs.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_listing_passes_an_earlier_reader_its_user_code_joins() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_walk_listing_passes_an_earlier_reader_its_user_code_joins",
+        walk_listing_passes_an_earlier_reader_its_user_code_joins,
+    )
+    .assert_clean();
+}
+
+fn walk_listing_passes_an_earlier_reader_its_user_code_joins() {
+    use Expr::{Add, Catch, PanicIf, Read};
+    thread_local! {
+        static B: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let b = Box::new;
+    let fix = Strat::Fixpoint {
+        initial: 0,
+        limit: 3,
+    };
+    let q = |expr, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy,
+    };
+    let case = Case {
+        specs: vec![
+            q(Read(1, false), Strat::None),
+            q(Catch(b(Read(2, false))), Strat::None),
+            q(Add(b(Read(3, false)), b(Read(4, false))), fix),
+            q(Read(2, false), fix),
+            q(PanicIf(b(Read(5, false)), 3), Strat::None),
+            Spec::Input(0),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 5,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(1), Op::Set(5, 3), Op::Get(0)],
+    };
+    let twin = |frames: Option<u32>| {
+        let rts = runtimes::<Shared>(frames, 0);
+        let live = Live::new(&rts, &case);
+        for op in &case.ops[..2] {
+            live.apply(op);
+        }
+        let (parked, released) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let hook: crate::runtime::ParkHook = {
+            let (parked, released) = (parked.clone(), released.clone());
+            Box::new(move |p| {
+                if B.with(std::cell::Cell::get)
+                    && !matches!(p, ParkPoint::GetAfterHandleCheck(_))
+                    && !parked.swap(true, SeqCst)
+                {
+                    until(|| released.load(SeqCst));
+                }
+            })
+        };
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+        let b_out = Arc::new(Mutex::new(None));
+        let joined = Arc::new(AtomicBool::new(false));
+        let listed = Arc::new(AtomicU32::new(0));
+        std::thread::scope(|s| {
+            let b_read = s.spawn(|| {
+                B.with(|b| b.set(true));
+                let out = live.apply(&Op::Get(3));
+                *b_out.lock().unwrap() = Some(out);
+            });
+            until(|| parked.load(SeqCst) || b_read.is_finished());
+            assert!(parked.load(SeqCst), "B returned before it waited");
+            let a = s.spawn(|| {
+                let (released, joined, b_out) = (released.clone(), joined.clone(), b_out.clone());
+                let listed = listed.clone();
+                let before = crate::reserve::walk_listings();
+                ENTERED.with(|e| {
+                    *e.borrow_mut() = Some(Box::new(move |side, i| {
+                        if (side, i) == (0, 1) && !joined.swap(true, SeqCst) {
+                            listed.store(crate::reserve::walk_listings() - before, SeqCst);
+                            released.store(true, SeqCst);
+                            until(|| b_out.lock().unwrap().is_some());
+                        }
+                    }));
+                });
+                let a = live.apply(&Op::Get(0));
+                ENTERED.with(|e| e.borrow_mut().take());
+                a
+            });
+            let a = a.join().unwrap();
+            released.store(true, SeqCst);
+            b_read.join().unwrap();
+            assert!(joined.load(SeqCst), "R's closure never ran");
+            let outs = (a, b_out.lock().unwrap().take().unwrap());
+            (outs, listed.load(SeqCst))
+        })
+    };
+    quiet(|| {
+        let (bounded, listed) = twin(Some(1));
+        assert!(listed > 0, "the budget listed nothing before R's entry");
+        assert_eq!(bounded, twin(None).0);
+    });
+}
+
+/// 0x7883 and 0x8ce0 under the byte budget: a contained panic lists a
+/// node, and the walk's next user code is a Fixpoint member's initial-value
+/// callback, of a node outside the listing's peers. The callback lets a
+/// read B of the listed node go and waits for it, as a std join would.
+/// Unbounded holds no frame of the node there and B returns while the
+/// callback waits; so must it when the budget made the listing.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_callback_joins_a_read_of_a_listed_node() {
+    quiet(|| {
+        for (seed, op, callback, listed) in [(0x7883, 6, 0, 2), (0x8ce0, 7, 13, 0)] {
+            let case = gen_case(seed, false, true);
+            let unbounded = callback_join(&case, op, callback, listed, 0);
+            let bounded = callback_join(&case, op, callback, listed, 16 * 1024);
+            assert!(unbounded.0, "{seed:#x}: B waited unbounded");
+            assert!(
+                bounded.1 > 0,
+                "{seed:#x}: the budget listed nothing before the callback"
+            );
+            assert_eq!(
+                (bounded.0, bounded.2),
+                (unbounded.0, unbounded.2),
+                "{seed:#x}"
+            );
+        }
+    });
+}
+
+/// Runs `case`'s operations before `op` in order, then `op` on a thread
+/// A whose first callback of node `callback` lets a read B of node
+/// `listed` go and waits up to 10 s for it.
+fn callback_join(case: &Case, op: usize, callback: usize, listed: usize, bytes: usize) -> Joined {
+    let rts = runtimes::<Shared>(None, bytes);
+    let live = Live::new(&rts, case);
+    let apply = |op: &Op| catch_unwind(AssertUnwindSafe(|| live.apply(op))).map_err(class);
+    for op in &case.ops[..op] {
+        let _ = apply(op);
+    }
+    let (go_tx, go) = std::sync::mpsc::channel::<()>();
+    let done = Arc::new(AtomicBool::new(false));
+    let returned = Arc::new(Mutex::new(None));
+    let listings = Arc::new(AtomicU32::new(0));
+    std::thread::scope(|s| {
+        let b = {
+            let done = done.clone();
+            s.spawn(move || {
+                go.recv().ok()?;
+                let out = apply(&Op::Get(listed));
+                done.store(true, SeqCst);
+                Some(out)
+            })
+        };
+        let a = s.spawn(|| {
+            let (done, returned, listings) = (done.clone(), returned.clone(), listings.clone());
+            let mut go_tx = Some(go_tx);
+            let before = crate::reserve::walk_listings();
+            CALLED.with(|c| {
+                *c.borrow_mut() = Some(Box::new(move |side, i| {
+                    if let Some(go) = go_tx.take_if(|_| (side, i) == (0, callback)) {
+                        listings.store(crate::reserve::walk_listings() - before, SeqCst);
+                        go.send(()).unwrap();
+                        let start = std::time::Instant::now();
+                        while !done.load(SeqCst) && start.elapsed().as_secs() < 10 {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        *returned.lock().unwrap() = Some(done.load(SeqCst));
+                    }
+                }));
+            });
+            let a = apply(&case.ops[op]);
+            CALLED.with(|c| c.borrow_mut().take());
+            a
+        });
+        let a = a.join().unwrap();
+        let returned = returned.lock().unwrap().expect("the callback never ran");
+        (returned, listings.load(SeqCst), (a, b.join().unwrap()))
+    })
+}
+
+/// 0x308ab at budget 1: op 3's `Get(1)` lists 2 when its walk's contained
+/// panic lands it Dirty, released with 1, and enters node 1's closure
+/// again before it claims 2 again, as the unbounded run does under 2's
+/// frame. The listing stays awake there, and a read of 2 begun there,
+/// while op 3 waits at that entry, waits for op 3 as it would unbounded;
+/// both reads and the final states are a serial order's. In a child,
+/// since a stalled schedule would hang.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_read_of_a_node_listed_through_a_peers_closure() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_read_of_a_node_listed_through_a_peers_closure",
+        read_of_a_node_listed_through_a_peers_closure,
+    )
+    .assert_clean();
+}
+
+fn read_of_a_node_listed_through_a_peers_closure() {
+    let case = gen_case(0x308ab, false, true);
+    let serial = |b_first: bool| {
+        let (a, b) = if b_first { (4, 3) } else { (3, 4) };
+        let mut ops = case.ops[..3].to_vec();
+        ops.extend([Op::Get(1), Op::Get(1)]);
+        ops[b] = Op::Get(2);
+        let t = run::<Shared>(
+            &Case {
+                ops,
+                ..case.clone()
+            },
+            None,
+            0,
+        );
+        (t[a].0.clone(), t[b].0.clone(), t[4].1.clone())
+    };
+    quiet(|| {
+        let orders = [serial(false), serial(true)];
+        let rts = runtimes::<Shared>(Some(1), 0);
+        let live = Live::new(&rts, &case);
+        for op in &case.ops[..3] {
+            live.apply(op);
+        }
+        let two = (
+            live.world.rt(0).runtime_id,
+            live.world.handle(0, 2).erased().slot(),
+        );
+        let (parked, awake, released) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                let (parked, awake, released) = (parked.clone(), awake.clone(), released.clone());
+                let mut entries = 0;
+                ENTERED.with(|e| {
+                    *e.borrow_mut() = Some(Box::new(move |side, i| {
+                        if (side, i) != (0, 1) {
+                            return;
+                        }
+                        entries += 1;
+                        if entries == 2 {
+                            awake.store(crate::reserve::mine_awake(two), SeqCst);
+                            parked.store(true, SeqCst);
+                            until(|| released.load(SeqCst));
+                        }
+                    }));
+                });
+                let a = live.apply(&Op::Get(1));
+                ENTERED.with(|e| e.borrow_mut().take());
+                a
+            });
+            until(|| parked.load(SeqCst) || a.is_finished());
+            assert!(parked.load(SeqCst), "op 3 entered node 1 once");
+            assert!(
+                awake.load(SeqCst),
+                "node 1's closure ended the listing of 2"
+            );
+            let b = s.spawn(|| live.apply(&Op::Get(2)));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            released.store(true, SeqCst);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let got = (a, b, live.snapshot());
+        assert!(orders.contains(&got), "no serial order's: {got:?}");
+    });
 }
 
 /// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry,
@@ -5499,6 +5845,45 @@ fn two_thread_wound_retracts_a_member_run_landing_under_a_closed_cycle() {
         },
     )
     .assert_clean();
+}
+
+/// 0x329f unbounded: op 1's `TryGet(4)` returned 1 where every order
+/// raises the cycle through 4, in about one run in ten under load, until
+/// what catches a cycle closed on this thread's stack was held.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_read_builds_on_no_unfinished_attempts_caught_cycle_329f() {
+    let case = gen_case(0x329f, false, true);
+    let phases = phases(&case, 0x329f);
+    let serial = Serial::new(&case, &phases);
+    quiet(|| {
+        for _ in 0..80 {
+            serial.differential("0x329f", None, 0, &|_| {});
+        }
+    });
+}
+
+/// 0x157d3 at two frames: a walk's retry delivers 7's panic to 6 while
+/// this thread holds 7's Failed landing, and 6 published Failed over it,
+/// so the other thread's contained read of 6 took a ticket with 7 still
+/// unpublished, about one run in two hundred under load.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_delivered_read_of_a_held_landing_holds_its_reader_157d3() {
+    let case = gen_case(0x157d3, false, true);
+    let phases = phases(&case, 0x157d3);
+    quiet(|| {
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let serial = Serial::new(&case, &phases);
+                    for _ in 0..500 {
+                        serial.differential("0x157d3", Some(2), 16 * 1024, &|_| {});
+                    }
+                });
+            }
+        });
+    });
 }
 
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty

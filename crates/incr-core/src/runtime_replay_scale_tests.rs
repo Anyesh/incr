@@ -154,6 +154,19 @@ cycle_100k_tests! {
     shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
 }
 
+/// The deep budget the redelivered root read tests run a 5,000-member
+/// ring under. TSan's shadow stack holds 64Ki calls per thread and does not
+/// check its end, so a deeper call stack corrupts TSan's own memory; a
+/// Local ring level takes about 23, so the TSan job (which sets
+/// `INCR_TEST_REDUCED`) stops at 2048 levels.
+fn deep_budget() -> u32 {
+    if std::env::var_os("INCR_TEST_REDUCED").is_some() {
+        2048
+    } else {
+        4096
+    }
+}
+
 /// A ring's retries redeliver each discarded walk root's direct read, one
 /// per doom: the delivery index work that costs stays per doom, not per
 /// delivery its maker made, so it does not grow with the budget.
@@ -185,10 +198,11 @@ fn redelivered_root_reads_cost_the_same_at_any_budget() {
         let units = *units.lock().unwrap();
         units
     };
-    let (narrow, wide) = (work(256), work(4096));
+    let (narrow, wide) = (work(256), work(deep_budget()));
     assert!(
         wide * 4 <= narrow * 5,
-        "{narrow} units of note work at budget 256, {wide} at 4096"
+        "{narrow} units of note work at budget 256, {wide} at {}",
+        deep_budget()
     );
 }
 
@@ -199,7 +213,7 @@ fn redelivered_root_reads_cost_the_same_at_any_budget() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn redelivered_root_reads_hold_a_direct_per_virtual_frame() {
-    for frames in [256, 4096] {
+    for frames in [256, deep_budget()] {
         let peak = Arc::new(Mutex::new((0, 0, 0)));
         let out = peak.clone();
         on_stack(1 << 30, move || {
