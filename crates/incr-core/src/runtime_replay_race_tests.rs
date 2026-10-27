@@ -4680,6 +4680,7 @@ fn shared_retry_joins_a_reader_that_takes_a_held_payload_over() {
 fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
+    rt.set_max_frames(u32::MAX);
     let (in_w, at_claim) = (Gate::new(), Gate::new());
     let y = rt.create_query_with(|_: &Rt| -> u64 { panic!("y boom") }, replayable());
     let w = {
