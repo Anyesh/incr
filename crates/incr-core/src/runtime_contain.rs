@@ -576,14 +576,18 @@ impl<C: Cells> Runtime<C> {
 
     /// Every landing a ticket keeps is in its Failed landing and indexed to
     /// it: every change from that landing releases it. A ticket of more
-    /// than [`FULL_CHECK_MEMBERS`] has only the members from `pushed_from`
-    /// on checked, and not its count, so a ticket that grows by a landing
-    /// per hold costs a test build linear work as it does a user's.
+    /// than [`FULL_CHECK_MEMBERS`] is walked whole, count included, only
+    /// when this hold took it past a power of two, and otherwise has only
+    /// the members from `pushed_from` on checked: a ticket that grows by a
+    /// landing per hold costs a test build linear work, as it does a
+    /// user's, and a member gone stale is seen within one doubling.
     fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket, pushed_from: usize) {
         let members = ticket.members.lock();
-        let full = members.members.len() <= FULL_CHECK_MEMBERS;
+        let len = members.members.len();
+        let full =
+            len <= FULL_CHECK_MEMBERS || pushed_from == 0 || pushed_from.ilog2() != len.ilog2();
         let from = if full { 0 } else { pushed_from };
-        crate::replay::ticket_checks(members.members.len() - from);
+        crate::replay::ticket_checks(len - from);
         let live = members.members[from..]
             .iter()
             .filter(|m| m.gone == u64::MAX);
