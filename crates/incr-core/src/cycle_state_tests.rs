@@ -1,9 +1,15 @@
-use super::{own_episode, own_episodes, Held, Look, OWN_EPISODES};
-use crate::cycle::{self, Erased};
+use std::sync::Arc;
+
+use super::{
+    left_rec_since, note_rec_left, own_episode, own_episodes, recs_left_count, Held, Look,
+    OWN_EPISODES,
+};
+use crate::cycle::{self, Cycle, Erased};
 use crate::deferred::Unbuilt;
-use crate::handle::RuntimeId;
+use crate::handle::{ErasedIncr, RuntimeId};
 use crate::node::NodeId;
 use crate::replay;
+use crate::runtime::GroupInfo;
 
 fn value(v: u32) -> Option<Erased> {
     Some(Box::new(v))
@@ -275,4 +281,24 @@ fn a_destructors_discard_leaves_a_lazy_doom_in_flight() {
     );
     assert!(!super::end_lazy(1));
     assert!(!crate::attempt::in_flight());
+}
+
+/// A walk counts as its own only the record changes this thread noted after
+/// its expansion: one noted before it, which another thread's changes then
+/// undid back to the same record, is another thread's.
+#[test]
+fn a_record_change_noted_before_the_mark_is_not_this_threads_since() {
+    let rt = RuntimeId::for_test(1 << 41);
+    let rec = Arc::new(GroupInfo {
+        members: vec![(3, 0)],
+        cycle: Cycle::new(vec![ErasedIncr::new(3, 0, rt)]),
+    });
+    note_rec_left(rt, 3, None);
+    let mark = recs_left_count();
+    assert!(left_rec_since(0, rt, 3, None));
+    assert!(!left_rec_since(mark, rt, 3, None));
+    note_rec_left(rt, 3, Some(rec.clone()));
+    assert!(left_rec_since(mark, rt, 3, Some(&rec)));
+    assert!(!left_rec_since(mark, rt, 3, None));
+    assert!(!left_rec_since(mark, rt, 4, Some(&rec)));
 }

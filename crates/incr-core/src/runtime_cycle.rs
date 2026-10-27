@@ -2559,7 +2559,7 @@ impl<C: Cells> Runtime<C> {
         });
         for (m, _) in &entries {
             let (node, flags) = self.nodes.get_with_flags(*m);
-            let old = inner.member_recs.insert(*m, group.clone());
+            let old = inner.set_member_rec(self.runtime_id, *m, Some(group.clone()));
             if held {
                 let in_group = C::u8_load_relaxed(flags) & IN_GROUP != 0;
                 hold::keep_rec(state::cell_key::<C>(node.state_cell()), old, in_group);

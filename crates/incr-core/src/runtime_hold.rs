@@ -385,24 +385,24 @@ impl<C: Cells> Runtime<C> {
         }
         let mut inner = self.inner.write();
         for (slot, rec, in_group) in recs {
-            self.restore_rec(&mut inner, slot, rec, in_group);
+            self.restore_rec(&mut inner, slot, rec, in_group, true);
         }
     }
 
+    /// Puts `slot`'s group record back; `own` unless the landing it undoes
+    /// is another thread's.
     fn restore_rec(
         &self,
         inner: &mut Inner<C>,
         slot: u32,
         rec: Option<Arc<GroupInfo>>,
         in_group: bool,
+        own: bool,
     ) {
-        match rec {
-            Some(r) => {
-                inner.member_recs.insert(slot, r);
-            }
-            None => {
-                inner.member_recs.remove(&slot);
-            }
+        if own {
+            inner.set_member_rec(self.runtime_id, slot, rec);
+        } else {
+            inner.set_others_member_rec(slot, rec);
         }
         let flags = self.nodes.get_with_flags(slot).1;
         let bits = C::u8_load_relaxed(flags);
@@ -870,7 +870,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 if let Some((rec, in_group)) = e.undo.rec.take() {
-                    self.restore_rec(&mut inner, e.slot, rec, in_group);
+                    self.restore_rec(&mut inner, e.slot, rec, in_group, own);
                 }
                 // An entry over a list that lost a dep counted the whole
                 // old list.
@@ -879,7 +879,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             for (slot, rec) in cut_recs {
-                self.restore_rec(&mut inner, slot, rec, true);
+                self.restore_rec(&mut inner, slot, rec, true, own);
             }
         }
         for (i, e) in entries.iter_mut().enumerate() {
