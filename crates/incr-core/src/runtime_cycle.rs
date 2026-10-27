@@ -1027,6 +1027,10 @@ impl<C: Cells> Runtime<C> {
         }
         let mut began = None;
         let word = value_code::thread_word();
+        // A dep a speculative run reads Clean was unchanged since then only
+        // if it is no newer than this, as a landing's `verify_rev` checks.
+        let started = (word & value_code::SPECULATING_BIT != 0)
+            .then(|| C::walked(&self.walk, &self.revision));
         if word & value_code::SPEC_READS_BIT != 0 {
             // Notes at this position or above are an earlier frame's.
             cycle_state::with_held(|h| h.drop_spec_reads(self.runtime_id, cidx));
@@ -1108,7 +1112,7 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let (replaced, spec_buf) = cycle_state::with_held(|h| {
             let basis = if look.is_speculative() {
-                self.spec_basis(h, cidx, &deps, result.is_ok(), &ctl)
+                self.spec_basis(h, cidx, &deps, result.is_ok(), &ctl, started)
             } else {
                 h.drop_spec_reads(rt, cidx);
                 None
@@ -1144,7 +1148,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The basis of a speculative member run at `cidx` that read `deps`, if
-    /// it ended well and read only real state; drops its notes either way.
+    /// it ended well and read only real state, each other node unchanged
+    /// since revision `started`; drops its notes either way.
     #[cold]
     #[inline(never)]
     fn spec_basis(
@@ -1154,9 +1159,15 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         ok: bool,
         ctl: &ComputeCtl,
+        started: Option<u64>,
     ) -> Option<Basis> {
-        if ok && !ctl.has(cycle::UNREAL_READS) && !ctl.looked_up_unrecorded() {
-            h.take_basis(self.runtime_id, cidx, deps, &|d| self.clean_stamp(d))
+        if let (true, Some(started)) = (
+            ok && !ctl.has(cycle::UNREAL_READS) && !ctl.looked_up_unrecorded(),
+            started,
+        ) {
+            h.take_basis(self.runtime_id, cidx, deps, &|d| {
+                self.clean_stamp(d).filter(|&(_, at)| at <= started)
+            })
         } else {
             h.drop_spec_reads(self.runtime_id, cidx);
             None

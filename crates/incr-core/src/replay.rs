@@ -3648,6 +3648,7 @@ impl Speculating {
     pub(crate) fn enter(chain: RuntimeId) -> Self {
         SPECULATIVE.with(|s| s.set(s.get() + 1));
         SPECULATING_IN.with(|c| c.borrow_mut().push(chain));
+        value_code::set_bits(value_code::SPECULATING_BIT, true);
         Self(())
     }
 }
@@ -3655,7 +3656,11 @@ impl Speculating {
 impl Drop for Speculating {
     fn drop(&mut self) {
         SPECULATING_IN.with(|c| c.borrow_mut().pop());
-        SPECULATIVE.with(|s| s.set(s.get() - 1));
+        let left = SPECULATIVE.with(|s| {
+            s.set(s.get() - 1);
+            s.get()
+        });
+        value_code::set_bits(value_code::SPECULATING_BIT, left != 0);
     }
 }
 

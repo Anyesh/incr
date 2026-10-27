@@ -66,6 +66,10 @@ pub(crate) const HELD_BIT: u64 = 1 << 53;
 /// held members, so a member run outside speculation finds out with the
 /// load it already makes that it has no stale notes to drop.
 pub(crate) const SPEC_READS_BIT: u64 = 1 << 52;
+/// Set while this thread speculates (`replay::Speculating`), so a member
+/// run tells with the load it already makes whether to note when it
+/// started.
+pub(crate) const SPECULATING_BIT: u64 = 1 << 51;
 
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
 /// so a live memo, unwind kind, replay context or note never trips the
@@ -80,7 +84,8 @@ pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT
     | REGEN_ABORTED
     | TOOK_BIT
     | HELD_BIT
-    | SPEC_READS_BIT);
+    | SPEC_READS_BIT
+    | SPECULATING_BIT);
 
 const _: () = assert!(crate::bits::disjoint(&[
     MEMO_BIT,
@@ -94,6 +99,7 @@ const _: () = assert!(crate::bits::disjoint(&[
     TOOK_BIT,
     HELD_BIT,
     SPEC_READS_BIT,
+    SPECULATING_BIT,
 ]));
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
