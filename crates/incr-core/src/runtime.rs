@@ -3783,6 +3783,14 @@ impl<C: Cells> Runtime<C> {
                     }
                     NodeState::Failed => {
                         if self.flip_failed(id) {
+                            // A held landing's note over this node can be
+                            // newer than the walk (`note_held_failed_deps`);
+                            // the flip's lock orders it before this load.
+                            let past = if C::SINGLE_THREADED {
+                                past
+                            } else {
+                                self.failed_past.load(std::sync::atomic::Ordering::Relaxed)
+                            };
                             if past & contain_impl::past_bit(id.0) != 0 {
                                 self.take_past_sets(id, &mut queue);
                             }
@@ -5672,6 +5680,9 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         self.hold_panic_landing(id, node, attempt.first, wrote, bag);
+        if !C::SINGLE_THREADED && hold::holds(state::cell_key::<C>(node.state_cell())) {
+            self.note_held_failed_deps(id, node, deps);
+        }
         let landing = match self.publish_deps(
             id,
             deps,
