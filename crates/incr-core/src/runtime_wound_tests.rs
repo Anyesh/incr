@@ -90,7 +90,18 @@ struct StaleEdge {
 
 impl StaleEdge {
     fn new(reads: QReads, q_new: bool) -> Self {
-        let rt = Arc::new(Runtime::<Shared>::new());
+        Self::with_replay(reads, q_new, false)
+    }
+
+    /// [`Self::new`] with every query replayable if `replayable`, so a frame
+    /// budget replays its reads.
+    fn with_replay(reads: QReads, q_new: bool, replayable: bool) -> Self {
+        let mut rt = Runtime::<Shared>::new();
+        rt.all_replayable = replayable;
+        let rt = Arc::new(rt);
+        if replayable {
+            rt.set_placeholder(0_i64);
+        }
         let s = rt.create_input(0_i64);
         let t = rt.create_input(0_i64);
         let u = rt.create_input(0_i64);
@@ -181,6 +192,20 @@ impl StaleEdge {
         thread::JoinHandle<i64>,
         thread::JoinHandle<thread::Result<R>>,
     ) {
+        self.run_parking_b(a_first, None, b)
+    }
+
+    /// [`Self::run`], also parking B at `b_exit` when its outermost exit
+    /// checks its cycle verdicts.
+    fn run_parking_b<R: Send + 'static>(
+        &self,
+        a_first: bool,
+        b_exit: Option<Gate>,
+        b: impl FnOnce(&Runtime<Shared>) -> R + Send + 'static,
+    ) -> (
+        thread::JoinHandle<i64>,
+        thread::JoinHandle<thread::Result<R>>,
+    ) {
         self.a_gate.arm();
         let thread_a = {
             let rt = Arc::clone(&self.rt);
@@ -188,13 +213,34 @@ impl StaleEdge {
             thread::spawn(move || rt.get(a))
         };
         self.a_gate.wait_parked();
-        park_at(
-            &self.rt,
-            vec![(ParkPoint::BeforeComputeOne(id(self.a)), self.b_gate.clone())],
-        );
+        let b_thread = Arc::new(OnceLock::new());
+        match b_exit {
+            None => park_at(
+                &self.rt,
+                vec![(ParkPoint::BeforeComputeOne(id(self.a)), self.b_gate.clone())],
+            ),
+            Some(exit) => {
+                let (b_gate, b_thread, a) = (self.b_gate.clone(), b_thread.clone(), id(self.a));
+                b_gate.arm();
+                exit.arm();
+                let installed = self.rt.park_hook.set(Box::new(move |p| {
+                    if p == ParkPoint::BeforeComputeOne(a) {
+                        b_gate.park();
+                    } else if p == ParkPoint::VerdictCheck
+                        && b_thread.get() == Some(&thread::current().id())
+                    {
+                        exit.park();
+                    }
+                }));
+                assert!(installed.is_ok(), "park hook installed twice");
+            }
+        }
         let thread_b = {
             let rt = Arc::clone(&self.rt);
-            thread::spawn(move || catch_unwind(AssertUnwindSafe(|| b(&rt))))
+            thread::spawn(move || {
+                b_thread.set(thread::current().id()).unwrap();
+                catch_unwind(AssertUnwindSafe(|| b(&rt)))
+            })
         };
         self.b_gate.wait_parked();
         let (first, second) = if a_first {
@@ -230,6 +276,89 @@ fn stale_edge_waits_for_cycle(a_first: bool) {
     }
     assert_wounded();
     g.rt.assert_invariant_i();
+}
+
+/// B, the older thread, closes the cycle and its unwind releases the
+/// members before its outermost exit, so A's retry can land them first.
+/// B read nothing after the cycle, so its outcome stays the cycle, the
+/// order with B's read first, at every frame budget.
+fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
+    let g = StaleEdge::with_replay(QReads::Plain, false, budget.is_some());
+    if let Some(n) = budget {
+        g.rt.set_max_frames(n);
+    }
+    let q = g.q;
+    let exit = Gate::new();
+    let (thread_a, thread_b) = g.run_parking_b(false, Some(exit.clone()), move |rt| rt.get(q));
+    exit.wait_parked();
+    let deadline = Instant::now() + POLL_DEADLINE;
+    while !thread_a.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "A never finished while B was parked"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    exit.release();
+    assert_eq!(thread_a.join().unwrap(), 4);
+    let message = panic_message(thread_b.join().unwrap().unwrap_err());
+    assert!(message.contains("dependency cycle"), "{message}");
+    assert_eq!(g.rt.verdict_reruns.load(Ordering::Relaxed), 0);
+    if budget.is_some() {
+        let replayed = (
+            g.rt.dooms.lock().unwrap().len(),
+            g.rt.entries.lock().unwrap().len(),
+            g.rt.deliveries.lock().unwrap().len(),
+        );
+        assert_ne!(
+            replayed,
+            (0, 0, 0),
+            "the budget replayed no read (dooms, entries, deliveries)"
+        );
+    }
+    assert_eq!(g.rt.get(q), 4);
+    assert_wounded();
+    g.rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_older_threads_uncaught_cycle_stands_over_a_later_landing() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_over_a_later_landing",
+        || older_threads_uncaught_cycle_stands(None),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_1() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_1",
+        || older_threads_uncaught_cycle_stands(Some(1)),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_2() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_2",
+        || older_threads_uncaught_cycle_stands(Some(2)),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_3() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_3",
+        || older_threads_uncaught_cycle_stands(Some(3)),
+    )
+    .assert_clean();
 }
 
 #[test]

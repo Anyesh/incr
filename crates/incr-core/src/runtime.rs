@@ -178,6 +178,9 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// At an outermost exit that holds landings, before it checks the
+    /// cycle verdicts its attempt may have taken.
+    VerdictCheck,
     /// In a read's walk loop, after the walk and before the slot read.
     AfterWalk(NodeId),
     /// In `compute_attempts`, after the claim CAS and before the check for
@@ -1368,6 +1371,12 @@ pub struct Runtime<C: Cells> {
     regens: C::Lock<replay_impl::Regens>,
     /// Set once `regens` holds a record, so a delete looks for one only then.
     regens_held: std::sync::atomic::AtomicBool,
+    /// Run landings of the nodes whose cycle verdict a read may have
+    /// taken, by (slot, generation), while any read watches them.
+    verdict_watch: C::Lock<cycle_impl::Watches<C>>,
+    /// `verdict_watch`'s length, written under its lock; a run landing
+    /// counts itself only when it is nonzero.
+    watching: C::U32,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1449,6 +1458,8 @@ pub struct Runtime<C: Cells> {
     /// Walks planned again from their root after another thread's release.
     #[cfg(test)]
     pub(crate) root_replans: std::sync::atomic::AtomicU32,
+    #[cfg(all(test, not(loom)))]
+    pub(crate) verdict_reruns: std::sync::atomic::AtomicU32,
     /// Waits on another thread's doom reservation, for tests.
     #[cfg(test)]
     pub(crate) reservation_waits: std::sync::atomic::AtomicU32,
@@ -1531,6 +1542,8 @@ impl<C: Cells> Runtime<C> {
             failed_past: std::sync::atomic::AtomicU64::new(0),
             regens: replay_impl::regens::<C>(),
             regens_held: std::sync::atomic::AtomicBool::new(false),
+            verdict_watch: cycle_impl::verdict_watch::<C>(),
+            watching: C::new_u32(0),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -1577,6 +1590,8 @@ impl<C: Cells> Runtime<C> {
             unrun_unclaims: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             root_replans: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(all(test, not(loom)))]
+            verdict_reruns: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             reservation_waits: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -2821,10 +2836,14 @@ impl<C: Cells> Runtime<C> {
 
     #[inline(never)]
     fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
-        cycle_state::KeptUnwind::around_read(
+        let read = cycle_state::KeptUnwind::around_read(
             || self.read_slow(handle, observed, ReadKind::TryGet),
             || self.reads_in_lazy_frame(),
-        )
+        );
+        if read.is_err() && cycle_state::depth() > 0 {
+            self.note_cycle_caught(None);
+        }
+        read
     }
 
     /// The cycle of the group `handle` landed in last, if its last
@@ -5201,8 +5220,10 @@ impl<C: Cells> Runtime<C> {
                         verify_rev,
                     };
                     if let Err(payload) = &result {
-                        if word & value_code::UNWIND_MASK != 0 {
-                            cycle_impl::clear_caught_cycle(&**payload, &deps, reading);
+                        if word & value_code::UNWIND_MASK != 0
+                            && cycle_impl::read_past_cycle(&**payload, &deps, reading, &ctl)
+                        {
+                            self.note_cycle_caught(Some(&ctl));
                         }
                     }
                     if let Some(dropped) =
@@ -5896,7 +5917,7 @@ impl<C: Cells> Runtime<C> {
         if word & value_code::KEPT_BIT != 0 {
             replay::drop_kept_from(self.runtime_id, attempt.cidx);
         }
-        if self.after_pop(word, result.is_ok()) {
+        if self.after_pop(word, result.is_ok(), ctl) {
             *result = Err(match UnwindKind::of_word(word) {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
                 _ => Box::new(cycle::WoundUnwind),
@@ -5934,13 +5955,13 @@ impl<C: Cells> Runtime<C> {
     /// wound, which the pop lands as an unwind.
     #[cold]
     #[inline(never)]
-    fn after_pop(&self, word: u64, returned: bool) -> bool {
+    fn after_pop(&self, word: u64, returned: bool, ctl: &ComputeCtl) -> bool {
         if word & value_code::MEMO_BIT != 0 {
             taint_memo::clear_from(self.dep_stack.next_cidx() + 1);
         }
         returned
             && !std::thread::panicking()
-            && self.swallowed(cycle_state::UnwindKind::of_word(word))
+            && self.swallowed(cycle_state::UnwindKind::of_word(word), ctl)
     }
 
     /// A single-node landing: a node landing outside an episode leaves
@@ -6193,6 +6214,9 @@ impl<C: Cells> Runtime<C> {
         flagged: NodeState,
         unrun: bool,
     ) -> NodeState {
+        if !C::SINGLE_THREADED && !unrun && C::u32_load_relaxed(&self.watching) != 0 {
+            self.count_watched_run(id, node);
+        }
         node.set_unrun(unrun);
         if !C::SINGLE_THREADED && unrun {
             reserve::note((self.runtime_id, id.0), node.generation());
