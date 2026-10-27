@@ -2518,3 +2518,56 @@ which loses AUX data at 3).
   `moved_since_read`; that runs at the publication of a held Failed
   landing, or of a held Clean one being lowered there, which no
   workload here makes, so the rows stand.
+
+## Exact take-over and the walk listing of held landings (increment 17)
+
+Increment 17 `33c30fd66` is `w/T10-held-unwind-landings` (`a09b77e81`:
+held panic landings, and a take-over only while the owner is outside
+the engine, through the attempt's `outside` flag) with the walk listing
+of held landings and its take-over refusal (`854fdfd5d`), merged onto
+increment 16 `6bfc3b196`. Cachegrind on GitHub runners, bench driver
+per iteration with a 0-iteration run subtracted: the port against 16
+(gh-cmd `33c30fd6-cafc79`, one codegen unit `33c30fd6-2327e7`), and
+the branch alone against its base increment 9 `95436e778`
+(`686405c7-65d6e8`). These are the first measurements of the hold's
+cost on compute rows; the earlier held-landing sections measured walks.
+
+| workload | 16 | 17 | delta | 9 | branch | delta |
+|---|---|---|---|---|---|---|
+| `get_clean_local` | 99 | 99 | 0 | 99 | 99 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 | 193 | 193 | 0 |
+| `table_hit_local` | 155.12 | 155.12 | 0 | 155.12 | 155.12 | 0 |
+| `table_hit_shared` | 218.12 | 218.12 | 0 | 218.12 | 218.12 | 0 |
+| `value_slot_read_shared` | 87 | 87 | 0 | 87 | 87 | 0 |
+| `chain_shared/propagate/100` | 242988.1 | 246842.4 | +3854.3 | 242588.1 | 246442.4 | +3854.3 |
+| `delete_single_shared` | 1613.8 | 1663.8 | +50.0 | 1612.8 | 1662.8 | +50.0 |
+| `fanout_shared_4` | 26842.1 | 27292.3 | +450.3 | 26816.1 | 27267.3 | +451.3 |
+| `delete_single_local` | 750 | 762 | +12 | 749 | 761 | +12 |
+| `fanout_local_4` | 18761 | 18779 | +18 | 18750 | 18768 | +18 |
+
+- `chain_shared/propagate/100`, per symbol: `write_if_changed` +15 per
+  write (+1500), the `ComputeFn` wrapper +13 per compute (+1300, the
+  `outside` flag's store and restore around the closure),
+  `mark_dependents_dirty` +7 per node (+708), `FnOnce::call_once` +3
+  per compute (+303).
+- `delete_single_shared`: `wait_out_set` +39, the arena's `release`
+  +12, `delete_strict` +8. `fanout_shared_4`: `wait_out_set` +234,
+  `get_slow` +79, `release` +72, the `ComputeFn` wrapper +71,
+  `delete_erased` +48.
+- Local pays nothing. At one codegen unit `fanout_local_4` is 18772 on
+  both and `delete_single_local` 799 against 800; per line, every
+  source line of `delete_strict` costs the same on both, and the one
+  instruction sits on line 0 (no source line, register allocation).
+  Every guard is behind `C::SINGLE_THREADED` or a no-op on a thread
+  with no attempt word.
+- Contained panics: scale icount tops out at 1.0784
+  (`shared_contained_chain_stays_linear_at_budget_16`, 1.0405 at
+  budget 2, 1.0009 Local), the same on the branch alone (+423.9M
+  against +427.7M instructions). Panics, raises and `resume_unwind`s are
+  equal to base; each failed landing adds one `_Unwind_Resume` and
+  three `rust_eh_personality` calls, about 30k instructions per
+  contained panic, in the same frames (gdb, `8efe5cb8-2e6d92`). The
+  `ComputeFn` wrapper's guard is one cleanup pad (-79.5M without it,
+  `854fdfd5-6301ba`); `read_walk`'s guard adds no unwind call
+  (`854fdfd5-7279b7`). Growth class is unchanged.
+- Scale timing totals 0.994 (`33c30fd6-9b2bbf`).
