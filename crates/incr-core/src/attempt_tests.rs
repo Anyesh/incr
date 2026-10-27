@@ -54,6 +54,7 @@ fn an_old_attempts_word_acts_on_no_later_attempt() {
 fn a_waiter_takes_over_only_a_flight_that_stays_open() {
     begin();
     let a = mine();
+    let _user = Outside::enter(true);
     let mut patience = Patience::default();
     enter_flight();
     for _ in 0..STUCK_AFTER {
@@ -164,6 +165,7 @@ fn a_waiter_takes_over_no_older_owner_waiting_in_the_registry() {
     let rt = crate::handle::RuntimeId::for_test(u64::MAX - 11);
     begin();
     let a = enter_hold();
+    let _user = Outside::enter(true);
     let waiting = crate::waits::Registration::new(|_| 1, (rt, 2), vec![(rt, 1)]);
     let (took, refused) = take_over_from(&a, rt, |rt| {
         Some(crate::waits::Registration::new(
@@ -195,11 +197,33 @@ fn a_waiter_takes_over_an_older_owner_whose_wait_leaves_the_registry() {
     let rt = crate::handle::RuntimeId::for_test(u64::MAX - 12);
     begin();
     let a = enter_hold();
+    let _user = Outside::enter(true);
     let waiting = crate::waits::Registration::new(|_| 1, (rt, 2), vec![(rt, 1)]);
     assert!(
         take_over_from(&a, rt, |_| None).0,
         "the owner's wait on an unregistered holder kept its landing from the waiter"
     );
     drop(waiting);
+    assert!(leave_hold());
+}
+
+/// An owner in the engine moves on its own, however long one step takes:
+/// no take-over while it is there, and one once it is in user code.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_waiter_takes_over_no_owner_in_the_engine() {
+    let rt = crate::handle::RuntimeId::for_test(u64::MAX - 13);
+    begin();
+    let a = enter_hold();
+    assert!(
+        !take_over_from(&a, rt, |_| None).0,
+        "a waiter took over an owner in a long engine step"
+    );
+    let user = Outside::enter(true);
+    assert!(
+        take_over_from(&a, rt, |_| None).0,
+        "an owner in user code is taken over"
+    );
+    drop(user);
     assert!(leave_hold());
 }

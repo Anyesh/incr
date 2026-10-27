@@ -564,6 +564,7 @@ impl<C: Cells> Runtime<C> {
         also: Option<NodeId>,
         mut done: impl FnMut() -> bool,
     ) {
+        let _waiting = crate::attempt::Outside::enter(true);
         let mut holds: Vec<waits::Claim> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
@@ -695,6 +696,7 @@ impl<C: Cells> Runtime<C> {
             .push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &ctl, u32::MAX);
         self.dep_stack.settle_foreign_keeping(false);
         let _barrier = Barrier(self);
+        let _user = crate::attempt::Outside::enter(true);
         value_code::run(f)
     }
 

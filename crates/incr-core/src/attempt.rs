@@ -62,8 +62,9 @@ const STUCK_AFTER: u32 = crate::waits::REGISTER_AFTER;
 #[cfg(loom)]
 const STUCK_AFTER: u32 = 2;
 
-/// How long one flight must also stay open: an owner descheduled in its
-/// unwind looks the same as one held in user code by checks alone. A
+/// How long one flight must also stay open with its owner outside the
+/// engine: an owner descheduled in its unwind looks the same as one held
+/// in user code by checks alone. A
 /// take-over of it is serializable too, but puts the slow owner's read
 /// after the waiter's rather than in the order its start gave.
 #[cfg(not(loom))]
@@ -74,6 +75,11 @@ const STUCK_FOR: std::time::Duration = std::time::Duration::from_millis(10);
 struct Word {
     state: AtomicU32,
     flights: AtomicU32,
+    /// Nonzero while the owner runs user code or waits, the only places
+    /// it cannot move on its own: written by the owner alone, so a plain
+    /// load and store, and a std atomic under loom too, where waiters
+    /// ignore it.
+    outside: std::sync::atomic::AtomicU32,
     met: Mutex<Vec<(u32, Claim)>>,
     /// The owner is stopped in a test's park hook, which stands for an
     /// engine step however long the test holds it: no holder is stuck there.
@@ -92,6 +98,7 @@ fn new_word() -> Arc<Word> {
     Arc::new(Word {
         state: AtomicU32::new(0),
         flights: AtomicU32::new(0),
+        outside: std::sync::atomic::AtomicU32::new(0),
         met: Mutex::new(Vec::new()),
         #[cfg(all(test, not(loom)))]
         parked: AtomicU32::new(0),
@@ -111,6 +118,33 @@ loom::thread_local! {
 /// This thread's attempt word, which outlives its attempts.
 pub(crate) fn word_id() -> usize {
     MINE.with(|w| Arc::as_ptr(w) as usize)
+}
+
+/// While it lives, this thread is outside the engine (`true`: in user code
+/// or a wait) or back in it (`false`), as a take-over judges its owner;
+/// the drop puts the enclosing state back.
+pub(crate) struct Outside(u32);
+
+impl Outside {
+    #[inline(always)]
+    pub(crate) fn enter(outside: bool) -> Self {
+        MINE.with(|w| {
+            let was = w.outside.load(std::sync::atomic::Ordering::Relaxed);
+            w.outside
+                .store(u32::from(outside), std::sync::atomic::Ordering::Relaxed);
+            Self(was)
+        })
+    }
+}
+
+impl Drop for Outside {
+    #[inline(always)]
+    fn drop(&mut self) {
+        MINE.with(|w| {
+            w.outside
+                .store(self.0, std::sync::atomic::Ordering::Relaxed)
+        });
+    }
 }
 
 /// This thread's current attempt.
@@ -211,8 +245,12 @@ pub(crate) fn take_met() -> Vec<Claim> {
 pub(crate) struct Patience {
     seen: Option<(usize, u32, u32)>,
     checks: u32,
+    /// The time the flight has stayed open with its owner outside the
+    /// engine, and the last check that saw it outside.
     #[cfg(not(loom))]
-    since: Option<std::time::Instant>,
+    outside_for: std::time::Duration,
+    #[cfg(not(loom))]
+    last_outside: Option<std::time::Instant>,
 }
 
 /// A waiter's patience that has already seen this thread's open flight
@@ -268,15 +306,27 @@ impl Attempt {
         if patience.seen != Some(flight) {
             *patience = Patience {
                 seen: Some(flight),
-                checks: 0,
-                #[cfg(not(loom))]
-                since: Some(std::time::Instant::now()),
+                ..Patience::default()
             };
             return false;
         }
+        // An owner in the engine moves on its own, however long one of its
+        // steps takes: only checks that find it in user code or a wait
+        // count, and only the time between two such checks.
+        #[cfg(not(loom))]
+        {
+            if self.word.outside.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                patience.last_outside = None;
+                return false;
+            }
+            let now = std::time::Instant::now();
+            if let Some(last) = patience.last_outside.replace(now) {
+                patience.outside_for += now - last;
+            }
+        }
         patience.checks += 1;
         #[cfg(not(loom))]
-        if patience.since.is_some_and(|t| t.elapsed() < STUCK_FOR) {
+        if patience.outside_for < STUCK_FOR {
             return false;
         }
         patience.checks >= STUCK_AFTER && self.take_over(claim, Some(flight.2))
@@ -287,7 +337,7 @@ impl Attempt {
     /// owner may be in user code that waits on the waiter, unless the
     /// owner waits in the registry older than the waiter
     /// ([`crate::waits::take_over_in_order`]). True if it is wounded now.
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn wound_in_flight(&self, claim: Claim) -> bool {
         self.take_over(claim, None)
     }

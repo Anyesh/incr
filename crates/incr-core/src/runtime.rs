@@ -1848,7 +1848,11 @@ impl<C: Cells> Runtime<C> {
             let arena_inner = arena;
             let compute: ComputeFn<C> = Box::new(
                 move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
-                    let new_value = f(rt);
+                    let new_value = {
+                        let _user =
+                            (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
+                        f(rt)
+                    };
                     let node = rt.nodes.get(slot);
                     let outcome = match ctl.flags.get()
                         & (cycle::RECOMPUTE
@@ -2910,6 +2914,7 @@ impl<C: Cells> Runtime<C> {
         word: u64,
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
+        let _engine = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(false));
         let slot = handle.slot();
         let arm = || reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
         let mut root = Some(arm());
@@ -3954,12 +3959,6 @@ impl<C: Cells> Runtime<C> {
         let mut unchecked = None;
         #[cfg(test)]
         let mut revisited: Vec<NodeId> = Vec::new();
-        // A holder's walk is engine progress as its pops are: a waiter that
-        // took it for one held in user code would wound an owner that moves
-        // on its own.
-        const PROGRESS_POPS: u32 = 64;
-        let holding = !C::SINGLE_THREADED && hold::active();
-        let mut pops: u32 = 0;
 
         while let Some(Entry {
             id: cur,
@@ -4102,12 +4101,6 @@ impl<C: Cells> Runtime<C> {
             #[cfg(test)]
             self.walk_pops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if holding {
-                pops = pops.wrapping_add(1);
-                if pops.is_multiple_of(PROGRESS_POPS) {
-                    crate::attempt::hold_progress();
-                }
-            }
             if walk.is_visited(cur) {
                 continue;
             }

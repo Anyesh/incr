@@ -2874,7 +2874,13 @@ fn shared_reader_of_a_held_landing_waits_out_its_owners_walk() {
     });
     let y = rt.create_input(0_i64);
     let mut top = rt.create_query(move |rt| rt.get(y).min(0));
-    for _ in 0..100_000 {
+    // A release walk is that much faster per node.
+    let len = if cfg!(debug_assertions) {
+        100_000
+    } else {
+        600_000
+    };
+    for _ in 0..len {
         let below = top;
         top = rt.create_query(move |rt| rt.get(below));
         assert_eq!(rt.get(top), 0);
