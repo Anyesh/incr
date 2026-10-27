@@ -17,6 +17,19 @@ use crate::dep_stack::DepStack;
 use crate::handle::Incr;
 use crate::state::NodeState;
 
+/// `n` times `INCR_TEST_SCALE` (1 when unset), so a test can be timed at a
+/// multiple of its size against its stated growth class.
+fn scaled<T: std::ops::Mul<Output = T> + From<u8>>(n: T) -> T {
+    static SCALE: OnceLock<u8> = OnceLock::new();
+    let k = *SCALE.get_or_init(|| {
+        std::env::var("INCR_TEST_SCALE").map_or(1, |v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("INCR_TEST_SCALE={v} is not a small integer"))
+        })
+    });
+    n * T::from(k)
+}
+
 fn counters(n: usize) -> Arc<Vec<AtomicU32>> {
     Arc::new((0..n).map(|_| AtomicU32::new(0)).collect())
 }
@@ -85,7 +98,7 @@ fn ring<C: Cells>(
 /// member to 5. Every member runs at most twice per pass, the discovery
 /// pass counted with the iterations.
 fn cycle_100k<C: Cells>(strategy: Strategy, frames: u32) {
-    let n = 100_000;
+    let n = scaled(100_000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     rt.set_max_frames(frames);
@@ -177,7 +190,7 @@ fn redelivered_root_reads_cost_the_same_at_any_budget() {
         let units = Arc::new(Mutex::new(0));
         let out = units.clone();
         on_stack(1 << 30, move || {
-            let n = 5_000;
+            let n = scaled(5_000);
             let rt = Runtime::<Local>::new();
             rt.set_placeholder(0_i64);
             rt.set_max_frames(frames);
@@ -217,7 +230,7 @@ fn redelivered_root_reads_hold_a_direct_per_virtual_frame() {
         let peak = Arc::new(Mutex::new((0, 0, 0)));
         let out = peak.clone();
         on_stack(1 << 30, move || {
-            let n = 5_000;
+            let n = scaled(5_000);
             let rt = Runtime::<Local>::new();
             rt.set_placeholder(0_i64);
             rt.set_max_frames(frames);
@@ -251,7 +264,7 @@ thread_local! {
 /// over-budget read of an unbuffered member dooms its reader and pushes
 /// the member as a held entry instead of running it nested.
 fn ring_member_runs_within_budget<C: Cells>(strategy: Strategy) {
-    let n = 2000;
+    let n = scaled(2000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     rt.set_max_frames(1);
@@ -368,7 +381,7 @@ fn taint_shape<C: Cells>(rt: &Runtime<C>, n: usize) -> Taint {
 /// most n + B + 1 expansions at budget 256, 2n + 3 at budget 1.
 #[cfg(not(debug_assertions))]
 fn taint_100k<C: Cells>(frames: u32) {
-    let n = 100_000;
+    let n = scaled(100_000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     rt.set_max_frames(frames);
@@ -580,7 +593,7 @@ fn first_doom_depth<C: Cells>(rt: &Runtime<C>) -> usize {
 /// `get` and at most one level earlier under `stabilize`, with the
 /// unbounded value.
 fn byte_budget_first<C: Cells>() {
-    let n = 1000;
+    let n = scaled(1000);
     let rt = Runtime::<C>::new();
     let nodes = heavy_chain(&rt, n);
     assert_eq!(rt.get(nodes[0]), n as u64);
@@ -625,8 +638,9 @@ fn doom_under_stabilize<C: Cells>() {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
-    let first = chain(&rt, 100);
-    let second = chain(&rt, 100);
+    let len = scaled(100);
+    let first = chain(&rt, len);
+    let second = chain(&rt, len);
     let fired: Arc<Mutex<Vec<(usize, u64)>>> = Arc::default();
     for (i, c) in [&first, &second].into_iter().enumerate() {
         let fired = fired.clone();
@@ -635,7 +649,7 @@ fn doom_under_stabilize<C: Cells>() {
     rt.stabilize();
     let mut fired = fired.lock().unwrap().clone();
     fired.sort_unstable();
-    assert_eq!(fired, vec![(0, 100), (1, 100)]);
+    assert_eq!(fired, vec![(0, len as u64), (1, len as u64)]);
     for c in [&first, &second] {
         assert_eq!(rt.state_of(c.nodes[0]), NodeState::Clean);
         assert!(c.max_runs() <= 2, "a node ran {} times", c.max_runs());
@@ -686,7 +700,7 @@ fn shared_doom_under_stabilize() {
 /// `caught_delivery_after_its_node_lands`, whose T reads the nodes first.
 #[cfg(not(debug_assertions))]
 fn wide_diverted_retry<C: Cells>() {
-    let n = 100_000;
+    let n = scaled(100_000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -751,7 +765,7 @@ const FAILED_WALK_SIZES: &[usize] = if cfg!(miri) {
 /// raises, so the walks stay linear.
 fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
     for &n in FAILED_WALK_SIZES {
-        failed_entry_chain_of::<C>(n, frames);
+        failed_entry_chain_of::<C>(scaled(n), frames);
     }
 }
 
@@ -840,7 +854,7 @@ enum Caught {
 /// copy a read keeps matches every earlier note: the work on notes, their
 /// copies and the kept reads stays linear only if copies share the notes.
 fn many_caught_unwinds<C: Cells>(shape: Caught) {
-    let n = 2000;
+    let n = scaled(2000);
     let rt = Runtime::<C>::new();
     rt.set_max_frames(1);
     let failing = |rt: &Runtime<C>, i: usize| match shape {
@@ -927,7 +941,7 @@ fn shared_many_caught_unwinds_stay_linear() {
 /// finding that ordinal must not cost a pass over the frame's earlier
 /// reads.
 fn many_foreign_reads<C: Cells>(clean: bool) {
-    let n = 2000;
+    let n = scaled(2000);
     let foreign = Arc::new(Runtime::<Shared>::new());
     let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
     if clean {
@@ -971,7 +985,7 @@ fn many_foreign_reads<C: Cells>(clean: bool) {
 /// An unbudgeted runtime's frame reading `n` Clean nodes of another
 /// runtime settles once that it keeps none of them, and keeps none.
 fn unbudgeted_foreign_clean_reads<C: Cells>() {
-    let n = 1000;
+    let n = scaled(1000);
     let foreign = Arc::new(Runtime::<Shared>::new());
     let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
     for &x in &reads {
@@ -1069,6 +1083,7 @@ fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
         &[1000, 2000, 4000]
     };
     for &n in sizes {
+        let n = scaled(n);
         let (first, work) = contained_chain::<C>(frames, n);
         assert!(
             first <= 24 * n as u64,
@@ -1158,7 +1173,7 @@ fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, 
 }
 
 fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
-    let n = if cfg!(miri) { 8 } else { 4000 };
+    let n = scaled(if cfg!(miri) { 8 } else { 4000 });
     let (first, second, pushes) = panicking_chain_path_steps::<C>(frames, n);
     assert!(
         first <= 8 * n as u64 && second <= 8 * n as u64,
@@ -1201,7 +1216,7 @@ fn shared_panicking_chain_paths_stay_linear_at_budget_1() {
 /// passes the Failed node without walking the chain once per reader.
 fn failed_entry_fan_in<C: Cells>() {
     for &k in FAILED_WALK_SIZES {
-        failed_entry_fan_in_of::<C>(k);
+        failed_entry_fan_in_of::<C>(scaled(k));
     }
 }
 
@@ -1292,7 +1307,7 @@ fn quiet_chain_payload() {
 #[cfg(not(debug_assertions))]
 fn custom_payload_chain_100k<C: Cells>(frames: u32) {
     quiet_chain_payload();
-    let n = crate::test_size::test_size(100_000) as u64;
+    let n = scaled(crate::test_size::test_size(100_000)) as u64;
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     let j = rt.create_input(1_u64);
@@ -1384,17 +1399,18 @@ fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
         (true, 1) => 72,
         (true, _) => 240,
     };
-    let n = if cfg!(miri) { 8 } else { 4000 };
+    let n = scaled(if cfg!(miri) { 8 } else { 4000 });
     let work = nested_caught_chain_work::<C>(frames, through, n);
     assert!(
         work <= per_level * n,
         "budget {frames}: {work} units of note work for a {n}-chain"
     );
     if through && !cfg!(miri) {
-        let small = nested_caught_chain_work::<C>(frames, through, 1000);
+        let short = scaled(1000);
+        let small = nested_caught_chain_work::<C>(frames, through, short);
         assert!(
             work <= 6 * small,
-            "budget {frames}: {small} and {work} units of note work for 1000- and 4000-chains"
+            "budget {frames}: {small} and {work} units of note work for {short}- and {n}-chains"
         );
     }
 }
@@ -1473,7 +1489,7 @@ fn shared_nested_caught_chain_through_a_query_stays_linear_at_budget_1() {
 /// `n / 2` deep, which the budget dooms: the caught reads kept for the
 /// reader's retry must not each cost a pass over the chain's landings.
 fn caught_fan_over_deep_chain<C: Cells>(frames: u32) {
-    let n: u64 = if cfg!(miri) { 8 } else { 4000 };
+    let n: u64 = scaled(if cfg!(miri) { 8 } else { 4000 });
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
@@ -1546,7 +1562,7 @@ fn fan_out_under_replayed_chain<C: Cells>(n: u64) -> u64 {
 }
 
 fn fan_out_under_replayed_chain_stays_linear<C: Cells>() {
-    let n = crate::test_size::test_size(8_000) as u64;
+    let n = scaled(crate::test_size::test_size(8_000)) as u64;
     let half = fan_out_under_replayed_chain::<C>(n / 2);
     let full = fan_out_under_replayed_chain::<C>(n);
     assert!(
@@ -1573,7 +1589,7 @@ fn shared_fan_out_under_replayed_chain_stays_linear() {
 /// its retry, sharing the frame's, maker's and node's lists, and removing
 /// them must not cost a pass over those lists each.
 fn wide_frame_deliveries<C: Cells>() {
-    let n = 4000;
+    let n = scaled(4000);
     let foreign = Arc::new(Runtime::<Shared>::new());
     let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
     let rt = Runtime::<C>::new();
@@ -1613,7 +1629,7 @@ fn shared_wide_frame_deliveries_stay_linear() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_first_entries_under_held_landings_stay_linear() {
-    let n: usize = 4000;
+    let n: usize = scaled(4000);
     let held = Runtime::<Shared>::new();
     let cycles: Vec<Incr<i64>> = (0..n / 2)
         .map(|_| {
@@ -1702,6 +1718,7 @@ fn same_text_fan_over_chain_stays_linear<C: Cells>(through: bool) {
         (256, 600, &[1000, 4000, 16000])
     };
     for &n in sizes {
+        let n = scaled(n);
         let work = same_text_fan_over_chain::<C>(n, through, frames, len);
         let per_panic = if through { 40 } else { 32 };
         assert!(
