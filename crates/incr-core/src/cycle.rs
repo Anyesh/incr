@@ -432,6 +432,11 @@ pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
 /// A speculative frame whose outcome no stash keeps: a doomed run is
 /// discarded, and an open cycle's provisional read may settle otherwise.
 pub(crate) const UNSTASHED: u16 = DOOMED | LOW;
+/// A frame that read some node other than as its real state: a
+/// placeholder, a kept or held landing, another runtime's node unchecked,
+/// or a dep that did not land Clean.
+pub(crate) const UNREAL_READS: u16 =
+    DOOMED | POISONED | PH_SEEN | KEPT_READ | FOREIGN_HOLD | KEPT_UNCHECKED | HOLD;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,

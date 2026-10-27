@@ -913,7 +913,11 @@ impl<C: Cells> Runtime<C> {
             }
         }
         ctl.lower(anchor);
-        Some(Ok(self.held_value::<T>(slot, false)))
+        let value = self.held_value::<T>(slot, false);
+        if replay::speculative() {
+            cycle_state::with_held(|h| h.note_spec_read(rt, at, slot));
+        }
+        Some(Ok(value))
     }
 
     /// An R5 member run that ended in an unwind: a cycle a `get` in it
@@ -1085,7 +1089,11 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let look = Look::here();
+        let real_reads = result.is_ok() && !ctl.has(cycle::UNREAL_READS);
         let (replaced, spec_buf) = cycle_state::with_held(|h| {
+            let basis = h
+                .take_basis(self.runtime_id, cidx, &deps, &|d| self.clean_stamp(d))
+                .filter(|_| real_reads);
             let e = h
                 .get_mut(&(self.runtime_id, slot))
                 .expect("incr-core: a member run's node is held");
@@ -1095,6 +1103,7 @@ impl<C: Cells> Runtime<C> {
                 ctl.buf.take(),
                 !ctl.children.get().is_null(),
                 ctl.poison(),
+                basis,
             );
             e.hold |= ctl.has(cycle::HOLD);
             // An engine unwind is no fault of the member's.
@@ -1175,12 +1184,16 @@ impl<C: Cells> Runtime<C> {
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
         held.wrote = ctl.wrote.get() != 0;
+        let basis =
+            cycle_state::with_held(|h| h.take_basis(rt, cidx, &deps, &|d| self.clean_stamp(d)))
+                .filter(|_| !ctl.has(cycle::UNREAL_READS));
         let (replaced, spec_buf) = held.record(
             Look::here(),
             deps,
             ctl.buf.take(),
             !ctl.children.get().is_null(),
             ctl.poison(),
+            basis,
         );
         debug_assert!(
             replaced.is_none() && spec_buf.is_none(),
@@ -1231,9 +1244,8 @@ impl<C: Cells> Runtime<C> {
                 .iter()
                 .map(|m| {
                     let (seen, spec_buf) = h
-                        .get_mut(&(rt, *m))
-                        .expect("incr-core: an episode member is held")
-                        .look(look);
+                        .look(&(rt, *m), look, &|d| self.clean_stamp(d))
+                        .expect("incr-core: an episode member is held");
                     debug_assert!(
                         spec_buf.is_none(),
                         "incr-core: an episode member is settled before its graph"
@@ -1324,8 +1336,12 @@ impl<C: Cells> Runtime<C> {
     /// Whether episode member `slot` has no buffer, a speculative run's
     /// settled first.
     fn unbuffered(&self, slot: u32) -> bool {
-        let (spec_buf, none) = self.take_held(slot, |e| {
-            let (seen, spec_buf) = e.look(Look::here());
+        let (spec_buf, none) = cycle_state::with_held(|h| {
+            let (seen, spec_buf) = h
+                .look(&(self.runtime_id, slot), Look::here(), &|d| {
+                    self.clean_stamp(d)
+                })
+                .expect("incr-core: an episode member is held");
             (spec_buf, seen.buf().is_none())
         });
         drop(spec_buf);
@@ -1344,12 +1360,12 @@ impl<C: Cells> Runtime<C> {
             // What a settle took is dropped before `f` runs, which may run
             // user code; the claim's next look settles nothing.
             let seen = cycle_state::with_held(|h| {
-                let Some(e) = h.get_mut(&(self.runtime_id, slot)) else {
-                    return Ok(None);
-                };
-                match e.look(look) {
-                    (seen, None) => Ok(Some(f.take().expect("look_held calls f once")(&seen))),
-                    (_, Some(spec_buf)) => Err(spec_buf),
+                match h.look(&(self.runtime_id, slot), look, &|d| self.clean_stamp(d)) {
+                    None => Ok(None),
+                    Some((seen, None)) => {
+                        Ok(Some(f.take().expect("look_held calls f once")(&seen)))
+                    }
+                    Some((_, Some(spec_buf))) => Err(spec_buf),
                 }
             });
             match seen {
@@ -1498,9 +1514,8 @@ impl<C: Cells> Runtime<C> {
                         .iter()
                         .filter_map(|m| {
                             let (mut e, spec_buf) = h
-                                .get_mut(&(rt, *m))
-                                .expect("incr-core: an episode member is held")
-                                .look(look);
+                                .look(&(rt, *m), look, &|d| self.clean_stamp(d))
+                                .expect("incr-core: an episode member is held");
                             e.episode = Some(cycle.clone());
                             e.ep = id;
                             e.in_cu = ep.cu.binary_search(m).is_ok();
@@ -1647,8 +1662,10 @@ impl<C: Cells> Runtime<C> {
                         // 4. The strategy members' next values.
                         let mut converged = vec![true; r.strategies.len()];
                         for (i, (m, s)) in r.strategies.iter().enumerate() {
-                            let (out, spec_buf) = self.take_held(*m, |e| {
-                                let (mut seen, spec_buf) = e.look(Look::here());
+                            let (out, spec_buf) = cycle_state::with_held(|h| {
+                                let (mut seen, spec_buf) = h
+                                    .look(&(rt, *m), Look::here(), &|d| self.clean_stamp(d))
+                                    .expect("incr-core: an episode member is held");
                                 (seen.take_buf(), spec_buf)
                             });
                             debug_assert!(

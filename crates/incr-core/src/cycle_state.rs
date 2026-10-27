@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
@@ -134,6 +134,12 @@ pub(crate) struct Held {
     /// While the buffer and run record come from a run made under
     /// speculation: the record from before that run's write.
     pre_spec: Option<Box<RunRecord>>,
+    /// Renewed whenever the buffer is written or taken, so a reader's note
+    /// of it tells whether the buffer it read is still the one held.
+    stamp: u64,
+    /// What the last speculative run read, if it read only real state: a
+    /// look outside speculation adopts the run while all of it is unchanged.
+    basis: Option<Box<Basis>>,
 }
 
 impl Held {
@@ -173,13 +179,16 @@ impl Held {
             ep: 0,
             in_cu: false,
             pre_spec: None,
+            stamp: next_stamp(),
+            basis: None,
         }
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
     /// child index and its frame's `POISONED` and `HANDLED` flags
     /// (`poison`). Under speculation it first
-    /// keeps the record it replaces; outside, it settles first. Returns
+    /// keeps the record it replaces, and `basis` is what the run read if
+    /// it read only real state; outside, it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
     /// caller to drop outside the held map.
     pub(crate) fn record(
@@ -189,13 +198,16 @@ impl Held {
         buf: Option<Erased>,
         opened: bool,
         poison: u16,
+        basis: Option<Basis>,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
             self.keep_record();
+            self.basis = basis.map(Box::new);
             None
         } else {
             self.settle()
         };
+        self.stamp = next_stamp();
         for &d in &deps {
             if !self.deps.contains(&d) {
                 self.deps.push(d);
@@ -212,7 +224,7 @@ impl Held {
 
     /// The claim's run as `look` sees it, and the value a settle dropped,
     /// for the caller to drop outside the held map.
-    pub(crate) fn look(&mut self, look: Look) -> (Seen<&mut Held>, Option<Unbuilt>) {
+    fn look(&mut self, look: Look) -> (Seen<&mut Held>, Option<Unbuilt>) {
         let spec_buf = self.settle_for(look);
         (Seen(self), spec_buf)
     }
@@ -225,6 +237,7 @@ impl Held {
 
     /// Takes the buffer to drop it, leaving the run record as it is.
     pub(crate) fn discard_buf(&mut self) -> Option<Discarded> {
+        self.stamp = next_stamp();
         self.buf.take().map(|buf| Discarded {
             _values: (Some(buf), None),
         })
@@ -247,6 +260,7 @@ impl Held {
     /// a landing that speculation may make.
     pub(crate) fn adopt(&mut self) {
         self.pre_spec = None;
+        self.basis = None;
     }
 
     /// Before a run's buffer and record are written under speculation:
@@ -276,6 +290,8 @@ impl Held {
     /// value it buffered, as the unbounded run may never make that run.
     fn settle(&mut self) -> Option<Unbuilt> {
         let r = self.pre_spec.take()?;
+        self.basis = None;
+        self.stamp = next_stamp();
         self.deps = r.deps;
         self.last = r.last;
         self.installed = r.installed;
@@ -364,7 +380,9 @@ impl<H: Borrow<Held>> Seen<H> {
 
 impl<H: BorrowMut<Held>> Seen<H> {
     pub(crate) fn take_buf(&mut self) -> Option<Erased> {
-        self.0.borrow_mut().buf.take()
+        let e = self.0.borrow_mut();
+        e.stamp = next_stamp();
+        e.buf.take()
     }
 
     pub(crate) fn take_deps(&mut self) -> Vec<(NodeId, u32)> {
@@ -389,6 +407,22 @@ impl Seen<Held> {
 /// Values taken off a claim only to be dropped.
 pub(crate) struct Discarded {
     _values: (Option<Erased>, Option<Erased>),
+}
+
+/// What a speculative run read, for [`HeldMap::look`] to check: the held
+/// members whose buffers it read, each with the buffer's stamp, and the
+/// other nodes, each Clean when the run recorded, with its generation and
+/// `changed_at`.
+#[derive(Debug, Default)]
+pub(crate) struct Basis {
+    pub(crate) held: Vec<(u32, u64)>,
+    pub(crate) clean: Vec<(NodeId, u32, u64)>,
+}
+
+static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
+
+fn next_stamp() -> u64 {
+    NEXT_STAMP.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A claim's run record, kept while a speculative run's is written over it.
@@ -481,6 +515,9 @@ pub(crate) struct HeldMap {
     /// The groups a virtual frame owns.
     by_virtual_owner: BTreeSet<(RuntimeId, u32, u64)>,
     next_group: u64,
+    /// `(rt, reader position, member, stamp)` of each buffer a speculative
+    /// run read, until that run records.
+    spec_reads: Vec<(RuntimeId, u32, u32, u64)>,
 }
 
 struct Group {
@@ -506,6 +543,7 @@ impl HeldMap {
             by_owner: BTreeSet::new(),
             by_virtual_owner: BTreeSet::new(),
             next_group: 1,
+            spec_reads: Vec::new(),
         }
     }
 
@@ -624,6 +662,117 @@ impl HeldMap {
 
     pub(crate) fn get_mut(&mut self, key: &(RuntimeId, u32)) -> Option<&mut Held> {
         self.claims.get_mut(key)
+    }
+
+    /// Claim `key`'s run as `look` sees it, and the value a settle dropped.
+    /// A look outside speculation adopts a speculative run, with the
+    /// speculative runs whose buffers it read, while everything they read
+    /// is unchanged ([`Self::adoptable`]); otherwise it settles the claim.
+    /// `clean` gives a node's generation and `changed_at` while it is
+    /// Clean.
+    pub(crate) fn look(
+        &mut self,
+        key: &(RuntimeId, u32),
+        look: Look,
+        clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
+    ) -> Option<(Seen<&mut Held>, Option<Unbuilt>)> {
+        if !look.speculative && self.claims.get(key)?.spec_written() {
+            let mut runs = Vec::new();
+            if self.adoptable(key.0, key.1, clean, &mut runs) {
+                for m in runs {
+                    if let Some(e) = self.claims.get_mut(&(key.0, m)) {
+                        e.adopt();
+                    }
+                }
+            }
+        }
+        self.claims.get_mut(key).map(|e| e.look(look))
+    }
+
+    /// Whether claim `slot`'s buffer is real: a run's outside speculation,
+    /// or a speculative run's whose reads were all of real state and are
+    /// unchanged, each Clean node at its generation and `changed_at` and
+    /// each member's buffer the one read and itself real. `runs` collects
+    /// the claims checked, a claim already there counting as real.
+    fn adoptable(
+        &self,
+        rt: RuntimeId,
+        slot: u32,
+        clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
+        runs: &mut Vec<u32>,
+    ) -> bool {
+        if runs.contains(&slot) {
+            return true;
+        }
+        runs.push(slot);
+        let Some(e) = self.claims.get(&(rt, slot)) else {
+            return false;
+        };
+        if !e.spec_written() {
+            return true;
+        }
+        let Some(basis) = &e.basis else {
+            return false;
+        };
+        basis
+            .clean
+            .iter()
+            .all(|&(d, generation, at)| clean(d) == Some((generation, at)))
+            && basis.held.iter().all(|&(m, stamp)| {
+                self.claims.get(&(rt, m)).is_some_and(|r| r.stamp == stamp)
+                    && self.adoptable(rt, m, clean, runs)
+            })
+    }
+
+    /// Notes a speculative run's read, at position `at`, of member `slot`'s
+    /// buffer.
+    pub(crate) fn note_spec_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
+        if let Some(e) = self.claims.get(&(rt, slot)) {
+            self.spec_reads.push((rt, at, slot, e.stamp));
+        }
+    }
+
+    /// The basis of a speculative run at position `at` that read `deps`,
+    /// if each was real state: a member's buffer noted as read, or a node
+    /// `clean` finds Clean at the generation read. Drops every read noted
+    /// at `at` or above.
+    pub(crate) fn take_basis(
+        &mut self,
+        rt: RuntimeId,
+        at: u32,
+        deps: &[(NodeId, u32)],
+        clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
+    ) -> Option<Basis> {
+        let mut held = Vec::new();
+        self.spec_reads.retain(|&(r, c, m, stamp)| {
+            let mine = r == rt && c >= at;
+            if mine && c == at {
+                held.push((m, stamp));
+            }
+            !mine
+        });
+        let mut basis = Basis {
+            held,
+            clean: Vec::new(),
+        };
+        if basis
+            .held
+            .iter()
+            .any(|&(m, _)| !self.claims.contains_key(&(rt, m)))
+        {
+            return None;
+        }
+        for &(d, generation) in deps {
+            if self.claims.contains_key(&(rt, d.0)) {
+                if !basis.held.iter().any(|&(m, _)| m == d.0) {
+                    return None;
+                }
+            } else {
+                let (g, at) = clean(d).filter(|&(g, _)| g == generation)?;
+                basis.clean.push((d, g, at));
+            }
+        }
+        Some(basis)
     }
 
     pub(crate) fn contains_key(&self, key: &(RuntimeId, u32)) -> bool {
