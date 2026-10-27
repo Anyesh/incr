@@ -110,6 +110,29 @@ fn shared_delete_of_a_node_landed_earlier_in_the_read() {
     );
 }
 
+/// The delete of a node whose landing the read holds moves the reshape
+/// count, as every delete does, so no stash taken over the node stands.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_delete_of_a_held_landing_counts_a_reshape() {
+    let rt = Runtime::<Shared>::new();
+    let (a, _b) = two_cycle(&rt);
+    let c = rt.create_query(move |rt| rt.get(a) + 1);
+    let counted: Arc<OnceLock<(bool, u64)>> = Arc::new(OnceLock::new());
+    let root = {
+        let counted = counted.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            let v = rt.get(c);
+            let before = Shared::u64_load_relaxed(&rt.reshapes);
+            let deleted = catch_unwind(AssertUnwindSafe(|| rt.delete_node(c))).is_ok();
+            let _ = counted.set((deleted, Shared::u64_load_relaxed(&rt.reshapes) - before));
+            v
+        })
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(root)));
+    assert_eq!(counted.get(), Some(&(true, 1)));
+}
+
 /// p reads a held cycle and then d, its first read of d, so p's edge on d
 /// waits for the read's exit. Another thread deletes d, which has no
 /// dependent yet, and recycles its slot before the exit publishes. As for
