@@ -827,6 +827,9 @@ struct EntryState {
     /// The held map has entries: a check of a thread that holds nothing
     /// reads this block and not the map, whose access tests liveness.
     held_any: Cell<bool>,
+    /// A read in the outermost entry's attempt took a cycle and went on.
+    /// Set only with `outer_set`.
+    cycle_caught: Cell<bool>,
     /// The address of a local of the outermost entry, from which a read
     /// measures the stack it has used against a byte budget.
     stack_base: Cell<usize>,
@@ -873,6 +876,7 @@ thread_local! {
             failures: Cell::new(0),
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
+            cycle_caught: Cell::new(false),
             stack_base: Cell::new(0),
             budget_clock: Cell::new(0),
             failed_here: Cell::new(0),
@@ -907,6 +911,7 @@ loom::thread_local! {
         failures: Cell::new(0),
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
+        cycle_caught: Cell::new(false),
         stack_base: Cell::new(0),
         budget_clock: Cell::new(0),
         failed_here: Cell::new(0),
@@ -1023,6 +1028,18 @@ pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
         crate::reserve::mark_taken();
         set_wounded(true);
     }
+}
+
+/// Notes that the attempt took a cycle and reads on past it.
+pub(crate) fn note_cycle_caught() {
+    ENTRY.with(|e| {
+        e.cycle_caught.set(true);
+        e.outer_set.set(true);
+    });
+}
+
+pub(crate) fn cycle_caught() -> bool {
+    ENTRY.with(|e| e.cycle_caught.get())
 }
 
 /// Where the engine catches a discard: if a waiter wounded the attempt
@@ -1677,6 +1694,7 @@ fn outer_open(rt: u64) -> bool {
 #[inline(always)]
 pub(crate) fn reset_outermost() {
     if ENTRY.with(|e| e.outer_set.replace(false)) {
+        ENTRY.with(|e| e.cycle_caught.set(false));
         OUTER.with(|o| {
             let mut o = o.borrow_mut();
             o.dissolved.clear();

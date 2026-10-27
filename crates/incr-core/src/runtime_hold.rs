@@ -445,14 +445,21 @@ impl<C: Cells> Runtime<C> {
         self.publish_own_parked()
     }
 
-    /// The attempt was wounded: every held landing goes back.
+    /// The attempt was wounded or reruns: every held landing goes back.
+    /// True if a waiter wounded it first.
     #[cold]
     #[inline(never)]
-    pub(super) fn retract_held(&self) {
+    pub(super) fn retract_held(&self) -> bool {
         let hold::Taken {
-            entries, cut_recs, ..
+            entries,
+            cut_recs,
+            wounded,
+            verdicts,
+            ..
         } = hold::take(self.runtime_id);
+        self.unwatch_verdicts(&verdicts);
         self.retract_entries(entries, cut_recs, true, false);
+        wounded
     }
 
     /// A claim wait on `on`, past `REGISTER_AFTER`: if another thread holds
@@ -680,7 +687,9 @@ impl<C: Cells> Runtime<C> {
             episodes,
             cut_recs,
             wounded,
+            verdicts,
         } = hold::take(self.runtime_id);
+        self.unwatch_verdicts(&verdicts);
         if wounded || !self.publish_edges(&entries) {
             self.retract_entries(entries, cut_recs, true, false);
             return false;
