@@ -1496,7 +1496,12 @@ fn run_logged<C: Cells>(
     log: bool,
 ) -> (Trace, Vec<Vec<Eval>>) {
     let rts = runtimes::<C>(frames, bytes);
-    let live = Live::new(&rts, case);
+    run_live(&Live::new(&rts, case), case, log)
+}
+
+/// Each of `case`'s operations on `live`, from a fresh thread state, with
+/// each operation's closure runs if `log`.
+fn run_live<C: Cells>(live: &Live<C>, case: &Case, log: bool) -> (Trace, Vec<Vec<Eval>>) {
     reset_thread();
     let (mut trace, mut evals) = (Vec::new(), Vec::new());
     for op in &case.ops {
@@ -4603,6 +4608,50 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
             differential_two(&case, 0x1965);
         }
     });
+}
+
+/// 0x761 and 0x8c2, two-thread cases on one thread, Shared at one frame:
+/// a wound at any claim gives the unbounded run's outcome, as its
+/// retraction puts each held landing back as its claim found it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wound_at_any_claim_after_a_held_failed_landing_seeds() {
+    for seed in [0x761, 0x8c2] {
+        let case = gen_case(seed, false, true);
+        quiet(|| {
+            let unbounded = run::<Shared>(&case, None, 0);
+            for k in 1.. {
+                let label = format!("seed {seed:#x}, budget 1 frames, wound at claim {k}");
+                let (bounded, fired) =
+                    labelled(&label, || run_wounded_at_claim(&case, Some(1), 0, k));
+                if !fired {
+                    break;
+                }
+                compare(&case, &unbounded, &bounded, &label);
+            }
+        });
+    }
+}
+
+/// [`run`] under Shared with a wound raised at the run's `k`-th claim,
+/// and whether the run made that many claims.
+fn run_wounded_at_claim(case: &Case, frames: Option<u32>, bytes: usize, k: usize) -> (Trace, bool) {
+    let rts = runtimes::<Shared>(frames, bytes);
+    let claims = Arc::new(AtomicUsize::new(0));
+    for rt in &rts {
+        let claims = claims.clone();
+        let rtp = RtPtr::<Shared>(&**rt);
+        let hook: super::ParkHook = Box::new(move |p| {
+            if matches!(p, ParkPoint::BeforeClaim(_)) && claims.fetch_add(1, SeqCst) + 1 == k {
+                // SAFETY: the runtimes outlive the run.
+                let RtPtr(p) = &rtp;
+                unsafe { &**p }.raise_wound();
+            }
+        });
+        assert!(rt.park_hook.set(hook).is_ok());
+    }
+    let (trace, _) = run_live(&Live::new(&rts, case), case, false);
+    (trace, claims.load(SeqCst) >= k)
 }
 
 /// Two-thread seeds with a second runtime, each over several schedules.
