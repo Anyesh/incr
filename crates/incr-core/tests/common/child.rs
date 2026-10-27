@@ -15,6 +15,17 @@ const CHILD: &str = "INCR_TEST_CHILD";
 
 pub const HANG_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// [`HANG_TIMEOUT`], or 60 s in a sanitized build (`INCR_TEST_REDUCED`, which
+/// the TSan job sets): a child that takes 7 s under TSan on one runner
+/// passed 10 s on a runner 1.7 times slower.
+pub fn hang_timeout() -> Duration {
+    if env::var_os("INCR_TEST_REDUCED").is_some() {
+        Duration::from_secs(60)
+    } else {
+        HANG_TIMEOUT
+    }
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     Clean,
@@ -45,14 +56,14 @@ impl Outcome {
     }
 }
 
-/// Runs `body` in a re-executed copy of this test binary with the 10 s timeout.
+/// Runs `body` in a re-executed copy of this test binary with [`hang_timeout`].
 ///
 /// `test` is the full test path as libtest names it (matched with `--exact`).
 /// In the child the body runs and the process exits; in the parent the child's
 /// fate is returned. Callers must add `#[cfg_attr(miri, ignore)]` because Miri
 /// cannot spawn processes.
 pub fn run_in_child(test: &str, body: impl FnOnce()) -> Outcome {
-    run_in_child_within(test, HANG_TIMEOUT, body)
+    run_in_child_within(test, hang_timeout(), body)
 }
 
 /// Runs `body` with no other test thread in the process: in a child, or
