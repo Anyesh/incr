@@ -1204,6 +1204,11 @@ impl<C: Cells> Runtime<C> {
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
         held.wrote = ctl.wrote.get() != 0;
+        // A compute frame's notes may be an earlier frame's at this
+        // position, so a speculative one keeps no basis.
+        if value_code::thread_word() & value_code::SPEC_READS_BIT != 0 {
+            cycle_state::with_held(|h| h.drop_spec_reads(rt, cidx));
+        }
         let (replaced, spec_buf) = held.record(
             Look::here(),
             deps,
