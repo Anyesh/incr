@@ -217,9 +217,23 @@ pub(crate) fn take_over_in_order(owner: usize, ticket: u64, wound: impl FnOnce()
         .iter()
         .any(|w| w.owner == owner && w.ticket < mine && w.state.load(Ordering::Acquire) == WAITING);
     if older_waits {
+        #[cfg(all(test, not(loom)))]
+        REFUSALS.with(|r| r.set(r.get() + 1));
         return false;
     }
     wound()
+}
+
+#[cfg(all(test, not(loom)))]
+std::thread_local! {
+    static REFUSALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The take-overs the wound order refused on this thread since the last
+/// call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_refusals() -> u32 {
+    REFUSALS.with(|r| r.replace(0))
 }
 
 /// Before a wounded entry retries: waits until the oldest waiter on the

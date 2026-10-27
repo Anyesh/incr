@@ -2884,7 +2884,7 @@ fn shared_reader_of_a_held_landing_waits_out_its_owners_walk() {
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicUsize::new(0)),
     );
-    let walked = Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+    let walked = Arc::new(std::sync::Mutex::new(None));
     let d = {
         let (holding, runs, walked) = (holding.clone(), runs.clone(), walked.clone());
         rt.create_query(move |rt: &Runtime<Shared>| {
@@ -2893,7 +2893,7 @@ fn shared_reader_of_a_held_landing_waits_out_its_owners_walk() {
             holding.store(true, Ordering::SeqCst);
             let start = std::time::Instant::now();
             let w = rt.get(top);
-            *walked.lock().unwrap() = start.elapsed();
+            *walked.lock().unwrap() = Some((start, std::time::Instant::now()));
             v + w
         })
     };
@@ -2903,17 +2903,24 @@ fn shared_reader_of_a_held_landing_waits_out_its_owners_walk() {
             while !holding.load(Ordering::SeqCst) {
                 std::thread::yield_now();
             }
-            catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err()
+            let started = std::time::Instant::now();
+            let failed = catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err();
+            (failed, started, std::time::Instant::now())
         })
     };
     assert_eq!(rt.get(d), 7);
-    assert!(reader.join().unwrap(), "the reader of f got a value");
-    let walked = *walked.lock().unwrap();
-    // Well past the take-over's 10 ms STUCK_FOR, or the test shows nothing.
+    let (failed, started, done) = reader.join().unwrap();
+    assert!(failed, "the reader of f got a value");
+    let (walk_start, walk_end) = walked.lock().unwrap().expect("d walked its chain");
+    // Waited through well past the take-over's 10 ms STUCK_FOR of the walk,
+    // or the test shows nothing.
     assert!(
-        walked >= std::time::Duration::from_millis(40),
-        "the walk took only {walked:?}"
+        started < walk_end
+            && walk_end - started.max(walk_start) >= std::time::Duration::from_millis(40),
+        "the reader waited only {:?} of the walk",
+        walk_end.saturating_duration_since(started.max(walk_start))
     );
+    assert!(done >= walk_end, "the reader read f before the walk ended");
     assert_eq!(
         runs.load(Ordering::SeqCst),
         1,
