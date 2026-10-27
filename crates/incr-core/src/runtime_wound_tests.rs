@@ -99,6 +99,9 @@ impl StaleEdge {
         let mut rt = Runtime::<Shared>::new();
         rt.all_replayable = replayable;
         let rt = Arc::new(rt);
+        if replayable {
+            rt.set_placeholder(0_i64);
+        }
         let s = rt.create_input(0_i64);
         let t = rt.create_input(0_i64);
         let u = rt.create_input(0_i64);
