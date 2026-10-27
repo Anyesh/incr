@@ -344,7 +344,6 @@ struct Renoted {
     epoch: u64,
     from_base: u32,
     rt: RuntimeId,
-    key: PayloadKey,
     base: u32,
     cut: Option<Cut>,
 }
@@ -383,10 +382,12 @@ impl Notes {
     /// their depths above the copy's base, but those its cut took. When
     /// the copy of the log noted last went to the same place, at an epoch
     /// no later, under the same cut, and no note has gone since, the
-    /// entries it held are noted already, so only later ones are: a second
-    /// note of a node at the same place retires with the first, and one
-    /// deeper retires with its own frame, as each note of a whole renote
-    /// does.
+    /// entries it held are noted already, under whichever key delivered
+    /// them, so only later ones are: a second note of a node at the same
+    /// place retires with the first, and one deeper retires with its own
+    /// frame, as each note of a whole renote does. One-text panics can
+    /// share a payload address and so one log, whose copies would
+    /// otherwise each note every earlier panic's landings again.
     pub(crate) fn note_copy(
         &mut self,
         rt: RuntimeId,
@@ -406,8 +407,8 @@ impl Notes {
         } = copy;
         let from = match &log.borrow().renoted {
             Some(r)
-                if (r.renote_gen, r.rt, r.key, r.base, r.from_base)
-                    == (self.renote_gen, rt, key, base, from_base)
+                if (r.renote_gen, r.rt, r.base, r.from_base)
+                    == (self.renote_gen, rt, base, from_base)
                     && r.len <= len
                     && r.epoch <= epoch
                     && match (&r.cut, cut) {
@@ -430,7 +431,6 @@ impl Notes {
             epoch,
             from_base,
             rt,
-            key,
             base,
             cut: cut.cloned(),
         });
@@ -474,7 +474,6 @@ impl Notes {
             epoch,
             from_base: base,
             rt,
-            key,
             base,
             cut: None,
         });
