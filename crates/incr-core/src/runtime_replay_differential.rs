@@ -6149,11 +6149,10 @@ fn two_thread_walk_plan_holds_over_unrelated_releases() {
 /// Op 7 enters it at 8, which has none, so 7's `try_get(4)` gets the
 /// cycle (R3). Here op 7 then holds until op 6, entering at 12, has
 /// landed 8 Clean, and 7 reads 8 = 2 twice: 7777 + 2 + 2, no order's
-/// value. The oracle orders that get per read: each read is an order's
-/// outcome for it, and the value is 7's closure over them.
+/// value, so op 7 reruns once and gives the 6-first order's 8.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
+fn two_thread_get_that_caught_a_cycle_the_partner_then_landed_reruns() {
     let case = gen_case(0x1006, false, true);
     let phases = phases(&case, 0x1006);
     let overlap = phases.iter().position(|p| p.ops() == [6, 7]).unwrap();
@@ -6189,10 +6188,11 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
     };
     quiet(|| {
         let serial = Serial::new(&case, &phases);
-        let (verdict, seven) = (Mutex::new(None), Mutex::new(None));
+        let (verdict, seven, reruns) = (Mutex::new(None), Mutex::new(None), Mutex::new(None));
         let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
             if p == overlap {
                 on.store(false, SeqCst);
+                *reruns.lock().unwrap() = Some(live.world.rt(0).verdict_reruns.load(SeqCst));
                 let evals = live.evals.lock().unwrap();
                 let last = evals[&7]
                     .iter()
@@ -6208,14 +6208,19 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
             *verdict.lock().unwrap() = v;
             stop
         });
-        assert_eq!(got[7].0, Out::Value(7781));
-        serial.check("0x1006", &got, verdict.into_inner().unwrap());
-        let per_read = serial.per_read.lock().unwrap().clone();
         assert_eq!(
-            per_read.keys().collect::<Vec<_>>(),
-            [&7],
-            "op 6 stays exact"
+            got[7].0,
+            Out::Value(8),
+            "op 7 gives the 6-first order's value"
         );
+        assert_eq!(reruns.into_inner().unwrap(), Some(1), "the race was driven");
+        serial.check("0x1006", &got, verdict.into_inner().unwrap());
+        let in_order = run::<Shared>(&case, None, 0);
+        assert_eq!(
+            got[7].1 .0[7], in_order[7].1 .0[7],
+            "the rerun leaves the 6-first order's state"
+        );
+        let per_read = serial.per_read.lock().unwrap().clone();
 
         let (prefix, mut sevens) = seven.into_inner().unwrap().unwrap();
         let read = (sevens.reads.iter_mut())
@@ -6243,22 +6248,15 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
             failed[k].1 .0[5] = NodeState::Failed;
         }
         rejects(failed, "a Failed node no order leaves");
-        // 7 read 4 through the cycle's unwind, so it lands Dirty, where 6
-        // first leaves it Clean: the states differ past the phase and, in
-        // a case with cycles, later results are history as after any such
-        // phase.
-        let in_order = run::<Shared>(&case, None, 0);
-        assert_eq!(got[7].1 .0[7], NodeState::Dirty);
-        assert_eq!(in_order[7].1 .0[7], NodeState::Clean);
     });
 }
 
 /// 0x1006's phase [6, 7] run serially: op 7 holds at its first park until
 /// op 6 has landed 8..12 Clean, so no race is possible and op 7's outcome
 /// must be the 6-first order's Value(8). With a stale-catch fault spliced
-/// in (op 7 carries the racing run's reads, its `try_get(4)` = Cycle, and
-/// returns 7781), the oracle must reject the trace: the cycle was caught
-/// after the partner landed it, not before.
+/// in (op 7 carries the reads of the racing attempt its rerun discarded,
+/// its `try_get(4)` = Cycle, and returns 7781), the oracle must reject the
+/// trace: the cycle was caught after the partner landed it, not before.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
@@ -6316,7 +6314,11 @@ fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
         let race_got = run_two_until(&case, &phases, None, 0, &race_rig, &|p, prefix, live| {
             if p == overlap {
                 on.store(false, SeqCst);
-                *race_evals.lock().unwrap() = Some(live.evals.lock().unwrap()[&7].clone());
+                let rt = live.world.rt(0);
+                assert_eq!(rt.verdict_reruns.load(SeqCst), 1, "the race was driven");
+                let evals = live.evals.lock().unwrap()[&7].clone();
+                let discarded = evals.into_iter().filter(|e| !e.caught.is_empty());
+                *race_evals.lock().unwrap() = Some(discarded.collect::<Vec<_>>());
             }
             let v = racing.at_overlap("0x1006 race", prefix, live);
             if p + 1 == overlap {
@@ -6324,7 +6326,11 @@ fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
             }
             v.is_some()
         });
-        assert_eq!(race_got[7].0, Out::Value(7781), "the race was driven");
+        assert_eq!(
+            race_got[7].0,
+            Out::Value(8),
+            "op 7 reran in the 6-first order"
+        );
         let race_evals = race_evals.into_inner().unwrap().unwrap();
 
         let serial = Serial::new(&case, &phases);

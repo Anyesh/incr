@@ -92,6 +92,12 @@ impl Frame {
         self.tagged_rt.rt()
     }
 
+    fn note_read_at(&self) {
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        unsafe { (*self.ctl).read_at.set(self.deps.len() as u32) };
+    }
+
     /// Whether the frame is `rt`'s, never the sentinel. A frame that does
     /// not divert holds `rt` untagged in `read_rt`, so the common case
     /// skips the mask.
@@ -436,6 +442,37 @@ pub trait DepStack: sealed::Sealed + 'static {
         self.with(|s| s.push(Frames::frame(node, rt, ctl, cidx)))
     }
 
+    /// Whether any frame on the stack, of any runtime, has a control block
+    /// for which `f` holds.
+    fn any_frame(&self, f: impl Fn(&ComputeCtl) -> bool) -> bool {
+        self.with(|s| {
+            s.frames.iter().any(|frame| {
+                // SAFETY: the frame is on the stack, so its control block is
+                // live (see `Frame::ctl`).
+                f(unsafe { &*frame.ctl })
+            })
+        })
+    }
+
+    fn each_frame(&self, f: impl Fn(&ComputeCtl)) {
+        self.with(|s| {
+            for frame in &s.frames {
+                // SAFETY: the frame is on the stack, so its control block is
+                // live (see `Frame::ctl`).
+                f(unsafe { &*frame.ctl });
+            }
+        });
+    }
+
+    /// The top frame raises from its own code here, after any read so far.
+    fn note_raise(&self) {
+        self.with(|s| {
+            if let Some(top) = s.frames.last() {
+                top.note_read_at();
+            }
+        });
+    }
+
     /// Pop the top frame and return the deps it recorded, each with the
     /// generation it was read at.
     #[inline(always)]
@@ -699,13 +736,15 @@ pub trait DepStack: sealed::Sealed + 'static {
             let depth = s.frames.len() as u32;
             let top = match s.frames.last_mut() {
                 Some(top) if top.is_of(rt) => top,
-                Some(_) => {
+                Some(top) => {
+                    top.note_read_at();
                     s.foreign_non_clean_read();
                     return None;
                 }
                 None => return None,
             };
             top.deps.push((dep, generation));
+            top.note_read_at();
             top.reading = u64::from(dep.0) | (u64::from(generation) << 32);
             Some(ActiveRead {
                 node: top.node,
