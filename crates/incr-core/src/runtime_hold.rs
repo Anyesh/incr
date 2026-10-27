@@ -206,11 +206,13 @@ impl<C: Cells> Runtime<C> {
         !held.is_empty()
     }
 
-    /// The entry of a run that publishes a held dep, opened before the
-    /// deps are written, with the claim's origin. The run took no `HOLD`,
-    /// so its write kept nothing: the undo leaves the node unverified, and
-    /// a Dirty claim goes back Dirty with its old deps, as the claim found
-    /// it.
+    /// The entry of a landing about to install `deps` (a run's, an adopted
+    /// stash's or a panic's union) that will be held: one the thread
+    /// already lands held, or whose publish reads a held dep. Opened before
+    /// the deps are written, with the claim's origin, so the undo keeps the
+    /// old deps; its write kept nothing, so the undo leaves the node
+    /// unverified, and a Dirty claim goes back Dirty with its old deps, as
+    /// the claim found it.
     #[cold]
     #[inline(never)]
     pub(super) fn open_hold_for_held_deps(
@@ -221,7 +223,8 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
     ) {
         let cell = state::cell_key::<C>(node.state_cell());
-        if hold::holds(cell) || !self.publishes_held_dep(node, deps) {
+        if hold::holds(cell) || !(self.lands_held(id, node) || self.publishes_held_dep(node, deps))
+        {
             return;
         }
         let own = hold::open(
