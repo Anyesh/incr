@@ -19,6 +19,7 @@ use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
 use crate::cycle_state::thread_key;
 use crate::handle::Incr;
+use crate::locks::Lock;
 use crate::node::NodeId;
 use crate::state::NodeState;
 
@@ -2791,40 +2792,41 @@ fn walk_rereads_under_constant_releases() {
 /// Fallback of 15. Entered at `x` the cycle closes at `x`, which has no
 /// strategy, so `k` takes its error; entered at `z` it resolves to 15.
 /// `top` = get(k) + get(x), parking at `gate` between the two reads.
-fn cycle_verdict_taken_then_landed(rt: &Rt, gate: Gate) -> (Incr<u64>, Incr<u64>) {
-    let cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
-    let z_reads = cell.clone();
-    let z = rt.create_query_with_fallback(move |rt| rt.get(*z_reads.get().unwrap()), |_| 15_u64);
-    let x = rt.create_query(move |rt| rt.get(z));
-    cell.set(x).unwrap();
-    let k = rt.create_query(move |rt| rt.try_get(x).unwrap_or(7777));
+fn cycle_verdict_taken_then_landed(rt: &Rt, gate: Gate, catchers: usize) -> (Incr<u64>, Incr<u64>) {
+    let (x, z) = verdict_cycle(rt);
+    let ks: Vec<Incr<u64>> = (0..catchers)
+        .map(|_| rt.create_query(move |rt| rt.try_get(x).unwrap_or(7777)))
+        .collect();
     let top = rt.create_query(move |rt| {
-        let taken = rt.get(k);
+        let taken: u64 = ks.iter().map(|&k| rt.get(k)).sum();
         gate.park();
         taken + rt.get(x)
     });
     (top, z)
 }
 
-/// Thread A's read of `top` takes the cycle verdict on `x` through `k`,
-/// then parks; B's read of `z` lands `x` = 15 meanwhile. A's `top` must
-/// give an order's answer: 30 (B's read first, so `k` = 15) or a cycle
-/// panic (A's first), never 7777 + 15 from both (seed 0x6e771's shape).
-#[test]
-fn a_read_that_took_a_cycle_verdict_another_thread_lands_over_reruns() {
-    {
-        let rt = Rt::new();
-        let (top, _) = cycle_verdict_taken_then_landed(&rt, Gate::new());
-        assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
-    }
-    {
-        let rt = Rt::new();
-        let (top, z) = cycle_verdict_taken_then_landed(&rt, Gate::new());
-        assert_eq!((rt.get(z), rt.get(top)), (15, 30));
-    }
+/// `x` and `z` read each other; only `z` has a fallback, 15, so a read
+/// entering the cycle at `x` gets the cycle and one entering at `z`
+/// lands both as 15.
+fn verdict_cycle<C: Cells>(rt: &Runtime<C>) -> (Incr<u64>, Incr<u64>) {
+    let cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let z_reads = cell.clone();
+    let z = rt.create_query_with_fallback(
+        move |rt: &Runtime<C>| rt.get(*z_reads.get().unwrap()),
+        |_| 15_u64,
+    );
+    let x = rt.create_query(move |rt: &Runtime<C>| rt.get(z));
+    cell.set(x).unwrap();
+    (x, z)
+}
+
+/// A's `top` reads `catchers` nodes that each take the cycle verdict on
+/// `x`, then parks while B's read of `z` lands `x`; returns A's result
+/// and A's reruns.
+fn race_verdict_taken_then_landed(catchers: usize) -> (Option<u64>, u32) {
     let rt = Arc::new(Rt::new());
     let gate = Gate::new();
-    let (top, z) = cycle_verdict_taken_then_landed(&rt, gate.clone());
+    let (top, z) = cycle_verdict_taken_then_landed(&rt, gate.clone(), catchers);
     gate.arm();
     let first = {
         let rt = Arc::clone(&rt);
@@ -2841,8 +2843,213 @@ fn a_read_that_took_a_cycle_verdict_another_thread_lands_over_reruns() {
             .spawn(move || rt.get(z))
             .unwrap()
     };
-    let landed = second.join().unwrap();
+    assert_eq!(second.join().unwrap(), 15);
     gate.release();
-    assert_eq!((first.join().unwrap(), landed), (Some(30), 15));
+    let got = first.join().unwrap();
     rt.assert_invariant_i();
+    (got, rt.verdict_reruns.load(Ordering::Relaxed))
+}
+
+/// Thread A's read of `top` takes the cycle verdict on `x` through `k`,
+/// then parks; B's read of `z` lands `x` = 15 meanwhile. A's `top` must
+/// give an order's answer: 30 (B's read first, so `k` = 15) or a cycle
+/// panic (A's first), never 7777 + 15 from both (seed 0x6e771's shape).
+#[test]
+fn a_read_that_took_a_cycle_verdict_another_thread_lands_over_reruns() {
+    {
+        let rt = Rt::new();
+        let (top, _) = cycle_verdict_taken_then_landed(&rt, Gate::new(), 1);
+        assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    }
+    {
+        let rt = Rt::new();
+        let (top, z) = cycle_verdict_taken_then_landed(&rt, Gate::new(), 1);
+        assert_eq!((rt.get(z), rt.get(top)), (15, 30));
+    }
+    assert_eq!(race_verdict_taken_then_landed(1), (Some(30), 1));
+}
+
+/// One landing over a verdict many readers took reruns the attempt once.
+#[test]
+fn a_landing_over_a_verdict_many_readers_took_reruns_once() {
+    for catchers in [1, 8, 64] {
+        assert_eq!(
+            race_verdict_taken_then_landed(catchers),
+            (Some(15 * catchers as u64 + 15), 1),
+            "{catchers} catchers"
+        );
+    }
+}
+
+fn verdict_then_own_landing<C: Cells>(rt: &Runtime<C>) -> Incr<u64> {
+    let (x, z) = verdict_cycle(rt);
+    let k = rt.create_query(move |rt: &Runtime<C>| rt.try_get(x).unwrap_or(7777));
+    rt.create_query(move |rt: &Runtime<C>| rt.get(k) + rt.get(z))
+}
+
+/// A single thread that takes the verdict on `x` and then lands `x`
+/// itself, entering the cycle at `z`, answers as `Local` does, unrerun.
+#[test]
+fn a_verdict_the_reading_thread_lands_over_itself_does_not_rerun() {
+    let local = LocalRt::new();
+    let top = verdict_then_own_landing(&local);
+    assert_eq!(local.get(top), 7792);
+    let shared = Rt::new();
+    let top = verdict_then_own_landing(&shared);
+    assert_eq!(shared.get(top), 7792);
+    assert_eq!(shared.verdict_reruns.load(Ordering::Relaxed), 0);
+}
+
+/// The verdict record's rule, driven on one node: a run landing another
+/// thread counts after the verdict supersedes it, whatever the node's
+/// later landings; this thread's own runs do not; the attempt's end
+/// stops the watch.
+#[test]
+fn a_verdict_is_superseded_by_another_threads_run_of_its_node() {
+    let rt = Rt::new();
+    let q = rt.create_query(|_| 1_u64);
+    rt.get(q);
+    let node = rt.nodes.get(q.slot());
+    let other_run = || {
+        thread::scope(|s| {
+            s.spawn(|| rt.count_watched_run(id(q), node))
+                .join()
+                .unwrap()
+        })
+    };
+
+    rt.note_verdict(id(q));
+    assert!(!rt.verdict_superseded(), "no run since the verdict");
+    rt.count_watched_run(id(q), node);
+    assert!(!rt.verdict_superseded(), "this thread's own run");
+    other_run();
+    assert!(rt.verdict_superseded(), "another thread's run");
+    node.set_unrun(true);
+    assert!(
+        rt.verdict_superseded(),
+        "a later unrun release leaves the run counted"
+    );
+    rt.retract_held();
+    assert_eq!(
+        Lock::read(&rt.verdict_watch).len(),
+        0,
+        "the attempt's end stops the watch"
+    );
+    assert_eq!(<Shared as Cells>::u32_load_relaxed(&rt.watching), 0);
+
+    rt.note_verdict(id(q));
+    other_run();
+    rt.count_watched_run(id(q), node);
+    assert!(rt.verdict_superseded(), "this thread's run over another's");
+    rt.retract_held();
+}
+
+/// `x` = get(i) + get(z) and `z` = get(x), Fallback 15, with `z` parking
+/// at `z_gate` before its read; `top` = the verdict `k` takes on `x`, then
+/// get(x), parking at `first` and `second` before and after that read.
+fn verdict_cycle_reclaimed(
+    rt: &Rt,
+    first: Gate,
+    second: Gate,
+    z_gate: Gate,
+) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let i = rt.create_input(0_u64);
+    let cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let z_reads = cell.clone();
+    let z = rt.create_query_with_fallback(
+        move |rt: &Rt| {
+            z_gate.park();
+            rt.get(*z_reads.get().unwrap())
+        },
+        |_| 15_u64,
+    );
+    let x = rt.create_query(move |rt: &Rt| rt.get(i) + rt.get(z));
+    cell.set(x).unwrap();
+    let k = rt.create_query(move |rt: &Rt| rt.try_get(x).unwrap_or(7777));
+    let top = rt.create_query(move |rt: &Rt| {
+        let taken = rt.get(k);
+        first.park();
+        let read = rt.get(x);
+        second.park();
+        taken + read
+    });
+    (top, x, z, i)
+}
+
+/// A's `top` after B's read of `z`, the set of `i` and C's read of `x`,
+/// in that order on one thread.
+fn verdict_reclaimed_after_c() -> Option<u64> {
+    let rt = Rt::new();
+    let (top, x, z, i) = verdict_cycle_reclaimed(&rt, Gate::new(), Gate::new(), Gate::new());
+    assert_eq!(rt.get(z), 15);
+    rt.set(i, 1);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(x)));
+    catch_unwind(AssertUnwindSafe(|| rt.get(top))).ok()
+}
+
+/// A takes the verdict on `x`, B lands `x` = 15 and A reads it; then a
+/// set dirties `x` and C claims `x` and `z` again before A's exit. A read
+/// both B's run and the verdict it supersedes, so A reruns and answers as
+/// it would after C's read, never 7777 + 15.
+#[test]
+fn a_verdict_superseded_by_a_run_whose_node_is_claimed_again_reruns() {
+    let after_c = verdict_reclaimed_after_c();
+    assert_ne!(after_c, Some(7777 + 15));
+    let rt = Arc::new(Rt::new());
+    let (first, second, z_gate) = (Gate::new(), Gate::new(), Gate::new());
+    let (top, x, z, i) =
+        verdict_cycle_reclaimed(&rt, first.clone(), second.clone(), z_gate.clone());
+    first.arm();
+    second.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("A".into())
+            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(top))).ok())
+            .unwrap()
+    };
+    first.wait_parked();
+    let b = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("B".into())
+            .spawn(move || rt.get(z))
+            .unwrap()
+    };
+    assert_eq!(b.join().unwrap(), 15);
+    first.release();
+    second.wait_parked();
+    rt.set(i, 1);
+    z_gate.arm();
+    let c = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("C".into())
+            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).ok())
+            .unwrap()
+    };
+    z_gate.wait_parked();
+    // Checked once every gate is released: a parked thread left behind
+    // would abort the test binary.
+    let claimed = (rt.state_of(x), rt.state_of(z)) == (NodeState::Computing, NodeState::Computing);
+    second.release();
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
+    let mut stuck = false;
+    while rt.verdict_reruns.load(Ordering::Relaxed) == 0 && !a.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            stuck = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    z_gate.release();
+    c.join().unwrap();
+    let got = a.join().unwrap();
+    assert!(claimed, "C's read claimed x and z again before A's exit");
+    assert!(!stuck, "A neither reran nor returned while C held x");
+    rt.assert_invariant_i();
+    assert_eq!(
+        (got, rt.verdict_reruns.load(Ordering::Relaxed)),
+        (after_c, 1)
+    );
 }

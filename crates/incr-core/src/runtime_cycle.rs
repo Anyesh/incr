@@ -20,6 +20,7 @@ use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::{Episode, Held, HeldMap, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
+use crate::locks::Lock;
 use crate::{attempt, hold, reserve, set_stack, waits};
 
 /// What a compute attempt carries into its landings.
@@ -387,10 +388,16 @@ impl<C: Cells> Runtime<C> {
             }
             match catch_unwind(AssertUnwindSafe(&mut *f)) {
                 Ok(r) => {
-                    if outermost && !C::SINGLE_THREADED && hold::active() && !self.publish_held() {
-                        cycle_state::settle_hold();
-                        self.retry_wounded(r);
-                        continue;
+                    if outermost && !C::SINGLE_THREADED && hold::active() {
+                        if self.verdict_superseded() {
+                            self.rerun_superseded(r);
+                            continue;
+                        }
+                        if !self.publish_held() {
+                            cycle_state::settle_hold();
+                            self.retry_wounded(r);
+                            continue;
+                        }
                     }
                     if outermost {
                         cycle_state::debug_assert_exit_clear();
@@ -444,10 +451,16 @@ impl<C: Cells> Runtime<C> {
         // Any other unwind out of the outermost entry ends the attempt as
         // its read's outcome, which every landing it made is part of,
         // unless a waiter took one of them over first.
-        if outermost && !C::SINGLE_THREADED && hold::active() && !self.publish_held() {
-            cycle_state::settle_hold();
-            self.retry_wounded(payload);
-            return None;
+        if outermost && !C::SINGLE_THREADED && hold::active() {
+            if self.verdict_superseded() {
+                self.rerun_superseded(payload);
+                return None;
+            }
+            if !self.publish_held() {
+                cycle_state::settle_hold();
+                self.retry_wounded(payload);
+                return None;
+            }
         }
         if outermost {
             cycle_state::debug_assert_exit_clear();
@@ -505,6 +518,96 @@ impl<C: Cells> Runtime<C> {
         );
         self.park(ParkPoint::WoundRetracted);
         self.await_winner();
+    }
+
+    /// Whether another thread's run has landed a node whose cycle verdict
+    /// this attempt may have taken, since the verdict. A read of that
+    /// landing would mix two serial orders, so the attempt reruns whole.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn verdict_superseded(&self) -> bool {
+        let verdicts = hold::verdicts(self.runtime_id);
+        if verdicts.is_empty() {
+            return false;
+        }
+        let watch = self.verdict_watch.read();
+        verdicts.into_iter().any(|(slot, v)| {
+            watch
+                .get(&(slot, v.generation))
+                .is_some_and(|w| C::u64_load_relaxed(&w.runs) - v.runs > v.own)
+        })
+    }
+
+    /// Notes the verdict on `id` an unwind is about to release, watching
+    /// the node's run landings from before the release on.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_verdict(&self, id: NodeId) {
+        let generation = self.nodes.get(id.0).generation();
+        if hold::has_verdict(self.runtime_id, id.0, generation) {
+            return;
+        }
+        let runs = {
+            let mut watch = self.verdict_watch.write();
+            let w = watch.entry((id.0, generation)).or_insert_with(|| Watch {
+                runs: C::new_u64(0),
+                watchers: 0,
+            });
+            w.watchers += 1;
+            let runs = C::u64_load_relaxed(&w.runs);
+            C::u32_store_relaxed(&self.watching, watch.len() as u32);
+            runs
+        };
+        if let Some(old) = hold::note_verdict(self.runtime_id, id.0, generation, runs) {
+            self.unwatch_verdicts(&[(id.0, old)]);
+        }
+    }
+
+    /// Counts a run landing of `id` if a read watches it, before its
+    /// publication, which a read of the landing then also reads.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn count_watched_run(&self, id: NodeId, node: &NodeData<C>) {
+        let generation = node.generation();
+        match self.verdict_watch.read().get(&(id.0, generation)) {
+            Some(w) => C::u64_fetch_add(&w.runs, 1),
+            None => return,
+        };
+        hold::own_run(self.runtime_id, id.0, generation);
+    }
+
+    pub(super) fn unwatch_verdicts(&self, verdicts: &[(u32, u32)]) {
+        if verdicts.is_empty() {
+            return;
+        }
+        let mut watch = self.verdict_watch.write();
+        for key in verdicts {
+            if let Some(w) = watch.get_mut(key) {
+                w.watchers -= 1;
+                if w.watchers == 0 {
+                    watch.remove(key);
+                }
+            }
+        }
+        C::u32_store_relaxed(&self.watching, watch.len() as u32);
+    }
+
+    /// Drops what the attempt's run returned or raised and reruns it whole,
+    /// through the wound's retry if a waiter wounded it meanwhile.
+    #[cold]
+    #[inline(never)]
+    fn rerun_superseded<P>(&self, run: P) {
+        if self.retract_held() {
+            cycle_state::settle_hold();
+            self.retry_wounded(run);
+            return;
+        }
+        cycle_state::take_unwind_kind();
+        drop(run);
+        end_replay();
+        #[cfg(all(test, not(loom)))]
+        self.verdict_reruns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The head start of a wounded thread, which holds nothing now: until
@@ -2216,6 +2319,13 @@ impl<C: Cells> Runtime<C> {
                 landings.push((id.0, dissolved, stale, grouped));
             }
         } else {
+            // Before the release, which another thread's run may claim.
+            if !C::SINGLE_THREADED
+                && kind == Some(UnwindKind::Cycle)
+                && hold::closed(self.runtime_id)
+            {
+                self.note_verdict(id);
+            }
             self.discard_land(id, first, wrote, stamp_rev, bag);
         }
     }
@@ -3116,4 +3226,16 @@ pub(super) fn clear_caught_cycle(payload: &(dyn Any + Send), deps: &[(NodeId, u3
     {
         cycle_state::set_unwind_kind(None);
     }
+}
+
+/// A node's run landings while reads watch its cycle verdict.
+pub(crate) struct Watch<C: Cells> {
+    runs: C::U64,
+    watchers: u32,
+}
+
+pub(crate) type Watches<C> = HashMap<(u32, u32), Watch<C>, FxBuildHasher>;
+
+pub(crate) fn verdict_watch<C: Cells>() -> C::Lock<Watches<C>> {
+    <C::Lock<Watches<C>> as Lock<Watches<C>>>::new(Watches::default())
 }

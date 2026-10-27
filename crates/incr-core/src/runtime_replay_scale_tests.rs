@@ -154,6 +154,52 @@ cycle_100k_tests! {
     shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
 }
 
+/// A read that takes a 100k ring's cycle verdict and then lands a 100k
+/// chain in the same attempt: under `Shared` the ring's members stay
+/// recorded as taken verdicts while every chain node lands.
+fn verdict_then_chain_100k<C: Cells>() {
+    let n = 100_000;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let runs = counters(n);
+    let iterations = Arc::new(AtomicU32::new(0));
+    let members = ring(&rt, n, Strategy::None, &runs, &iterations, |rt, next, _| {
+        rt.get(next) + 1
+    });
+    let head = members[0];
+    let tail = chain(&rt, n).nodes[0];
+    let watched = Arc::new(AtomicU32::new(0));
+    let saw = watched.clone();
+    let top = rt.create_query(move |rt: &Runtime<C>| {
+        let caught = u64::from(rt.try_get(head).is_err());
+        saw.store(C::u32_load_relaxed(&rt.watching), SeqCst);
+        (caught << 40) + rt.get(tail)
+    });
+    assert_eq!(rt.get(top), (1 << 40) + n as u64);
+    let expected = if C::SINGLE_THREADED { 0 } else { n as u32 };
+    assert_eq!(
+        watched.load(SeqCst),
+        expected,
+        "ring members watched under the chain"
+    );
+    assert_eq!(rt.verdict_reruns.load(SeqCst), 0);
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_verdict_then_chain_100k() {
+    on_stack(16 << 20, verdict_then_chain_100k::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_verdict_then_chain_100k() {
+    on_stack(16 << 20, verdict_then_chain_100k::<Shared>);
+}
+
 thread_local! {
     static DEEPEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
