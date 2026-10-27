@@ -109,7 +109,12 @@ fn new_word() -> Arc<Word> {
 
 #[cfg(not(loom))]
 thread_local! {
-    static MINE: Arc<Word> = new_word();
+    static MINE: Mine = Mine::new();
+    /// MINE's `outside` flag while MINE lives, else null: a const
+    /// thread_local, so a guard reads it without MINE's lazy-init check,
+    /// and in a thread_local's destructor after MINE's too.
+    static OUTSIDE: std::cell::Cell<*const std::sync::atomic::AtomicU32> =
+        const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 #[cfg(loom)]
@@ -118,8 +123,31 @@ loom::thread_local! {
 }
 
 #[cfg(not(loom))]
-thread_local! {
-    static OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+struct Mine(Arc<Word>);
+
+#[cfg(not(loom))]
+impl Mine {
+    fn new() -> Self {
+        let word = new_word();
+        OUTSIDE.set(&word.outside);
+        Self(word)
+    }
+}
+
+#[cfg(not(loom))]
+impl std::ops::Deref for Mine {
+    type Target = Arc<Word>;
+
+    fn deref(&self) -> &Arc<Word> {
+        &self.0
+    }
+}
+
+#[cfg(not(loom))]
+impl Drop for Mine {
+    fn drop(&mut self) {
+        OUTSIDE.set(std::ptr::null());
+    }
 }
 
 /// This thread's attempt word, which outlives its attempts.
@@ -129,34 +157,25 @@ pub(crate) fn word_id() -> usize {
 
 /// While it lives, this thread is outside the engine (`true`: in user code
 /// or a wait) or back in it (`false`), as a take-over judges its owner;
-/// the drop puts the enclosing state back.
+/// the drop puts the enclosing state back. A no-op on a thread with no
+/// attempt word, which owns nothing a waiter could take over.
 pub(crate) struct Outside(Option<(NonNull<std::sync::atomic::AtomicU32>, u32)>);
 
 impl Outside {
     #[inline(always)]
     pub(crate) fn enter(outside: bool) -> Self {
-        // A thread_local's destructor can drop a `Shared` runtime after
-        // MINE is gone: no word is left to mark then.
-        Self(
-            MINE.try_with(|w| {
-                let was = w.outside.load(std::sync::atomic::Ordering::Relaxed);
-                w.outside
-                    .store(u32::from(outside), std::sync::atomic::Ordering::Relaxed);
-                (NonNull::from(&w.outside), was)
-            })
-            .ok(),
-        )
-    }
-
-    /// [`Self::enter`] for user code reached without a runtime's `Cells`:
-    /// a no-op on a thread that never began a `Shared` attempt.
-    #[inline(always)]
-    pub(crate) fn user_code() -> Self {
         #[cfg(not(loom))]
-        if !OWNER.get() {
-            return Self(None);
-        }
-        Self::enter(true)
+        let flag = NonNull::new(OUTSIDE.get().cast_mut());
+        #[cfg(loom)]
+        let flag = MINE.try_with(|w| NonNull::from(&w.outside)).ok();
+        Self(flag.map(|flag| {
+            // SAFETY: a live MINE's word holds `flag`, and MINE outlives
+            // every guard on its thread's stack.
+            let word = unsafe { flag.as_ref() };
+            let was = word.load(std::sync::atomic::Ordering::Relaxed);
+            word.store(u32::from(outside), std::sync::atomic::Ordering::Relaxed);
+            (flag, was)
+        }))
     }
 }
 
@@ -164,8 +183,7 @@ impl Drop for Outside {
     #[inline(always)]
     fn drop(&mut self) {
         if let Some((flag, was)) = self.0 {
-            // SAFETY: the guard lives on its thread's stack, and MINE, whose
-            // word holds `flag`, drops only at that thread's exit.
+            // SAFETY: as in `enter`.
             unsafe { flag.as_ref() }.store(was, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -179,7 +197,7 @@ pub(crate) fn outside_now() -> bool {
 /// This thread's current attempt.
 pub(crate) fn mine() -> Attempt {
     MINE.with(|w| Attempt {
-        word: w.clone(),
+        word: Arc::clone(w),
         epoch: w.state.load(Ordering::Relaxed) & !FLAGS,
     })
 }
@@ -187,8 +205,6 @@ pub(crate) fn mine() -> Attempt {
 /// Starts a new attempt, at the outermost entry and at each of its
 /// retries: every flag clears, and the epoch moves on.
 pub(crate) fn begin() {
-    #[cfg(not(loom))]
-    OWNER.set(true);
     MINE.with(|w| {
         let epoch = (w.state.load(Ordering::Relaxed) & !FLAGS).wrapping_add(EPOCH);
         w.state.store(epoch, Ordering::Release);
@@ -222,7 +238,7 @@ pub(crate) fn enter_hold() -> Attempt {
         w.flights.fetch_add(1, Ordering::Relaxed);
         let was = w.state.fetch_or(HOLDING, Ordering::AcqRel);
         Attempt {
-            word: w.clone(),
+            word: Arc::clone(w),
             epoch: was & !FLAGS,
         }
     })

@@ -474,7 +474,7 @@ impl<V: ?Sized> Drop for Unbuilt<V> {
         if let Some(value) = self.0.take() {
             #[cfg(all(test, not(loom)))]
             crate::replay::note_drop();
-            let _drops = crate::attempt::Outside::user_code();
+            let _drops = crate::attempt::Outside::enter(true);
             isolate(|| drop(value));
         }
     }

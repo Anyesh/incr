@@ -252,6 +252,7 @@ fn the_items_a_panicking_drop_leaves_in_a_bag_drop_outside_the_engine() {
             panic!("drop");
         }
     }
+    begin();
     let rt = crate::runtime::Runtime::<crate::Shared>::new();
     let mut bag = crate::deferred::Deferred::new();
     bag.push_erased(Box::new(Panics));
