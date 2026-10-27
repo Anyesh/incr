@@ -2139,7 +2139,7 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
     static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
-    static SPEC_READS: RefCell<SpecReads> = RefCell::new(HashMap::default());
+    static SPEC_READS: RefCell<SpecReads> = const { RefCell::new(HashMap::with_hasher(FxBuildHasher)) };
     static SPEC_PENDING: Cell<Option<SpecPending>> = const { Cell::new(None) };
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
@@ -4097,19 +4097,36 @@ pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
     })
 }
 
-/// Drops the runs of each runtime in `gone` that has no context left in
-/// `c`: a frame that starts before its next context opens has no run, and
-/// must not find one of an earlier frame at its stack address.
+/// Drops the runs, and outside speculation the stash reads, of each
+/// runtime in `gone` that has no context left in `c`: a frame that starts
+/// before its next context opens has no run, and must not find one of an
+/// earlier frame at its stack address.
 fn end_sessions(c: &[Context], gone: impl IntoIterator<Item = RuntimeId>) {
+    let reads = !speculative() && SPEC_READS.with(|d| !d.borrow().is_empty());
+    let end_reads = |rt: Option<RuntimeId>| {
+        SPEC_READS.with(|d| {
+            let d = &mut *d.borrow_mut();
+            match rt {
+                Some(rt) => d.retain(|&(of, _, _), _| of != rt),
+                None => d.clear(),
+            }
+        });
+    };
     RUNS.with(|r| {
         let r = &mut *r.borrow_mut();
         if c.is_empty() {
             *r = Runs::default();
+            if reads {
+                end_reads(None);
+            }
             return;
         }
         for rt in gone {
             if innermost(c, rt).is_none() {
                 r.forget(rt);
+                if reads {
+                    end_reads(Some(rt));
+                }
             }
         }
     });
