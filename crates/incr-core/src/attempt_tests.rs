@@ -227,3 +227,91 @@ fn a_waiter_takes_over_no_owner_in_the_engine() {
     drop(user);
     assert!(leave_hold());
 }
+
+/// A drop that reports whether its thread was marked outside the engine.
+struct Reports(&'static std::sync::atomic::AtomicU32);
+
+impl Drop for Reports {
+    fn drop(&mut self) {
+        self.0.store(
+            1 + u32::from(outside_now()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+/// A bag's drain is user code to its last item: what a panicking drop
+/// leaves drops with the bag, still outside the engine.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn the_items_a_panicking_drop_leaves_in_a_bag_drop_outside_the_engine() {
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    struct Panics;
+    impl Drop for Panics {
+        fn drop(&mut self) {
+            panic!("drop");
+        }
+    }
+    let rt = crate::runtime::Runtime::<crate::Shared>::new();
+    let mut bag = crate::deferred::Deferred::new();
+    bag.push_erased(Box::new(Panics));
+    bag.push_erased(Box::new(Reports(&SEEN)));
+    let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bag.drain(&rt)));
+    assert!(drained.is_err());
+    assert_eq!(
+        SEEN.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the leftover item dropped in the engine (1) or not at all (0)"
+    );
+    assert!(!outside_now());
+}
+
+/// A value the engine built for a read and never delivered drops as user
+/// code on a thread that began a `Shared` attempt.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_undelivered_value_drops_outside_the_engine() {
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    begin();
+    drop(crate::deferred::Unbuilt::new(Box::new(Reports(&SEEN))));
+    assert_eq!(SEEN.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(!outside_now());
+}
+
+/// A `Shared` runtime a thread_local holds can drop after the thread's
+/// attempt word: its values still retire, and the thread exits cleanly.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_shared_runtime_dropped_after_the_attempt_word_retires_its_values() {
+    crate::child_test::run_in_child(
+        "attempt::tests::a_shared_runtime_dropped_after_the_attempt_word_retires_its_values",
+        || {
+            static DROPPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            struct Marks;
+            impl Drop for Marks {
+                fn drop(&mut self) {
+                    DROPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            thread_local! {
+                static RT: std::cell::RefCell<Option<(crate::runtime::Runtime<crate::Shared>, Marks)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            std::thread::spawn(|| {
+                RT.with(|r| {
+                    let rt = crate::runtime::Runtime::<crate::Shared>::new();
+                    let x = rt.create_input(1_i64);
+                    rt.set(x, 2);
+                    *r.borrow_mut() = Some((rt, Marks));
+                });
+                // MINE starts after RT, so it is destroyed first.
+                word_id();
+            })
+            .join()
+            .unwrap();
+            assert!(DROPPED.load(std::sync::atomic::Ordering::SeqCst));
+        },
+    )
+    .assert_clean();
+}

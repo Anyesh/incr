@@ -147,6 +147,11 @@ impl Drop for Outside {
     }
 }
 
+#[cfg(all(test, not(loom)))]
+pub(crate) fn outside_now() -> bool {
+    MINE.with(|w| w.outside.load(std::sync::atomic::Ordering::Relaxed) != 0)
+}
+
 /// This thread's current attempt.
 pub(crate) fn mine() -> Attempt {
     MINE.with(|w| Attempt {
