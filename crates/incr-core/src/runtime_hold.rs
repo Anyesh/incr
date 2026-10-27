@@ -362,6 +362,9 @@ impl<C: Cells> Runtime<C> {
             )
             .is_err()
             {}
+            // After the CAS, so a run that loads the new count sees the
+            // node Dead.
+            C::u64_fetch_add(&self.reshapes, 1);
             // Under the hold, as `claim_single` takes it.
             self.counted_change()
         };
