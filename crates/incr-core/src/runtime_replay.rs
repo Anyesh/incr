@@ -429,6 +429,13 @@ impl<C: Cells> Runtime<C> {
             || self.frame_owes_outcome(id)
     }
 
+    /// Whether a speculative stand-in's run read something its landing
+    /// alone can't check: a read `KEPT_UNCHECKED` or a stash, whose reads
+    /// go with the frame.
+    pub(super) fn stand_in_unchecked(&self, cidx: u32, ctl: &ComputeCtl) -> bool {
+        !self.take_spec_reads(cidx, ctl).is_empty() || ctl.has(cycle::KEPT_UNCHECKED)
+    }
+
     /// The popping frame's reads of other stashes, for its own stash.
     fn take_spec_reads(&self, cidx: u32, ctl: &ComputeCtl) -> Vec<(u32, u32, u64)> {
         if ctl.read_stashes() {
@@ -798,9 +805,15 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn drop_stash(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) {
-        if replay::speculative() {
-            return;
+        if !replay::speculative() {
+            self.end_stash(id, generation, bag);
         }
+    }
+
+    /// Ends the stash of node `id` at `generation`, under speculation too,
+    /// with the children a creator's stashed run made: something other than
+    /// the stash's run landed the node.
+    pub(super) fn end_stash(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) {
         if let Some(stash) = self.take_stash(id.0, generation, false, None) {
             self.discard_stashed_children(id, stash.index, bag);
             bag.push_erased(Box::new(stash.outcome));
@@ -1040,10 +1053,27 @@ impl<C: Cells> Runtime<C> {
         replay::speculative() && self.stashed(id.0, generation, true)
     }
 
-    /// A speculative read's value of `handle` from its stash.
+    /// A read's value from its node's stash, which a rerun of the reader
+    /// can't regenerate; a speculative frame's read names the stash as its
+    /// source.
+    pub(super) fn stash_read_value<T: Value>(
+        &self,
+        handle: Incr<T>,
+        frame: Option<ActiveRead>,
+        (value, serial): (T, u64),
+    ) -> T {
+        self.unregenerable(frame);
+        if frame.is_some() {
+            self.spec_source(handle, replay::SpecSource::Stash(serial));
+        }
+        value
+    }
+
+    /// A speculative read's value of `handle` from its stash, with the
+    /// stash's serial.
     #[cold]
     #[inline(never)]
-    pub(super) fn stashed_read<T: Value>(&self, handle: Incr<T>) -> Option<T> {
+    pub(super) fn stashed_read<T: Value>(&self, handle: Incr<T>) -> Option<(T, u64)> {
         if !replay::speculative() {
             return None;
         }
@@ -1070,8 +1100,7 @@ impl<C: Cells> Runtime<C> {
         // run's discard stands in for. A node tried in this revision is not
         // run again, so its reader is discarded too.
         let value = read.unwrap_or_else(|()| self.drop_unwind())?;
-        self.spec_source(handle, replay::SpecSource::Stash(serial));
-        value_code::run(|| value.0.value().downcast_ref::<T>().cloned())
+        value_code::run(|| value.0.value().downcast_ref::<T>().cloned()).map(|v| (v, serial))
     }
 
     /// A speculative run's closure panicked, over a frame that read only
@@ -1503,7 +1532,7 @@ impl<C: Cells> Runtime<C> {
         let Some(f) = frame.filter(|_| replay::speculative()) else {
             return self.read_cold_body(handle, observed, kind, frame, word, first);
         };
-        let scope = SpecReadScope::open(self.runtime_id, handle.slot(), handle.generation());
+        let scope = SpecReadScope::open(self.runtime_id, handle.slot(), handle.generation(), f.ctl);
         let read = self.read_cold_body(handle, observed, kind, frame, word, first);
         self.note_spec_source(f, (handle.slot(), handle.generation()), scope.close());
         read
@@ -6260,12 +6289,14 @@ enum Landing {
 /// An open speculative read, closed when the read returns or unwinds.
 struct SpecReadScope {
     outer: Option<Option<replay::SpecPending>>,
+    ctl: *const ComputeCtl,
 }
 
 impl SpecReadScope {
-    fn open(rt: RuntimeId, slot: u32, generation: u32) -> Self {
+    fn open(rt: RuntimeId, slot: u32, generation: u32, ctl: *const ComputeCtl) -> Self {
         Self {
             outer: Some(replay::open_spec_read(rt, slot, generation)),
+            ctl,
         }
     }
 
@@ -6274,10 +6305,15 @@ impl SpecReadScope {
     }
 }
 
+/// A read that unwinds leaves its frame unkeepable, whatever source it
+/// named before the unwind.
 impl Drop for SpecReadScope {
     fn drop(&mut self) {
         if let Some(outer) = self.outer.take() {
             replay::close_spec_read(outer);
+            // SAFETY: the reading frame is on the stack while its read
+            // unwinds, so its control block is live.
+            unsafe { &*self.ctl }.raise(cycle::KEPT_UNCHECKED);
         }
     }
 }

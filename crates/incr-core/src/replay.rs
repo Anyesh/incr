@@ -2445,10 +2445,11 @@ pub(crate) fn close_spec_read(outer: Option<SpecPending>) -> SpecSource {
 }
 
 /// Keeps the frame of `ctl` at `cidx` of `rt`'s read of node `slot` at
-/// `generation` from its stash `serial`. The reads of frames above it go,
-/// and so do an earlier frame's at its position on the frame's first one
-/// (`fresh`). False if the frame read another stash of the node, whose
-/// adoption both reads cannot share.
+/// `generation` from its stash `serial`. The reads of popped frames above
+/// it go, and so do an earlier frame's of the same control block on the
+/// frame's first one (`fresh`); another frame at its position, as a member
+/// run at its episode root's, keeps its own. False if the frame read
+/// another stash of the node, whose adoption both reads cannot share.
 pub(crate) fn keep_spec_read(
     rt: RuntimeId,
     cidx: u32,
@@ -2459,7 +2460,7 @@ pub(crate) fn keep_spec_read(
 ) -> bool {
     SPEC_READS.with(|d| {
         let mut d = d.borrow_mut();
-        d.retain(|e| e.rt != rt || e.cidx < cidx || !fresh && e.cidx == cidx && e.ctl == ctl);
+        d.retain(|e| e.rt != rt || e.cidx < cidx || e.cidx == cidx && (e.ctl != ctl || !fresh));
         let ours = |e: &&SpecRead| {
             e.rt == rt
                 && e.cidx == cidx
@@ -2503,8 +2504,8 @@ pub(crate) fn spec_read_of(
 }
 
 /// The stash reads of the frame of `ctl` at `cidx` of `rt`, which is
-/// popping, as `(slot, generation, serial)`, taken with those of frames
-/// above it.
+/// popping, as `(slot, generation, serial)`, taken with those of popped
+/// frames above it.
 pub(crate) fn take_spec_reads(
     rt: RuntimeId,
     cidx: u32,
@@ -2512,8 +2513,10 @@ pub(crate) fn take_spec_reads(
 ) -> Vec<(u32, u32, u64)> {
     SPEC_READS.with(|d| {
         d.borrow_mut()
-            .extract_if(.., |e| e.rt == rt && e.cidx >= cidx)
-            .filter(|e| e.cidx == cidx && e.ctl == ctl)
+            .extract_if(.., |e| {
+                e.rt == rt && (e.cidx > cidx || e.cidx == cidx && e.ctl == ctl)
+            })
+            .filter(|e| e.cidx == cidx)
             .map(|e| (e.slot, e.generation, e.serial))
             .collect()
     })

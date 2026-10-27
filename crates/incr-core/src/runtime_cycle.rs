@@ -1081,12 +1081,7 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let look = Look::here();
-        // A stand-in lands its speculative run alone only over reads its
-        // landing can check, which a stash read is not.
-        let unchecked = ctl.has(cycle::KEPT_UNCHECKED) || ctl.read_stashes();
-        if ctl.read_stashes() {
-            replay::take_spec_reads(self.runtime_id, cidx, &ctl);
-        }
+        let unchecked = self.stand_in_unchecked(cidx, &ctl);
         let (replaced, spec_buf) = cycle_state::with_held(|h| {
             let e = h
                 .get_mut(&(self.runtime_id, slot))
@@ -1178,10 +1173,7 @@ impl<C: Cells> Runtime<C> {
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
         held.wrote = ctl.wrote.get() != 0;
-        let unchecked = ctl.has(cycle::KEPT_UNCHECKED) || ctl.read_stashes();
-        if ctl.read_stashes() {
-            replay::take_spec_reads(rt, cidx, ctl);
-        }
+        let unchecked = self.stand_in_unchecked(cidx, ctl);
         let (replaced, spec_buf) = held.record(
             Look::here(),
             deps,

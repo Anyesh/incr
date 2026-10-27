@@ -58,7 +58,7 @@ impl<C: Cells> Runtime<C> {
         // which stands for the run the seed replaces.
         if C::u32_load_relaxed(&self.stash_count) != 0 {
             let mut bag = Deferred::new();
-            self.drop_stash(id, q.generation(), &mut bag);
+            self.end_stash(id, q.generation(), &mut bag);
             bag.drain_isolated();
         }
         let arena = self

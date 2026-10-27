@@ -2914,14 +2914,15 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
+        // A speculative frame's read names its value's source.
+        let spec = MODE & VIRT != 0 && frame.is_some() && replay::speculative();
         let arm = || reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
         let mut root = Some(arm());
         let mut restarts = 0;
         loop {
             if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
                 if let Some(value) = self.stashed_read(handle) {
-                    self.unregenerable(frame);
-                    return Ok(value);
+                    return Ok(self.stash_read_value(handle, frame, value));
                 }
             }
             // A read whose walk a doom stopped goes on with it even if its
@@ -2931,8 +2932,7 @@ impl<C: Cells> Runtime<C> {
                 && !(MODE & VIRT != 0 && self.resume_pending(NodeId(slot)))
             {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
-                let cyclic =
-                    MODE & VIRT != 0 && state::load::<C>(node.state_cell()) == NodeState::Cyclic;
+                let cyclic = spec && state::load::<C>(node.state_cell()) == NodeState::Cyclic;
                 if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
                     if cyclic {
                         self.spec_source(handle, replay::SpecSource::Settled);
@@ -2952,8 +2952,7 @@ impl<C: Cells> Runtime<C> {
                 Computed::Done | Computed::Unsettled => {
                     if MODE & VIRT != 0 {
                         if let Some(value) = self.stashed_read(handle) {
-                            self.unregenerable(frame);
-                            return Ok(value);
+                            return Ok(self.stash_read_value(handle, frame, value));
                         }
                     }
                 }
@@ -2991,10 +2990,9 @@ impl<C: Cells> Runtime<C> {
                     == NodeState::Dirty
             };
             let dirty_before = !C::SINGLE_THREADED && frame.is_some() && dirty();
-            // A speculative read's source: the published state before the
-            // slot read, and an unchanged stash the read may stand on, which
-            // must be the same stash once the value is pinned.
-            let spec = MODE & VIRT != 0 && frame.is_some();
+            // The published state before the slot read, and an unchanged
+            // stash the read may stand on, which must be the same stash once
+            // the value is pinned.
             let settled_before = spec && state::load::<C>(node.state_cell()).is_settled();
             let unchanged_before = (spec && !settled_before)
                 .then(|| self.unchanged_serial(slot, handle.generation()))
@@ -3049,7 +3047,7 @@ impl<C: Cells> Runtime<C> {
                         return Err(cycle);
                     }
                     Err(NodeState::Clean) => {
-                        if MODE & VIRT != 0 && state::load::<C>(node.state_cell()).is_settled() {
+                        if spec && state::load::<C>(node.state_cell()).is_settled() {
                             self.spec_source(handle, replay::SpecSource::Settled);
                         }
                         return Ok(self.read_slot(handle, node, type_tag, arena_slot));
