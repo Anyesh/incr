@@ -5393,7 +5393,9 @@ impl<C: Cells> Runtime<C> {
             }
         };
         if cycle_state::wounded() && !std::thread::panicking() {
+            let user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
             drop(payload);
+            drop(user);
             self.raise_wound();
         }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));

@@ -438,7 +438,9 @@ impl<C: Cells> Runtime<C> {
         // an unwind leaves the kind Wound, so the closure's pop raises it.
         let wounded = !outermost && cycle_state::wounded();
         if wounded && !std::thread::panicking() {
+            let user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
             drop(payload);
+            drop(user);
             self.raise_wound();
         }
         // Any other unwind out of the outermost entry ends the attempt as
@@ -696,7 +698,7 @@ impl<C: Cells> Runtime<C> {
             .push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &ctl, u32::MAX);
         self.dep_stack.settle_foreign_keeping(false);
         let _barrier = Barrier(self);
-        let _user = crate::attempt::Outside::enter(true);
+        let _user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         value_code::run(f)
     }
 
@@ -1682,6 +1684,8 @@ impl<C: Cells> Runtime<C> {
                                 let cur = self.take_held(*m, |e| e.s.take());
                                 let same = cur.as_ref().is_some_and(|c| {
                                     self.attributed(*m, cidx, bag, || {
+                                        let _user = (!C::SINGLE_THREADED)
+                                            .then(|| crate::attempt::Outside::enter(true));
                                         value_code::run(|| s.same(p, c))
                                     })
                                 });

@@ -827,6 +827,7 @@ impl<C: Cells> Runtime<C> {
             self.sync_held(&t);
             buried
         };
+        let _drops = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(buried))).err()
     }
 

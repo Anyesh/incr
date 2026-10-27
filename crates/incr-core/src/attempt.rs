@@ -39,6 +39,8 @@ use loom::sync::{
 #[cfg(loom)]
 use std::sync::PoisonError;
 
+use std::ptr::NonNull;
+
 use crate::waits::Claim;
 
 /// A doom's unwind is in flight: set and cleared by the owner only.
@@ -115,6 +117,11 @@ loom::thread_local! {
     static MINE: Arc<Word> = new_word();
 }
 
+#[cfg(not(loom))]
+thread_local! {
+    static OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// This thread's attempt word, which outlives its attempts.
 pub(crate) fn word_id() -> usize {
     MINE.with(|w| Arc::as_ptr(w) as usize)
@@ -123,27 +130,44 @@ pub(crate) fn word_id() -> usize {
 /// While it lives, this thread is outside the engine (`true`: in user code
 /// or a wait) or back in it (`false`), as a take-over judges its owner;
 /// the drop puts the enclosing state back.
-pub(crate) struct Outside(u32);
+pub(crate) struct Outside(Option<(NonNull<std::sync::atomic::AtomicU32>, u32)>);
 
 impl Outside {
     #[inline(always)]
     pub(crate) fn enter(outside: bool) -> Self {
-        MINE.with(|w| {
-            let was = w.outside.load(std::sync::atomic::Ordering::Relaxed);
-            w.outside
-                .store(u32::from(outside), std::sync::atomic::Ordering::Relaxed);
-            Self(was)
-        })
+        // A thread_local's destructor can drop a `Shared` runtime after
+        // MINE is gone: no word is left to mark then.
+        Self(
+            MINE.try_with(|w| {
+                let was = w.outside.load(std::sync::atomic::Ordering::Relaxed);
+                w.outside
+                    .store(u32::from(outside), std::sync::atomic::Ordering::Relaxed);
+                (NonNull::from(&w.outside), was)
+            })
+            .ok(),
+        )
+    }
+
+    /// [`Self::enter`] for user code reached without a runtime's `Cells`:
+    /// a no-op on a thread that never began a `Shared` attempt.
+    #[inline(always)]
+    pub(crate) fn user_code() -> Self {
+        #[cfg(not(loom))]
+        if !OWNER.get() {
+            return Self(None);
+        }
+        Self::enter(true)
     }
 }
 
 impl Drop for Outside {
     #[inline(always)]
     fn drop(&mut self) {
-        MINE.with(|w| {
-            w.outside
-                .store(self.0, std::sync::atomic::Ordering::Relaxed)
-        });
+        if let Some((flag, was)) = self.0 {
+            // SAFETY: the guard lives on its thread's stack, and MINE, whose
+            // word holds `flag`, drops only at that thread's exit.
+            unsafe { flag.as_ref() }.store(was, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -163,6 +187,8 @@ pub(crate) fn mine() -> Attempt {
 /// Starts a new attempt, at the outermost entry and at each of its
 /// retries: every flag clears, and the epoch moves on.
 pub(crate) fn begin() {
+    #[cfg(not(loom))]
+    OWNER.set(true);
     MINE.with(|w| {
         let epoch = (w.state.load(Ordering::Relaxed) & !FLAGS).wrapping_add(EPOCH);
         w.state.store(epoch, Ordering::Release);
