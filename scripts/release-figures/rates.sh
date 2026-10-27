@@ -42,12 +42,16 @@ export ENVS=$envs SEED=$seed MATCH=$match
 # One run: "<tree index> pass", "<k> match | <text>" (a failure whose text
 # holds every " && "-separated part of MATCH, or any failure when MATCH is
 # *), "<k> fail | <text>" (another failure text) or "<k> other <panic or
-# timeout>" (no differential verdict).
+# timeout>" (no differential verdict, "other no-test-ran" for a zero exit
+# that ran no test).
 one() {
   local o rc t part rest
   o=$(env $ENVS REPLAY_CHECK=$SEED timeout 600 "$2" --ignored --exact runtime::replay_differential::replay_scan --test-threads=1 2>&1)
   rc=$?
-  if ((rc == 0)); then echo "$1 pass"; return; fi
+  if ((rc == 0)); then
+    if grep -aq '^test result: ok. 1 passed' <<<"$o"; then echo "$1 pass"; else echo "$1 other no-test-ran"; fi
+    return
+  fi
   if ((rc == 124)); then echo "$1 other timeout"; return; fi
   t=$(grep -aE -A3 '^seed 0x[0-9a-f]+[,:]' <<<"$o" | head -n 4 | sed -E 's/^seed 0x[0-9a-f]+, //' | cut -c1-600 | paste -sd'|')
   if [[ -z $t ]]; then
