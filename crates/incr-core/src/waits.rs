@@ -44,6 +44,8 @@ pub(crate) type Claim = (RuntimeId, u32);
 
 struct Waiter {
     ticket: u64,
+    /// The waiting thread's attempt word, as [`crate::attempt::word_id`].
+    owner: usize,
     waiting_on: Claim,
     holds: Vec<Claim>,
     state: Arc<AtomicU8>,
@@ -138,6 +140,7 @@ impl Registration {
         let ticket = ticket(&mut next);
         reg.waiters.push(Waiter {
             ticket,
+            owner: crate::attempt::word_id(),
             waiting_on,
             holds,
             state: state.clone(),
@@ -198,6 +201,25 @@ impl Drop for Registration {
         }
         self.state.store(DONE, Ordering::Release);
     }
+}
+
+/// Runs `wound`, a waiter's take-over of the attempt whose word is
+/// `owner`, under the registry lock, unless that owner waits here with an
+/// older ticket than the waiter's `ticket` (0 for one not taken yet, which
+/// is younger than every taken one): the wound order settles that owner's
+/// waits, and a take-over is only for an owner held where the registry
+/// cannot see it. False if refused.
+pub(crate) fn take_over_in_order(owner: usize, ticket: u64, wound: impl FnOnce() -> bool) -> bool {
+    let reg = registry();
+    let mine = if ticket == 0 { u64::MAX } else { ticket };
+    let older_waits = reg
+        .waiters
+        .iter()
+        .any(|w| w.owner == owner && w.ticket < mine && w.state.load(Ordering::Acquire) == WAITING);
+    if older_waits {
+        return false;
+    }
+    wound()
 }
 
 /// Before a wounded entry retries: waits until the oldest waiter on the

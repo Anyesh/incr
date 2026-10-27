@@ -108,6 +108,11 @@ loom::thread_local! {
     static MINE: Arc<Word> = new_word();
 }
 
+/// This thread's attempt word, which outlives its attempts.
+pub(crate) fn word_id() -> usize {
+    MINE.with(|w| Arc::as_ptr(w) as usize)
+}
+
 /// This thread's current attempt.
 pub(crate) fn mine() -> Attempt {
     MINE.with(|w| Attempt {
@@ -279,9 +284,25 @@ impl Attempt {
 
     /// A waiter on this attempt, which met it at `claim`: wounds it if its
     /// discard is in flight or it holds landings, pinned or not, since its
-    /// owner may be in user code that waits on the waiter. True if it is
-    /// wounded now.
+    /// owner may be in user code that waits on the waiter, unless the
+    /// owner waits in the registry older than the waiter
+    /// ([`crate::waits::take_over_in_order`]). True if it is wounded now.
     pub(crate) fn wound_in_flight(&self, claim: Claim) -> bool {
+        let w = self.word.state.load(Ordering::Acquire);
+        if !self.current(w) || w & (IN_FLIGHT | HOLDING) == 0 {
+            return false;
+        }
+        if w & WOUNDED != 0 {
+            return true;
+        }
+        crate::waits::take_over_in_order(
+            Arc::as_ptr(&self.word) as usize,
+            crate::cycle_state::ticket_now(),
+            || self.wound_now(claim),
+        )
+    }
+
+    fn wound_now(&self, claim: Claim) -> bool {
         let mut w = self.word.state.load(Ordering::Acquire);
         let mut listed = false;
         loop {
