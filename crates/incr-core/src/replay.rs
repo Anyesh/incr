@@ -494,7 +494,11 @@ pub(crate) struct Pending {
     slots: Vec<Option<Delivery>>,
     live: usize,
     by_key: Index<ReadKey, usize>,
-    by_maker: Index<u32, usize>,
+    /// A removal leaves its index in its maker's list until the list holds
+    /// as many removed as live, so a removal from a budget-long list
+    /// passes over none of it; readers skip emptied slots, which no push
+    /// reuses while a list holds them.
+    by_maker: HashMap<u32, Made, FxBuildHasher>,
     by_frame: Index<(u32, u32, u32), usize>,
     /// By the frame and the node it reads.
     by_read: Index<(u32, u32, u32, u64), usize>,
@@ -530,6 +534,14 @@ pub(crate) struct Pending {
 enum Filed {
     Deep(u32),
     Shallow(u32, [Option<PayloadKey>; 2]),
+}
+
+/// The deliveries a level's run made, oldest first, and how many of them
+/// are live.
+#[derive(Default)]
+struct Made {
+    live: u32,
+    list: Few<usize>,
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -601,7 +613,9 @@ impl Pending {
     pub(crate) fn push(&mut self, d: Delivery) {
         let i = self.slots.len();
         list(&mut self.by_key, d.key, i);
-        list(&mut self.by_maker, d.maker, i);
+        let made = self.by_maker.entry(d.maker).or_default();
+        made.live += 1;
+        made.list.push(i);
         list(&mut self.by_frame, frame_of(&d.key), i);
         list(&mut self.by_read, read_of(&d.key), i);
         list(&mut self.by_node, (d.key.node, d.key.generation), i);
@@ -660,7 +674,6 @@ impl Pending {
         let slots = &self.slots;
         let gone = |&j: &usize| slots[j].is_none();
         unlist_all(&mut self.by_key, out.iter().map(|d| d.key), gone, many);
-        unlist_all(&mut self.by_maker, out.iter().map(|d| d.maker), gone, many);
         unlist_all(
             &mut self.by_frame,
             out.iter().map(|d| frame_of(&d.key)),
@@ -690,6 +703,7 @@ impl Pending {
             unlist_all(&mut self.by_frontier, traced().map(frontier), gone, many);
         }
         for d in out {
+            self.unmake(d.maker);
             if awaits(d) {
                 self.count_taken(frame_of(&d.key));
             }
@@ -697,7 +711,27 @@ impl Pending {
         self.live -= out.len();
         // No index is held across a point where none is live.
         if self.live == 0 {
+            debug_assert!(
+                self.by_maker.is_empty(),
+                "a maker list outlived its deliveries"
+            );
             self.slots.clear();
+        }
+    }
+
+    fn unmake(&mut self, maker: u32) {
+        let MapEntry::Occupied(mut e) = self.by_maker.entry(maker) else {
+            debug_assert!(false, "a maker's live count went below zero");
+            return;
+        };
+        let made = e.get_mut();
+        made.live -= 1;
+        if made.live == 0 {
+            e.remove();
+        } else if made.list.as_slice().len() >= 2 * made.live as usize {
+            note_work(made.list.as_slice().len());
+            let slots = &self.slots;
+            made.list.retain(|&j| slots[j].is_some());
         }
     }
 
@@ -955,7 +989,15 @@ impl Pending {
 
     /// The deliveries the run at `level` made, oldest first.
     pub(crate) fn of_maker(&self, level: u32) -> Vec<usize> {
-        listed(&self.by_maker, &level)
+        self.by_maker.get(&level).map_or_else(Vec::new, |made| {
+            note_work(made.list.as_slice().len());
+            made.list
+                .as_slice()
+                .iter()
+                .copied()
+                .filter(|&j| self.slots[j].is_some())
+                .collect()
+        })
     }
 
     /// Removes the deliveries the run at `level` made, oldest first.
@@ -1649,8 +1691,7 @@ impl Context {
     /// retry that took an earlier walk or direct delivery for the read:
     /// the walk goes and the direct one is read again with `runs`, since
     /// the runs it kept no longer cover the ended ones. A direct one from
-    /// the same maker is updated in place: removing it walks the maker's
-    /// index, as long as the budget, once per doom.
+    /// the same maker is updated in place, sparing a removal and a push.
     pub(crate) fn redeliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
         let key = ReadKey::blocked(below);
         self.pending.remove_walks(&key);
