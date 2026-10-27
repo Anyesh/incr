@@ -658,12 +658,23 @@ impl<C: Cells> Runtime<C> {
 
     /// Notes that the attempt took a cycle and reads on past it, unless the
     /// read is in a doomed or speculative run, which the unbounded run may
-    /// never make: its retry notes it again if it does.
+    /// never make: its retry notes it again if it does. Each speculative
+    /// frame is marked `KEPT_UNCHECKED`, so no stash is adopted in place of
+    /// that retry.
     #[cold]
     #[inline(never)]
     pub(super) fn note_cycle_caught(&self, popped: Option<&ComputeCtl>) {
         let discarded = |ctl: &ComputeCtl| ctl.has(cycle::DOOMED) || ctl.has(cycle::SPECULATIVE);
         if popped.is_some_and(discarded) || self.dep_stack.any_frame(discarded) {
+            let unstash = |ctl: &ComputeCtl| {
+                if ctl.has(cycle::SPECULATIVE) {
+                    ctl.raise(cycle::KEPT_UNCHECKED);
+                }
+            };
+            if let Some(ctl) = popped {
+                unstash(ctl);
+            }
+            self.dep_stack.each_frame(unstash);
             return;
         }
         cycle_state::note_cycle_caught();

@@ -454,6 +454,16 @@ pub trait DepStack: sealed::Sealed + 'static {
         })
     }
 
+    fn each_frame(&self, f: impl Fn(&ComputeCtl)) {
+        self.with(|s| {
+            for frame in &s.frames {
+                // SAFETY: the frame is on the stack, so its control block is
+                // live (see `Frame::ctl`).
+                f(unsafe { &*frame.ctl });
+            }
+        });
+    }
+
     /// The top frame raises from its own code here, after any read so far.
     fn note_raise(&self) {
         self.with(|s| {
