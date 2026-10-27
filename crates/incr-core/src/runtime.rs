@@ -1128,11 +1128,12 @@ impl Walk {
 
     /// Plans afresh from the root, which another thread landed since the
     /// walk planned it (a claim the walk waited out, a New plan that met it
-    /// Dirty, or a landing its claim found in the episode log), as a read that came after that landing would: where the
-    /// walk enters a cycle of recorded deps depends on its visit count at
-    /// the switch to exact mode, and which queued entries a Failed root
-    /// passes depends on the Failed landings since the walk began. No state
-    /// the new plan expands predates the releases an earlier wait is about.
+    /// Dirty, or a landing its claim found in the episode log), as a read
+    /// that came after that landing would: where the walk enters a cycle of
+    /// recorded deps depends on its visit count at the switch to exact mode,
+    /// and which queued entries a Failed root passes depends on the Failed
+    /// landings since the walk began. No state the new plan expands predates
+    /// the releases an earlier wait is about.
     #[cold]
     #[inline(never)]
     fn restart(&mut self) {
@@ -3927,6 +3928,7 @@ impl<C: Cells> Runtime<C> {
         } else {
             self.planned()
         };
+        let mut root_revisits = 0;
         let mut walk = resume.unwrap_or_else(|| {
             let mut walk = Walk::new(id, gen, observed);
             if !C::SINGLE_THREADED {
@@ -3995,8 +3997,13 @@ impl<C: Cells> Runtime<C> {
                     visit,
                     Some(generation),
                     !is_root,
-                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur)))
-                        .then_some(planned),
+                    (!C::SINGLE_THREADED
+                        && if is_root {
+                            root_revisits < ROOT_RESTARTS
+                        } else {
+                            unchecked.take() != Some(cur)
+                        })
+                    .then_some(planned),
                     seen,
                 );
                 ran_unsettled |= computed == Computed::Unsettled;
@@ -4004,6 +4011,9 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     revisited.push(cur);
                     if is_root {
+                        // A read's root claim checks its plan at most
+                        // `ROOT_RESTARTS` times, as its replans restart.
+                        root_revisits += 1;
                         walk.restart();
                         planned = self.planned();
                     }
@@ -4434,6 +4444,13 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.unrun_unclaims
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.give_back(node, dirty, true);
+    }
+
+    /// [`Self::unclaim_unrun`], marking the node unrun only if `unrun`.
+    #[cold]
+    #[inline(never)]
+    fn give_back(&self, node: &NodeData<C>, dirty: bool, unrun: bool) {
         let back = if dirty {
             NodeState::Dirty
         } else {
@@ -4442,11 +4459,11 @@ impl<C: Cells> Runtime<C> {
         // The owner's re-claim of its own held node goes back to the view.
         if !C::SINGLE_THREADED
             && hold::active()
-            && hold::land(state::cell_key::<C>(node.state_cell()), back, back, true)
+            && hold::land(state::cell_key::<C>(node.state_cell()), back, back, unrun)
         {
             return;
         }
-        node.set_unrun(true);
+        node.set_unrun(unrun);
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
                 state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
@@ -4896,14 +4913,17 @@ impl<C: Cells> Runtime<C> {
             }
             // No entry check covers the root, so its claim checks for
             // another thread's landing of it since the plan, whose deps a
-            // read after that landing expands first.
+            // read after that landing expands first; a node released unrun
+            // is another read's still. The landing precedes every reader's
+            // claim, so the claim goes back unmarked and another reader's
+            // root check still sees it.
             if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED && !walked) {
                 if seen != Seen::Unwalked
                     && !node.unrun()
                     && self.others_since(p)
                     && self.root_reached(p, id)
                 {
-                    self.unclaim_unrun(node, claimed_dirty);
+                    self.give_back(node, claimed_dirty, false);
                     return Computed::Revisit;
                 }
             }
