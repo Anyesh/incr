@@ -6,9 +6,9 @@ root=$PWD
 rel=$1
 shift
 runs=${PURE_RUNS:-30000}
-secs=${PURE_SECS:-6000}
+secs=${PURE_SECS:-1200}
 runner=${RUNNER_NAME:-unknown}
-wt=$root/../pure-$1
+wt=$root/../pure-$rel
 if ! { git fetch -q --depth=1 origin "$rel" || git fetch -q --depth=1 https://github.com/Anyesh/incr.git "$rel"; } ||
   ! git worktree add -q --detach "$wt" FETCH_HEAD; then
   echo "PURE-FETCH-FAILED $rel"
@@ -40,6 +40,10 @@ for c in "$@"; do
     failed=1
   elif [[ -n $s ]] && ((rc == 0)); then
     echo "PURE $c $rel $s wall-s $w runner=$runner"
+    [[ $s == "runs $runs "* ]] || { echo "PURE-SHORT $c $s of $runs"; failed=1; }
+  elif ((rc == 124)); then
+    echo "PURE-TIMEOUT $c $rel after $secs s runner=$runner"
+    failed=1
   elif [[ -n $h ]]; then
     echo "PURE-HANG $c $rel $h runner=$runner"
     failed=1
