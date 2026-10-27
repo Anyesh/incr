@@ -63,7 +63,7 @@ fn probe_fan_timing() {
     let tree = std::env::var("FIGURE_TREE").unwrap_or_default();
     std::panic::set_hook(Box::new(|_| {}));
     let frames = 1;
-    for n in [2000_u64, 4000] {
+    for n in [1000_u64, 2000, 4000, 8000] {
         let (local, local_ok) = timed::<Local>(n, frames);
         let (shared, shared_ok) = timed::<Shared>(n, frames);
         println!(
