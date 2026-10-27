@@ -1749,8 +1749,11 @@ fn a_foreign_rerun_after_the_owners_landing_leaves_no_stale_delivery() {
 /// **A Failed landing's delivery stays the read it stands for**, at
 /// budget 1: R reads F, F reads X and X reads input I, panicking while I
 /// is 1. R dooms on X, X's entry lands it Failed and its panic is
-/// delivered to F's retry; R parks before F's entry. A set of I to 2 lets
-/// X compute, and another thread reads X. F's retry takes the panic, as
+/// delivered to F's retry; R parks before F's entry, holding X's landing.
+/// A set of I to 2 lets X compute, and another thread's read of X waits
+/// for that hold: R is parked in engine code, not user code, and the
+/// unbounded run's F runs no user code between X's landing and its
+/// unwind. F's retry takes the panic, as
 /// the unbounded run's F read it when X landed, but once both reads are
 /// done F must not stay Failed over X's new value.
 #[test]
@@ -1777,9 +1780,17 @@ fn a_foreign_rerun_after_a_failed_landing_leaves_no_stale_delivery() {
     };
     entry.wait_parked();
     rt.set(i, 2);
-    let x_read = read_unreserved(&rt, x);
+    let other = {
+        let rt = rt.clone();
+        spawn("other", move || rt.get(x))
+    };
+    // A reader that holds nothing never registers its wait.
+    assert!(
+        other.0.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the read of X did not wait for R's held landing"
+    );
     entry.release();
-    let f_read = r.join();
+    let (f_read, x_read) = (r.join(), other.join());
     assert_eq!(f_read, Err("x boom".to_string()));
     assert_eq!(x_read, Ok(3));
     assert_eq!(

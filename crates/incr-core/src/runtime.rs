@@ -1851,6 +1851,9 @@ impl<C: Cells> Runtime<C> {
                     if !C::SINGLE_THREADED {
                         reserve::user_code((rt.runtime_id, slot));
                     }
+                    // The closure, and the value's Eq at the cutoff and Drop
+                    // of the value it replaces, are user code.
+                    let _user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
                     let outcome = match ctl.flags.get()
@@ -2913,6 +2916,7 @@ impl<C: Cells> Runtime<C> {
         word: u64,
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
+        let _engine = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(false));
         let slot = handle.slot();
         let arm = || reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
         let mut root = Some(arm());
@@ -3684,13 +3688,23 @@ impl<C: Cells> Runtime<C> {
                 first.extend_into(&mut queue);
             }
         }
+        // This thread's own set reaches its held landings over the edges
+        // their publication installs.
+        let pending = if !C::SINGLE_THREADED && hold::active() {
+            hold::pending_edges(self.runtime_id)
+        } else {
+            Vec::new()
+        };
+        push_pending(&pending, start, &mut queue);
 
         let mut expanded_new: Option<HashSet<NodeId>> = None;
         let past = self.failed_past.load(std::sync::atomic::Ordering::Relaxed);
         while let Some(id) = queue.pop() {
             let (node, flags) = self.nodes.get_with_flags(id.0);
             loop {
-                let cur = state::load::<C>(node.state_cell());
+                // This thread's own set flips its held landings through
+                // the view, as it would flip them published.
+                let cur = self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
                 match cur {
                     NodeState::Clean => {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
@@ -3704,6 +3718,7 @@ impl<C: Cells> Runtime<C> {
                                 self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
+                            push_pending(&pending, id, &mut queue);
                             break;
                         }
                         // The state moved under us (a claim or another
@@ -3719,6 +3734,7 @@ impl<C: Cells> Runtime<C> {
                                 self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
+                            push_pending(&pending, id, &mut queue);
                             break;
                         }
                         // The state moved under us (a claim or another
@@ -3746,6 +3762,7 @@ impl<C: Cells> Runtime<C> {
                                 self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
+                            push_pending(&pending, id, &mut queue);
                             break;
                         }
                     }
@@ -3763,10 +3780,11 @@ impl<C: Cells> Runtime<C> {
                             }
                             let inner = self.inner.read();
                             let list = &inner.dependents[id.0 as usize];
-                            if !list.is_empty()
+                            if (!list.is_empty() || pending.iter().any(|&(d, _)| d == id.0))
                                 && expanded_new.get_or_insert_with(HashSet::default).insert(id)
                             {
                                 list.extend_into(&mut queue);
+                                push_pending(&pending, id, &mut queue);
                             }
                             break;
                         }
@@ -3785,6 +3803,7 @@ impl<C: Cells> Runtime<C> {
                                 self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
+                            push_pending(&pending, id, &mut queue);
                             break;
                         }
                     }
@@ -5436,7 +5455,8 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 &[],
                 Some(&*payload),
-                !ctl.has(cycle::UNREGENERABLE),
+                !ctl.has(cycle::UNREGENERABLE)
+                    && (!ctl.has(cycle::HOLD) || self.held_reads_regenerable(deps)),
                 bag,
             );
             self.end_reservation(id, node);
@@ -5576,9 +5596,7 @@ impl<C: Cells> Runtime<C> {
         own_run: bool,
         bag: &mut Deferred<C>,
     ) {
-        if !C::SINGLE_THREADED && hold::active() {
-            self.open_hold_for_held_deps(id, node, attempt.first, deps);
-        }
+        self.hold_panic_landing(id, node, attempt.first, wrote, bag);
         let landing = match self.publish_deps(
             id,
             deps,
@@ -5606,11 +5624,16 @@ impl<C: Cells> Runtime<C> {
         if landing == NodeState::Failed {
             if !C::SINGLE_THREADED {
                 self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
+                if hold::active() {
+                    hold::keep_failed_at(
+                        state::cell_key::<C>(node.state_cell()),
+                        attempt.verify_rev,
+                    );
+                }
             }
-            // A rerun can't take a held landing from Failed, as its word
-            // stays Computing until the exit publishes it.
-            let regenerable =
-                own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0 && !self.lands_held(id, node);
+            // A held landing stays regenerable: the owner's rerun reclaims
+            // it through the view, and no other thread sees it Failed.
+            let regenerable = own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0;
             mark = self.failed_landing(
                 id,
                 node.generation(),
@@ -5687,9 +5710,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        if !C::SINGLE_THREADED && hold::active() {
-            self.open_hold_for_held_deps(id, node, attempt.first, deps);
-        }
+        self.hold_panic_landing(id, node, attempt.first, wrote, bag);
         // Any outcome lands New, which recomputes.
         self.publish_deps(
             id,
@@ -6843,6 +6864,19 @@ mod drop_panic_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_race_tests.rs"]
 mod value_code_race_tests;
+
+/// Queues the readers of `id` among a set walk's pending held edges.
+#[inline(always)]
+fn push_pending(pending: &[(u32, u32)], id: NodeId, queue: &mut Vec<NodeId>) {
+    if !pending.is_empty() {
+        queue.extend(
+            pending
+                .iter()
+                .filter(|&&(d, _)| d == id.0)
+                .map(|&(_, r)| NodeId(r)),
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

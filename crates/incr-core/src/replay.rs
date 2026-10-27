@@ -2472,6 +2472,7 @@ fn keep(mut read: KeptRead, fresh: bool, number: bool) {
         gone
     });
     value_code::set_kept_bit(true);
+    let _drops = crate::attempt::Outside::enter(true);
     drop(gone);
 }
 
@@ -2900,6 +2901,7 @@ pub(crate) fn drop_kept_from(rt: RuntimeId, cidx: u32) {
     if value_code::thread_word() & value_code::KEPT_BIT == 0 {
         forget_events();
     }
+    let _drops = crate::attempt::Outside::enter(true);
     drop(gone);
 }
 

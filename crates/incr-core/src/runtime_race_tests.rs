@@ -110,6 +110,21 @@ impl Gate {
     }
 }
 
+/// Releases its gates if the test unwinds, so a failed assert fails the
+/// test instead of leaving a thread parked until its timeout aborts the
+/// binary. A release sent before a thread parks lets that park through.
+pub(crate) struct ReleaseOnUnwind(pub(crate) Vec<Gate>);
+
+impl Drop for ReleaseOnUnwind {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            for gate in &self.0 {
+                gate.release();
+            }
+        }
+    }
+}
+
 /// Install the runtime's park hook with armed gates at `points`.
 pub(super) fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>) {
     for (_, gate) in &points {
@@ -430,8 +445,18 @@ fn b3_dep_recomputed_for_an_unwalked_set_supersedes_new_dependent() {
 }
 
 /// `f` panics while `x` is even; `d` catches that panic as 7 and reads
-/// `y`, parking on `gate` once its reads are done.
+/// `y`, parking on `gate` in its own code once its reads are done, while
+/// its attempt holds `f`'s Failed landing.
 fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    caught_failed_dep_counted(rt, gate, &Arc::new(AtomicUsize::new(0)))
+}
+
+/// [`caught_failed_dep`], counting `d`'s runs in `d_runs`.
+fn caught_failed_dep_counted(
+    rt: &Rt,
+    gate: &Gate,
+    d_runs: &Arc<AtomicUsize>,
+) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
     let x = rt.create_input(0_u64);
     let y = rt.create_input(0_u64);
     let f = rt.create_query(move |rt: &Rt| {
@@ -441,9 +466,11 @@ fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, 
     });
     let d = {
         let gate = gate.clone();
+        let d_runs = Arc::clone(d_runs);
         rt.create_query(move |rt: &Rt| {
+            d_runs.fetch_add(1, Ordering::SeqCst);
             let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10) + rt.get(y);
-            gate.park();
+            gate.park_in_user_code();
             v
         })
     };
@@ -452,7 +479,8 @@ fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, 
 
 /// A set moves `d`'s Failed dep `f` between `d`'s first read and its
 /// publish, before `d`'s edge exists, so the walk can't reach `d`: it
-/// lands Dirty with no memo.
+/// lands Dirty with no memo. `d`'s attempt holds `f`'s Failed landing
+/// until it ends, so the set meets it held.
 #[test]
 fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
     let rt = Arc::new(Rt::new());
@@ -464,7 +492,7 @@ fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
         thread::spawn(move || rt.get(d))
     };
     gate.wait_parked();
-    assert_eq!(rt.state_of(f), NodeState::Failed);
+    assert_eq!(rt.state_of(f), NodeState::Computing);
     rt.set(x, 1);
     gate.release();
     assert_eq!(reader.join().unwrap(), 7);
@@ -476,13 +504,16 @@ fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
     assert_eq!(rt.get(d), 10);
 }
 
-/// As above, and `f` lands Failed again for the set before `d` publishes,
-/// so the Failed state `d` finds is not the one it read.
+/// As above, and `f` lands Failed again for the set before `d` publishes:
+/// the reader that relands it takes `f`'s held landing over from `d`'s
+/// parked attempt, wounding it, so `d` never publishes over a Failed state
+/// it did not read: its retry reads the relanded one and keeps that memo.
 #[test]
-fn caught_failed_dep_relanded_failed_before_the_first_publish_keeps_no_memo() {
+fn caught_failed_dep_relanded_failed_before_the_first_publish_retries_over_it() {
     let rt = Arc::new(Rt::new());
     let gate = Gate::new();
-    let (x, _, f, d) = caught_failed_dep(&rt, &gate);
+    let d_runs = Arc::new(AtomicUsize::new(0));
+    let (x, _, f, d) = caught_failed_dep_counted(&rt, &gate, &d_runs);
     gate.arm();
     let reader = {
         let rt = Arc::clone(&rt);
@@ -498,10 +529,13 @@ fn caught_failed_dep_relanded_failed_before_the_first_publish_keeps_no_memo() {
     assert_eq!(rt.state_of(f), NodeState::Failed);
     gate.release();
     assert_eq!(reader.join().unwrap(), 7);
+    assert_eq!(d_runs.load(Ordering::SeqCst), 2);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
-    assert!(!rt.has_memo_of(d));
+    assert!(rt.has_memo_of(d));
     rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 7);
+    assert_eq!(d_runs.load(Ordering::SeqCst), 2);
 }
 
 /// `d` lands Dirty with a memo over Failed `f`; a recompute for `y` reads

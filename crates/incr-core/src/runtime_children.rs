@@ -249,12 +249,46 @@ impl<C: Cells> Runtime<C> {
     ) {
         if !C::SINGLE_THREADED && crate::hold::active() {
             let cell = crate::state::cell_key::<C>(self.nodes.get(id.0).state_cell());
+            if landing == ChildLanding::Sweep && !crate::hold::holds(cell) {
+                self.hold_for_held_child(id, cell, opened);
+            }
             if crate::hold::holds(cell) {
                 crate::hold::defer_children(cell, landing, opened);
                 return;
             }
         }
         self.land_children_now(id, landing, opened, bag);
+    }
+
+    /// A sweep cannot delete a child whose landing this thread holds, as
+    /// its word stays `Computing`, though once published it could: the
+    /// creator's landing is held too, so its sweep runs at publication,
+    /// after the child's.
+    fn hold_for_held_child(&self, id: NodeId, cell: usize, opened: bool) {
+        let candidates = self
+            .index_at(id)
+            .with(|s| s.pending_sweep_candidates(opened));
+        let held = candidates.iter().any(|c| {
+            crate::hold::holds(crate::state::cell_key::<C>(
+                self.nodes.get(c.slot()).state_cell(),
+            ))
+        });
+        if held {
+            let node = self.nodes.get(id.0);
+            let own = crate::hold::open(
+                cell,
+                self.runtime_id,
+                id.0,
+                node.generation(),
+                false,
+                None,
+                None,
+            );
+            debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
+            if crate::hold::holds(cell) {
+                node.set_held_mark(true);
+            }
+        }
     }
 
     /// [`Self::land_children`] past the hold.

@@ -575,12 +575,18 @@ impl<C: Cells> Runtime<C> {
         for m in live {
             n += 1;
             let node = self.nodes.get(m.node.0);
+            // Another thread's held landing shows Computing here until its
+            // publication, which releases what it does not land Failed.
             assert!(
                 node.generation() == m.node.1
-                    && self.in_failed_landing(
-                        m.node.0,
-                        self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
-                    )
+                    && (node.held_mark()
+                        || self.in_failed_landing(
+                            m.node.0,
+                            self.seen_quietly(
+                                node.state_cell(),
+                                state::load::<C>(node.state_cell()),
+                            ),
+                        ))
                     && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
@@ -821,6 +827,7 @@ impl<C: Cells> Runtime<C> {
             self.sync_held(&t);
             buried
         };
+        let _drops = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(buried))).err()
     }
 
