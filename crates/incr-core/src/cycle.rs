@@ -432,6 +432,11 @@ pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
 /// A speculative frame whose outcome no stash keeps: a doomed run is
 /// discarded, and an open cycle's provisional read may settle otherwise.
 pub(crate) const UNSTASHED: u16 = DOOMED | LOW;
+/// A frame that read some node other than as its real state: a
+/// placeholder, a kept or held landing, another runtime's node unchecked,
+/// or a dep that did not land Clean.
+pub(crate) const UNREAL_READS: u16 =
+    DOOMED | POISONED | PH_SEEN | KEPT_READ | FOREIGN_HOLD | KEPT_UNCHECKED | HOLD;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
@@ -456,6 +461,8 @@ const _: () = assert!(crate::bits::disjoint(&[
 const PATH_KEPT: u8 = 1;
 /// [`ComputeCtl::marks`]: see [`ComputeCtl::reads_counted`].
 const READS_COUNTED: u8 = 2;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::looked_up_unrecorded`].
+const LOOKED_UP_UNRECORDED: u8 = 4;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -545,6 +552,16 @@ impl ComputeCtl {
 
     pub(crate) fn count_reads(&self) {
         self.marks.set(self.marks.get() | READS_COUNTED);
+    }
+
+    /// Whether a `BUFFERED` frame made a lookup that records no dep, which
+    /// a speculative member run's basis cannot check.
+    pub(crate) fn looked_up_unrecorded(&self) -> bool {
+        self.marks.get() & LOOKED_UP_UNRECORDED != 0
+    }
+
+    pub(crate) fn look_up_unrecorded(&self) {
+        self.marks.set(self.marks.get() | LOOKED_UP_UNRECORDED);
     }
 
     /// The frame's path, if [`Self::keep_path`] kept it.
