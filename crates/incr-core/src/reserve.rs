@@ -812,9 +812,7 @@ pub(crate) fn may_take_over(
     generation: u32,
     patience: &mut attempt::Patience,
 ) -> bool {
-    // A walk listing keeps its claim's table entry, so no live entry in
-    // its bucket means no listing.
-    if any() && bucket_hit(claim) && walk_listed_awake(claim, generation) {
+    if walk_listed_awake(claim, generation) {
         *patience = attempt::Patience::default();
         return false;
     }
