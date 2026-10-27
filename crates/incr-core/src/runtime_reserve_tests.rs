@@ -492,7 +492,11 @@ fn a_waiter_on_an_awake_walk_listing_takes_no_owner_over() {
     let took = thread::spawn(move || {
         let mut patience = Patience::default();
         let until = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < until {
+        // Enough checks for a waiter's patience on a loaded runner.
+        for calls in 0.. {
+            if calls >= 256 && Instant::now() >= until {
+                break;
+            }
             if take_over(n, 1, &mut patience) {
                 return true;
             }

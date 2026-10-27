@@ -3344,12 +3344,16 @@ fn waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake() {
     note_walk(claim, generation, &Peers::new([slot, slot + 2]));
     user_code((rt.runtime_id, slot + 2));
     let user = Outside::enter(true);
-    let wait = |take: &(dyn Fn(&mut Patience) -> bool + Sync)| {
+    let wait = |within: Duration, take: &(dyn Fn(&mut Patience) -> bool + Sync)| {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let mut patience = Patience::default();
-                let until = Instant::now() + Duration::from_millis(100);
-                while Instant::now() < until {
+                let until = Instant::now() + within;
+                // Enough checks for a waiter's patience on a loaded runner.
+                for calls in 0.. {
+                    if calls >= 256 && Instant::now() >= until {
+                        break;
+                    }
                     if take(&mut patience) {
                         return true;
                     }
@@ -3362,7 +3366,8 @@ fn waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake() {
         })
     };
     assert!(
-        !wait(&|p| rt.hand_over(NodeId(slot), p)),
+        !wait(Duration::from_millis(100), &|p| rt
+            .hand_over(NodeId(slot), p)),
         "a waiter took a held landing over in a peer's user code"
     );
     assert!(!crate::attempt::wounded());
@@ -3372,7 +3377,10 @@ fn waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake() {
         "other user code left the refusal standing"
     );
     assert!(
-        wait(&|p| crate::hold::hand_over(cell, claim, p).is_some()),
+        wait(Duration::from_secs(5), &|p| crate::hold::hand_over(
+            cell, claim, p
+        )
+        .is_some()),
         "the held landing was never takeable"
     );
     drop(user);
