@@ -295,6 +295,107 @@ fn shared_held_failed_landing_sees_its_failed_dep_rerun_before_the_exit() {
     rt.assert_invariant_i();
 }
 
+/// q catches d's Failed landing, which is over x, left Dirty by a caught
+/// panic, and then reads the held cycle and panics, so q's own Failed
+/// landing is held. A set below x, made before q's exit (`held`) or after
+/// it, stops at x: the take there flips d, and q lands Dirty from its
+/// publication's check of d (held) or through its edge on d. Returns
+/// q's next read and the states of x, d and q before it.
+fn failed_over_a_dirty_dep_set_below(held: bool) -> (Result<i64, String>, Vec<NodeState>) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let (a, _) = two_cycle(&*rt);
+    let fail = rt.create_input(0_i64);
+    let gate = rt.create_input(0_i64);
+    let failed = rt.create_query(move |rt| {
+        if rt.get(fail) != 0 {
+            panic!("failed below x");
+        }
+        0_i64
+    });
+    let x =
+        rt.create_query(move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1));
+    let d = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        if rt.get(gate) != 0 {
+            panic!("d over {v}");
+        }
+        v
+    });
+    let q = rt.create_query(move |rt| -> i64 {
+        let saw = catch_unwind(AssertUnwindSafe(|| rt.get(d))).map_err(panic_message);
+        let cycle = rt.get(a);
+        panic!("q saw {saw:?} over {cycle}")
+    });
+    assert_eq!(rt.get(d), 0);
+    rt.set(fail, 1);
+    rt.set(gate, 1);
+    let early = catch_unwind(AssertUnwindSafe(|| rt.get(d))).map_err(panic_message);
+    assert_eq!(early, Err(String::from("d over 1")));
+    assert_eq!(
+        rt.state_of(x),
+        NodeState::Dirty,
+        "the caught panic left x Dirty"
+    );
+    let set = Arc::new(AtomicBool::new(false));
+    if held {
+        let hook: super::ParkHook = {
+            let (weak, set) = (Arc::downgrade(&rt), set.clone());
+            let owner = std::thread::current().id();
+            Box::new(move |point| {
+                if point != super::ParkPoint::BeforeHeldPublish
+                    || std::thread::current().id() != owner
+                    || set.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                let rt = weak.upgrade().unwrap();
+                std::thread::spawn(move || rt.set(fail, 0)).join().unwrap();
+                set.store(true, Ordering::SeqCst);
+            })
+        };
+        assert!(rt.park_hook.set(hook).is_ok());
+    }
+    let first = catch_unwind(AssertUnwindSafe(|| rt.get(q))).map_err(panic_message);
+    assert!(
+        first
+            .as_ref()
+            .is_err_and(|m| m.starts_with("q saw Err(") && m.contains("stays Failed")),
+        "q ran over d's Failed landing: {first:?}"
+    );
+    if held {
+        assert!(
+            set.load(Ordering::SeqCst),
+            "the read published held landings"
+        );
+    } else {
+        rt.set(fail, 0);
+    }
+    let states = vec![rt.state_of(x), rt.state_of(d), rt.state_of(q)];
+    let again = catch_unwind(AssertUnwindSafe(|| rt.get(q))).map_err(panic_message);
+    rt.assert_invariant_i();
+    (again, states)
+}
+
+/// A held Failed landing over a Failed dep d, and d over a Dirty x, take a
+/// set below x as the published landing does: the same read and the same
+/// states. The set lands before the publication reads d, so this passes
+/// without the held note too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_failed_landing_over_a_dirty_dep_takes_a_set_below_as_published() {
+    let published = failed_over_a_dirty_dep_set_below(false);
+    let held = failed_over_a_dirty_dep_set_below(true);
+    assert_eq!(held, published, "held, then published");
+    assert!(
+        published
+            .0
+            .as_ref()
+            .is_err_and(|m| m.starts_with("q saw Err(\"d over 0\")")),
+        "q reran over d's new landing: {:?}",
+        published.0
+    );
+}
+
 /// Reads `p`, whose landing is held, with its publication panicking at the
 /// first other landing it publishes, where a child sweep's caught panic
 /// resumes, and `also` sees every other park point. Returns that landing's
