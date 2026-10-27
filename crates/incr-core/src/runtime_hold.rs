@@ -210,7 +210,7 @@ impl<C: Cells> Runtime<C> {
     /// deps are written, with the claim's origin. The run took no `HOLD`,
     /// so its write kept nothing: the undo leaves the node unverified, and
     /// a Dirty claim goes back Dirty with its old deps, as the claim found
-    /// it, where a user panic's unkept write goes back New.
+    /// it.
     #[cold]
     #[inline(never)]
     pub(super) fn open_hold_for_held_deps(
