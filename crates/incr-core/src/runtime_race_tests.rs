@@ -2718,6 +2718,57 @@ fn an_episode_reaches_a_plan_only_through_another_threads_slots() {
     assert_eq!(landed(&log, 3), [u32::MAX]);
 }
 
+/// A root's claim reacts only to another thread's entries a publication
+/// logged, which ended their read: never to a release an attempt that goes
+/// on made, nor to its eviction.
+#[test]
+fn a_root_check_reads_only_another_threads_ended_entries() {
+    let published = |mut log: EpisodeLog, number: u32, slots: Vec<u32>| {
+        thread::spawn(move || {
+            log.push_as(true, true, number, thread_key(), slots);
+            log
+        })
+        .join()
+        .unwrap()
+    };
+    let mut log = foreign(EpisodeLog::default(), false, 5, vec![2]);
+    assert!(log.ended_with(4, 0, 2), "a landed episode missed");
+    assert!(!log.ended_with(5, 0, 2));
+    assert!(!log.ended_with(4, 0, 3));
+    log = foreign(log, true, 7, vec![4]);
+    assert!(!log.ended_with(0, 6, 4), "an interim release reached");
+    log = published(log, 8, vec![6]);
+    assert!(log.ended_with(0, 7, 6));
+    assert!(!log.ended_with(0, 8, 6));
+    assert!(
+        !log.ended_with(6, 4, 2),
+        "a landed number read as a release"
+    );
+    log.push_as(true, true, 9, thread_key(), [7]);
+    assert!(!log.ended_with(0, 8, 7), "an own publication reached");
+
+    log = published(log, u32::MAX, vec![10]);
+    log = published(log, 0, vec![11]);
+    assert!(log.ended_with(0, u32::MAX - 1, 10));
+    assert!(log.ended_with(0, u32::MAX, 11));
+    assert!(!log.ended_with(0, u32::MAX, 10));
+
+    let all = || (0..EPISODE_LOG_LEN as u32).collect::<Vec<_>>();
+    let mut log = foreign(EpisodeLog::default(), true, 1, all());
+    log = foreign(log, true, 2, all());
+    assert!(
+        !log.ended_with(0, 0, u32::MAX),
+        "an evicted interim release reached"
+    );
+    log = published(log, 3, all());
+    log = published(log, 4, vec![0]);
+    assert!(
+        log.ended_with(0, 2, u32::MAX),
+        "an evicted publication missed"
+    );
+    assert!(!log.ended_with(0, 3, u32::MAX));
+}
+
 /// Landings write nothing to the episode log, which only landed episodes
 /// and releases of held claims fill, so a Shared recompute pays for no log.
 #[test]
