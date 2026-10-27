@@ -5,6 +5,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 rounds=${FIGURE_ROUNDS:-3}
 declare -A sha=([rel]=$1 [b5]=c61be873c4d6681cd0b59333441267749f4776cc [main]=b9f0d0bf3b11adec48b81eee123f9921a8ef694c)
 declare -A against built kind
+failed=0
 probes=()
 while IFS=$'\t' read -r probe vs _ src; do
   [[ -n $probe ]] || continue
@@ -48,12 +49,14 @@ for n in rel b5 main; do
       cp "$here/probes/$p.rs" "../fig-$n/crates/incr-core/tests/"
     elif [[ ! -f ../fig-$n/crates/incr-core/tests/$p.rs ]]; then
       echo "FIG-MISSING $n $p"
+      failed=1
       continue
     fi
     if in_tree "$n" cargo test --release -p incr-core --test "$p" --no-run >"$logs/$n-$p.log" 2>&1; then
       built[$n:$p]=1
     else
       echo "FIG-BUILD-FAILED $n $p"
+      failed=1
       grep -a -E '^error' -A6 "$logs/$n-$p.log" | head -20
     fi
   done
@@ -63,13 +66,24 @@ for p in "${probes[@]}"; do
   for r in $(seq "$rounds"); do
     for n in $(trees_of "$p" | tac); do
       [[ -n ${built[$n:$p]:-} ]] || continue
-      in_tree "$n" env FIGURE_TREE="r$r-$n" NC_TREE="r$r-$n" cargo test -q --release -p incr-core --test "$p" -- --nocapture 2>&1 |
-        if [[ ${kind[$p]} == tree ]]; then
-          grep -a ' B per \|panicked\|FAILED' | sed "s/^/FIG r$r-$n $p /"
-        else
-          grep -a '^NC \|^FIG \|panicked\|FAILED'
-        fi
+      out=$logs/run-$r-$n-$p.log
+      in_tree "$n" env FIGURE_TREE="r$r-$n" NC_TREE="r$r-$n" cargo test -q --release -p incr-core --test "$p" -- --nocapture >"$out" 2>&1
+      rc=$?
+      if [[ ${kind[$p]} == tree ]]; then
+        grep -a ' B per \|panicked\|FAILED' "$out" | sed "s/^/FIG r$r-$n $p /"
+      else
+        grep -a '^NC \|^FIG \|panicked\|FAILED' "$out"
+      fi
+      if ((rc != 0)); then
+        echo "FIG-RUN-FAILED r$r-$n $p rc=$rc"
+        failed=1
+      elif ! grep -a -q ' B per \|^NC \|^FIG ' "$out"; then
+        echo "FIG-RUN-EMPTY r$r-$n $p"
+        failed=1
+      fi
     done
   done
 done
 echo "runner=${RUNNER_NAME:-unknown}"
+echo "FIG-DONE failed=$failed"
+exit "$failed"
