@@ -1118,6 +1118,11 @@ struct Direct {
     runs: u32,
 }
 
+const _: () = assert!(std::mem::size_of::<Direct>() == 56);
+
+/// Runs along a path as `(node, generation, count)`.
+type RunCounts = Few<(u32, u32, u32)>;
+
 const EMPTY: u32 = u32::MAX;
 const TAKEN: u32 = 1 << 31;
 const HAS_EPISODE: u32 = 1 << 30;
@@ -1138,7 +1143,6 @@ const VACANT: Direct = Direct {
     runs: 0,
 };
 
-/// Positions per chunk of [`Directs::at`].
 const CHUNK: usize = 4096;
 
 impl Direct {
@@ -1222,12 +1226,12 @@ pub(crate) struct Directs {
     boundary: u32,
     /// In chunks of [`CHUNK`] positions, as many as the highest position the
     /// context has used, empty or not, so a deep direct that goes and comes
-    /// back finds its position made, and no growth copies the positions.
-    at: Vec<Box<[Direct]>>,
+    /// back finds its position made, and growth copies at most a chunk.
+    at: Vec<Vec<Direct>>,
     more_at: HashMap<u32, Vec<Direct>, FxBuildHasher>,
     /// Counts of runs of nodes other than the one read, by position and
     /// stamp, for directs with [`MORE_RUNS`].
-    more_runs: HashMap<(u32, u32), Few<(u32, u32, u32)>, FxBuildHasher>,
+    more_runs: HashMap<(u32, u32), RunCounts, FxBuildHasher>,
     live: usize,
     next_stamp: u32,
     /// Nodes whose frames a user panic's release ended, with the stamp
@@ -1254,11 +1258,13 @@ impl Directs {
     }
 
     fn slot(&self, i: usize) -> Option<&Direct> {
-        self.at.get(i / CHUNK).map(|c| &c[i % CHUNK])
+        self.at.get(i / CHUNK).and_then(|c| c.get(i % CHUNK))
     }
 
     fn slot_mut(&mut self, i: usize) -> Option<&mut Direct> {
-        self.at.get_mut(i / CHUNK).map(|c| &mut c[i % CHUNK])
+        self.at
+            .get_mut(i / CHUNK)
+            .and_then(|c| c.get_mut(i % CHUNK))
     }
 
     fn dead(&self, d: &Direct) -> bool {
@@ -1276,7 +1282,6 @@ impl Directs {
         first.into_iter().chain(more)
     }
 
-    /// The directs of the frame at `cidx`.
     fn at(&self, cidx: u32) -> impl Iterator<Item = &Direct> {
         let i = self.position(cidx);
         i.into_iter()
@@ -1290,7 +1295,7 @@ impl Directs {
         &mut self,
         cidx: u32,
         pick: impl Fn(&Direct) -> bool,
-        mut f: impl FnMut(&mut Direct, &mut Few<(u32, u32, u32)>) -> bool,
+        mut f: impl FnMut(&mut Direct, &mut RunCounts) -> bool,
     ) {
         let Some(i) = self.position(cidx) else {
             return;
@@ -1298,11 +1303,14 @@ impl Directs {
         let released = &self.released;
         let alive = |d: &Direct| {
             d.node != EMPTY
-                && !(released.get(&(d.node, d.generation))).is_some_and(|&s| d.stamp < s)
+                && (released.get(&(d.node, d.generation))).is_none_or(|&s| d.stamp >= s)
                 && pick(d)
         };
         let mut none = Few::None;
-        let first = self.at.get_mut(i / CHUNK).map(|c| &mut c[i % CHUNK]);
+        let first = self
+            .at
+            .get_mut(i / CHUNK)
+            .and_then(|c| c.get_mut(i % CHUNK));
         let Some(first) = first.filter(|d| d.node != EMPTY) else {
             return;
         };
@@ -1387,10 +1395,7 @@ impl Directs {
             d.owner |= MORE_RUNS;
             self.more_runs.insert((i as u32, stamp), more);
         }
-        while self.at.len() * CHUNK <= i {
-            note_work(CHUNK);
-            self.at.push(vec![VACANT; CHUNK].into_boxed_slice());
-        }
+        self.make(i);
         let first = &mut self.at[i / CHUNK][i % CHUNK];
         if first.node == EMPTY {
             *first = d;
@@ -1403,6 +1408,30 @@ impl Directs {
         self.live += 1;
         #[cfg(all(test, not(loom)))]
         PEAK_DIRECTS.with(|p| p.set(p.get().max(self.live)));
+    }
+
+    /// Makes position `i`: the chunks below it whole, its own to the next
+    /// power of two, so a shallow context pays for the positions it uses.
+    fn make(&mut self, i: usize) {
+        let (c, j) = (i / CHUNK, i % CHUNK);
+        let grow = |chunk: &mut Vec<Direct>, len: usize| {
+            if chunk.len() < len {
+                note_work(len - chunk.len());
+                chunk.resize(len, VACANT);
+            }
+        };
+        if let Some(last) = self.at.len().checked_sub(1).filter(|&l| l < c) {
+            grow(&mut self.at[last], CHUNK);
+        }
+        while self.at.len() < c {
+            let mut chunk = Vec::new();
+            grow(&mut chunk, CHUNK);
+            self.at.push(chunk);
+        }
+        if self.at.len() == c {
+            self.at.push(Vec::new());
+        }
+        grow(&mut self.at[c], (j + 1).next_power_of_two().min(CHUNK));
     }
 
     /// The stamps ran out: the gone directs are taken out and the rest
@@ -1612,7 +1641,6 @@ impl Directs {
         at
     }
 
-    /// Clears `TAKEN` on the directs at position `i` that `pick` accepts.
     fn rearm_at(&mut self, i: usize, pick: impl Fn(&Direct) -> bool) {
         if let Some(d) = self.slot_mut(i).filter(|d| d.node != EMPTY && pick(d)) {
             d.set_taken(false);
@@ -1688,14 +1716,13 @@ impl Directs {
     }
 }
 
-/// Whether position `j` holds a direct from `maker`.
 fn holds_maker(
-    at: &[Box<[Direct]>],
+    at: &[Vec<Direct>],
     more_at: &HashMap<u32, Vec<Direct>, FxBuildHasher>,
     j: usize,
     maker: u32,
 ) -> bool {
-    let Some(first) = at.get(j / CHUNK).map(|c| &c[j % CHUNK]) else {
+    let Some(first) = at.get(j / CHUNK).and_then(|c| c.get(j % CHUNK)) else {
         return false;
     };
     first.node != EMPTY
@@ -4498,10 +4525,7 @@ mod tests {
     use super::*;
     use crate::notes::Notes;
 
-    /// A deep direct that goes with its maker's run and comes back with the
-    /// next doom is held at its position again without making the
-    /// positions below it again.
-    fn run_slot(key: &ReadKey) -> RunSlot {
+    fn keyed_run_slot(key: &ReadKey) -> RunSlot {
         let step = Step {
             node: key.node,
             episode: key.episode,
@@ -4536,9 +4560,9 @@ mod tests {
     fn a_released_nodes_directs_are_gone_and_come_back_fresh() {
         let (x, y) = (direct_key(1, 7), direct_key(2, 7 | 1 << 32));
         let mut directs = Directs::new(0);
-        directs.deliver(x, 0, run_slot(&x));
-        directs.deliver(y, 0, run_slot(&y));
-        let (px, py) = (run_slot(&x).path, run_slot(&y).path);
+        directs.deliver(x, 0, keyed_run_slot(&x));
+        directs.deliver(y, 0, keyed_run_slot(&y));
+        let (px, py) = (keyed_run_slot(&x).path, keyed_run_slot(&y).path);
         directs.bump(&x, px, 7, 0);
         directs.bump(&x, px, 8, 0);
         directs.bump(&y, py, 7, 1);
@@ -4546,7 +4570,7 @@ mod tests {
         assert!(!directs.frame_awaits((1, 0, 5)));
         assert!(directs.frame_awaits((2, 0, 5)));
         assert!(directs.take(&x).is_none());
-        directs.deliver(x, 0, run_slot(&x));
+        directs.deliver(x, 0, keyed_run_slot(&x));
         directs.bump(&x, px, 8, 0);
         let fresh = directs.take(&x).expect("delivered again");
         assert_eq!(
@@ -4559,18 +4583,33 @@ mod tests {
         assert!(directs.released.is_empty() && directs.more_runs.is_empty());
     }
 
+    /// A shallow context's directs make only the positions it uses.
+    #[test]
+    #[cfg(not(loom))]
+    fn a_shallow_direct_makes_few_positions() {
+        let key = direct_key(1, 7);
+        let mut directs = Directs::new(0);
+        take_note_work();
+        directs.deliver(key, 0, keyed_run_slot(&key));
+        let units = take_note_work();
+        assert!(
+            units <= 8,
+            "{units} units of note work for a direct at position 5"
+        );
+    }
+
     /// Running out of stamps drops the released directs and keeps the
     /// others' counts.
     #[test]
     fn running_out_of_stamps_keeps_the_live_directs_runs() {
         let (x, y, z) = (direct_key(1, 7), direct_key(2, 7), direct_key(3, 7));
         let mut directs = Directs::new(0);
-        directs.deliver(x, 0, run_slot(&x));
-        directs.deliver(y, 1, run_slot(&y));
-        directs.bump(&y, run_slot(&y).path, 8, 0);
+        directs.deliver(x, 0, keyed_run_slot(&x));
+        directs.deliver(y, 1, keyed_run_slot(&y));
+        directs.bump(&y, keyed_run_slot(&y).path, 8, 0);
         directs.remove_node(1, 0);
         directs.next_stamp = u32::MAX;
-        directs.deliver(z, 1, run_slot(&z));
+        directs.deliver(z, 1, keyed_run_slot(&z));
         assert_eq!(directs.live, 2);
         assert!(directs.released.is_empty());
         assert_eq!(directs.take(&y).expect("kept").count(8, 0), 1);
@@ -4580,6 +4619,9 @@ mod tests {
         assert_eq!(directs.live, 0);
     }
 
+    /// A deep direct that goes with its maker's run and comes back with the
+    /// next doom is held at its position again without making the
+    /// positions below it again.
     #[test]
     #[cfg(not(loom))]
     fn a_deep_direct_held_again_makes_no_positions_again() {
@@ -4598,7 +4640,7 @@ mod tests {
         let mut directs = Directs::new(0);
         take_note_work();
         for _ in 0..10 {
-            directs.deliver(key, 0, run_slot(&key));
+            directs.deliver(key, 0, keyed_run_slot(&key));
             directs.remove_maker(0);
         }
         let units = take_note_work();
