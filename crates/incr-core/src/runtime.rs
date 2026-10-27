@@ -6325,14 +6325,13 @@ impl<C: Cells> Runtime<C> {
         flagged: NodeState,
         unrun: bool,
     ) -> NodeState {
-        if !C::SINGLE_THREADED && !unrun && C::u32_load_relaxed(&self.watching) != 0 {
-            self.count_watched_run(id, node);
-        }
         node.set_unrun(unrun);
         self.land_marked(id, node, target, flagged, unrun)
     }
 
-    /// [`Self::land_now`] with the node's unrun mark already set.
+    /// [`Self::land_now`] with the node's unrun mark already set. A run's
+    /// landing counts for the reads watching the node here, so a held
+    /// landing's publication counts as an unheld landing does.
     #[inline(always)]
     fn land_marked(
         &self,
@@ -6342,6 +6341,9 @@ impl<C: Cells> Runtime<C> {
         flagged: NodeState,
         unrun: bool,
     ) -> NodeState {
+        if !C::SINGLE_THREADED && !unrun && C::u32_load_relaxed(&self.watching) != 0 {
+            self.count_watched_run(id, node);
+        }
         if !C::SINGLE_THREADED && unrun {
             reserve::note((self.runtime_id, id.0), node.generation());
         }
