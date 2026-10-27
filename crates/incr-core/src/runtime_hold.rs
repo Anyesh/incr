@@ -188,6 +188,57 @@ impl<C: Cells> Runtime<C> {
         Some(target)
     }
 
+    /// Whether `deps` adds a dep this thread holds a landing of: the
+    /// publish that installs them may read it through the view, which
+    /// holds the run's landing.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn publishes_held_dep(&self, node: &NodeData<C>, deps: &[(NodeId, u32)]) -> bool {
+        let mut held: Vec<NodeId> = deps
+            .iter()
+            .map(|&(d, _)| d)
+            .filter(|d| hold::holds(state::cell_key::<C>(self.nodes.get(d.0).state_cell())))
+            .collect();
+        if held.is_empty() {
+            return false;
+        }
+        node.for_each_dep(|d| held.retain(|&h| h != d));
+        !held.is_empty()
+    }
+
+    /// The entry of a run that publishes a held dep, opened before the
+    /// deps are written, with the claim's origin. The run took no `HOLD`,
+    /// so its write kept nothing: the undo leaves the node unverified, and
+    /// a Dirty claim goes back Dirty with its old deps, as the claim found
+    /// it.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn open_hold_for_held_deps(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        first: bool,
+        deps: &[(NodeId, u32)],
+    ) {
+        let cell = state::cell_key::<C>(node.state_cell());
+        if hold::holds(cell) || !self.publishes_held_dep(node, deps) {
+            return;
+        }
+        let own = hold::open(
+            cell,
+            self.runtime_id,
+            id.0,
+            node.generation(),
+            first,
+            None,
+            None,
+        );
+        debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
+        if hold::holds(cell) {
+            node.set_held_mark(true);
+        }
+    }
+
     /// Opens the entry of a landing about to be held, before its writes,
     /// so the undo record sees what they replace.
     #[cold]
@@ -527,6 +578,35 @@ impl<C: Cells> Runtime<C> {
         if let Some(rt) = self.dep_stack.raise_hold() {
             hold::note_closed(rt);
         }
+    }
+
+    /// [`Self::hold_closed_cycle`] of a cycle closed at position `p`. A
+    /// member at or above `p` that has only a virtual frame has no frame
+    /// for a pop to pass the hold to, so its member record takes it, and
+    /// its stand-in landing opens its entry before the write.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn hold_closed_cycle_at(&self, p: u32) {
+        self.hold_closed_cycle();
+        let rt = self.runtime_id;
+        let members: Vec<u32> = crate::replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| x.stacked())
+                .filter(|v| v.cidx >= p)
+                .map(|v| v.node)
+                .collect()
+        });
+        if members.is_empty() {
+            return;
+        }
+        cycle_state::with_held(|h| {
+            for slot in members {
+                if let Some(e) = h.get_mut(&(rt, slot)) {
+                    e.hold = true;
+                }
+            }
+        });
     }
 
     /// The reading frame's landing depends on state this attempt has not
