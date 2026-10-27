@@ -4788,6 +4788,22 @@ fn two_thread_doomed_frame_value_seeds() {
     });
 }
 
+/// 0x777bd: op 1's speculative runs stash node 23 and node 10, which read
+/// it, against node 24 before op 2 deletes and recreates 24 in the same
+/// revision. Op 7 finds 23's stash stale and computes 23, but op 12's
+/// `Get(10)` adopted 10's stash over the Clean 23: the bounded run gave
+/// `Value(2)` where the unbounded run gives `Value(1)`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stash_read_before_a_delete_is_not_adopted_777bd() {
+    let case = gen_case(0x777bd, true, true);
+    quiet(|| {
+        differential::<Local>(&case, 0x777bd);
+        differential::<Shared>(&case, 0x777bd);
+        differential_two(&case, 0x777bd);
+    });
+}
+
 /// 0x38e2a, two threads with a second runtime: op 1's `Get(9)` gives a
 /// value no order of the overlapping reads gives, as it did on main.
 #[test]

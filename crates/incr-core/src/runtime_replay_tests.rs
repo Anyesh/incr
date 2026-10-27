@@ -3634,3 +3634,44 @@ fn local_a_stash_keeps_one_count_per_foreign_runtime() {
 fn shared_a_stash_keeps_one_count_per_foreign_runtime() {
     a_stash_keeps_one_count_per_foreign_runtime::<Shared>();
 }
+
+/// A speculative frame that read a stash and then panics on a deleted
+/// handle pops with no stash, so nothing takes its stash reads; they end
+/// with the replay context, and none outlives the read.
+fn stash_reads_end_with_their_context<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let q = rt.create_query_with(|_: &Runtime<C>| 7_u64, replayable());
+    let gone = rt.create_input(1_u64);
+    rt.delete_node(gone);
+    let p = rt.create_query_with(
+        move |rt: &Runtime<C>| rt.get(q) + rt.get(gone),
+        replayable(),
+    );
+    let b = rt.create_query(|_: &Runtime<C>| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(p)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(reader), 5);
+    assert_eq!(rt.get(q), 7);
+    assert_eq!(crate::replay::spec_read_frames(), 0);
+}
+
+#[test]
+fn local_stash_reads_end_with_their_context() {
+    stash_reads_end_with_their_context::<Local>();
+}
+
+#[test]
+fn shared_stash_reads_end_with_their_context() {
+    stash_reads_end_with_their_context::<Shared>();
+}

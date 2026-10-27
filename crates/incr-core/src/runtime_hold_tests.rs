@@ -3521,3 +3521,205 @@ fn waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake() {
     drop(read);
     assert!(crate::hold::take(rt.runtime_id).wounded);
 }
+
+/// What `retracted_held_read_shape` saw.
+#[derive(Debug)]
+struct RetractedHeldRead {
+    q: i64,
+    r: i64,
+    g: i64,
+    d: i64,
+    /// The thread of each run of d: 1 reads r, 2 reads g.
+    d_runs_on: Vec<u8>,
+    r_real_runs: usize,
+    /// r's reads of g: begun, returned.
+    g_reads: (usize, usize),
+    /// q's reads of d during the read of r: d's raw state and the value.
+    q_reads_before: Vec<(NodeState, i64)>,
+    /// q's closure runs in the final read of q; 0 means a stash was adopted.
+    q_runs_in_final: usize,
+    stashes_before_final: u32,
+    held_after: (usize, usize),
+}
+
+/// Thread 1 reads r, which reads d, which reads the held cycle a, so d's
+/// landing (a plus its run count) is held; r then reads the replayable
+/// chain p, which dooms at `frames`, and on its placeholder reads q, so
+/// the driver runs q speculatively over d's held landing. r's first run
+/// with p's real value parks while thread 2 claims g, whose run reads d
+/// and registers a wait on d's held landing; r then reads g. Thread 1's
+/// registration closes the waits-for cycle as the younger waiter, so it
+/// is wounded and d's landing goes back; thread 2 runs d again, and
+/// thread 1's retry reads d only after that run. q is then read in the
+/// same revision, after both reads published.
+fn retracted_held_read_shape(frames: u32) -> RetractedHeldRead {
+    let mut rt = Runtime::<Shared>::new();
+    rt.all_replayable = false;
+    let rt = Arc::new(rt);
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(frames);
+    let (a, _) = two_cycle(&rt);
+    let d_runs_on = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let d = {
+        let d_runs_on = d_runs_on.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            let v = rt.get(a);
+            let mut on = d_runs_on.lock().unwrap();
+            on.push(std::thread::current().id());
+            v + on.len() as i64
+        })
+    };
+    let q_reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let q = {
+        let q_reads = q_reads.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<Shared>| {
+                let v = rt.get(d);
+                q_reads.lock().unwrap().push((rt.state_of(d), v));
+                v * 10
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_input(0_i64);
+    let mut p = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(x) + 1, replayable());
+    for _ in 0..3 {
+        let below = p;
+        p = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(below) + 1, replayable());
+    }
+    let g = rt.create_query(move |rt: &Runtime<Shared>| rt.get(d) + 1);
+    let parked = Gate::new();
+    let r_real_runs = Arc::new(AtomicUsize::new(0));
+    let g_reads = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let r = {
+        let (parked, r_real_runs, g_reads, d_runs_on) = (
+            parked.clone(),
+            r_real_runs.clone(),
+            g_reads.clone(),
+            d_runs_on.clone(),
+        );
+        rt.create_query_with(
+            move |rt: &Runtime<Shared>| {
+                // A retry that claimed d before thread 2 would close the
+                // cycle again and wound itself a second time.
+                if g_reads.0.load(Ordering::SeqCst) > g_reads.1.load(Ordering::SeqCst) {
+                    wait_until(|| d_runs_on.lock().unwrap().len() >= 2);
+                }
+                let v = rt.get(d);
+                let c = rt.get(p);
+                if c == 0 {
+                    let _ = rt.get(q);
+                } else {
+                    r_real_runs.fetch_add(1, Ordering::SeqCst);
+                    parked.park();
+                    g_reads.0.fetch_add(1, Ordering::SeqCst);
+                    let _ = rt.get(g);
+                    g_reads.1.fetch_add(1, Ordering::SeqCst);
+                }
+                v + c
+            },
+            replayable(),
+        )
+    };
+    let d_claim = (rt.runtime_id, d.erase().slot());
+    parked.arm();
+    let _release = super::race_tests::ReleaseOnUnwind(vec![parked.clone()]);
+    let t1 = {
+        let rt = rt.clone();
+        std::thread::spawn(move || (rt.get(r), crate::hold::held_count()))
+    };
+    parked.wait_parked();
+    let t2 = {
+        let rt = rt.clone();
+        std::thread::spawn(move || (rt.get(g), crate::hold::held_count()))
+    };
+    // A parked holder is never taken over, so thread 2 stays registered
+    // on d until the release.
+    wait_until(|| crate::waits::waited_on(d_claim));
+    assert!(
+        crate::waits::waited_on(d_claim),
+        "frames={frames}: thread 2's run of g waits on d's held landing"
+    );
+    parked.release();
+    let threads = [t1.thread().id(), t2.thread().id()];
+    let (r_value, t1_held) = t1.join().unwrap();
+    let (g_value, t2_held) = t2.join().unwrap();
+    assert_eq!(crate::waits::registered_on(rt.runtime_id), 0);
+    let q_reads_before = std::mem::take(&mut *q_reads.lock().unwrap());
+    let stashes_before_final = Shared::u32_load_relaxed(&rt.stash_count);
+    let q_value = rt.get(q);
+    let q_runs_in_final = q_reads.lock().unwrap().len();
+    let d_runs_on = d_runs_on
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            threads
+                .iter()
+                .position(|x| x == t)
+                .map_or(0, |i| i as u8 + 1)
+        })
+        .collect();
+    RetractedHeldRead {
+        q: q_value,
+        r: r_value,
+        g: g_value,
+        d: rt.get(d),
+        d_runs_on,
+        r_real_runs: r_real_runs.load(Ordering::SeqCst),
+        g_reads: (
+            g_reads.0.load(Ordering::SeqCst),
+            g_reads.1.load(Ordering::SeqCst),
+        ),
+        q_reads_before,
+        q_runs_in_final,
+        stashes_before_final,
+        held_after: (t1_held, t2_held),
+    }
+}
+
+/// d ran on thread 1 and again on thread 2, and thread 1's first read of
+/// g unwound from its wait, so r's real run ran twice.
+fn assert_wounded_schedule(side: &str, s: &RetractedHeldRead) {
+    assert_eq!(s.d_runs_on, [1, 2], "{side}: d's runs: {s:?}");
+    assert_eq!(
+        (s.r_real_runs, s.g_reads),
+        (2, (2, 1)),
+        "{side}: thread 1's first read of g was wounded: {s:?}"
+    );
+    assert_eq!((s.g, s.d), (103, 102), "{side}: {s:?}");
+    assert_eq!(s.held_after, (0, 0), "{side}: {s:?}");
+}
+
+/// Worker-13's case C: q's speculative run reads d's held landing as Clean
+/// through the view and is stashed; a waits-for cycle with another thread
+/// wounds the holder, which retracts d, and the other thread lands d again
+/// with another value; a later read of q in the same revision must give
+/// what the unbounded run gives, not adopt the stash over the retracted
+/// landing.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stash_over_a_retracted_held_landing_is_not_adopted() {
+    let want = retracted_held_read_shape(u32::MAX);
+    assert_wounded_schedule("unbounded", &want);
+    assert_eq!(
+        (want.q, want.r),
+        (1020, 106),
+        "unbounded: d lands 101 held, is retracted and lands 102; q reads 102: {want:?}"
+    );
+    assert!(want.q_reads_before.is_empty(), "{want:?}");
+    let got = retracted_held_read_shape(2);
+    assert_wounded_schedule("bounded", &got);
+    assert_eq!(
+        got.q_reads_before.first(),
+        Some(&(NodeState::Computing, 101)),
+        "q's speculative run read d's held landing first: {got:?}"
+    );
+    assert_eq!(
+        (got.q, got.r),
+        (want.q, want.r),
+        "q read its stash over d's retracted landing (q ran {} times in the final read, {} stashes before it)",
+        got.q_runs_in_final,
+        got.stashes_before_final
+    );
+}

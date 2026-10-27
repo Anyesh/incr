@@ -2475,6 +2475,8 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
     static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
+    static SPEC_READS: RefCell<SpecReads> = const { RefCell::new(HashMap::with_hasher(FxBuildHasher)) };
+    static SPEC_PENDING: Cell<Option<SpecPending>> = const { Cell::new(None) };
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
@@ -2504,6 +2506,8 @@ thread_local! {
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
     static CHECKED_READS: RefCell<Vec<CheckedRead>> = RefCell::new(Vec::new());
+    static SPEC_READS: RefCell<SpecReads> = RefCell::new(HashMap::default());
+    static SPEC_PENDING: Cell<Option<SpecPending>> = Cell::new(None);
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
@@ -2707,6 +2711,135 @@ pub(crate) fn check_read(
             });
         }
     });
+}
+
+/// Where a speculative frame's read of a node took its value. Only a
+/// listed source leaves the frame's stash adoptable; every other read,
+/// including one through a path no site lists, leaves it `Unchecked`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpecSource {
+    Unchecked,
+    /// The node's published state was Clean or Cyclic when its value was
+    /// read, so it stays so for the revision.
+    Settled,
+    /// The node's stash with this serial, which the frame's adoption needs
+    /// the node to land from.
+    Stash(u64),
+}
+
+/// The open speculative read of node `slot` at `generation` of `rt`.
+#[derive(Clone, Copy)]
+pub(crate) struct SpecPending {
+    rt: RuntimeId,
+    slot: u32,
+    generation: u32,
+    source: SpecSource,
+}
+
+/// Speculative frames' reads of other stashes, by frame (runtime,
+/// position and control block) and then by node, to each stash's serial.
+/// A frame that pops without taking its reads leaves them until the
+/// thread's replay context ends; a frame its control block's address
+/// reuses clears them on its first read.
+type SpecReads =
+    HashMap<(RuntimeId, u32, usize), HashMap<(u32, u32), u64, FxBuildHasher>, FxBuildHasher>;
+
+/// Opens a speculative frame's read of node `slot` at `generation` of
+/// `rt`, `Unchecked` until a listed source names its own; returns the
+/// read it nests in, for [`close_spec_read`].
+pub(crate) fn open_spec_read(rt: RuntimeId, slot: u32, generation: u32) -> Option<SpecPending> {
+    SPEC_PENDING.with(|p| {
+        p.replace(Some(SpecPending {
+            rt,
+            slot,
+            generation,
+            source: SpecSource::Unchecked,
+        }))
+    })
+}
+
+/// A listed source of the open read, if it is of node `slot` at
+/// `generation` of `rt`.
+pub(crate) fn spec_source(rt: RuntimeId, slot: u32, generation: u32, source: SpecSource) {
+    SPEC_PENDING.with(|p| {
+        if let Some(mut q) = p.get() {
+            if q.rt == rt && q.slot == slot && q.generation == generation {
+                q.source = source;
+                p.set(Some(q));
+            }
+        }
+    });
+}
+
+/// Closes the open read, back to `outer`, and returns its source.
+pub(crate) fn close_spec_read(outer: Option<SpecPending>) -> SpecSource {
+    SPEC_PENDING
+        .with(|p| p.replace(outer))
+        .map_or(SpecSource::Unchecked, |q| q.source)
+}
+
+/// Keeps the frame of `ctl` at `cidx` of `rt`'s read of node `slot` at
+/// `generation` from its stash `serial`; an earlier frame's reads under the
+/// same control block at the position go on the frame's first one
+/// (`fresh`). False if the frame read another stash of the node, whose
+/// adoption both reads cannot share.
+pub(crate) fn keep_spec_read(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    node: (u32, u32),
+    serial: u64,
+    fresh: bool,
+) -> bool {
+    SPEC_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        let reads = d.entry((rt, cidx, ctl as usize)).or_default();
+        if fresh {
+            reads.clear();
+        }
+        *reads.entry(node).or_insert(serial) == serial
+    })
+}
+
+/// Whether the frame of `ctl` at `cidx` of `rt` read node `slot` at
+/// `generation` from a stash.
+pub(crate) fn spec_read_of(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    slot: u32,
+    generation: u32,
+) -> bool {
+    SPEC_READS.with(|d| {
+        d.borrow()
+            .get(&(rt, cidx, ctl as usize))
+            .is_some_and(|reads| reads.contains_key(&(slot, generation)))
+    })
+}
+
+/// The stash reads of the frame of `ctl` at `cidx` of `rt`, which is
+/// popping, as `(slot, generation, serial)`.
+pub(crate) fn take_spec_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<(u32, u32, u64)> {
+    SPEC_READS.with(|d| {
+        d.borrow_mut()
+            .remove(&(rt, cidx, ctl as usize))
+            .map_or_else(Vec::new, |reads| {
+                reads
+                    .into_iter()
+                    .map(|((slot, generation), serial)| (slot, generation, serial))
+                    .collect()
+            })
+    })
+}
+
+/// How many frames' stash reads this thread still keeps.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn spec_read_frames() -> usize {
+    SPEC_READS.with(|d| d.borrow().len())
 }
 
 /// A context named so that no context of another thread, now or later, has
@@ -3261,6 +3394,7 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
             COPIED_GEN.with(|g| g.set(0));
             if !speculative() {
                 CHECKED_READS.with(|c| c.borrow_mut().clear());
+                SPEC_READS.with(|c| c.borrow_mut().clear());
             }
             if word & value_code::NOTES_BIT == 0 {
                 end_kept_marks();
@@ -4306,19 +4440,36 @@ pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
     })
 }
 
-/// Drops the runs of each runtime in `gone` that has no context left in
-/// `c`: a frame that starts before its next context opens has no run, and
-/// must not find one of an earlier frame at its stack address.
+/// Drops the runs, and outside speculation the stash reads, of each
+/// runtime in `gone` that has no context left in `c`: a frame that starts
+/// before its next context opens has no run, and must not find one of an
+/// earlier frame at its stack address.
 fn end_sessions(c: &[Context], gone: impl IntoIterator<Item = RuntimeId>) {
+    let reads = !speculative() && SPEC_READS.with(|d| !d.borrow().is_empty());
+    let end_reads = |rt: Option<RuntimeId>| {
+        SPEC_READS.with(|d| {
+            let d = &mut *d.borrow_mut();
+            match rt {
+                Some(rt) => d.retain(|&(of, _, _), _| of != rt),
+                None => d.clear(),
+            }
+        });
+    };
     RUNS.with(|r| {
         let r = &mut *r.borrow_mut();
         if c.is_empty() {
             *r = Runs::default();
+            if reads {
+                end_reads(None);
+            }
             return;
         }
         for rt in gone {
             if innermost(c, rt).is_none() {
                 r.forget(rt);
+                if reads {
+                    end_reads(Some(rt));
+                }
             }
         }
     });

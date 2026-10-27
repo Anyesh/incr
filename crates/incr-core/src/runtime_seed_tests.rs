@@ -654,7 +654,7 @@ fn a_seed_ends_the_stashes_that_read_its_node<C: Cells>() {
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
     let x = rt.create_input(3_u64);
-    let (q, _) = counted(&rt, x);
+    let (q, runs) = counted(&rt, x);
     let r = rt.create_query_with(
         move |rt: &Runtime<C>| rt.get(q) + 1,
         super::replay_tests::replayable(),
@@ -672,6 +672,11 @@ fn a_seed_ends_the_stashes_that_read_its_node<C: Cells>() {
         super::replay_tests::replayable(),
     );
     assert_eq!(rt.get(top), 5);
+    assert_eq!(runs.load(SeqCst), 1, "q had no speculative run");
+    assert!(
+        rt.stashed(r.slot(), r.generation(), false),
+        "r has no stash"
+    );
     let base = seed_base(&rt);
     assert_eq!(
         seed_query(&rt, &base, q, 40, &[dep(x)], Reuse::IfUnchanged),
