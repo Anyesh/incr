@@ -2624,3 +2624,44 @@ fn local_walk_past_the_cap_frees_its_buffer() {
 fn shared_walk_past_the_cap_frees_its_buffer() {
     a_walk_past_the_cap_frees_its_buffer::<Shared>();
 }
+
+/// The 20-deep chain's bottom reads the 200-deep `side` chain only once
+/// `x` is odd, so the walk after `x` turns odd runs `side`'s Dirty walk
+/// nested in its compute. The nested walk returns its buffer first; the
+/// outer walk's smaller one, returned after, must not displace it.
+fn a_shorter_outer_walk_keeps_the_nested_walks_buffer<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (y, side) = dirty_chain(&rt, 200);
+    let x = rt.create_input(0_i64);
+    let mut top = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        if v % 2 == 1 {
+            let _ = rt.get(side);
+        }
+        v
+    });
+    rt.get(top);
+    for _ in 1..20 {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below) + 1);
+        rt.get(top);
+    }
+    rt.set(y, 1);
+    rt.set(x, 1);
+    assert_eq!(rt.get(top), 20);
+    let (cap, _) = spare_work();
+    assert!(
+        cap >= 200,
+        "the outer walk's {cap} entries displaced the nested walk's buffer"
+    );
+}
+
+#[test]
+fn local_shorter_outer_walk_keeps_the_nested_walks_buffer() {
+    a_shorter_outer_walk_keeps_the_nested_walks_buffer::<Local>();
+}
+
+#[test]
+fn shared_shorter_outer_walk_keeps_the_nested_walks_buffer() {
+    a_shorter_outer_walk_keeps_the_nested_walks_buffer::<Shared>();
+}
