@@ -163,6 +163,8 @@ jobs:
           - { model: "loom_models::give_back_wait_ends_on_a_give_back", bound: 2 }
           - { model: "loom_models::give_back_wait_ends_on_a_landing", bound: 2 }
           - { model: "loom_models::give_back_wait_ends_when_a_take_over_keeps_the_claim", bound: 2 }
+          - { model: "loom_models::walk_listing_ends_where_its_read_enters_user_code", bound: 2 }
+          - { model: "loom_models::walk_listing_ends_at_its_nodes_settled_landing", bound: 2 }
           - { model: "loom_models::discard_under_set", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance_relanded", bound: 2 }
