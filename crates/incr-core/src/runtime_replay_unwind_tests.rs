@@ -2031,9 +2031,12 @@ thread_local! {
 /// retry delivers copies of one note log under different keys. The reader
 /// then raises again its last box, or its first one after the later
 /// retries, and an outer query catches it, before and after a `set` under
-/// the chain: every read and state is the unbounded run's.
+/// the chain: every read and state is the unbounded run's. `dep` has the
+/// fan read the input, so the walk after the `set` raises the stashed
+/// boxes again, and `deep` puts the outer query over its own chain, so its
+/// frame's retry delivers the reader's box.
 fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
-    let run = |frames: Option<u32>, n: usize, through: bool, first: bool| {
+    let run = |frames: Option<u32>, n: usize, through: bool, first: bool, dep: bool, deep: bool| {
         FAN_LAST.with(|b| b.borrow_mut().take());
         FAN_FIRST.with(|b| b.borrow_mut().take());
         let rt = runtime::<C>(frames);
@@ -2042,7 +2045,10 @@ fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
         let failing: Vec<Incr<u64>> = (0..n)
             .map(|_| {
                 let f = rt.create_query_with(
-                    |_| -> u64 {
+                    move |rt| -> u64 {
+                        if dep {
+                            rt.get(p);
+                        }
                         let b = FAN_LAST.with(|b| b.borrow_mut().take());
                         std::panic::resume_unwind(b.unwrap_or_else(|| Box::new("fan")))
                     },
@@ -2089,8 +2095,18 @@ fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
             replayable(),
         );
         nodes.push(reader);
+        let mut above = rt.create_query_with(move |rt| rt.get(p), replayable());
+        nodes.push(above);
+        for _ in 0..12 {
+            let below = above;
+            above = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+            nodes.push(above);
+        }
         let outer = rt.create_query_with(
-            move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(reader))).unwrap_or(1000),
+            move |rt| {
+                let v = if deep { rt.get(above) } else { 0 };
+                v + catch_unwind(AssertUnwindSafe(|| rt.get(reader))).unwrap_or(1000)
+            },
             replayable(),
         );
         nodes.push(outer);
@@ -2105,13 +2121,14 @@ fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
     let mut differ = Vec::new();
     for n in [2, 3, 5] {
         for through in [false, true] {
-            for first in [false, true] {
-                let unbounded = run(None, n, through, first);
+            for (first, dep, deep) in (0..8).map(|i| (i & 1 != 0, i & 2 != 0, i & 4 != 0)) {
+                let unbounded = run(None, n, through, first, dep, deep);
                 for frames in [1, 2, 3, 8] {
-                    let bounded = run(Some(frames), n, through, first);
+                    let bounded = run(Some(frames), n, through, first, dep, deep);
                     if bounded != unbounded {
                         differ.push(format!(
-                            "n {n} through {through} first {first} frames {frames}: \
+                            "n {n} through {through} first {first} dep {dep} deep {deep} \
+                             frames {frames}: \
                              want {unbounded:?} got {bounded:?}"
                         ));
                     }
