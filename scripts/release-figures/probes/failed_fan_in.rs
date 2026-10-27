@@ -1,8 +1,8 @@
 //! `k` queries each reading an input and one query left Failed over a
 //! chain of `k` queries, read through one top query that catches each
-//! reader's panic: the first read after a `set` below the chain fails the
-//! chain, the second after a `set` of the readers' input reruns the
-//! readers over the Failed query.
+//! reader's panic: a clean read builds the fan, a read after a `set` below
+//! the chain fails the chain, and a read after a `set` of the readers'
+//! input reruns the readers over the Failed query.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
