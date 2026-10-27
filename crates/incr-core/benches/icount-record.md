@@ -1959,16 +1959,6 @@ each segment, which put Local and Shared over the memory ceiling at
 owner writes both and its release publishes both. Base `ca94bbad`, tip
 `52987c56`, same box, `icount.sh` defaults.
 
-## Doom reservations
-
-`f98fc424` (on `ac199763`) keeps a node a doom released for its
-context's retry from other threads until that context ends. Each Shared
-claim reads one global count after its CAS, an unrun landing notes the
-node when a reservation scope is open, and every outermost Shared entry
-checks on exit that its thread holds none. Base `78d070d4` (`ac199763`
-adds only a comment), tip `12f67a7d` (the later commits change only the
-wound path and loom builds), same box, `icount.sh` defaults.
-
 | workload | base | tip | delta |
 |---|---|---|---|
 | `get_clean_shared` | 196 | 196 | 0 |
@@ -2087,6 +2077,18 @@ on every read that takes nothing; T8-divert-per-read-undivert-cost ends
 it only after a take, a removal or a doom instead. The release replay
 scale tests finish in 24.94 s at the tip against 28.39 s at the base.
 
+## Doom reservations
+
+`f98fc424` (on `ac199763`) keeps a node a doom released for its
+context's retry from other threads until that context ends. Each Shared
+claim reads one global count after its CAS, an unrun landing notes the
+node when a reservation scope is open, and every outermost Shared entry
+checks on exit that its thread holds none. Base `78d070d4` (`ac199763`
+adds only a comment), tip `12f67a7d` (the later commits change only the
+wound path and loom builds), same box, `icount.sh` defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
 | `delete_single_shared` | 1533.25 | 1563.36 | +30.11 |
 | `early_cutoff_shared` | 3683.85 | 3739.84 | +55.99 |
 | `fanout_shared_4` | 23724.09 | 24031.99 | +307.90 |
