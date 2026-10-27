@@ -5120,6 +5120,23 @@ fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
     });
 }
 
+/// Seed 0x366149ed's op 7, `Get2(3, false)`, cross, at a budget of 1:
+/// node 19's held Failed landing read 4, whose held landing the attempt
+/// then left Dirty with no memo, so 4 moved and 19 lands Dirty, as the
+/// unbounded run reruns it and reads 1. A held Dirty dep that keeps a
+/// memo for the revision is what 19 read, as in the case above.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_held_failed_reader_of_a_dep_left_dirty_without_a_memo_moves() {
+    let mut case = gen_case(0x3661_49ed, true, false);
+    case.ops.truncate(8);
+    assert!(matches!(case.ops[7], Op::Get2(3, false)));
+    quiet(|| {
+        differential::<Local>(&case, 0x3661_49ed);
+        differential::<Shared>(&case, 0x3661_49ed);
+    });
+}
+
 /// Seed 0x66a, unbounded: a released claim's later finished run published
 /// deps without dropping its released entry, so its kept count outlived
 /// the list it counted. [`Live::assert_invariants`] finds an entry
