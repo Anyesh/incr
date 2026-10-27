@@ -9169,6 +9169,22 @@ fn a_failure_over_a_dirty_dep_reruns_after_a_set() {
     });
 }
 
+/// 0x9593: 7 lands Failed over the Dirty 0, whose dep 1 is an open frame of
+/// the cycle through 7 unbounded and a frame the budget already unwound to
+/// Dirty bounded. 1 lands Dirty in both, so the set at op 6, which stops at
+/// 1, must flag 7 in both or in neither.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failure_over_a_dirty_dep_over_an_open_frame_flips_as_unbounded() {
+    for cross in [false, true] {
+        let case = gen_case(0x9593, cross, false);
+        quiet(|| {
+            differential::<Local>(&case, 0x9593);
+            differential::<Shared>(&case, 0x9593);
+        });
+    }
+}
+
 /// Each serial order of the two-thread cases of seeds
 /// `REPLAY_FROM..REPLAY_SCAN` (or the hex seeds in `SEEDS_FILE`), run
 /// unbounded, against [`fresh_read`]: the two-thread differential takes
