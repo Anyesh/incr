@@ -2777,7 +2777,7 @@ fn an_episode_reaches_a_plan_only_through_another_threads_slots() {
 fn a_root_check_reads_only_another_threads_ended_entries() {
     let published = |mut log: EpisodeLog, number: u32, slots: Vec<u32>| {
         thread::spawn(move || {
-            log.push_as(true, true, number, thread_key(), slots);
+            log.push_as(true, true, false, number, thread_key(), slots);
             log
         })
         .join()
@@ -2796,7 +2796,7 @@ fn a_root_check_reads_only_another_threads_ended_entries() {
         !log.ended_with(6, 4, 2),
         "a landed number read as a release"
     );
-    log.push_as(true, true, 9, thread_key(), [7]);
+    log.push_as(true, true, false, 9, thread_key(), [7]);
     assert!(!log.ended_with(0, 8, 7), "an own publication reached");
 
     log = published(log, u32::MAX, vec![10]);
