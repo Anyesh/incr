@@ -2090,85 +2090,97 @@ fn shared_vframe_reader_under_a_native_read_races_for_the_payload() {
     );
 }
 
-/// As `shared_vframe_reader_waits_under_a_native_read`, with the other
-/// thread's run of X parked in its Failed landing after the payload's
-/// record is out and before the state store, while W's retry reads X. The
-/// other thread's read starts once the retry's pops have left X's
-/// reservation at rest, so it passes it; the store waits until the
-/// driver's read returned or waits on X's claim. The payload is W's only
-/// once X reads Failed: taken while X is Computing, W's publish finds X
-/// unsettled and W lands Dirty where the unbounded run leaves all three
-/// Failed.
+/// As `shared_vframe_reader_waits_under_a_native_read`, with W's retry
+/// parked at its read of X while the other thread reads X. Y's Failed
+/// landing is held by the driver's entry, so the other thread claims X and
+/// waits on Y, and the retry's read of X then waits on that claim. The
+/// driver is wounded out of the cycle, which retracts its held Y; the
+/// other thread lands Y and X Failed, and the retry reads X Failed. All
+/// three end Failed, as in the unbounded run, with the closure's payload
+/// on one of the two reads.
 #[test]
-fn shared_vframe_reader_takes_an_owed_payload_after_the_landing_store() {
+fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
     let s = delivery_shape(Panics::Out, Some(Panics::Out));
     let rt = s.rt.clone();
     rt.set_max_frames(2);
-    let (stored, read) = (Gate::new(), Gate::new());
+    let (read, at_y) = (Gate::new(), Gate::new());
     let driver = Arc::new(OnceLock::new());
-    let waited = Arc::new(AtomicBool::new(false));
+    let flag = || Arc::new(AtomicBool::new(false));
+    let (entered, waited, wounded) = (flag(), flag(), flag());
     let installed = rt.park_hook.set(Box::new({
-        let (entry, stored, read, driver, waited) = (
-            s.gate.clone(),
-            stored.clone(),
-            read.clone(),
-            driver.clone(),
-            waited.clone(),
-        );
-        let (top, x) = (id(s.top), id(s.x));
+        let (read, at_y, driver) = (read.clone(), at_y.clone(), driver.clone());
+        let (entered, waited, wounded) = (entered.clone(), waited.clone(), wounded.clone());
+        let (top, x, y) = (id(s.top), id(s.x), id(s.y));
         move |p| {
-            let on_driver = || driver.get() == Some(&thread::current().id());
-            if p == ParkPoint::BeforeEntry(top) {
-                let _ = driver.set(thread::current().id());
-                entry.park();
-            } else if p == ParkPoint::FailedBeforeStore(x) && !on_driver() {
-                stored.park();
-            } else if p == ParkPoint::GetAfterHandleCheck(x) && on_driver() {
+            if driver.get() != Some(&thread::current().id()) {
+                if p == ParkPoint::BeforeComputeOne(y) {
+                    at_y.park();
+                }
+            } else if p == ParkPoint::BeforeEntry(top) {
+                entered.store(true, SeqCst);
+            } else if p == ParkPoint::GetAfterHandleCheck(x) && entered.load(SeqCst) {
                 read.park();
-            } else if p == ParkPoint::ComputeWaits(x) && on_driver() {
+            } else if p == ParkPoint::ComputeWaits(x) {
                 waited.store(true, SeqCst);
+            } else if p == ParkPoint::WoundRetracted {
+                wounded.store(true, SeqCst);
             }
         }
     }));
     assert!(installed.is_ok(), "park hook installed twice");
-    let _release = ReleaseOnUnwind(vec![s.gate.clone(), read.clone(), stored.clone()]);
-    let first = {
-        let (rt, top) = (rt.clone(), s.top);
-        spawn(move || outcome(|| rt.get(top)))
-    };
-    s.gate.wait_parked();
-    assert_eq!(rt.state_of(s.y), NodeState::Failed);
+    let _release = ReleaseOnUnwind(vec![read.clone(), at_y.clone()]);
     read.arm();
-    s.gate.release();
+    let first = {
+        let (rt, top, driver) = (rt.clone(), s.top, driver.clone());
+        spawn(move || {
+            let _ = driver.set(thread::current().id());
+            outcome(|| rt.get(top))
+        })
+    };
     read.wait_parked();
-    stored.arm();
+    assert_eq!(
+        (rt.state_of(s.y), rt.state_of(s.x), rt.state_of(s.top)),
+        (NodeState::Computing, NodeState::New, NodeState::Computing),
+        "Y's Failed landing is not held at the retry's read of X"
+    );
+    at_y.arm();
     let other = {
         let (rt, x) = (rt.clone(), s.x);
         spawn(move || outcome(|| rt.get(x)))
     };
-    stored.wait_parked();
+    at_y.wait_parked();
     assert_eq!(rt.state_of(s.x), NodeState::Computing);
+    let before = rt.reservation_waits.load(SeqCst);
+    at_y.release();
+    await_reservation_wait(&rt, before);
     read.release();
     let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
-    let mut pending = first;
-    let first = loop {
-        match pending.join_within(Duration::from_millis(10)) {
-            Ok(first) => break first,
-            Err(first) if waited.load(SeqCst) => {
-                stored.release();
-                break first.join();
-            }
-            Err(first) => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the reader neither returned nor waited on X's claim"
-                );
-                pending = first;
+    let (mut first, mut other) = (Some(first), Some(other));
+    let (mut got_first, mut got_other) = (None, None);
+    while got_first.is_none() || got_other.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the wait cycle did not resolve"
+        );
+        if let Some(h) = first.take() {
+            match h.join_within(Duration::from_millis(10)) {
+                Ok(v) => got_first = Some(v),
+                Err(h) => first = Some(h),
             }
         }
-    };
-    stored.release();
-    let other = other.join();
+        if let Some(h) = other.take() {
+            match h.join_within(Duration::from_millis(10)) {
+                Ok(v) => got_other = Some(v),
+                Err(h) => other = Some(h),
+            }
+        }
+    }
+    let (first, other) = (got_first.unwrap(), got_other.unwrap());
+    assert!(waited.load(SeqCst), "the retry never waited on X's claim");
+    assert!(
+        wounded.load(SeqCst),
+        "the driver was not wounded out of the cycle"
+    );
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 
