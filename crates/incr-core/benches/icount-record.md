@@ -2514,6 +2514,7 @@ which loses AUX data at 3).
   scale timing at 9 rounds totals 1.001.
 - Local pays nothing: every `Local` row is within 0.2 % of base, and
   the walk's checks sit behind `C::SINGLE_THREADED`.
-- The tip measured predates `db513d2da`, which changes only
+- The tip measured predates `05816c989`, which changes only
   `moved_since_read`; that runs at the publication of a held Failed
-  landing, which no workload here makes, so the rows stand.
+  landing, or of a held Clean one being lowered there, which no
+  workload here makes, so the rows stand.

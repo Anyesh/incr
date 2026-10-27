@@ -5128,7 +5128,7 @@ fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
 /// 19 down the branch that reads 1, which the unbounded run never takes.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn a_held_failed_reader_of_a_dep_a_budget_left_dirty_stays_failed() {
+fn a_held_failed_reader_of_a_dep_a_budget_left_dirty_matches_the_unbounded_run() {
     let mut case = gen_case(0x3661_49ed, true, false);
     case.ops.truncate(8);
     assert!(matches!(case.ops[7], Op::Get2(3, false)));
