@@ -841,15 +841,15 @@ pub trait DepStack: sealed::Sealed + 'static {
         })
     }
 
-    /// Whether the thread's top frame is another runtime's than `rt` and
-    /// doomed, so a read `rt` serves now comes from a closure that has
-    /// read a placeholder.
-    fn other_top_doomed(&self, rt: RuntimeId) -> bool {
+    /// The runtime of the thread's top frame if it is another than `rt`
+    /// and the frame is doomed, so a read `rt` serves now comes from a
+    /// closure that has read a placeholder.
+    fn other_top_doomed(&self, rt: RuntimeId) -> Option<RuntimeId> {
         self.with(|s| {
-            s.frames.last().is_some_and(|top| {
+            s.frames.last().and_then(|top| {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
-                top.rt() != rt && unsafe { &*top.ctl }.has(DOOMED)
+                (top.rt() != rt && unsafe { &*top.ctl }.has(DOOMED)).then(|| top.rt())
             })
         })
     }
@@ -1244,10 +1244,10 @@ mod tests {
         s1.record_dep(rt(1), NodeId(9), 0, 0);
         s1.poison_current_frame(rt(1));
         assert!(!a.has(POISONED));
-        assert!(!s1.other_top_doomed(rt(1)));
+        assert_eq!(s1.other_top_doomed(rt(1)), None);
         b.raise(DOOMED);
-        assert!(s1.other_top_doomed(rt(1)));
-        assert!(!s2.other_top_doomed(rt(2)));
+        assert_eq!(s1.other_top_doomed(rt(1)), Some(rt(2)));
+        assert_eq!(s2.other_top_doomed(rt(2)), None);
         assert!(s2.pop_frame().is_empty());
         assert!(s1.current_frame_active(rt(1)));
         s1.record_dep(rt(1), NodeId(10), 0, 0);

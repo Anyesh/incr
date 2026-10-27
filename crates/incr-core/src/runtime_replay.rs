@@ -880,6 +880,9 @@ impl<C: Cells> Runtime<C> {
         if changed || first {
             node.max_changed_at(stamp_rev);
         }
+        if !C::SINGLE_THREADED && crate::hold::active() {
+            self.open_hold_for_held_deps(a.id, node, first, &a.stash.deps);
+        }
         let published = self.publish_deps(a.id, &a.stash.deps, None, verify_rev, bag);
         if published == Publish::Stale {
             if first && wrote.get() == 0 {
@@ -1289,7 +1292,7 @@ impl<C: Cells> Runtime<C> {
         replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .any(|x| x.pending.frame_awaits(frame))
+                .any(|x| x.pending.frame_awaits(frame) || x.directs.frame_awaits(frame))
         })
     }
 
@@ -1304,9 +1307,10 @@ impl<C: Cells> Runtime<C> {
         let frame = (f.node.0, self.nodes.get(f.node.0).generation(), f.cidx);
         let listed = |ordinal, parts| {
             replay::with(|c| {
-                c.iter()
-                    .filter(|x| x.rt == rt)
-                    .any(|x| x.pending.read_awaits(frame, reading, ordinal, parts))
+                c.iter().filter(|x| x.rt == rt).any(|x| {
+                    x.pending.read_awaits(frame, reading, ordinal, parts)
+                        || x.directs.read_awaits(frame, reading, ordinal, parts)
+                })
             })
         };
         if !listed(None, None) {
@@ -1472,7 +1476,7 @@ impl<C: Cells> Runtime<C> {
                 // A doomed frame has read a placeholder, so the unbounded
                 // run may never make this read: what it computes natively
                 // is speculative, as an entry pushed here would be.
-                _speculating = Some(replay::Speculating::enter());
+                _speculating = Some(replay::Speculating::enter(self.runtime_id));
             } else {
                 if word & value_code::REPLAY_BIT != 0 {
                     if let Some(read) = self.judge_virtual(handle, f, kind) {
@@ -1487,11 +1491,11 @@ impl<C: Cells> Runtime<C> {
                     mode |= ARMED;
                 }
             }
-        } else if self.dep_stack.other_top_doomed(self.runtime_id) {
+        } else if let Some(chain) = self.dep_stack.other_top_doomed(self.runtime_id) {
             // Another runtime's doomed frame reads this one: its
             // placeholder may have led it to a read the unbounded run never
             // makes, as a doomed frame's own native read is.
-            _speculating = Some(replay::Speculating::enter());
+            _speculating = Some(replay::Speculating::enter(chain));
         }
         // A speculative run of a runtime with no context, read from another
         // runtime's doomed frame, runs in VIRT mode too, so that its
@@ -2983,7 +2987,7 @@ impl<C: Cells> Runtime<C> {
                     })),
                 }
             }
-            Some(Delivered::Walk(..) | Delivered::Direct) => {
+            Some(Delivered::Walk(..)) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             None => catch_unwind(AssertUnwindSafe(|| {
@@ -3924,7 +3928,9 @@ impl<C: Cells> Runtime<C> {
                             &self.dep_stack,
                             self.dep_stack.place_next_at(cidx, level > 0),
                         );
-                        let _speculating = entry.spec.then(replay::Speculating::enter);
+                        let _speculating = entry
+                            .spec
+                            .then(|| replay::Speculating::enter(self.runtime_id));
                         self.member_run(entry.node, cidx, true, entry.walked, !entry.r5)
                     };
                     drop(replay::run_ended(
@@ -4014,7 +4020,9 @@ impl<C: Cells> Runtime<C> {
             }
             let placement = self.dep_stack.place_next_at(at, level > 0);
             let ran = {
-                let _speculating = entry.spec.then(replay::Speculating::enter);
+                let _speculating = entry
+                    .spec
+                    .then(|| replay::Speculating::enter(self.runtime_id));
                 catch_unwind(AssertUnwindSafe(|| {
                     if level == 0 {
                         // The target is the walk entry whose compute was
@@ -4077,6 +4085,8 @@ impl<C: Cells> Runtime<C> {
                         for i in x.pending.of_maker(level).into_iter().chain(own) {
                             x.pending.set_taken(i, false);
                         }
+                        x.directs.rearm_maker(level);
+                        x.directs.rearm_frame((entry.node, entry.generation, at));
                     }
                 });
             } else {
@@ -4281,7 +4291,7 @@ impl<C: Cells> Runtime<C> {
             *kept = above;
             taint_memo::restore(own);
             let ran = {
-                let _speculating = v.spec.then(replay::Speculating::enter);
+                let _speculating = v.spec.then(|| replay::Speculating::enter(self.runtime_id));
                 self.member_run(v.node, v.cidx, true, v.walked, true)
             };
             drop(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
@@ -4612,7 +4622,7 @@ impl<C: Cells> Runtime<C> {
         };
         self.count_release([slot]);
         let (e, spec_buf) = e.into_look(Look::here());
-        self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
+        let peers = self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
         let id = NodeId(slot);
         let stamp_rev = self.current_revision();
         if discarding {
@@ -4637,7 +4647,10 @@ impl<C: Cells> Runtime<C> {
                 false,
                 bag,
             );
-            self.note_unwound_landing(id, node);
+            if self.lists_walks() {
+                let peers = peers.map_or_else(|| reserve::Peers::new([slot]), |p| p.and(slot));
+                self.note_unwound_landing(id, node, &peers);
+            }
             self.end_reservation(id, node);
         }
         if let Some(spec_buf) = spec_buf {
@@ -4850,6 +4863,7 @@ impl<C: Cells> Runtime<C> {
                 for i in x.pending.of_frame(node, generation, cidx) {
                     x.pending.set_taken(i, false);
                 }
+                x.directs.rearm_frame((node, generation, cidx));
             }
         });
     }
@@ -4859,7 +4873,10 @@ impl<C: Cells> Runtime<C> {
         let ended: Vec<Delivery> = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == id)
-                .map(|x| x.pending.extract_frame(node, generation, cidx))
+                .map(|x| {
+                    x.directs.remove_frame((node, generation, cidx));
+                    x.pending.extract_frame(node, generation, cidx)
+                })
                 .unwrap_or_default()
         });
         drop(ended);
@@ -4933,6 +4950,7 @@ impl<C: Cells> Runtime<C> {
             for x in c.iter_mut().filter(|x| x.rt == rt) {
                 for &slot in released {
                     let generation = self.nodes.get(slot).generation();
+                    x.directs.remove_node(slot, generation);
                     dropped.extend(x.pending.extract_node(slot, generation));
                     x.end_node_runs(slot, generation);
                 }
@@ -4958,7 +4976,10 @@ impl<C: Cells> Runtime<C> {
         let ended: Vec<Delivery> = replay::with(|c| {
             c.iter_mut()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.pending.extract_frame(root.0, generation, cidx))
+                .flat_map(|x| {
+                    x.directs.remove_frame((root.0, generation, cidx));
+                    x.pending.extract_frame(root.0, generation, cidx)
+                })
                 .collect()
         });
         // No retry reads the ended run's frame again, so its unread reads
@@ -5251,12 +5272,8 @@ impl<C: Cells> Runtime<C> {
                 let mut resumed = None;
                 for x in c.iter_mut().filter(|x| x.rt == rt) {
                     x.direct = None;
-                    if let Some(i) = x
-                        .pending
-                        .find_keyed(&key, |d| !d.taken() && matches!(d.what, Delivered::Direct))
-                    {
-                        x.pending.set_taken(i, true);
-                        resumed = Some(x.pending.get(i).runs.clone());
+                    if let Some(runs) = x.directs.take(&key) {
+                        resumed = Some(runs);
                         x.direct = Some((slot, handle.generation(), f.cidx));
                     }
                     x.resume = None;
@@ -5286,6 +5303,12 @@ impl<C: Cells> Runtime<C> {
             // SAFETY: the active frame's control block is live.
             unsafe { &*f.ctl }.lower(anchor);
         }
+        // A delivered read of a landing this thread holds rests on it as a
+        // native read does, so the reader's landing is held too.
+        if !C::SINGLE_THREADED {
+            let node = self.nodes.get(handle.slot());
+            let _ = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
+        }
         let (cycle, poison, attributed, payload, nodes) = match what {
             Delivered::Unwind {
                 cycle,
@@ -5294,7 +5317,7 @@ impl<C: Cells> Runtime<C> {
                 payload,
                 nodes,
             } => (cycle, poison, attributed, payload, nodes),
-            Delivered::Walk(..) | Delivered::Direct => {
+            Delivered::Walk(..) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             Delivered::Landed(value, poison) => {
@@ -5829,11 +5852,15 @@ impl<C: Cells> Runtime<C> {
             }
             Computed::Discarded => match self.walk_discarded(visit) {
                 Some(after) => after,
+                None if is_root => {
+                    self.stash_root_direct(root);
+                    return Err(computed);
+                }
                 None => {
                     // The discarded compute is a frame the reading frame's
                     // retry runs again.
                     walk.repush(entry);
-                    self.stash_walk(root, (!is_root).then_some(walk), Some(entry.id.0));
+                    self.stash_walk(root, Some(walk), Some(entry.id.0));
                     return Err(computed);
                 }
             },
@@ -5856,8 +5883,35 @@ impl<C: Cells> Runtime<C> {
     /// resumes `walk`, the rest of it, or with none left, takes the root's
     /// landing as the read's outcome.
     fn stash_walk(&self, root: NodeId, walk: Option<&mut Walk>, pushed: Option<u32>) {
-        // A doomed frame's walk reads past placeholders, and a speculative
-        // run's retry takes no delivery.
+        self.at_blocked_read(root, |c, i, v| match walk {
+            Some(walk) => {
+                let runs = replay::run_snapshot(c, self.runtime_id, v);
+                c[i].deliver_walk(v, std::mem::take(walk), pushed, runs);
+            }
+            None => c[i].pending.remove_walks(&ReadKey::blocked(v)),
+        });
+    }
+
+    /// A doom discarded the compute of `root` its reading frame's walk
+    /// ended at: the retry runs that compute directly, counting its runs
+    /// from those that ended, so it takes the seq after them and none of
+    /// their deliveries.
+    fn stash_root_direct(&self, root: NodeId) {
+        self.at_blocked_read(root, |c, i, v| {
+            let runs = replay::run_snapshot(c, self.runtime_id, v);
+            c[i].redeliver_direct(v, runs);
+        });
+    }
+
+    /// Runs `f` on the innermost virtual frame of this runtime blocked in
+    /// the active frame's read of `root`, with its context's index. A
+    /// doomed frame's walk reads past placeholders, and a speculative
+    /// run's retry takes no delivery, so neither reaches `f`.
+    fn at_blocked_read(
+        &self,
+        root: NodeId,
+        f: impl FnOnce(&mut Vec<replay::Context>, usize, &VFrame),
+    ) {
         if replay::speculative() {
             return;
         }
@@ -5875,16 +5929,7 @@ impl<C: Cells> Runtime<C> {
                     .find(|v| v.cidx == at && v.reading == reading)
                     .cloned()
                 {
-                    match walk {
-                        Some(walk) => {
-                            let runs = replay::run_snapshot(c, rt, &v);
-                            c[i].deliver_walk(&v, std::mem::take(walk), pushed, runs);
-                        }
-                        None => {
-                            let key = ReadKey::blocked(&v);
-                            c[i].pending.remove_walks(&key);
-                        }
-                    }
+                    f(c, i, &v);
                     return;
                 }
             }

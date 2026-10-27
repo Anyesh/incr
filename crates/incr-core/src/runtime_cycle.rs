@@ -564,6 +564,19 @@ impl<C: Cells> Runtime<C> {
         also: Option<NodeId>,
         mut done: impl FnMut() -> bool,
     ) {
+        // A speculative run may read what the unbounded run never reads, so
+        // a wait it registered could close a waits-for cycle, or a take-over
+        // wound an owner, that the unbounded run never has; the wound would
+        // retry the real attempt and lose what it saw. The run drops its
+        // chain instead.
+        if replay::speculating_in(self.runtime_id) {
+            if done() {
+                return;
+            }
+            #[cfg(test)]
+            replay::count_speculative_wait_drop();
+            self.drop_unwind();
+        }
         let mut holds: Vec<waits::Claim> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
@@ -690,6 +703,9 @@ impl<C: Cells> Runtime<C> {
                 self.0.dep_stack.pop_frame();
             }
         }
+        if !C::SINGLE_THREADED {
+            reserve::callback_code();
+        }
         let ctl = ComputeCtl::new(0);
         self.dep_stack
             .push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &ctl, u32::MAX);
@@ -786,7 +802,7 @@ impl<C: Cells> Runtime<C> {
             .filter(|_| !self.foreign_frame_above(p));
         let Some((ctl, at)) = active else {
             if !C::SINGLE_THREADED {
-                self.hold_closed_cycle();
+                self.hold_closed_cycle_at(p);
             }
             return Some(Err(self.cycle_at(p)));
         };
@@ -833,7 +849,7 @@ impl<C: Cells> Runtime<C> {
         if on_stack.is_some() {
             ctl.lower(p);
             if !C::SINGLE_THREADED {
-                self.hold_closed_cycle();
+                self.hold_closed_cycle_at(p);
             }
             return Some(Err(self.cycle_at(p)));
         }
@@ -2053,13 +2069,13 @@ impl<C: Cells> Runtime<C> {
         discarding: bool,
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> Option<reserve::Peers> {
         let mut keep = Vec::new();
         if kind == Some(UnwindKind::Discard) {
             self.virtually_owned(cidx, &mut keep);
         }
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, kind, subtree, &keep, payload, bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &keep, payload, bag)
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
@@ -2075,7 +2091,8 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn kept_children(&self, cidx: u32, keep: &[u32], root: u32) -> KeptChildren {
         let rt = self.runtime_id;
         cycle_state::with_held(|h| {
-            if h.is_empty() {
+            // Only a run above `cidx` that deferred claims can keep children.
+            if !h.any_owned_from(rt, cidx.saturating_add(1)) {
                 return KeptChildren::default();
             }
             let released = releasable(h, rt, cidx, None, keep);
@@ -2097,7 +2114,7 @@ impl<C: Cells> Runtime<C> {
         keep: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> Option<reserve::Peers> {
         // The unwinding frame, of node `subtree`, owns the claims owned at
         // its position by it, and those owned above.
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
@@ -2112,11 +2129,20 @@ impl<C: Cells> Runtime<C> {
                 .collect()
         });
         if entries.is_empty() {
-            return;
+            return None;
         }
         self.count_release(entries.iter().map(|&(slot, _)| slot));
         entries.sort_unstable_by_key(|(slot, _)| *slot);
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
+        // One episode: the unwinding frame's node and what it released.
+        let peers = (!discarding && kind.is_none() && self.lists_walks()).then(|| {
+            reserve::Peers::new(
+                released
+                    .iter()
+                    .copied()
+                    .chain(subtree.filter(|&n| n != u32::MAX)),
+            )
+        });
         let stamp_rev = self.current_revision();
         let verify_rev = C::walked(&self.walk, &self.revision);
         let look = Look::here();
@@ -2153,7 +2179,9 @@ impl<C: Cells> Runtime<C> {
             }
             // A cycle's retry may run a member again; a user panic ends its run.
             if !discarding && kind.is_none() {
-                self.note_unwound_landing(id, self.nodes.get(slot));
+                if let Some(peers) = &peers {
+                    self.note_unwound_landing(id, self.nodes.get(slot), peers);
+                }
                 self.end_reservation(id, self.nodes.get(slot));
             }
             // A discarded claim's run is one the unbounded run never makes,
@@ -2173,6 +2201,7 @@ impl<C: Cells> Runtime<C> {
         if kind.is_none() {
             self.end_released_runs(&released);
         }
+        peers
     }
 
     /// The discard landing of a claim this thread holds: the node lands as
@@ -2316,10 +2345,16 @@ impl<C: Cells> Runtime<C> {
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
         let first = e.first;
-        // A cut's claim lands held, as does one whose run took `HOLD`: its
-        // entry opens before the write, so the undo keeps what the write
-        // displaces.
-        if !C::SINGLE_THREADED && (e.hold || hold::cut_kept(rt, slot)) {
+        // A cut's claim lands held, as does one whose run took `HOLD`, one
+        // the thread already lands held, or one whose publish adds a held
+        // dep: its entry opens before the write, so the undo keeps what the
+        // write displaces.
+        if !C::SINGLE_THREADED
+            && (e.hold
+                || hold::cut_kept(rt, slot)
+                || hold::active()
+                    && (self.lands_held(id, node) || self.publishes_held_dep(node, e.last())))
+        {
             self.open_hold(id, node, first, None, bag);
         }
         let written = catch_unwind(AssertUnwindSafe(|| {
@@ -2814,7 +2849,7 @@ impl<C: Cells> Runtime<C> {
         payload: Payload,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
+        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false, bag);
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
@@ -2823,13 +2858,26 @@ impl<C: Cells> Runtime<C> {
     /// Dirty as if never claimed: no member ran, so another thread's read
     /// of one must make the decision a read before the claims would have
     /// made. They stay in their group unless `leave`, when they land out
-    /// of it, unverified (see `leave_group`).
-    fn release_group_claims<'a>(&self, claimed: impl IntoIterator<Item = &'a u32>, leave: bool) {
+    /// of it, unverified (see `leave_group`), held if this thread holds
+    /// landings: a retraction puts the record back with the state. A claim
+    /// a waiter took publishes at once, past any retraction, so then they
+    /// all stay.
+    pub(super) fn release_group_claims<'a, I>(&self, claimed: I, leave: bool, bag: &mut Deferred<C>)
+    where
+        I: IntoIterator<Item = &'a u32>,
+        I::IntoIter: Clone,
+    {
         let rt = self.runtime_id;
+        let claimed = claimed.into_iter();
+        let held = !C::SINGLE_THREADED && hold::active();
+        let leave = leave && !(held && claimed.clone().any(|&c| reserve::taken((rt, c))));
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
             let (node, flags) = self.nodes.get_with_flags(c);
             if leave {
+                if held {
+                    self.open_hold(NodeId(c), node, false, None, bag);
+                }
                 self.land_single_as(
                     NodeId(c),
                     node,
@@ -2910,6 +2958,7 @@ impl<C: Cells> Runtime<C> {
                 self.release_group_claims(
                     &claimed,
                     !took && !virtual_member && seen != NodeState::Dirty && !is_computing(seen),
+                    bag,
                 );
                 return GroupEnd::Ordinary;
             }
@@ -2978,7 +3027,7 @@ impl<C: Cells> Runtime<C> {
             // A tainted node never runs: release the group, and leave `x`
             // Dirty for the closure that still reads it, whose read the
             // taint memo makes compute `x` alone.
-            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
+            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false, bag);
             self.memoize(x, owner);
             return GroupEnd::Done(Computed::Done);
         }
