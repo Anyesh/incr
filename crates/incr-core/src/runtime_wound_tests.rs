@@ -293,6 +293,12 @@ fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
     let message = panic_message(thread_b.join().unwrap().unwrap_err());
     assert!(message.contains("dependency cycle"), "{message}");
     assert_eq!(g.rt.verdict_reruns.load(Ordering::Relaxed), 0);
+    if budget.is_some() {
+        assert!(
+            !g.rt.entries.lock().unwrap().is_empty(),
+            "the budget replayed no read"
+        );
+    }
     assert_eq!(g.rt.get(q), 4);
     assert_wounded();
     g.rt.assert_invariant_i();
