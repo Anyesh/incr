@@ -432,6 +432,42 @@ fn a_walk_listing_ends_at_its_nodes_settled_landing() {
     drop(read);
 }
 
+/// Another thread reads a walk listing awake exactly while it holds every
+/// op: through a peer's user code, not past other user code, a cycle
+/// callback, the node's settled landing or the read's end.
+#[test]
+fn a_walk_listing_reads_awake_from_another_thread_while_it_holds_every_op() {
+    use crate::reserve::{end_walk_landed, note_walk, user_code, walk_listed_awake, Peers, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let elsewhere = |generation| {
+        std::thread::scope(|s| {
+            s.spawn(move || walk_listed_awake(n, generation))
+                .join()
+                .unwrap()
+        })
+    };
+    let read = Root::arm(true, root);
+    assert!(!elsewhere(1));
+    note_walk(n, 1, &Peers::new([5, 7]));
+    assert!(elsewhere(1), "listed");
+    assert!(!elsewhere(2), "another generation");
+    user_code((rt.runtime_id, 5));
+    assert!(elsewhere(1), "a peer's user code");
+    user_code(outside(&rt));
+    assert!(!elsewhere(1), "other user code");
+    note_walk(n, 1, &Peers::new([7]));
+    rt.callback(|| ());
+    assert!(!elsewhere(1), "a cycle callback");
+    note_walk(n, 1, &Peers::new([]));
+    end_walk_landed(n, 1);
+    assert!(!elsewhere(1), "the settled landing");
+    note_walk(n, 1, &Peers::new([]));
+    assert!(elsewhere(1), "listed again");
+    drop(read);
+    assert!(!elsewhere(1), "the read's end");
+}
+
 /// A context that also reserves the node and ends before the walk's
 /// thread runs user code leaves the walk listing awake.
 #[test]

@@ -6077,14 +6077,17 @@ impl<C: Cells> Runtime<C> {
     /// Keeps `id`, which a user panic's unwind just landed New or Dirty with
     /// `peers`, for this thread's read ([`reserve::note_walk`]): a walk that
     /// contains the panic runs it again after the context holding it has
-    /// ended. Only where [`Self::lists_walks`].
+    /// ended. A held landing is listed too, so a waiter on it leaves the
+    /// owner be where the listing holds every op. Only where
+    /// [`Self::lists_walks`].
     pub(super) fn note_unwound_landing(
         &self,
         id: NodeId,
         node: &NodeData<C>,
         peers: &reserve::Peers,
     ) {
-        if matches!(node.state(), NodeState::New | NodeState::Dirty) {
+        let seen = self.seen_quietly(node.state_cell(), node.state());
+        if matches!(seen, NodeState::New | NodeState::Dirty) {
             reserve::note_walk((self.runtime_id, id.0), node.generation(), peers);
         }
     }

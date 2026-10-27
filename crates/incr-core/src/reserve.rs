@@ -56,6 +56,8 @@ type Entry = (u32, usize, u64);
 /// The stamp of a reservation every other reader waits on.
 const AWAKE: u64 = u64::MAX;
 
+type AwakeWalks = HashMap<(Claim, u32), u32, FxBuildHasher>;
+
 /// Entries in [`TABLE`], and per hash bucket of their claims, both stored
 /// under its lock: a claim that reads a release sees non-zero counts
 /// without taking the lock, and takes it only on its own bucket's hit.
@@ -68,6 +70,12 @@ static BUCKETS: [AtomicU32; BUCKETS_LEN] = [const { AtomicU32::new(0) }; BUCKETS
 #[cfg(not(loom))]
 static TABLE: Mutex<BTreeMap<Claim, (Entry, Attempt)>> = Mutex::new(BTreeMap::new());
 
+/// Every thread's awake walk listings ([`Release`]) by claim and node
+/// generation, counted once per release that lists one, so another thread
+/// can tell a listing that holds every op ([`walk_listed_awake`]).
+#[cfg(not(loom))]
+static AWAKE_WALKS: Mutex<AwakeWalks> = Mutex::new(HashMap::with_hasher(FxBuildHasher));
+
 /// Orders the start of each op that leaves the Clean fast path against
 /// [`rest`]s.
 #[cfg(not(loom))]
@@ -77,6 +85,7 @@ static SEQ: AtomicU64 = AtomicU64::new(1);
 loom::lazy_static! {
     static ref LIVE: AtomicUsize = AtomicUsize::new(0);
     static ref TABLE: Mutex<BTreeMap<Claim, (Entry, Attempt)>> = Mutex::new(BTreeMap::new());
+    static ref AWAKE_WALKS: Mutex<AwakeWalks> = Mutex::new(HashMap::with_hasher(FxBuildHasher));
     static ref SEQ: AtomicU64 = AtomicU64::new(1);
 }
 
@@ -210,6 +219,42 @@ fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, (Entry, Attempt)>
     {
         TABLE.lock().unwrap()
     }
+}
+
+fn awake_walks() -> impl std::ops::DerefMut<Target = AwakeWalks> {
+    #[cfg(not(loom))]
+    {
+        AWAKE_WALKS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    #[cfg(loom)]
+    {
+        AWAKE_WALKS.lock().unwrap()
+    }
+}
+
+fn wake_walk(claim: (Claim, u32)) {
+    *awake_walks().entry(claim).or_default() += 1;
+}
+
+fn end_awake_walks(claims: impl IntoIterator<Item = (Claim, u32)>) {
+    let mut awake = awake_walks();
+    for claim in claims {
+        if let Some(n) = awake.get_mut(&claim) {
+            *n -= 1;
+            if *n == 0 {
+                awake.remove(&claim);
+            }
+        }
+    }
+}
+
+/// Whether some thread's walk listing of `claim` at `generation` is awake:
+/// the unbounded run still holds the node in its owner's frame, so a
+/// waiter may not wound the owner over it.
+#[cold]
+#[inline(never)]
+pub(crate) fn walk_listed_awake(claim: Claim, generation: u32) -> bool {
+    awake_walks().contains_key(&(claim, generation))
 }
 
 #[cfg(not(loom))]
@@ -456,7 +501,9 @@ pub(crate) fn note_walk(claim: Claim, generation: u32, peers: &Peers) {
             .find_map(|r| r.woken.get(&(claim, generation)).copied())
             .unwrap_or(was);
         let release = w.last_mut().expect("a release was just pushed");
-        release.woken.insert((claim, generation), was);
+        if release.woken.insert((claim, generation), was).is_none() {
+            wake_walk((claim, generation));
+        }
     });
     ANY_WOKEN.with(|a| a.set(true));
     #[cfg(all(test, not(loom)))]
@@ -508,6 +555,7 @@ fn end_woken(entering: Option<Claim>) {
     });
     #[cfg(all(test, not(loom)))]
     WALK_WORK.with(|n| n.set(n.get() + ended.len() as u64));
+    end_awake_walks(ended.iter().map(|&(_, claim, _)| claim));
     for (context, claim, was) in ended {
         end_walk(context, claim, was);
     }
@@ -533,6 +581,7 @@ pub(crate) fn end_walk_landed(claim: Claim, generation: u32) {
         });
         ANY_WOKEN.with(|a| a.set(!w.is_empty()));
     });
+    end_awake_walks(ended.iter().map(|_| claim));
     for (context, was) in ended {
         end_walk(context, claim, was);
     }
@@ -622,6 +671,7 @@ fn end_root(key: u64) {
             });
             let _ = ANY_WOKEN.try_with(|a| a.set(!w.is_empty()));
         });
+        end_awake_walks(woken.iter().map(|&(claim, _)| claim));
         unlist(ended, token, true);
         woken.retain(|&(claim, _)| !walk_listed(claim));
         restamp(woken, token);
@@ -933,7 +983,8 @@ pub(crate) fn end_context(context: u64) {
 /// its own node included: none of its contexts outlives this.
 pub(crate) fn end_all() {
     ROOTS.with(|n| n.set(0));
-    WOKEN.with(|w| w.borrow_mut().clear());
+    let woken = WOKEN.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    end_awake_walks(woken.into_iter().flat_map(|r| r.woken.into_keys()));
     ANY_WOKEN.with(|a| a.set(false));
     let (groups, token) = MINE.with(|m| (std::mem::take(&mut *m.0.borrow_mut()), m.token()));
     for g in groups {
