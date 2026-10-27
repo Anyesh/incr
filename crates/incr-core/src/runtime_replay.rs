@@ -1493,6 +1493,7 @@ impl<C: Cells> Runtime<C> {
             match cycle_state::unwind_kind() {
                 Some(UnwindKind::Cycle) => {
                     cycle_state::set_unwind_kind(None);
+                    self.note_cycle_caught(None);
                     word = value_code::thread_word();
                 }
                 Some(UnwindKind::Discard) if !std::thread::panicking() => {
