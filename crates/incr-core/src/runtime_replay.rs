@@ -1289,7 +1289,7 @@ impl<C: Cells> Runtime<C> {
         replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .any(|x| x.pending.frame_awaits(frame))
+                .any(|x| x.pending.frame_awaits(frame) || x.directs.frame_awaits(frame))
         })
     }
 
@@ -1304,9 +1304,10 @@ impl<C: Cells> Runtime<C> {
         let frame = (f.node.0, self.nodes.get(f.node.0).generation(), f.cidx);
         let listed = |ordinal, parts| {
             replay::with(|c| {
-                c.iter()
-                    .filter(|x| x.rt == rt)
-                    .any(|x| x.pending.read_awaits(frame, reading, ordinal, parts))
+                c.iter().filter(|x| x.rt == rt).any(|x| {
+                    x.pending.read_awaits(frame, reading, ordinal, parts)
+                        || x.directs.read_awaits(frame, reading, ordinal, parts)
+                })
             })
         };
         if !listed(None, None) {
@@ -2983,7 +2984,7 @@ impl<C: Cells> Runtime<C> {
                     })),
                 }
             }
-            Some(Delivered::Walk(..) | Delivered::Direct) => {
+            Some(Delivered::Walk(..)) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             None => catch_unwind(AssertUnwindSafe(|| {
@@ -4077,6 +4078,8 @@ impl<C: Cells> Runtime<C> {
                         for i in x.pending.of_maker(level).into_iter().chain(own) {
                             x.pending.set_taken(i, false);
                         }
+                        x.directs.rearm_maker(level);
+                        x.directs.rearm_frame((entry.node, entry.generation, at));
                     }
                 });
             } else {
@@ -4850,6 +4853,7 @@ impl<C: Cells> Runtime<C> {
                 for i in x.pending.of_frame(node, generation, cidx) {
                     x.pending.set_taken(i, false);
                 }
+                x.directs.rearm_frame((node, generation, cidx));
             }
         });
     }
@@ -4859,7 +4863,10 @@ impl<C: Cells> Runtime<C> {
         let ended: Vec<Delivery> = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == id)
-                .map(|x| x.pending.extract_frame(node, generation, cidx))
+                .map(|x| {
+                    x.directs.remove_frame((node, generation, cidx));
+                    x.pending.extract_frame(node, generation, cidx)
+                })
                 .unwrap_or_default()
         });
         drop(ended);
@@ -4933,6 +4940,7 @@ impl<C: Cells> Runtime<C> {
             for x in c.iter_mut().filter(|x| x.rt == rt) {
                 for &slot in released {
                     let generation = self.nodes.get(slot).generation();
+                    x.directs.remove_node(slot, generation);
                     dropped.extend(x.pending.extract_node(slot, generation));
                     x.end_node_runs(slot, generation);
                 }
@@ -4958,7 +4966,10 @@ impl<C: Cells> Runtime<C> {
         let ended: Vec<Delivery> = replay::with(|c| {
             c.iter_mut()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.pending.extract_frame(root.0, generation, cidx))
+                .flat_map(|x| {
+                    x.directs.remove_frame((root.0, generation, cidx));
+                    x.pending.extract_frame(root.0, generation, cidx)
+                })
                 .collect()
         });
         // No retry reads the ended run's frame again, so its unread reads
@@ -5251,12 +5262,8 @@ impl<C: Cells> Runtime<C> {
                 let mut resumed = None;
                 for x in c.iter_mut().filter(|x| x.rt == rt) {
                     x.direct = None;
-                    if let Some(i) = x
-                        .pending
-                        .find_keyed(&key, |d| !d.taken() && matches!(d.what, Delivered::Direct))
-                    {
-                        x.pending.set_taken(i, true);
-                        resumed = Some(x.pending.get(i).runs.clone());
+                    if let Some(runs) = x.directs.take(&key) {
+                        resumed = Some(runs);
                         x.direct = Some((slot, handle.generation(), f.cidx));
                     }
                     x.resume = None;
@@ -5294,7 +5301,7 @@ impl<C: Cells> Runtime<C> {
                 payload,
                 nodes,
             } => (cycle, poison, attributed, payload, nodes),
-            Delivered::Walk(..) | Delivered::Direct => {
+            Delivered::Walk(..) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             Delivered::Landed(value, poison) => {

@@ -544,6 +544,23 @@ struct Made {
     list: Few<usize>,
 }
 
+impl Made {
+    /// One of its entries went: whether none is left, else the list sheds
+    /// the indexes `keep` refuses once it holds twice as many as live, so a
+    /// removal from a long list passes over none of it.
+    fn shed(&mut self, keep: impl FnMut(&usize) -> bool) -> bool {
+        self.live -= 1;
+        if self.live == 0 {
+            return true;
+        }
+        if self.list.as_slice().len() >= 2 * self.live as usize {
+            note_work(self.list.as_slice().len());
+            self.list.retain(keep);
+        }
+        false
+    }
+}
+
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
     (key.node, key.generation, key.cidx)
 }
@@ -722,19 +739,8 @@ impl Pending {
     }
 
     fn unmake(&mut self, maker: u32) {
-        let MapEntry::Occupied(mut e) = self.by_maker.entry(maker) else {
-            debug_assert!(false, "a maker's live count went below zero");
-            return;
-        };
-        let made = e.get_mut();
-        made.live -= 1;
-        if made.live == 0 {
-            e.remove();
-        } else if made.list.as_slice().len() >= 2 * made.live as usize {
-            note_work(made.list.as_slice().len());
-            let slots = &self.slots;
-            made.list.retain(|&j| slots[j].is_some());
-        }
+        let slots = &self.slots;
+        unmade(&mut self.by_maker, maker, |&j| slots[j].is_some());
     }
 
     pub(crate) fn get(&self, i: usize) -> &Delivery {
@@ -1081,6 +1087,350 @@ impl Pending {
     }
 }
 
+/// A virtual frame's blocked read that ran its node's compute, a virtual
+/// frame above the frame's, which the retry runs again as that compute: a
+/// walk would first visit deps the replay of that frame's run has left
+/// Failed or Dirty (see [`Context::deliver_direct`]). It stays, taken or
+/// not, until its maker's run ends, as a [`Delivery`] does. It keeps its
+/// [`ReadKey`] less the position, which is where [`Directs`] holds it, and
+/// the foreign runtime, which a blocked read has none of.
+struct Direct {
+    node: u32,
+    generation: u32,
+    reading: u64,
+    ordinal: u32,
+    path: u64,
+    seq: u32,
+    episode: Option<u64>,
+    maker: u32,
+    taken: bool,
+    runs: RunSlot,
+}
+
+impl Direct {
+    fn is(&self, key: &ReadKey) -> bool {
+        (self.node, self.generation, self.reading, self.ordinal)
+            == (key.node, key.generation, key.reading, key.ordinal)
+            && (self.path, self.seq, self.episode) == (key.path, key.seq, key.episode)
+            && key.foreign.is_none()
+    }
+
+    fn of(&self, node: u32, generation: u32) -> bool {
+        (self.node, self.generation) == (node, generation)
+    }
+}
+
+/// A context's direct deliveries, at most one per read, by their frame's
+/// position less the context's boundary. A deep chain's retries leave one
+/// per virtual frame until their makers' runs end, so they keep no
+/// [`Pending`] slot or index of their own.
+#[derive(Default)]
+pub(crate) struct Directs {
+    boundary: u32,
+    /// Sized to the highest position used until none is live, so a chain
+    /// that pushes and drops at its top does not regrow it each time.
+    at: Vec<Few<Direct>>,
+    live: usize,
+    /// Positions by maker, dropped lazily as in [`Pending::by_maker`].
+    by_maker: HashMap<u32, Made, FxBuildHasher>,
+    /// The position holding a node's directs, and any further ones.
+    by_node: HashMap<(u32, u32), u32, FxBuildHasher>,
+    more_by_node: HashMap<(u32, u32), Vec<u32>, FxBuildHasher>,
+}
+
+impl Directs {
+    fn new(boundary: u32) -> Self {
+        Self {
+            boundary,
+            ..Self::default()
+        }
+    }
+
+    /// Where the frame at `cidx` keeps its directs: none below the
+    /// context's boundary.
+    fn position(&self, cidx: u32) -> Option<usize> {
+        cidx.checked_sub(self.boundary).map(|i| i as usize)
+    }
+
+    fn at(&self, cidx: u32) -> &[Direct] {
+        self.position(cidx)
+            .and_then(|i| self.at.get(i))
+            .map_or(&[], Few::as_slice)
+    }
+
+    fn at_mut(&mut self, cidx: u32) -> &mut [Direct] {
+        match self.position(cidx).and_then(|i| self.at.get_mut(i)) {
+            Some(l) => l.as_mut_slice(),
+            None => &mut [],
+        }
+    }
+
+    fn get(&self, key: &ReadKey) -> Option<&Direct> {
+        self.at(key.cidx).iter().find(|d| d.is(key))
+    }
+
+    fn get_mut(&mut self, key: &ReadKey) -> Option<&mut Direct> {
+        self.at_mut(key.cidx).iter_mut().find(|d| d.is(key))
+    }
+
+    fn push(&mut self, key: ReadKey, maker: u32, runs: RunSlot) {
+        debug_assert!(key.foreign.is_none(), "a blocked read is its own runtime's");
+        let i = self
+            .position(key.cidx)
+            .expect("incr-core: a direct read is its context's frame's");
+        if self.at.len() <= i {
+            self.at.resize_with(i + 1, Few::default);
+        }
+        self.at[i].push(Direct {
+            node: key.node,
+            generation: key.generation,
+            reading: key.reading,
+            ordinal: key.ordinal,
+            path: key.path,
+            seq: key.seq,
+            episode: key.episode,
+            maker,
+            taken: false,
+            runs,
+        });
+        let made = self.by_maker.entry(maker).or_default();
+        made.live += 1;
+        made.list.push(i);
+        self.list_node((key.node, key.generation), i as u32);
+        self.live += 1;
+        #[cfg(all(test, not(loom)))]
+        PEAK_DIRECTS.with(|p| p.set(p.get().max(self.live)));
+    }
+
+    fn list_node(&mut self, node: (u32, u32), i: u32) {
+        match self.by_node.entry(node) {
+            MapEntry::Vacant(e) => {
+                e.insert(i);
+            }
+            MapEntry::Occupied(e) if *e.get() == i => {}
+            MapEntry::Occupied(_) => {
+                let more = self.more_by_node.entry(node).or_default();
+                if !more.contains(&i) {
+                    more.push(i);
+                }
+            }
+        }
+    }
+
+    /// Position `i` holds no more directs of `node`.
+    fn unlist_node(&mut self, node: (u32, u32), i: u32) {
+        if self.by_node.get(&node) == Some(&i) {
+            match self.more_by_node.get_mut(&node).and_then(Vec::pop) {
+                Some(j) => {
+                    self.by_node.insert(node, j);
+                }
+                None => {
+                    self.by_node.remove(&node);
+                }
+            }
+        } else if let Some(more) = self.more_by_node.get_mut(&node) {
+            more.retain(|&j| j != i);
+        }
+        if self.more_by_node.get(&node).is_some_and(Vec::is_empty) {
+            self.more_by_node.remove(&node);
+        }
+    }
+
+    fn node_positions(&self, node: (u32, u32)) -> Vec<usize> {
+        let more = self.more_by_node.get(&node).map_or(&[][..], Vec::as_slice);
+        (self.by_node.get(&node).into_iter().chain(more))
+            .map(|&i| i as usize)
+            .collect()
+    }
+
+    /// Removes the directs at position `i` that `f` picks. A caller
+    /// removing all of a maker's drops its list itself (`maker_listed`
+    /// false).
+    fn remove_at(&mut self, i: usize, maker_listed: bool, f: impl Fn(&Direct) -> bool) {
+        let Some(at) = self.at.get_mut(i) else {
+            return;
+        };
+        let mut gone = Vec::new();
+        at.retain(|d| {
+            let out = f(d);
+            if out {
+                gone.push((d.maker, (d.node, d.generation)));
+            }
+            !out
+        });
+        self.live -= gone.len();
+        for (maker, node) in gone {
+            if maker_listed {
+                let at = &self.at;
+                let mut seen = HashSet::new();
+                unmade(&mut self.by_maker, maker, |&j| {
+                    at.get(j)
+                        .is_some_and(|l| l.as_slice().iter().any(|d| d.maker == maker))
+                        && seen.insert(j)
+                });
+            }
+            if !(self.at[i].as_slice().iter()).any(|d| d.of(node.0, node.1)) {
+                self.unlist_node(node, i as u32);
+            }
+        }
+        if self.live == 0 {
+            debug_assert!(
+                self.by_maker.is_empty() && self.by_node.is_empty(),
+                "a direct list outlived its directs"
+            );
+            self.at.clear();
+        }
+    }
+
+    /// Sends the read `key` to its compute, unless a direct one already
+    /// does.
+    pub(crate) fn deliver(&mut self, key: ReadKey, maker: u32, runs: RunSlot) {
+        if self.get(&key).is_none() {
+            self.push(key, maker, runs);
+        }
+    }
+
+    /// Sends it again with `runs`: one from `maker` is read again in place,
+    /// one from another maker is replaced.
+    pub(crate) fn redeliver(&mut self, key: ReadKey, maker: u32, runs: RunSlot) {
+        match self.get_mut(&key) {
+            Some(d) if d.maker == maker => {
+                d.runs = runs;
+                d.taken = false;
+            }
+            Some(_) => {
+                if let Some(i) = self.position(key.cidx) {
+                    self.remove_at(i, true, |d| d.is(&key));
+                }
+                self.push(key, maker, runs);
+            }
+            None => self.push(key, maker, runs),
+        }
+    }
+
+    /// Takes the untaken direct for read `key`, returning the runs its
+    /// retry reads from.
+    pub(crate) fn take(&mut self, key: &ReadKey) -> Option<RunSlot> {
+        let d = self.get_mut(key).filter(|d| !d.taken)?;
+        d.taken = true;
+        Some(d.runs.clone())
+    }
+
+    /// Marks the direct for read `key` taken, if there is one.
+    pub(crate) fn take_keyed(&mut self, key: &ReadKey) {
+        if let Some(d) = self.get_mut(key) {
+            d.taken = true;
+        }
+    }
+
+    /// Counts the run of `node` at `generation` along `path` in the
+    /// untaken direct for read `key` whose runs follow that path.
+    pub(crate) fn bump(&mut self, key: &ReadKey, path: u64, node: u32, generation: u32) {
+        if let Some(d) = self.get_mut(key) {
+            if !d.taken && d.runs.path == path {
+                d.runs.bump(node, generation);
+            }
+        }
+    }
+
+    /// The positions listed for the run at `level`, each once, lowest
+    /// first.
+    fn of_maker(&self, level: u32) -> Vec<usize> {
+        let mut at: Vec<usize> = self
+            .by_maker
+            .get(&level)
+            .map_or_else(Vec::new, |m| m.list.as_slice().to_vec());
+        note_work(at.len());
+        at.sort_unstable();
+        at.dedup();
+        at
+    }
+
+    /// The run at `level` was doomed: its directs are read again.
+    pub(crate) fn rearm_maker(&mut self, level: u32) {
+        for i in self.of_maker(level) {
+            if let Some(l) = self.at.get_mut(i) {
+                for d in l.as_mut_slice().iter_mut().filter(|d| d.maker == level) {
+                    d.taken = false;
+                }
+            }
+        }
+    }
+
+    /// The frame at `frame`, as `(node, generation, cidx)`, runs again:
+    /// its directs are read again.
+    pub(crate) fn rearm_frame(&mut self, (node, generation, cidx): (u32, u32, u32)) {
+        for d in self
+            .at_mut(cidx)
+            .iter_mut()
+            .filter(|d| d.of(node, generation))
+        {
+            d.taken = false;
+        }
+    }
+
+    /// The run at `level` ended: its directs go.
+    pub(crate) fn remove_maker(&mut self, level: u32) {
+        let at = self.of_maker(level);
+        self.by_maker.remove(&level);
+        for i in at {
+            self.remove_at(i, false, |d| d.maker == level);
+        }
+    }
+
+    /// The directs for reads by the frame at `frame` go.
+    pub(crate) fn remove_frame(&mut self, (node, generation, cidx): (u32, u32, u32)) {
+        if let Some(i) = self.position(cidx) {
+            self.remove_at(i, true, |d| d.of(node, generation));
+        }
+    }
+
+    /// The directs for reads by the frames of `node` at `generation`, at
+    /// any position, go.
+    pub(crate) fn remove_node(&mut self, node: u32, generation: u32) {
+        for i in self.node_positions((node, generation)) {
+            self.remove_at(i, true, |d| d.of(node, generation));
+        }
+    }
+
+    /// As [`Pending::frame_awaits`].
+    pub(crate) fn frame_awaits(&self, (node, generation, cidx): (u32, u32, u32)) -> bool {
+        (self.at(cidx).iter()).any(|d| !d.taken && d.of(node, generation))
+    }
+
+    /// As [`Pending::read_awaits`].
+    pub(crate) fn read_awaits(
+        &self,
+        (node, generation, cidx): (u32, u32, u32),
+        reading: u64,
+        ordinal: Option<u32>,
+        parts: Option<(u64, Option<u64>, u32)>,
+    ) -> bool {
+        self.at(cidx).iter().any(|d| {
+            !d.taken
+                && d.of(node, generation)
+                && d.reading == reading
+                && ordinal.is_none_or(|o| d.ordinal == o)
+                && parts.is_none_or(|p| (d.path, d.episode, d.seq) == p)
+        })
+    }
+}
+
+/// One of `k`'s entries went (see [`Made::shed`]).
+fn unmade<K: std::hash::Hash + Eq>(
+    index: &mut HashMap<K, Made, FxBuildHasher>,
+    k: K,
+    keep: impl FnMut(&usize) -> bool,
+) {
+    let MapEntry::Occupied(mut e) = index.entry(k) else {
+        debug_assert!(false, "a maker's live count went below zero");
+        return;
+    };
+    if e.get_mut().shed(keep) {
+        e.remove();
+    }
+}
+
 impl Delivery {
     /// An untaken, unblocked delivery of `what` for the read `key`.
     pub(crate) fn new(key: ReadKey, maker: u32, what: Delivered) -> Self {
@@ -1158,10 +1508,6 @@ pub(crate) enum Delivered {
     /// compute pops: a doomed entry is not pushed back, so a pending entry
     /// of its node on top is a repeat the walk still owes.
     Walk(Box<crate::runtime::Walk>, Option<u32>),
-    /// The read ran its node's compute, a virtual frame above the frame's,
-    /// which the retry runs again as that compute: a walk would first
-    /// visit deps the replay of that frame's run has left Failed or Dirty.
-    Direct,
 }
 
 pub(crate) struct Context {
@@ -1183,6 +1529,7 @@ pub(crate) struct Context {
     /// loop starts.
     pub(crate) running: Option<u32>,
     pub(crate) pending: Pending,
+    pub(crate) directs: Directs,
     pub(crate) running_entry: Option<Entry>,
     /// The running entry still fronts its level: the driver has neither
     /// popped nor truncated it.
@@ -1284,6 +1631,7 @@ impl Context {
             running_entry: None,
             running_fronts: false,
             pending: Pending::default(),
+            directs: Directs::new(boundary),
             spec_base: target.spec,
             claims: Vec::new(),
             episodes: Vec::new(),
@@ -1605,6 +1953,7 @@ impl Context {
             p.spend();
         }
         self.pending.take_keyed(&key);
+        self.directs.take_keyed(&key);
         self.pending.pass(i);
         let Delivered::Unwind {
             cycle,
@@ -1679,16 +2028,8 @@ impl Context {
     /// the delivery before the frame's retry reads it. A kept one keeps its
     /// `runs`: the retry that took it ran none of the read's walk.
     pub(crate) fn deliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
-        let key = ReadKey::blocked(below);
-        if self
-            .pending
-            .find_keyed(&key, |d| matches!(d.what, Delivered::Direct))
-            .is_none()
-        {
-            let mut d = Delivery::new(key, below.maker, Delivered::Direct);
-            d.runs = runs;
-            self.pending.push(d);
-        }
+        self.directs
+            .deliver(ReadKey::blocked(below), below.maker, runs);
     }
 
     /// As [`Self::deliver_direct`], for a frame whose compute ran in the
@@ -1699,20 +2040,7 @@ impl Context {
     pub(crate) fn redeliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
         let key = ReadKey::blocked(below);
         self.pending.remove_walks(&key);
-        match self
-            .pending
-            .find_keyed(&key, |d| matches!(d.what, Delivered::Direct))
-        {
-            Some(i) if self.pending.get(i).maker == below.maker => {
-                self.pending.get_mut(i).runs = runs;
-                self.pending.set_taken(i, false);
-            }
-            Some(i) => {
-                drop(self.pending.remove(i));
-                self.deliver_direct(below, runs);
-            }
-            None => self.deliver_direct(below, runs),
-        }
+        self.directs.redeliver(key, below.maker, runs);
     }
 
     /// The run of the frame at `frame` along `path` is over, and a later
@@ -1737,6 +2065,7 @@ impl Context {
     pub(crate) fn end_maker(&mut self, level: u32) -> Vec<Delivery> {
         self.claim_revs.end_maker(level);
         self.run_failures.end_maker(level);
+        self.directs.remove_maker(level);
         self.pending.extract_maker(level)
     }
 
@@ -3299,18 +3628,19 @@ pub(crate) fn take_pending(
 ) -> Option<Delivered> {
     with(|c| {
         c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
-            let at = x.pending.find_keyed(key, |d| {
-                !d.taken && !matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
-            })?;
+            let at = x
+                .pending
+                .find_keyed(key, |d| !d.taken && !matches!(d.what, Delivered::Walk(..)))?;
             // The read has its outcome, which ended the walk it was
             // blocked in, so a later read under the same key in this
             // run must not resume that walk or recompute its node.
             x.pending.take_keyed(key);
+            x.directs.take_keyed(key);
             Some(match &x.pending.get(at).what {
                 Delivered::Landed(value, poison) => {
                     Delivered::Landed(Unbuilt::new(clone(value.value())), *poison)
                 }
-                Delivered::Walk(..) | Delivered::Direct => {
+                Delivered::Walk(..) => {
                     unreachable!("incr-core: a walk's direction is not a value")
                 }
                 Delivered::Unwind { .. } => x.take_unwind(at),
@@ -3688,13 +4018,11 @@ pub(crate) fn end_run(rt: RuntimeId, frame: Frame, path: u64) {
                 };
                 for j in 0..x.pending.keyed(&key).len() {
                     let d = x.pending.get_mut(x.pending.keyed(&key)[j]);
-                    if !d.taken
-                        && d.runs.path == path
-                        && matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
-                    {
+                    if !d.taken && d.runs.path == path && matches!(d.what, Delivered::Walk(..)) {
                         d.runs.bump(node, generation);
                     }
                 }
+                x.directs.bump(&key, path, node, generation);
             }
         }
         if let Some(slot) = run_slot_mut(c, rt, cidx, path) {
@@ -3719,6 +4047,7 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
             for i in x.pending.of_maker(level) {
                 x.pending.set_taken(i, false);
             }
+            x.directs.rearm_maker(level);
             return Vec::new();
         }
         x.end_maker(level)
