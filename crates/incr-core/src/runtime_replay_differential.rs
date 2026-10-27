@@ -5427,13 +5427,13 @@ fn two_thread_waiter_revisits_a_release_published_at_its_reads_end() {
                                                     .load(SeqCst)
                                                     || t.elapsed() > patience
                                             });
-                                            // Op 3 stays parked on its claim of 1 until
-                                            // this is set.
-                                            if wait {
-                                                park.waits.store(park.claimed.load(SeqCst), SeqCst);
-                                            }
                                         }
-                                        Some(1) if p == ParkPoint::ComputeWaits(n1) => {
+                                        // Op 3 stays parked on its claim of 1 until
+                                        // op 4 waits on it, in the walk or the claim.
+                                        Some(1)
+                                            if p == ParkPoint::WalkWaits(n1)
+                                                || p == ParkPoint::ComputeWaits(n1) =>
+                                        {
                                             park.waits.store(true, SeqCst);
                                         }
                                         _ => {}

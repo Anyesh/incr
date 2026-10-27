@@ -194,6 +194,9 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
+    /// In `clean_walk`, after the walk found a node another thread is
+    /// computing and before it waits on the claim.
+    WalkWaits(NodeId),
     /// In red/green verification, after the dep scan found no change and
     /// before the landing CAS.
     VerifyAfterScan(NodeId),
@@ -4185,6 +4188,7 @@ impl<C: Cells> Runtime<C> {
                     // one of them may be a claim this thread holds, which
                     // only the expansion skips.
                     self.park(ParkPoint::BeforeComputeOne(cur));
+                    self.park(ParkPoint::WalkWaits(cur));
                     let mut spins = 0;
                     loop {
                         spins += 1;
