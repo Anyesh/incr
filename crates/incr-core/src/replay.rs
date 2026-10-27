@@ -2500,6 +2500,12 @@ pub(crate) fn take_spec_reads(
     })
 }
 
+/// How many frames' stash reads this thread still keeps.
+#[cfg(test)]
+pub(crate) fn spec_read_frames() -> usize {
+    SPEC_READS.with(|d| d.borrow().len())
+}
+
 /// A context named so that no context of another thread, now or later, has
 /// the same name: context ids count per thread.
 pub(crate) type ContextName = (u64, u64);
