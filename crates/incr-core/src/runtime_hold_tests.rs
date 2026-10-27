@@ -2856,3 +2856,68 @@ fn shared_flipped_held_failed_landing_drops_its_record() {
     assert_eq!(rt.failed_run_token(f.slot(), f.generation()), None);
     rt.assert_invariant_i();
 }
+
+/// `d` catches `f`'s panic, so its attempt holds `f`'s Failed landing, and
+/// then walks a long chain that verifies without a run. Another thread's
+/// read of `f` waits on the held landing the whole walk: the walk is the
+/// owner's engine progress, so the reader waits it out instead of taking
+/// the landing over and retrying `d`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_reader_of_a_held_landing_waits_out_its_owners_walk() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let x = rt.create_input(0_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        assert!(v % 2 == 1, "even");
+        v
+    });
+    let y = rt.create_input(0_i64);
+    let mut top = rt.create_query(move |rt| rt.get(y).min(0));
+    for _ in 0..100_000 {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below));
+        assert_eq!(rt.get(top), 0);
+    }
+    rt.set(y, 1);
+    let (holding, runs) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let walked = Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+    let d = {
+        let (holding, runs, walked) = (holding.clone(), runs.clone(), walked.clone());
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10);
+            holding.store(true, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            let w = rt.get(top);
+            *walked.lock().unwrap() = start.elapsed();
+            v + w
+        })
+    };
+    let reader = {
+        let (rt, holding) = (rt.clone(), holding.clone());
+        std::thread::spawn(move || {
+            while !holding.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err()
+        })
+    };
+    assert_eq!(rt.get(d), 7);
+    assert!(reader.join().unwrap(), "the reader of f got a value");
+    let walked = *walked.lock().unwrap();
+    // Well past the take-over's 10 ms STUCK_FOR, or the test shows nothing.
+    assert!(
+        walked >= std::time::Duration::from_millis(40),
+        "the walk took only {walked:?}"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the reader took the held landing over during the owner's walk"
+    );
+    assert_eq!(crate::hold::held_count(), 0);
+}
