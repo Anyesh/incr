@@ -468,6 +468,49 @@ fn a_walk_listing_reads_awake_from_another_thread_while_it_holds_every_op() {
     assert!(!elsewhere(1), "the read's end");
 }
 
+/// A waiter on an awake walk listing leaves its owner be, however long the
+/// owner stays in a peer's user code: the unbounded run holds the node in
+/// the owner's frame there, and a wait cycle through it is the registry's,
+/// which sees the listing among the owner's claims.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_waiter_on_an_awake_walk_listing_takes_no_owner_over() {
+    use crate::attempt::{begin, enter_hold, leave_hold, Outside, Patience};
+    use crate::reserve::{note_walk, take_over, user_code, Peers, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    begin();
+    let owner = enter_hold();
+    let read = Root::arm(true, root);
+    note_walk(n, 1, &Peers::new([5, 7]));
+    user_code((rt.runtime_id, 5));
+    let user = Outside::enter(true);
+    assert!(
+        crate::reserve::held().contains(&n),
+        "the registry sees the listing"
+    );
+    let took = thread::spawn(move || {
+        let mut patience = Patience::default();
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            if take_over(n, 1, &mut patience) {
+                return true;
+            }
+            thread::yield_now();
+        }
+        false
+    })
+    .join()
+    .unwrap();
+    assert!(!took, "a waiter took over an owner in a peer's user code");
+    assert!(!owner.wounded());
+    drop(user);
+    user_code(outside(&rt));
+    assert!(!reserved_elsewhere(n));
+    drop(read);
+    assert!(leave_hold());
+}
+
 /// A context that also reserves the node and ends before the walk's
 /// thread runs user code leaves the walk listing awake.
 #[test]
