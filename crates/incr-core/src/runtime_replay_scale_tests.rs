@@ -185,7 +185,7 @@ cycle_100k_tests! {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_fallback_cycle_100k_read_from_two_threads() {
-    let n = 100_000;
+    let n = scaled(100_000);
     let rt = Runtime::<Shared>::new();
     rt.set_placeholder(0_i64);
     rt.set_max_frames(256);
