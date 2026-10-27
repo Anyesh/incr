@@ -827,6 +827,10 @@ struct EntryState {
     /// The held map has entries: a check of a thread that holds nothing
     /// reads this block and not the map, whose access tests liveness.
     held_any: Cell<bool>,
+    /// Times a cycle unwind left flight in the outermost entry's attempt
+    /// and was not put back by [`restore_unwind_kind`]: something caught it.
+    /// Nonzero only with `outer_set`.
+    cycle_takes: Cell<u32>,
     /// The address of a local of the outermost entry, from which a read
     /// measures the stack it has used against a byte budget.
     stack_base: Cell<usize>,
@@ -873,6 +877,7 @@ thread_local! {
             failures: Cell::new(0),
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
+            cycle_takes: Cell::new(0),
             stack_base: Cell::new(0),
             budget_clock: Cell::new(0),
             failed_here: Cell::new(0),
@@ -907,6 +912,7 @@ loom::thread_local! {
         failures: Cell::new(0),
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
+        cycle_takes: Cell::new(0),
         stack_base: Cell::new(0),
         budget_clock: Cell::new(0),
         failed_here: Cell::new(0),
@@ -1013,6 +1019,12 @@ pub(crate) fn unwind_kind() -> Option<UnwindKind> {
 pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
     let was = unwind_kind();
     value_code::set_unwind_bits(UnwindKind::bits(kind));
+    if was == Some(UnwindKind::Cycle) && kind != was {
+        ENTRY.with(|e| {
+            e.cycle_takes.set(e.cycle_takes.get().saturating_add(1));
+            e.outer_set.set(true);
+        });
+    }
     if flight_kept() {
         return;
     }
@@ -1023,6 +1035,20 @@ pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
         crate::reserve::mark_taken();
         set_wounded(true);
     }
+}
+
+/// [`set_unwind_kind`] for a frame passing on the kind it took from an
+/// unwind it does not stop.
+pub(crate) fn restore_unwind_kind(kind: Option<UnwindKind>) {
+    if kind == Some(UnwindKind::Cycle) && unwind_kind() != kind {
+        ENTRY.with(|e| e.cycle_takes.set(e.cycle_takes.get().saturating_sub(1)));
+    }
+    set_unwind_kind(kind);
+}
+
+/// Whether no cycle unwind was caught in the attempt so far.
+pub(crate) fn cycle_untaken() -> bool {
+    ENTRY.with(|e| e.cycle_takes.get() == 0)
 }
 
 /// Where the engine catches a discard: if a waiter wounded the attempt
@@ -1672,6 +1698,7 @@ fn outer_open(rt: u64) -> bool {
 #[inline(always)]
 pub(crate) fn reset_outermost() {
     if ENTRY.with(|e| e.outer_set.replace(false)) {
+        ENTRY.with(|e| e.cycle_takes.set(0));
         OUTER.with(|o| {
             let mut o = o.borrow_mut();
             o.dissolved.clear();

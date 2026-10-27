@@ -454,7 +454,12 @@ impl<C: Cells> Runtime<C> {
         // unless a waiter took one of them over first.
         if outermost && !C::SINGLE_THREADED && hold::active() {
             self.park(ParkPoint::VerdictCheck);
-            if self.verdict_superseded() {
+            // A cycle nothing caught is the attempt's own verdict, and it
+            // read nothing after it: its read comes first in the order.
+            let own_verdict = cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
+                && payload.is::<CycleUnwind>()
+                && cycle_state::cycle_untaken();
+            if !own_verdict && self.verdict_superseded() {
                 self.rerun_superseded(payload);
                 return None;
             }
@@ -2919,7 +2924,7 @@ impl<C: Cells> Runtime<C> {
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
         self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
-        cycle_state::set_unwind_kind(kind);
+        cycle_state::restore_unwind_kind(kind);
         bag.drain_carried(payload)
     }
 
