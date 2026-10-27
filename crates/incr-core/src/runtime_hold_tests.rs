@@ -1219,6 +1219,131 @@ fn shared_holder_joining_a_reader_of_its_held_panic_landing_finishes() {
     assert_eq!(rt.get(d), 10);
 }
 
+/// `x` and `w` read each other with `try_get`, and `w` panics after its
+/// read, so a read of either lands the ring Failed.
+fn failed_ring(rt: &Runtime<Shared>) -> (Incr<i64>, Incr<i64>) {
+    let i = rt.create_input(3_i64);
+    let xc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let w = {
+        let xc = xc.clone();
+        rt.create_query(move |rt| {
+            let v = rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1);
+            assert!(v < 0, "w fails");
+            v
+        })
+    };
+    let x = rt.create_query(move |rt| rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000));
+    xc.set(x).unwrap();
+    (x, w)
+}
+
+/// A `try_get` of `w`: 9 on a cycle, 8 if it panics.
+fn read_failed_ring_member(rt: &Runtime<Shared>, w: Incr<i64>) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| rt.try_get(w).unwrap_or(9))).unwrap_or(8)
+}
+
+/// `t` catches its read of `x` of a [`failed_ring`], so its attempt holds
+/// both Failed landings, and starts a thread that reads `w`. `t`'s first
+/// publication is wounded at its start, as a waiter's hand-over wounds an
+/// owner descheduled there, and waits until the reader has taken `w`
+/// over. Returns `t`'s and the reader's values, and how many landings the
+/// wounded attempt published.
+fn failed_ring_hand_over_at_publication() -> ((i64, i64), usize) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let (x, w) = failed_ring(&rt);
+    let reader: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<i64>>>> = Arc::default();
+    let t = {
+        let (weak, reader) = (Arc::downgrade(&rt), reader.clone());
+        rt.create_query(move |rt| {
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            let mut slot = reader.lock().unwrap();
+            if slot.is_none() {
+                let other = weak.upgrade().unwrap();
+                *slot = Some(std::thread::spawn(move || {
+                    read_failed_ring_member(&other, w)
+                }));
+            }
+            v
+        })
+    };
+    let owner = std::thread::current().id();
+    let claim = (rt.runtime_id, w.slot());
+    let first = Arc::new(AtomicBool::new(true));
+    let wounded = Arc::new(AtomicBool::new(false));
+    let published = Arc::new(AtomicUsize::new(0));
+    let hook: super::ParkHook = {
+        let (first, wounded, published) = (first.clone(), wounded.clone(), published.clone());
+        Box::new(move |point| {
+            if std::thread::current().id() != owner {
+                return;
+            }
+            match point {
+                ParkPoint::BeforeHeldPublish if first.swap(false, Ordering::SeqCst) => {
+                    let held = crate::hold::held_count();
+                    let attempt = crate::attempt::mine();
+                    std::thread::scope(|s| {
+                        s.spawn(|| assert!(attempt.wound_in_flight(claim)));
+                    });
+                    let start = std::time::Instant::now();
+                    while crate::hold::held_count() == held {
+                        assert!(
+                            start.elapsed() < std::time::Duration::from_secs(30),
+                            "the reader never took w over"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    wounded.store(true, Ordering::SeqCst);
+                }
+                ParkPoint::BeforeHeldPublish => wounded.store(false, Ordering::SeqCst),
+                ParkPoint::HeldPublished(_) if wounded.load(Ordering::SeqCst) => {
+                    published.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let got_t = rt.get(t);
+    let handle = reader.lock().unwrap().take().unwrap();
+    let got_w = handle.join().unwrap();
+    assert!(!first.load(Ordering::SeqCst), "t published no held landing");
+    rt.assert_invariant_i();
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(crate::waits::registered_on(rt.runtime_id), 0);
+    ((got_t, got_w), published.load(Ordering::SeqCst))
+}
+
+/// A reader takes over a Failed landing of a ring whose holder stands at
+/// its publication, wounding the attempt there: the wounded attempt
+/// publishes none of its landings, and both reads give a serial order's
+/// values. The loom models `hand_over_races_a_failed_publication_*` reach
+/// this race at bound 2, which CI cannot finish, and run at bound 1.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wounded_publication_of_a_failed_ring_publishes_nothing() {
+    let orders = [true, false].map(|t_first| {
+        let rt = Runtime::<Shared>::new();
+        let (x, w) = failed_ring(&rt);
+        let t =
+            rt.create_query(move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0));
+        if t_first {
+            let v = rt.get(t);
+            (v, read_failed_ring_member(&rt, w))
+        } else {
+            let r = read_failed_ring_member(&rt, w);
+            (rt.get(t), r)
+        }
+    });
+    let (got, published) = failed_ring_hand_over_at_publication();
+    assert_eq!(published, 0, "the wounded attempt published its landings");
+    assert!(
+        orders.contains(&got),
+        "t {}, reader {}: no serial order's, {orders:?}",
+        got.0,
+        got.1
+    );
+}
+
 /// `d` catches `f`'s panic, so its attempt holds `f`'s Failed landing, and
 /// then reads `g`, which another thread claimed first and whose run reads
 /// `f`: each thread waits on the other, through a claim and a held
