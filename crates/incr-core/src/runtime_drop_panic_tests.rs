@@ -512,6 +512,7 @@ fn shared_stale_path_drain_panic_under_a_swallowing_parent_lands_dirty() {
                 let rt = Arc::clone(&rt);
                 let z_gate = z_gate.clone();
                 thread::spawn(move || {
+                    let _released = z_gate.released_on_unwind();
                     z_gate.wait_parked();
                     rt.delete_node(z);
                     z_gate.release();
@@ -618,6 +619,7 @@ fn shared_gone_exit_after_a_recycle_drops_its_bag_item_once() {
                 let rt = Arc::clone(&rt);
                 let (z_gate, claim_gate) = (z_gate.clone(), claim_gate.clone());
                 thread::spawn(move || {
+                    let _released = (z_gate.released_on_unwind(), claim_gate.released_on_unwind());
                     z_gate.wait_parked();
                     rt.delete_node(z);
                     z_gate.release();

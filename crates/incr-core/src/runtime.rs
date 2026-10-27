@@ -348,6 +348,20 @@ pub(crate) fn park_timed_out(test: Option<&str>) -> ! {
     std::process::abort()
 }
 
+/// Runs its closure if dropped by a panic: a test that parks a thread
+/// releases it this way when it fails, before a scope joins the thread.
+#[cfg(test)]
+pub(crate) struct OnUnwind<F: FnMut()>(pub(crate) F);
+
+#[cfg(test)]
+impl<F: FnMut()> Drop for OnUnwind<F> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            (self.0)();
+        }
+    }
+}
+
 /// What [`Runtime::delete_erased`] did with a node.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DeleteOutcome {

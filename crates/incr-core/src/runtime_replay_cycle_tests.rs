@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
 use super::cycle_impl::EpisodeSeen;
-use super::race_tests::{id, Gate};
+use super::race_tests::{id, release_parked_on_unwind, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
@@ -1412,6 +1412,7 @@ fn reserved_vframe_handed_memo(grouped: bool) {
                     assert!(installed.is_ok(), "park hook installed twice");
                     doomed_read.arm();
                     let (root, f) = std::thread::scope(|s| {
+                        let _released = release_parked_on_unwind();
                         let reader = s.spawn(|| get(&rt, g.g));
                         doomed_read.wait_parked();
                         assert_ne!(rt.state_of(g.f), NodeState::Clean, "frames {frames:?}");
