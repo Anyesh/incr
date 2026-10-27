@@ -1670,6 +1670,9 @@ impl<C: Cells> Runtime<C> {
             let arena_inner = arena;
             let compute: ComputeFn<C> = Box::new(
                 move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
+                    if !C::SINGLE_THREADED {
+                        reserve::user_code((rt.runtime_id, slot));
+                    }
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
                     let outcome = match ctl.flags.get()
@@ -5626,8 +5629,9 @@ impl<C: Cells> Runtime<C> {
         self.land_as(id, node, target, flagged, false)
     }
 
-    /// Ends this thread's context reservation of `id` if its run `landed`
-    /// settled, as the unbounded run's frame releases its claim there. A
+    /// Ends this thread's context reservation and walk listing of `id` if
+    /// its run `landed` settled, as the unbounded run's frame releases its
+    /// claim there. A
     /// Dirty replay landing or a Dirty read ends it through
     /// [`Self::end_unowed_reservation`] unless this thread runs the node
     /// again; any other unsettled landing keeps it until a later run lands
@@ -5635,18 +5639,22 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn end_reservation_landed(&self, id: NodeId, node: &NodeData<C>, landed: NodeState) {
         if landed.is_settled() {
             self.end_reservation(id, node);
+            if !C::SINGLE_THREADED && reserve::any() && !replay::speculative() {
+                reserve::end_walk_landed((self.runtime_id, id.0), node.generation());
+            }
         }
     }
 
-    /// Keeps `id`, which a user panic's unwind just landed New or Dirty, for
-    /// this thread's read ([`reserve::note_walk`]): a walk that contains the
-    /// panic runs it again after the context holding it has ended.
-    pub(super) fn note_unwound_landing(&self, id: NodeId, node: &NodeData<C>) {
+    /// Keeps `id`, which a user panic's unwind just landed New or Dirty with
+    /// `peers`, for this thread's read ([`reserve::note_walk`]): a walk that
+    /// contains the panic runs it again after the context holding it has
+    /// ended.
+    pub(super) fn note_unwound_landing(&self, id: NodeId, node: &NodeData<C>, peers: &[u32]) {
         if !C::SINGLE_THREADED
             && self.budgeted()
             && matches!(node.state(), NodeState::New | NodeState::Dirty)
         {
-            reserve::note_walk((self.runtime_id, id.0), node.generation());
+            reserve::note_walk((self.runtime_id, id.0), node.generation(), peers);
         }
     }
 

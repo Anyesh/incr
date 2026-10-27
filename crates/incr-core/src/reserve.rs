@@ -158,6 +158,9 @@ thread_local! {
     /// [`SEQ`] as this thread's current op left the Clean fast path; 0
     /// before its first.
     static OP: Cell<u64> = const { Cell::new(0) };
+    /// Walk listings awake until this thread next enters user code.
+    static WOKEN: RefCell<Vec<Woken>> = const { RefCell::new(Vec::new()) };
+    static ANY_WOKEN: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(loom)]
@@ -167,6 +170,8 @@ loom::thread_local! {
     static ROOT: Cell<u64> = Cell::new(0);
     static ROOTS: Cell<u32> = Cell::new(0);
     static OP: Cell<u64> = Cell::new(0);
+    static WOKEN: RefCell<Vec<Woken>> = RefCell::new(Vec::new());
+    static ANY_WOKEN: Cell<bool> = Cell::new(false);
 }
 
 /// The context of a doom's reservations until the doom has marked one.
@@ -315,15 +320,20 @@ pub(crate) fn note_root(claim: Claim, generation: u32) {
 }
 
 /// Reserves `claim`, which a user panic's unwind inside this thread's
-/// innermost read just landed New or Dirty, until that read ends, at rest
-/// from now. A walk entry's contained unwind lands claims its walk runs
-/// again outside any doom's scope, and the context whose end follows the
-/// containment no longer holds them. Ops begun before wait, as the
-/// unbounded run's claim would make them; later ones, which the read's own
-/// retry may spawn and join, pass. The read's own node is [`note_root`]'s.
+/// innermost read just landed New or Dirty, until the read lands it
+/// settled or ends. A walk entry's contained unwind lands claims its walk
+/// runs again outside any doom's scope, and the context whose end follows
+/// the containment no longer holds them. The listing holds every op while
+/// the unbounded run would still hold the node in its frame: through
+/// engine code and the closures of `peers`, the slots the unwind
+/// released with it, whose frames sit in the same episode. It ends where
+/// this thread next enters another closure ([`user_code`]) or any cycle
+/// callback ([`callback_code`]), where the unbounded run holds no frame of
+/// it, so a reader that code joins, begun before or after, passes. A reservation of the node this thread already
+/// held goes back to its stamp. The read's own node is [`note_root`]'s.
 #[cold]
 #[inline(never)]
-pub(crate) fn note_walk(claim: Claim, generation: u32) {
+pub(crate) fn note_walk(claim: Claim, generation: u32, peers: &[u32]) {
     let key = ROOT.with(Cell::get);
     if key == 0 || key == root_key(claim) {
         return;
@@ -334,17 +344,17 @@ pub(crate) fn note_walk(claim: Claim, generation: u32) {
     }
     let listed = MINE.with(|m| {
         let token = m.token();
+        let mut was = AWAKE;
         {
             let mut t = table();
-            match t.get(&claim) {
+            match t.get_mut(&claim) {
                 // Another thread's reservation stands for the node; at
                 // rest it holds fewer ops than this listing would, the known
                 // later-op gap.
-                Some(&(g, owner, _)) if g == generation && owner != token => return false,
-                Some(&(g, _, _)) if g == generation => {}
+                Some(e) if e.0 == generation && e.1 != token => return None,
+                Some(e) if e.0 == generation => was = std::mem::replace(&mut e.2, AWAKE),
                 _ => {
-                    let stamp = SEQ.fetch_add(1, Ordering::SeqCst);
-                    if t.insert(claim, (generation, token, stamp)).is_none() {
+                    if t.insert(claim, (generation, token, AWAKE)).is_none() {
                         #[cfg(not(loom))]
                         bucket(claim).fetch_add(1, Ordering::Relaxed);
                     }
@@ -360,10 +370,127 @@ pub(crate) fn note_walk(claim: Claim, generation: u32) {
                 claims: Claims::one((claim, generation)),
             }),
         }
-        true
+        Some(was)
     });
-    if listed {
+    if let Some(was) = listed {
         ROOTS.with(|n| n.set(n.get() + 1));
+        WOKEN.with(|w| {
+            w.borrow_mut().push(Woken {
+                claim: (claim, generation),
+                was,
+                peers: peers.to_vec(),
+            })
+        });
+        ANY_WOKEN.with(|a| a.set(true));
+        #[cfg(all(test, not(loom)))]
+        WALK_LISTINGS.with(|n| n.set(n.get() + 1));
+    }
+}
+
+/// A walk listing awake until its thread next enters user code outside
+/// `peers`, the stamp this thread's reservation of the node had before the
+/// listing woke it ([`AWAKE`] for none), and the slots whose user code
+/// keeps it awake.
+struct Woken {
+    claim: (Claim, u32),
+    was: u64,
+    peers: Vec<u32>,
+}
+
+/// This thread is about to run the user code of `entering`: its walk
+/// listings end here unless `entering` is one of their peers.
+#[inline(always)]
+pub(crate) fn user_code(entering: Claim) {
+    if ANY_WOKEN.with(Cell::get) {
+        end_woken(|(rt, slot)| (rt, slot) == entering);
+    }
+}
+
+/// This thread is about to run a cycle callback: its walk listings end
+/// here, peers' callbacks too, since the callback may join a thread that
+/// reads a listed node while the unbounded run holds no frame of it.
+#[inline(always)]
+pub(crate) fn callback_code() {
+    if ANY_WOKEN.with(Cell::get) {
+        end_woken(|_| false);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn end_woken(keeps: impl Fn(Claim) -> bool) {
+    let woken = WOKEN.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    let (kept, ended): (Vec<_>, Vec<_>) = woken
+        .into_iter()
+        .partition(|w| w.peers.iter().any(|&peer| keeps((w.claim.0 .0, peer))));
+    ANY_WOKEN.with(|a| a.set(!kept.is_empty()));
+    WOKEN.with(|w| *w.borrow_mut() = kept);
+    for w in ended {
+        end_walk(w);
+    }
+}
+
+/// Ends this thread's walk listing of `claim`, which its run just landed
+/// settled, as the unbounded run's frame releases its claim there.
+#[cold]
+#[inline(never)]
+pub(crate) fn end_walk_landed(claim: Claim, generation: u32) {
+    if ROOTS.with(Cell::get) == 0 {
+        return;
+    }
+    let claim = (claim, generation);
+    let woken = WOKEN.with(|w| {
+        let mut w = w.borrow_mut();
+        let at = w.iter().position(|w| w.claim == claim);
+        let woken = at.map(|at| w.swap_remove(at));
+        ANY_WOKEN.with(|a| a.set(!w.is_empty()));
+        woken
+    });
+    end_walk(woken.unwrap_or(Woken {
+        claim,
+        was: AWAKE,
+        peers: Vec::new(),
+    }));
+}
+
+/// Takes `claim` out of this thread's walk groups and ends its listing,
+/// leaving a reservation another group of the thread still holds at the
+/// stamp it had before the listing woke it.
+fn end_walk(Woken { claim, was, .. }: Woken) {
+    let ended = MINE.try_with(|m| {
+        let mut groups = m.0.borrow_mut();
+        let mut found = 0;
+        for g in groups
+            .iter_mut()
+            .filter(|g| g.context & WALK != 0 && g.context != ROOT_READ)
+        {
+            if g.claims.remove(&claim) {
+                found += 1;
+            }
+        }
+        groups.retain(|g| g.context & WALK == 0 || g.context == ROOT_READ || !g.claims.is_empty());
+        (found != 0).then(|| (found, m.token()))
+    });
+    if let Ok(Some((found, token))) = ended {
+        ROOTS.with(|n| n.set(n.get() - found));
+        unlist([claim], token, true);
+        restamp([(claim, was)], token);
+    }
+}
+
+/// Puts back the stamp each of this thread's reservations had before a
+/// walk listing woke it, where another group still holds it awake.
+fn restamp(woken: impl IntoIterator<Item = ((Claim, u32), u64)>, token: usize) {
+    let mut t = table();
+    for ((claim, generation), was) in woken {
+        if was == AWAKE {
+            continue;
+        }
+        if let Some(e) = t.get_mut(&claim) {
+            if (e.0, e.1) == (generation, token) && e.2 == AWAKE {
+                e.2 = was;
+            }
+        }
     }
 }
 
@@ -399,7 +526,20 @@ fn end_root(key: u64) {
         .ok()
         .flatten();
     if let Some((ended, token)) = gone {
+        let mut woken = Vec::new();
+        let _ = WOKEN.try_with(|w| {
+            let mut w = w.borrow_mut();
+            w.retain(|w| {
+                let keep = !ended.contains(&w.claim);
+                if !keep {
+                    woken.push((w.claim, w.was));
+                }
+                keep
+            });
+            let _ = ANY_WOKEN.try_with(|a| a.set(!w.is_empty()));
+        });
         unlist(ended, token, true);
+        restamp(woken, token);
     }
 }
 
@@ -493,10 +633,28 @@ pub(crate) fn rest(claim: Claim, generation: u32) {
     if root {
         return;
     }
-    if let Some(e) = table().get_mut(&claim) {
-        if (e.0, e.1) == (generation, token) && e.2 == AWAKE {
-            e.2 = SEQ.fetch_add(1, Ordering::SeqCst);
-        }
+    let mut t = table();
+    let Some(e) = t.get_mut(&claim) else {
+        return;
+    };
+    if (e.0, e.1) != (generation, token) || e.2 != AWAKE {
+        return;
+    }
+    // An awake walk listing keeps the node awake; the rest takes effect
+    // where the listing ends.
+    let listed = WOKEN.try_with(|w| {
+        w.borrow_mut()
+            .iter_mut()
+            .find(|w| w.claim == (claim, generation))
+            .map(|w| {
+                if w.was == AWAKE {
+                    w.was = SEQ.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .is_some()
+    });
+    if !matches!(listed, Ok(true)) {
+        e.2 = SEQ.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -512,30 +670,13 @@ fn unlist(claims: impl IntoIterator<Item = (Claim, u32)>, token: usize, shared: 
         if (e.0, e.1) != (generation, token) {
             continue;
         }
-        match shared.then(|| still_listed_by(claim, generation)).flatten() {
-            // Only a walk group keeps it: at rest from here, as listed.
-            Some(Lister::Walk) => {
-                if e.2 == AWAKE {
-                    e.2 = SEQ.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            Some(Lister::Other) => {}
-            None => {
-                t.remove(&claim);
-                #[cfg(not(loom))]
-                bucket(claim).fetch_sub(1, Ordering::Relaxed);
-            }
+        if !(shared && still_listed(claim, generation)) {
+            t.remove(&claim);
+            #[cfg(not(loom))]
+            bucket(claim).fetch_sub(1, Ordering::Relaxed);
         }
     }
     LIVE.store(t.len(), Ordering::Relaxed);
-}
-
-/// Which of this thread's groups still list a claim.
-enum Lister {
-    /// Walk groups only.
-    Walk,
-    /// A context or the read-root group.
-    Other,
 }
 
 /// Whether this thread's read-root group may list anything; true once
@@ -544,25 +685,16 @@ fn roots_listed() -> bool {
     ROOTS.try_with(Cell::get).ok().is_none_or(|n| n != 0)
 }
 
-/// Which groups of this thread still list `claim`, as a read of its own
-/// node or its walk and a context can both. None once the thread's
-/// reservations are being destroyed.
-fn still_listed_by(claim: Claim, generation: u32) -> Option<Lister> {
+/// Whether another group of this thread still lists `claim`, as a read
+/// of its own node or its walk and a context can both. False once the
+/// thread's reservations are being destroyed.
+fn still_listed(claim: Claim, generation: u32) -> bool {
     MINE.try_with(|m| {
-        let groups = m.0.borrow();
-        let mut by = groups
+        m.0.borrow()
             .iter()
-            .filter(|g| g.claims.contains(&(claim, generation)));
-        let first = by.next()?;
-        let walk = |c: u64| c & WALK != 0 && c != ROOT_READ;
-        Some(if walk(first.context) && by.all(|g| walk(g.context)) {
-            Lister::Walk
-        } else {
-            Lister::Other
-        })
+            .any(|g| g.claims.contains(&(claim, generation)))
     })
-    .ok()
-    .flatten()
+    .unwrap_or(false)
 }
 
 /// Whether a context of this thread reserves `claim` at `generation`.
@@ -614,12 +746,27 @@ pub(crate) fn adopt(context: u64) {
 #[cfg(all(test, not(loom)))]
 thread_local! {
     static CONTEXT_ENDS: Cell<u32> = const { Cell::new(0) };
+    static WALK_LISTINGS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Walk listings this thread made, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn walk_listings() -> u32 {
+    WALK_LISTINGS.with(Cell::get)
 }
 
 /// Reservations this thread's context removals ended, for tests.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn context_ends() -> u32 {
     CONTEXT_ENDS.with(Cell::get)
+}
+
+/// Whether this thread holds `claim` awake, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn mine_awake(claim: Claim) -> bool {
+    let token = MINE.with(Listed::token);
+    any()
+        && matches!(table().get(&claim), Some(&(_, owner, stamp)) if owner == token && stamp == AWAKE)
 }
 
 /// Ends the reservations of `context`, which is being removed.

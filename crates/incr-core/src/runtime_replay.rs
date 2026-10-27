@@ -4474,7 +4474,9 @@ impl<C: Cells> Runtime<C> {
         };
         self.count_release();
         let (e, spec_buf) = e.into_look(Look::here());
-        self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
+        let mut peers =
+            self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
+        peers.push(slot);
         let id = NodeId(slot);
         let stamp_rev = self.current_revision();
         if discarding {
@@ -4499,7 +4501,7 @@ impl<C: Cells> Runtime<C> {
                 false,
                 bag,
             );
-            self.note_unwound_landing(id, node);
+            self.note_unwound_landing(id, node, &peers);
             self.end_reservation(id, node);
         }
         if let Some(spec_buf) = spec_buf {

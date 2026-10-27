@@ -649,6 +649,9 @@ impl<C: Cells> Runtime<C> {
                 self.0.dep_stack.pop_frame();
             }
         }
+        if !C::SINGLE_THREADED {
+            reserve::callback_code();
+        }
         let ctl = ComputeCtl::new(0);
         self.dep_stack
             .push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &ctl, u32::MAX);
@@ -1950,13 +1953,13 @@ impl<C: Cells> Runtime<C> {
         discarding: bool,
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> Vec<u32> {
         let mut keep = Vec::new();
         if kind == Some(UnwindKind::Discard) {
             self.virtually_owned(cidx, &mut keep);
         }
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, kind, subtree, &keep, payload, bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &keep, payload, bag)
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
@@ -1975,7 +1978,7 @@ impl<C: Cells> Runtime<C> {
         keep: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> Vec<u32> {
         // The unwinding frame, of node `subtree`, owns the claims owned at
         // its position by it, and those owned above.
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
@@ -2008,7 +2011,7 @@ impl<C: Cells> Runtime<C> {
                 .collect()
         });
         if entries.is_empty() {
-            return;
+            return Vec::new();
         }
         self.count_release();
         entries.sort_unstable_by_key(|(slot, _)| *slot);
@@ -2049,7 +2052,7 @@ impl<C: Cells> Runtime<C> {
             }
             // A cycle's retry may run a member again; a user panic ends its run.
             if !discarding && kind.is_none() {
-                self.note_unwound_landing(id, self.nodes.get(slot));
+                self.note_unwound_landing(id, self.nodes.get(slot), &released);
                 self.end_reservation(id, self.nodes.get(slot));
             }
             // A discarded claim's run is one the unbounded run never makes,
@@ -2069,6 +2072,7 @@ impl<C: Cells> Runtime<C> {
         if kind.is_none() {
             self.end_released_runs(&released);
         }
+        released
     }
 
     /// The discard landing of a claim this thread holds: the node lands as

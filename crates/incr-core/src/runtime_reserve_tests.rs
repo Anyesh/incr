@@ -352,6 +352,171 @@ fn a_rested_reservation_holds_only_ops_begun_before_its_first_rest() {
     end_contexts();
 }
 
+/// A claim no walk listing in these tests names as a peer.
+fn outside(rt: &Rt) -> crate::waits::Claim {
+    (rt.runtime_id, 9)
+}
+
+/// A walk listing holds every op until its thread next enters user code
+/// outside its peers, as the unbounded run holds the node while it runs
+/// only engine code; there it ends, so a reader that code joins passes
+/// whenever it began.
+#[test]
+fn a_walk_listing_ends_at_its_threads_next_entry_into_user_code() {
+    use crate::reserve::{note_walk, user_code, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    note_walk(n, 1, &[]);
+    assert!(
+        checked(begun_op(n)),
+        "an op begun after the listing passed before any user code"
+    );
+    let before = begun_op(n);
+    user_code(outside(&rt));
+    let after = begun_op(n);
+    assert!(!checked(before), "an op begun before user code waited");
+    assert!(!checked(after), "an op begun in user code waited");
+    assert!(!reserved_elsewhere(n));
+    drop(read);
+}
+
+/// A walk listing stays awake through the user code of a peer the unwind
+/// released with it, whose frame the unbounded run still holds the node
+/// under, and ends at the next entry of other user code.
+#[test]
+fn a_walk_listing_stays_awake_through_its_peers_user_code() {
+    use crate::reserve::{note_walk, user_code, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    note_walk(n, 1, &[5, 7]);
+    user_code((rt.runtime_id, 5));
+    assert!(checked(begun_op(n)), "a peer's user code ended the listing");
+    user_code(outside(&rt));
+    assert!(!checked(begun_op(n)), "other user code left the listing");
+    drop(read);
+}
+
+/// A walk listing ends where its thread enters a cycle callback, a peer's
+/// or not: the callback may join a thread that reads the node, which the
+/// unbounded run, holding no frame of it there, lets pass.
+#[test]
+fn a_walk_listing_ends_at_its_threads_next_cycle_callback() {
+    use crate::reserve::{note_walk, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    note_walk(n, 1, &[7]);
+    let before = begun_op(n);
+    rt.callback(|| ());
+    assert!(!checked(before), "the callback left the listing");
+    assert!(!reserved_elsewhere(n));
+    drop(read);
+}
+
+/// A walk listing ends where its node lands settled, so an op begun before
+/// waits no longer than the unbounded run's claim.
+#[test]
+fn a_walk_listing_ends_at_its_nodes_settled_landing() {
+    use crate::reserve::{end_walk_landed, note_walk, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    note_walk(n, 1, &[]);
+    let before = begun_op(n);
+    end_walk_landed(n, 1);
+    assert!(!checked(before), "the settled landing left the listing");
+    assert!(!reserved_elsewhere(n));
+    drop(read);
+}
+
+/// A context that also reserves the node and ends before the walk's
+/// thread runs user code leaves the walk listing awake.
+#[test]
+fn a_context_ending_before_user_code_leaves_its_walk_listing_awake() {
+    use crate::reserve::{end_contexts, note, note_walk, user_code, Root, Scope};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    {
+        let _scope = Scope::new(Some(5));
+        note(n, 1);
+    }
+    note_walk(n, 1, &[]);
+    end_contexts();
+    assert!(
+        checked(begun_op(n)),
+        "the context's end rested the walk listing"
+    );
+    user_code(outside(&rt));
+    assert!(
+        !checked(begun_op(n)),
+        "the listing stayed awake past user code"
+    );
+    drop(read);
+    assert!(!reserved_elsewhere(n));
+}
+
+/// A walk listing that wakes this thread's rested reservation of the node
+/// holds every op until the thread next enters user code, then leaves the
+/// reservation at its earlier stamp: an op begun after that rest, which
+/// the thread may join, passes again, and one begun before still waits.
+#[test]
+fn a_walk_listing_over_a_rested_reservation_leaves_its_stamp() {
+    use crate::reserve::{end_contexts, note, note_walk, rest, user_code, Root, Scope};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    {
+        let _scope = Scope::new(Some(5));
+        note(n, 1);
+    }
+    let before = begun_op(n);
+    rest(n, 1);
+    let between = begun_op(n);
+    note_walk(n, 1, &[]);
+    assert!(
+        checked(begun_op(n)),
+        "an op begun after the listing passed before any user code"
+    );
+    user_code(outside(&rt));
+    assert!(!checked(between), "the listing's end restamped the node");
+    assert!(
+        checked(before),
+        "the listing's end dropped the context's hold"
+    );
+    end_contexts();
+    drop(read);
+    assert!(!reserved_elsewhere(n));
+}
+
+/// A context's rest of a node an awake walk listing also holds takes
+/// effect where the listing ends, not before.
+#[test]
+fn a_rest_under_an_awake_walk_listing_waits_for_its_end() {
+    use crate::reserve::{end_contexts, note, note_walk, rest, user_code, Root, Scope};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    let scope = Scope::new(Some(5));
+    note(n, 1);
+    note_walk(n, 1, &[]);
+    let before = begun_op(n);
+    rest(n, 1);
+    assert!(
+        checked(begun_op(n)),
+        "the rest ended the awake listing's hold"
+    );
+    user_code(outside(&rt));
+    assert!(checked(before), "an op begun before the rest passed");
+    assert!(!checked(begun_op(n)), "an op begun after the rest waited");
+    drop(scope);
+    end_contexts();
+    drop(read);
+    assert!(!reserved_elsewhere(n));
+}
+
 /// Reserving a rested node again wakes its reservation for every op.
 #[test]
 fn reserving_a_rested_node_again_holds_ops_begun_after_the_rest() {
