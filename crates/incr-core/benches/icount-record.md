@@ -2363,8 +2363,26 @@ moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
 - `Walk::visit_pending` first compiled as an outlined call, about 13 per
   walked node under both cells (`chain_local/propagate/10` +130 of +140)
   and over the 1 % bar on `shared_incremental`; `285b26d31` inlines it.
-- Local pays nothing: the checks are compiled out, `chain_local` is 82
-  per op below base, from layout.
+- Local runs no new code: the checks are compiled out, `chain_local` is
+  82 per op below base, from layout. The Local scale rows that panic
+  (increment 2 scale icount, gh-cmd `0fc77156-d51efe`:
+  `local_custom_payload_chain_100k_at_budget_1` 1.0125,
+  `local_nested_caught_chain_stays_linear` 1.0088) rise in glibc's
+  `_dl_find_object`, which the unwinder calls per frame. Cachegrind on
+  `local_nested_caught_chain_stays_linear` (4000 caught panics), with the
+  walk's cfg(test) park calls and `NO_RESTART_HERE` check removed so that
+  only engine code differs: `096fb59d6` 1635.52M, `9a6be2014` 1647.65M
+  (+12.13M, +0.74 %). The step is `619c9e167` (`815b25be3` 1632.04M,
+  `619c9e167` 1647.72M), where `_dl_find_object`, both its parts, goes
+  from 13.38M to 28.88M over the same 321,960 calls (callgrind), 41.5 to
+  89.7 instructions per call: the lookup's cost moved with the test
+  binary's layout, not its count. Over `096fb59d6` to `9a6be2014` everything
+  outside `_dl_find_object` nets -3.3M (+12.13M against its +15.41M:
+  B-tree and `Notes` code moving between symbols, `_Unwind_Find_FDE`
+  -3.0M); across the `619c9e167` step alone it is about +2.6M. With
+  the cfg(test) code in, the same step lands at `61d37ff85` instead.
+  Same family as `B7-clean-walk-fde-growth`, unwind cost through the
+  walk that moves with codegen.
 
 ## The replay context counts queued entries only once a reservation asks
 
