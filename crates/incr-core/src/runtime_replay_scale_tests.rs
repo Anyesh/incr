@@ -1727,10 +1727,15 @@ fn shared_first_entries_under_held_landings_stay_linear() {
     );
 }
 
-/// As above with one text for every panic: each box takes an address an
-/// earlier caught one freed, so the panics share a payload key and a note
-/// log per address, and each kept read's copy holds every landing caught
-/// on its log before it. The retry must not pay that prefix again per
+thread_local! {
+    static LAST_FAN: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// As above with one text for every panic: each panic raises again the
+/// box the reader caught last, so the panics share a payload key and a
+/// note log per address whatever the allocator does, and each kept read's
+/// copy holds every landing caught on its log before it. The retry must not pay that prefix again per
 /// read. `through` puts a query between the frame and each panicking
 /// one, so every copy also holds landings a level deeper, which each
 /// later caught panic's landings take from it.
@@ -1740,7 +1745,13 @@ fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool, frames: u32, len: u
     rt.set_max_frames(frames);
     let failing: Vec<Incr<u64>> = (0..n)
         .map(|_| {
-            let f = rt.create_query_with(|_| -> u64 { panic!("fan") }, replayable());
+            let f = rt.create_query_with(
+                |_| -> u64 {
+                    let caught = LAST_FAN.with(|l| l.borrow_mut().take());
+                    std::panic::resume_unwind(caught.unwrap_or_else(|| Box::new("fan")))
+                },
+                replayable(),
+            );
             if through {
                 rt.create_query_with(move |rt| rt.get(f) + 1, replayable())
             } else {
@@ -1751,10 +1762,15 @@ fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool, frames: u32, len: u
     let top = chain(&rt, len).nodes[0];
     let reader = rt.create_query_with(
         move |rt| {
-            let caught = failing
-                .iter()
-                .filter(|&&f| catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err())
-                .count() as u64;
+            let mut caught = 0;
+            for &f in &failing {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                    if payload.is::<&'static str>() {
+                        LAST_FAN.with(|l| *l.borrow_mut() = Some(payload));
+                    }
+                    caught += 1;
+                }
+            }
             caught + rt.get(top)
         },
         replayable(),
