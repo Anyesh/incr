@@ -4911,3 +4911,129 @@ fn shared_taken_reader_of_a_held_cycle_keeps_no_held_mark() {
     }
     assert_eq!(rt.get(b), 200);
 }
+
+/// Case E: thread 1's speculative run of `p` reads `x` over the main thread's
+/// verify stash and parks after the walk; a set ends the revision and thread 2
+/// claims `x`, so thread 1 takes the old 0 with `x` Computing at both state
+/// loads. Serially `p` is 1000 before the set and 1001 after it, so a read
+/// after the set must get 1001 and not adopt the stash over 0.
+#[test]
+fn a_read_over_a_verify_stash_settled_across_a_set_is_not_adopted() {
+    let mut rt = Rt::new();
+    rt.all_replayable = false;
+    let rt = Arc::new(rt);
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let leaf = rt.create_query_with(move |rt: &Rt| rt.get(input) / 10, replayable());
+    let in_x = Gate::new();
+    let x = {
+        let in_x = in_x.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(leaf);
+                in_x.park();
+                v
+            },
+            replayable(),
+        )
+    };
+    let top = rt.create_query_with(move |rt: &Rt| rt.get(x) + 1, replayable());
+    assert_eq!(rt.get(top), 1);
+    rt.set(input, 2);
+    assert_eq!(rt.get(leaf), 0);
+    let b = rt.create_query(|_: &Rt| 5_u64);
+    let verifier = rt.create_query_with(
+        move |rt: &Rt| {
+            let v = rt.get(b);
+            if v == 0 {
+                rt.get(top)
+            } else {
+                v
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(verifier), 5);
+    assert!(
+        rt.stashed_verify(id(x).0, x.generation()),
+        "setup: the main thread's speculative verify of x is not stashed"
+    );
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let p_read = Gate::new();
+    let p = {
+        let (reads, p_read) = (reads.clone(), p_read.clone());
+        rt.create_query(move |rt: &Rt| {
+            let v = rt.get(x);
+            reads.lock().unwrap().push(v);
+            p_read.park();
+            v + 1000
+        })
+    };
+    let b2 = rt.create_query(|_: &Rt| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Rt| {
+            let v = rt.get(b2);
+            if v == 0 {
+                rt.get(p)
+            } else {
+                v
+            }
+        },
+        replayable(),
+    );
+
+    let walked = Gate::new();
+    let _release = ReleaseOnUnwind(vec![walked.clone(), in_x.clone(), p_read.clone()]);
+    hook(&rt, vec![(ParkPoint::AfterWalk(id(x)), walked.clone())]);
+    walked.arm();
+    p_read.arm();
+    let thread1 = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.get(reader))
+    };
+    walked.wait_parked();
+    assert_eq!(
+        rt.state_of(x),
+        NodeState::Dirty,
+        "thread 1's walk landed x instead of returning over the verify stash"
+    );
+    assert!(rt.stashed_verify(id(x).0, x.generation()));
+
+    rt.set(input, 13);
+    in_x.arm();
+    let thread2 = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.get(x))
+    };
+    in_x.wait_parked();
+    walked.release();
+    p_read.wait_parked();
+    in_x.release();
+    assert_eq!(thread2.join(), 1);
+    p_read.release();
+    assert_eq!(thread1.join(), 5);
+
+    let speculative = reads.lock().unwrap().clone();
+    assert_eq!(
+        speculative.first(),
+        Some(&0),
+        "thread 1 did not read x before thread 2's landing: {speculative:?}"
+    );
+    assert_eq!(
+        rt.get(p),
+        1001,
+        "p's stash over x = 0, read before the set, was adopted after it"
+    );
+    let reads = reads.lock().unwrap().clone();
+    assert_eq!(
+        reads,
+        [0, 1],
+        "p's closure: one speculative run over the old x, one real run after the set"
+    );
+    assert_eq!(rt.get(x), 1);
+    assert_eq!(rt.get(top), 2);
+    rt.assert_invariant_i();
+}
