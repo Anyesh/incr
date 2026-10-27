@@ -692,6 +692,8 @@ impl<C: Cells> Runtime<C> {
     ) {
         let mut t = self.tickets.write();
         for &(dep, _) in deps {
+            #[cfg(test)]
+            self.past_note_work.fetch_add(1, Relaxed);
             let notes = t.past.entry(dep.0).or_default();
             if !notes.contains(&(id.0, generation)) {
                 notes.push((id.0, generation));

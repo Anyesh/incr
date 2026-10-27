@@ -1449,6 +1449,9 @@ pub struct Runtime<C: Cells> {
     /// Walks planned again from their root after another thread's release.
     #[cfg(test)]
     pub(crate) root_replans: std::sync::atomic::AtomicU32,
+    /// Entries `note_past_sets` recorded, for tests.
+    #[cfg(test)]
+    pub(crate) past_note_work: std::sync::atomic::AtomicU64,
     /// Waits on another thread's doom reservation, for tests.
     #[cfg(test)]
     pub(crate) reservation_waits: std::sync::atomic::AtomicU32,
@@ -1577,6 +1580,8 @@ impl<C: Cells> Runtime<C> {
             unrun_unclaims: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             root_replans: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            past_note_work: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             reservation_waits: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
