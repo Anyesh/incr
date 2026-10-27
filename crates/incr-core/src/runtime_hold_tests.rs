@@ -2934,3 +2934,71 @@ fn shared_reader_of_a_held_landing_waits_out_its_owners_walk() {
     );
     assert_eq!(crate::hold::held_count(), 0);
 }
+
+/// `d` catches `f`'s panic, so its attempt holds `f`'s Failed landing, and
+/// then reads `g`, whose rerun replaces a value whose `Drop` joins a thread
+/// that reads `f`. The drop is user code, so the reader takes the held
+/// landing over instead of waiting on a holder that waits on it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_holder_whose_replaced_value_drop_joins_a_reader_finishes() {
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static JOINED: AtomicBool = AtomicBool::new(false);
+    static READER: OnceLock<Box<dyn Fn() -> bool + Send + Sync>> = OnceLock::new();
+    #[derive(Clone, Debug)]
+    struct Joins(i64);
+    impl PartialEq for Joins {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+    impl Drop for Joins {
+        fn drop(&mut self) {
+            if ARMED.swap(false, Ordering::SeqCst) {
+                let read = READER.get().expect("the reader is set before arming");
+                let failed = std::thread::scope(|s| s.spawn(read).join().unwrap());
+                JOINED.store(failed, Ordering::SeqCst);
+            }
+        }
+    }
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let x = rt.create_input(0_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        assert!(v % 2 == 1, "even");
+        v
+    });
+    let y = rt.create_input(0_i64);
+    let g = rt.create_query(move |rt| Joins(rt.get(y)));
+    assert_eq!(rt.get(g), Joins(0));
+    rt.set(y, 1);
+    let d = rt.create_query(move |rt: &Runtime<Shared>| {
+        let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10);
+        v + rt.get(g).0
+    });
+    let reader = rt.clone();
+    assert!(READER
+        .set(Box::new(move || catch_unwind(AssertUnwindSafe(
+            || reader.get(f)
+        ))
+        .is_err()))
+        .is_ok());
+    ARMED.store(true, Ordering::SeqCst);
+    crate::reclaim_probe::force(crate::reclaim_probe::RetireSite::ComputeWrite);
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let rt = rt.clone();
+        std::thread::spawn(move || tx.send(rt.get(d)).unwrap());
+    }
+    let got = rx.recv_timeout(std::time::Duration::from_secs(30));
+    assert_eq!(
+        got,
+        Ok(8),
+        "the holder waited on the reader its drop joined"
+    );
+    assert!(
+        !ARMED.load(Ordering::SeqCst),
+        "the replaced value never dropped"
+    );
+    assert!(JOINED.load(Ordering::SeqCst), "the reader of f got a value");
+}
