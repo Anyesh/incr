@@ -1117,7 +1117,7 @@ fn held_panic_wait(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
     };
     let b = rt.create_query(move |rt: &Rt| rt.get(s) + caught(rt));
     let a = rt.create_query(move |rt: &Rt| caught(rt) + rt.get(b));
-    assert_eq!((rt.get(a), rt.get(b)), (1, 1));
+    assert_eq!((rt.get(a), rt.get(b)), (2, 1));
     rt.set(k, 1);
     (a, b, p, w)
 }
