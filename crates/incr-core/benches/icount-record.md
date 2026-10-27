@@ -2507,23 +2507,28 @@ over 75 tests (Local rows within 0.03%), scale timing 1.012.
   at the old line, +4 at the new one, +26 in `bool::then_some`, +9 in
   `Option`), the claim compares it (`others_landed`, +10) and runs the
   root check (`!node.unrun()`, +2); `Vec` length reads +20 and
-  `takes_held` +4, while `complete_walk`'s inlining moves cancel (+13,
-  -13). The episode log is read under its lock (`root_reached`) only
-  when another thread landed since the plan, which a single-threaded
-  bench never does; Local skips the check (`C::SINGLE_THREADED`).
+  `takes_held` +4, atomics +1, while `complete_walk`'s inlining moves
+  cancel (+13, -13). The episode log is read under its lock
+  (`root_reached`) only when another thread landed since the plan, which
+  a single-threaded bench never does; Local skips the check
+  (`C::SINGLE_THREADED`).
 - The check reads only entries a publication logged (`Logged::ended`):
   a landing or release published at a read's end, never an interim
   landing of an attempt still running, so a restart reacts only to
   finished history. A node released unrun is skipped, its read still
   running elsewhere; `shared_reader_that_waited_out_a_discarded_claim_keeps_its_plan`
   (0x59bd) pins that a discarded claim's waiter keeps its plan.
-- No restart cap. Each restart replans, moving `since` past every number
-  logged so far, so a second restart needs a new ended entry for the
-  root numbered after the new plan, that is another read finished on the
-  root. Eviction cannot loop: an evicted entry counts only if it was
-  ended (`evicted_ended`, not `evicted`), and its number must follow the
-  new plan, so a restart taken on eviction alone still needs 1,024 new
-  log entries since the plan, one of them a finished read.
+- The root check's restart has no cap (the release replan keeps its
+  `ROOT_RESTARTS`). Each restart replans, moving `since` past every
+  number logged so far, so a second restart needs a new ended entry for
+  the root numbered after the new plan, that is another read finished on
+  the root. Eviction cannot loop: an evicted entry counts only if it was
+  ended (`evicted_ended`, not `evicted`) and its number follows the new
+  plan, so a restart taken on eviction alone needs 1,024 per-slot
+  entries logged after an ended one that is itself after the plan. Own
+  ended entries count there too, but only once `others_since` saw
+  another thread's landing, and each such restart still needs new log
+  traffic past the plan.
   `a_root_check_reads_only_another_threads_ended_entries` covers ended
   against interim, own against foreign, landed against released numbers,
   wrap and eviction.
