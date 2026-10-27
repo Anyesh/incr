@@ -1186,10 +1186,7 @@ mod tests {
         s.settle_foreign_keeping(false);
         assert_eq!(s.record_dep(rt(1), NodeId(5), 2, 4), 4);
         s.pop_frame();
-        assert_eq!(
-            s.pop_frame_reading(),
-            (vec![(NodeId(5), 2)], 5 | 2 << 32, 1)
-        );
+        assert_eq!(s.pop_frame_reading(), (vec![(NodeId(5), 2)], 5 | 2 << 32));
     }
 
     /// A frame that ends its diversion records Clean reads in place again.
