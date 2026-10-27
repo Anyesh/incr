@@ -460,8 +460,13 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn hand_over(&self, on: NodeId, patience: &mut Patience) -> bool {
-        let cell = state::cell_key::<C>(self.nodes.get(on.0).state_cell());
-        let Some(e) = hold::hand_over(cell, (self.runtime_id, on.0), patience) else {
+        let node = self.nodes.get(on.0);
+        let claim = (self.runtime_id, on.0);
+        if !reserve::may_take_over(claim, node.generation(), patience) {
+            return false;
+        }
+        let cell = state::cell_key::<C>(node.state_cell());
+        let Some(e) = hold::hand_over(cell, claim, patience) else {
             return false;
         };
         // The retraction is the owner's: none of this thread's contexts

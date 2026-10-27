@@ -790,7 +790,31 @@ pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
 #[cold]
 #[inline(never)]
 pub(crate) fn take_over(claim: Claim, generation: u32, patience: &mut attempt::Patience) -> bool {
-    owner_elsewhere(claim, generation).is_none_or(|a| a.wound_if_stuck(claim, patience))
+    owner_elsewhere(claim, generation).is_none_or(|a| {
+        may_take_over(claim, generation, patience) && a.wound_if_stuck(claim, patience)
+    })
+}
+
+/// Whether a waiter on `claim` may wound its owner: not while a walk
+/// listing of it is awake, where the unbounded run still holds the node in
+/// the owner's frame, so only the registry, which counts the listing among
+/// the owner's claims ([`held`]), breaks a wait cycle through it. A
+/// refusal restarts `patience`, which counts only time the owner could be
+/// taken over.
+#[cold]
+#[inline(never)]
+pub(crate) fn may_take_over(
+    claim: Claim,
+    generation: u32,
+    patience: &mut attempt::Patience,
+) -> bool {
+    // A walk listing keeps its claim's table entry, so no live entry in
+    // its bucket means no listing.
+    if any() && bucket_hit(claim) && walk_listed_awake(claim, generation) {
+        *patience = attempt::Patience::default();
+        return false;
+    }
+    true
 }
 
 /// Whether this thread reserved `claim` at `generation`.
