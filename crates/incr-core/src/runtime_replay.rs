@@ -5296,6 +5296,12 @@ impl<C: Cells> Runtime<C> {
             // SAFETY: the active frame's control block is live.
             unsafe { &*f.ctl }.lower(anchor);
         }
+        // A delivered read of a landing this thread holds rests on it as a
+        // native read does, so the reader's landing is held too.
+        if !C::SINGLE_THREADED {
+            let node = self.nodes.get(handle.slot());
+            let _ = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
+        }
         let (cycle, poison, attributed, payload, nodes) = match what {
             Delivered::Unwind {
                 cycle,
