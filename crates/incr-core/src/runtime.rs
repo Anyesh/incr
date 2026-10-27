@@ -197,6 +197,9 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
+    /// In `clean_walk`, after the walk found a node another thread is
+    /// computing and before it waits on the claim.
+    WalkWaits(NodeId),
     /// In red/green verification, after the dep scan found no change and
     /// before the landing CAS.
     VerifyAfterScan(NodeId),
@@ -628,6 +631,8 @@ struct Logged {
     slot: u32,
     by: u32,
     released: bool,
+    /// Logged by a publication, which ends its read.
+    ended: bool,
 }
 
 /// The slots the latest landed episodes and releases of held claims
@@ -639,16 +644,34 @@ pub(crate) struct EpisodeLog {
     /// The highest landed episode and release numbers whose slots the log
     /// no longer holds.
     evicted: [Option<u32>; 2],
+    /// [`Self::evicted`] of `ended` entries.
+    evicted_ended: [Option<u32>; 2],
 }
 
 impl EpisodeLog {
-    /// `by` is 0 for a release this thread made of another thread's
-    /// claims, which no thread's walks count as their own.
+    #[cfg(all(test, not(loom)))]
     fn push(&mut self, released: bool, number: u32, by: u32, slots: impl IntoIterator<Item = u32>) {
+        self.push_as(released, !released, number, by, slots);
+    }
+
+    /// `by` is 0 for a release this thread made of another thread's
+    /// claims, which no thread's walks count as their own. `ended` marks
+    /// what a publication, which ends its read, logs.
+    fn push_as(
+        &mut self,
+        released: bool,
+        ended: bool,
+        number: u32,
+        by: u32,
+        slots: impl IntoIterator<Item = u32>,
+    ) {
         for slot in slots {
             if self.entries.len() == EPISODE_LOG_LEN {
                 if let Some(old) = self.entries.pop_front() {
                     self.evicted[usize::from(old.released)] = Some(old.number);
+                    if old.ended {
+                        self.evicted_ended[usize::from(old.released)] = Some(old.number);
+                    }
                 }
             }
             self.entries.push_back(Logged {
@@ -656,6 +679,7 @@ impl EpisodeLog {
                 slot,
                 by,
                 released,
+                ended,
             });
         }
     }
@@ -680,6 +704,25 @@ impl EpisodeLog {
                 .map(|e| e.slot)
                 .collect(),
         )
+    }
+
+    /// Whether another thread's publication, which ends its read, logged
+    /// `slot` after `landed` episodes or `released` releases, or may have,
+    /// its entries being evicted.
+    fn ended_with(&self, landed: u32, released: u32, slot: u32) -> bool {
+        let after = |n: u32, since: u32| n.wrapping_sub(since) as i32 > 0;
+        if self.evicted_ended[0].is_some_and(|n| after(n, landed))
+            || self.evicted_ended[1].is_some_and(|n| after(n, released))
+        {
+            return true;
+        }
+        let me = cycle_state::thread_key();
+        self.entries.iter().any(|e| {
+            e.ended
+                && e.slot == slot
+                && e.by != me
+                && after(e.number, if e.released { released } else { landed })
+        })
     }
 
     /// Whether another thread's release numbered after `since` landed one
@@ -1132,12 +1175,14 @@ impl Walk {
     }
 
     /// Plans afresh from the root, which another thread landed since the
-    /// walk planned it (a claim the walk waited out, or a New plan that met
-    /// it Dirty), as a read that came after that landing would: where the
-    /// walk enters a cycle of recorded deps depends on its visit count at
-    /// the switch to exact mode, and which queued entries a Failed root
-    /// passes depends on the Failed landings since the walk began. No state
-    /// the new plan expands predates the releases an earlier wait is about.
+    /// walk planned it (a claim the walk waited out, a New plan that met it
+    /// Dirty, a replaced group, or a landing its claim found in the episode
+    /// log), as a read
+    /// that came after that landing would: where the walk enters a cycle of
+    /// recorded deps depends on its visit count at the switch to exact mode,
+    /// and which queued entries a Failed root passes depends on the Failed
+    /// landings since the walk began. No state the new plan expands predates
+    /// the releases an earlier wait is about.
     #[cold]
     #[inline(never)]
     fn restart(&mut self) {
@@ -4082,7 +4127,7 @@ impl<C: Cells> Runtime<C> {
                     visit,
                     Some(generation),
                     !is_root,
-                    (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
+                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur)))
                         .then_some(planned),
                     seen,
                 );
@@ -4092,6 +4137,7 @@ impl<C: Cells> Runtime<C> {
                     revisited.push(cur);
                     if is_root {
                         walk.restart();
+                        planned = self.planned();
                     }
                     walk.revisit(cur, generation);
                     continue;
@@ -4274,6 +4320,7 @@ impl<C: Cells> Runtime<C> {
                     // one of them may be a claim this thread holds, which
                     // only the expansion skips.
                     self.park(ParkPoint::BeforeComputeOne(cur));
+                    self.park(ParkPoint::WalkWaits(cur));
                     let mut spins = 0;
                     loop {
                         spins += 1;
@@ -4439,8 +4486,26 @@ impl<C: Cells> Runtime<C> {
         if *FORCE_REPLAN || FORCE_REPLAN_HERE.with(std::cell::Cell::get) {
             return true;
         }
+        self.others_since(planned)
+    }
+
+    #[inline(always)]
+    fn others_since(&self, planned: Planned) -> bool {
         let all = C::u64_load_acquire(&self.episodes_landed);
         all != planned.all && self.others_landed(planned, all)
+    }
+
+    /// Whether another thread's publication since `planned` landed `root`,
+    /// or may have, its slots being evicted. Only a publication ends a
+    /// read; a release before it is an attempt's that goes on.
+    #[cold]
+    #[inline(never)]
+    fn root_reached(&self, planned: Planned, root: NodeId) -> bool {
+        self.episode_log.read().ended_with(
+            planned.all as u32,
+            (planned.all / RELEASED) as u32,
+            root.0,
+        )
     }
 
     #[cold]
@@ -4501,6 +4566,15 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.unrun_unclaims
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.give_back(node, dirty, true);
+    }
+
+    /// [`Self::unclaim_unrun`], marking the node unrun only if `mark`;
+    /// otherwise its mark, and its held entry's, stay as the claim found
+    /// them.
+    #[cold]
+    #[inline(never)]
+    fn give_back(&self, node: &NodeData<C>, dirty: bool, mark: bool) {
         let back = if dirty {
             NodeState::Dirty
         } else {
@@ -4509,11 +4583,13 @@ impl<C: Cells> Runtime<C> {
         // The owner's re-claim of its own held node goes back to the view.
         if !C::SINGLE_THREADED
             && hold::active()
-            && hold::land(state::cell_key::<C>(node.state_cell()), back, back, true)
+            && hold::land_marking(state::cell_key::<C>(node.state_cell()), back, back, mark)
         {
             return;
         }
-        node.set_unrun(true);
+        if mark {
+            node.set_unrun(true);
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
                 state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
@@ -4694,8 +4770,8 @@ impl<C: Cells> Runtime<C> {
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
     ///
-    /// `planned` is what a walk entry under `Shared` was planned under, and
-    /// `seen` what the walk's visit found of an untainted entry.
+    /// `planned` is what a walk's entry or root under `Shared` was planned
+    /// under, and `seen` what the walk's visit found of an untainted entry.
     #[inline(always)]
     fn compute_one<const MODE: u8>(
         &self,
@@ -4954,11 +5030,27 @@ impl<C: Cells> Runtime<C> {
             // bumped first: the episode may have landed Clean a node this
             // plan reaches the node through, which a walk planned now
             // skips. A claim not ordered after an episode may run before it.
-            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
+            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED && walked) {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
                     self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Replan;
+                }
+            }
+            // No entry check covers the root, so its claim checks for
+            // another thread's landing of it since the plan, whose deps a
+            // read after that landing expands first; a node released unrun
+            // is another read's still. The landing precedes every reader's
+            // claim, so the claim goes back unmarked and another reader's
+            // root check still sees it.
+            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED && !walked) {
+                if seen != Seen::Unwalked
+                    && !node.unrun()
+                    && self.others_since(p)
+                    && self.root_reached(p, id)
+                {
+                    self.give_back(node, claimed_dirty, false);
+                    return Computed::Revisit;
                 }
             }
 
@@ -6237,6 +6329,19 @@ impl<C: Cells> Runtime<C> {
             self.count_watched_run(id, node);
         }
         node.set_unrun(unrun);
+        self.land_marked(id, node, target, flagged, unrun)
+    }
+
+    /// [`Self::land_now`] with the node's unrun mark already set.
+    #[inline(always)]
+    fn land_marked(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
         if !C::SINGLE_THREADED && unrun {
             reserve::note((self.runtime_id, id.0), node.generation());
         }

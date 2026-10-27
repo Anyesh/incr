@@ -704,7 +704,7 @@ impl<C: Cells> Runtime<C> {
         // since then expanded through their held states, and must see the
         // count move when they publish.
         if entries.iter().any(|e| e.unrun) {
-            self.count_release(entries.iter().filter(|e| e.unrun).map(|e| e.slot));
+            self.count_published_release(entries.iter().filter(|e| e.unrun).map(|e| e.slot));
         }
         let mut bag = Deferred::new();
         let mut rest = entries.into_iter();
@@ -959,7 +959,10 @@ impl<C: Cells> Runtime<C> {
                 self.ticket_mark(),
             )
         });
-        let landed = self.land_now(id, node, target, e.flagged, e.unrun);
+        // Publication ends the entry whose read released it unrun, so no
+        // run of that read is still to come: a waiter takes it as a landing.
+        node.set_unrun(false);
+        let landed = self.land_marked(id, node, target, e.flagged, e.unrun);
         *stopped = None;
         // A set flagged the held Failed landing, or moved a new dep of it
         // so that it publishes lowered, as `land_failed` handles at an
