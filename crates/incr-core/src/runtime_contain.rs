@@ -682,11 +682,13 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// A held Failed landing's new deps seen Failed: their reverse edges
-    /// wait for its publication, so a set's flip of one reaches the landing
-    /// only through a note. Taken before the publish reads whether they
-    /// are settled: a flip before the note leaves the dep Dirty for that
-    /// read, and one after finds the note.
+    /// A held Failed landing's new deps published Failed: their reverse
+    /// edges wait for its publication, so a set's flip of one reaches the
+    /// landing only through a note. Taken before the publish reads whether
+    /// they are settled: a flip before the note leaves the dep Dirty for
+    /// that read, and one after finds the note. A dep this thread holds
+    /// needs none, as no other thread reruns it before it publishes with
+    /// the landing, after every held edge is in.
     #[cold]
     #[inline(never)]
     pub(super) fn note_held_failed_deps(
@@ -697,10 +699,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         let failed: Vec<&(NodeId, u32)> = deps
             .iter()
-            .filter(|&&(d, _)| {
-                let dep = self.nodes.get(d.0);
-                self.seen_quietly(dep.state_cell(), dep.state()) == NodeState::Failed
-            })
+            .filter(|&&(d, _)| self.nodes.get(d.0).state() == NodeState::Failed)
             .collect();
         if failed.is_empty() {
             return;
