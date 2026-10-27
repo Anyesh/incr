@@ -18,6 +18,7 @@ use super::{
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
 use crate::cycle_state::thread_key;
+use crate::deferred::Deferred;
 use crate::handle::Incr;
 use crate::node::NodeId;
 use crate::state::NodeState;
@@ -2265,6 +2266,95 @@ fn a_walk_whose_expanded_group_dissolved_plans_its_entry_again() {
 #[test]
 fn a_walk_whose_expanded_group_was_replaced_plans_its_entry_again() {
     expanded_group_replaced_before_the_claim(true);
+}
+
+/// As the regrouping case of `expanded_group_replaced_before_the_claim`,
+/// but thread T then lands `p`, held, out of the new group and waits in its
+/// closure. A's claim wait takes the landing over, which puts the new
+/// group's record back as T's change, not A's, so A still plans `p` again.
+#[test]
+fn a_walk_that_took_over_a_held_landing_out_of_its_replaced_group_plans_its_entry_again() {
+    let rt = Arc::new(Rt::new());
+    let k = rt.create_input(0_i64);
+    let w_runs = Arc::new(AtomicUsize::new(0));
+    let w = {
+        let w_runs = w_runs.clone();
+        rt.create_query(move |rt| {
+            w_runs.fetch_add(1, Ordering::SeqCst);
+            rt.get(k) + 1
+        })
+    };
+    let x = rt.create_query(move |rt| rt.get(k) * 10);
+    let z = rt.create_query(move |rt| rt.get(w) * 2);
+    let p = rt.create_query(move |rt| rt.get(x) + rt.get(k));
+    let (planned, holding) = (Gate::new(), Gate::new());
+    let left = Arc::new(AtomicBool::new(false));
+    let t = {
+        let (holding, left) = (holding.clone(), left.clone());
+        rt.create_query(move |rt: &Rt| {
+            if !left.swap(true, Ordering::SeqCst) {
+                let (node, flags) = rt.nodes.get_with_flags(p.slot());
+                rt.force_state_for_test(p, NodeState::Computing);
+                let mut bag = Deferred::new();
+                rt.open_hold(id(p), node, false, None, &mut bag);
+                rt.land_single_as(id(p), node, flags, NodeState::Dirty, NodeState::Dirty, true);
+                bag.drain(rt);
+                holding.park_in_user_code();
+            }
+            0_i64
+        })
+    };
+    assert_eq!((rt.get(p), rt.get(z)), (0, 2));
+    w_runs.store(0, Ordering::SeqCst);
+    rt.force_group_for_test(&[p.erase(), x.erase()]);
+    rt.set(k, 1);
+    planned.arm();
+    holding.arm();
+    let p_at_w: Arc<Mutex<Vec<NodeState>>> = Arc::default();
+    let installed = rt.park_hook.set(Box::new({
+        let (rt, planned, p_at_w) = (Arc::downgrade(&rt), planned.clone(), p_at_w.clone());
+        move |point| {
+            if thread::current().name() != Some("A") {
+                return;
+            }
+            if point == ParkPoint::BeforeComputeOne(id(p)) {
+                planned.park();
+            } else if point == ParkPoint::BeforeComputeOne(id(w)) {
+                if let Some(rt) = rt.upgrade() {
+                    p_at_w.lock().unwrap().push(rt.state_of(p));
+                }
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let read = |name: &str, h: Incr<i64>| {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || rt.get(h))
+            .unwrap()
+    };
+    let a = read("A", p);
+    planned.wait_parked();
+    for m in [p.erase(), x.erase()] {
+        let (node, flags) = rt.nodes.get_with_flags(m.slot());
+        rt.leave_group(NodeId(m.slot()), node, flags, NodeState::Dirty);
+    }
+    rt.force_group_for_test(&[p.erase(), x.erase(), z.erase()]);
+    let held = read("T", t);
+    holding.wait_parked();
+    planned.release();
+    assert_eq!(a.join().unwrap(), 11);
+    holding.release();
+    assert_eq!(held.join().unwrap(), 0);
+    let p_at_w = p_at_w.lock().unwrap().clone();
+    assert!(
+        !p_at_w.is_empty() && p_at_w.iter().all(|&s| s == NodeState::Dirty),
+        "w ran under p's claim: {p_at_w:?}"
+    );
+    assert_eq!((rt.get(p), rt.get(z)), (11, 4));
+    assert_eq!(w_runs.load(Ordering::SeqCst), 1);
+    rt.assert_invariant_i();
 }
 
 /// Thread A's walk plans `a` New and parks at `at`; another read lands
