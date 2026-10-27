@@ -5473,7 +5473,7 @@ impl<C: Cells> Runtime<C> {
     ) -> ! {
         self.dep_stack
             .poison_current_frame_with(self.runtime_id, self.unwound_poison(kind));
-        cycle_state::restore_unwind_kind(kind);
+        cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
 

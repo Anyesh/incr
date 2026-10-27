@@ -1407,6 +1407,7 @@ impl<C: Cells> Runtime<C> {
             match cycle_state::unwind_kind() {
                 Some(UnwindKind::Cycle) => {
                     cycle_state::set_unwind_kind(None);
+                    cycle_state::note_cycle_caught();
                     word = value_code::thread_word();
                 }
                 Some(UnwindKind::Discard) if !std::thread::panicking() => {
@@ -2960,10 +2961,13 @@ impl<C: Cells> Runtime<C> {
                 cycle: true,
                 payload,
                 ..
-            }) if payload.is::<cycle::CycleUnwind>() => Ok(Err(payload
-                .downcast::<cycle::CycleUnwind>()
-                .expect("incr-core: checked to be a cycle unwind")
-                .0)),
+            }) if payload.is::<cycle::CycleUnwind>() => {
+                cycle_state::note_cycle_caught();
+                Ok(Err(payload
+                    .downcast::<cycle::CycleUnwind>()
+                    .expect("incr-core: checked to be a cycle unwind")
+                    .0))
+            }
             Some(Delivered::Unwind { cycle, payload, .. }) => {
                 let raised = match &key {
                     Some(key) => self.regenerated(handle, reader, key, payload),
@@ -5365,7 +5369,10 @@ impl<C: Cells> Runtime<C> {
         // carries the landings noted for it before the catch, as the native
         // box does.
         let payload = match payload.downcast::<crate::cycle::CycleUnwind>() {
-            Ok(unwind) if kind == ReadKind::TryGet => return Some(Err(unwind.0)),
+            Ok(unwind) if kind == ReadKind::TryGet => {
+                cycle_state::note_cycle_caught();
+                return Some(Err(unwind.0));
+            }
             Ok(unwind) => unwind,
             Err(payload) => {
                 self.note_delivered(nodes, &*payload);

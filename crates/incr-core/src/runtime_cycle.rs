@@ -454,11 +454,11 @@ impl<C: Cells> Runtime<C> {
         // unless a waiter took one of them over first.
         if outermost && !C::SINGLE_THREADED && hold::active() {
             self.park(ParkPoint::VerdictCheck);
-            // A cycle nothing caught is the attempt's own verdict, and it
-            // read nothing after it: its read comes first in the order.
+            // A cycle no read in the attempt took is its own verdict: its
+            // read comes first in the order.
             let own_verdict = cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
                 && payload.is::<CycleUnwind>()
-                && cycle_state::cycle_untaken();
+                && !cycle_state::cycle_caught();
             if !own_verdict && self.verdict_superseded() {
                 self.rerun_superseded(payload);
                 return None;
@@ -481,6 +481,9 @@ impl<C: Cells> Runtime<C> {
                     Err(payload) => resume_unwind(payload),
                 };
                 if kind == ReadKind::TryGet {
+                    if !outermost {
+                        cycle_state::note_cycle_caught();
+                    }
                     if wounded {
                         cycle_state::set_unwind_kind(Some(UnwindKind::Wound));
                     }
@@ -644,6 +647,7 @@ impl<C: Cells> Runtime<C> {
         match kind {
             Some(UnwindKind::Cycle) => {
                 cycle_state::set_unwind_kind(None);
+                cycle_state::note_cycle_caught();
                 false
             }
             Some(UnwindKind::Wound) | Some(UnwindKind::Discard) => true,
@@ -1015,6 +1019,7 @@ impl<C: Cells> Runtime<C> {
         if kind == ReadKind::TryGet && cycle_state::unwind_kind() == Some(UnwindKind::Cycle) {
             if let Some(unwind) = payload.downcast_ref::<CycleUnwind>() {
                 cycle_state::take_unwind_kind();
+                cycle_state::note_cycle_caught();
                 return unwind.0.clone();
             }
         }
@@ -2924,7 +2929,7 @@ impl<C: Cells> Runtime<C> {
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
         self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
-        cycle_state::restore_unwind_kind(kind);
+        cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
 
@@ -3226,12 +3231,15 @@ fn released_at(rt: RuntimeId, e: &Held, cidx: u32) -> bool {
 #[inline(never)]
 pub(super) fn clear_caught_cycle(payload: &(dyn Any + Send), deps: &[(NodeId, u32)], reading: u64) {
     if cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
-        && !payload.is::<CycleUnwind>()
         && deps
             .last()
             .is_some_and(|&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) != reading)
     {
-        cycle_state::set_unwind_kind(None);
+        // Read past the cycle, even if the closure raised the cycle again.
+        cycle_state::note_cycle_caught();
+        if !payload.is::<CycleUnwind>() {
+            cycle_state::set_unwind_kind(None);
+        }
     }
 }
 
