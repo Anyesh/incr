@@ -866,7 +866,7 @@ fn wound_inside_a_driver_entry() {
     );
     drop(entries);
     super::wound_tests::assert_wounded();
-    assert_eq!(crate::waits::registered(), 0);
+    assert_eq!(crate::waits::registered_on(s.rt.runtime_id), 0);
     s.rt.assert_invariant_i();
 }
 

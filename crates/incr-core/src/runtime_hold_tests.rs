@@ -1191,7 +1191,7 @@ fn shared_holder_joining_a_reader_of_its_held_panic_landing_finishes() {
     assert!(!joined.is_empty() && joined.iter().all(|&failed| failed));
     assert_eq!(rt.state_of(f), NodeState::Failed);
     assert_eq!(crate::hold::held_count(), 0);
-    assert_eq!(crate::waits::registered(), 0);
+    assert_eq!(crate::waits::registered_on(rt.runtime_id), 0);
     rt.set(x, 1);
     assert_eq!(rt.get(d), 10);
 }
@@ -1247,7 +1247,7 @@ fn shared_holder_waiting_on_a_claim_of_a_reader_of_its_held_panic_landing_finish
     caught.release();
     assert_eq!(holder.join().unwrap(), (8, 0));
     assert_eq!(reader.join().unwrap(), (1, 0));
-    assert_eq!(crate::waits::registered(), 0);
+    assert_eq!(crate::waits::registered_on(rt.runtime_id), 0);
     assert_eq!(rt.state_of(f), NodeState::Failed);
     rt.assert_invariant_i();
     rt.set(x, 1);

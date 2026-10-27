@@ -97,6 +97,17 @@ pub(crate) fn registered() -> usize {
     registry().waiters.len()
 }
 
+/// Threads registered now that wait on or hold a claim of `rt`: the count
+/// one test's runtime sees, whatever other tests' threads register.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn registered_on(rt: RuntimeId) -> usize {
+    registry()
+        .waiters
+        .iter()
+        .filter(|w| w.waiting_on.0 == rt || w.holds.iter().any(|h| h.0 == rt))
+        .count()
+}
+
 /// Whether a registered thread is waiting on `claim`, for tests.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn waited_on(claim: Claim) -> bool {
