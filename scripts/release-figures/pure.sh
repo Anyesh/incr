@@ -2,7 +2,7 @@
 set -uo pipefail
 (($# >= 2)) || { echo "usage: pure.sh <release-sha> <case>..." >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
-. "$here/lib.sh"
+. "$here/lib.sh" || { echo "release-figures: cannot load $here/lib.sh" >&2; exit 2; }
 root=$PWD
 rel=$1
 shift

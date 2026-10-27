@@ -2,7 +2,7 @@
 set -uo pipefail
 (($# == 2)) || { echo "usage: rates.sh <release-sha> <row>" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
-. "$here/lib.sh"
+. "$here/lib.sh" || { echo "release-figures: cannot load $here/lib.sh" >&2; exit 2; }
 root=$PWD
 row=$2
 declare -A sha=([rel]=$1 [b5]=c61be873c4d6681cd0b59333441267749f4776cc [main]=b9f0d0bf3b11adec48b81eee123f9921a8ef694c)
