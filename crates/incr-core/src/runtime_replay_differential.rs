@@ -8781,6 +8781,102 @@ fn hook() {
     });
 }
 
+/// 0x886d3's ops 21 and 22 with op 21's walk planned from 19 while 19 is
+/// New: op 21 holds before its claim of 9 until op 22 has ended, and op
+/// 22 holds before it computes 19 until op 21 is there. Op 22's doom
+/// driver lands 19 Clean, its read of 9 on the stack closes the ring, and
+/// the cycle unwind lands 9, 10 and 11 New unrun. In the only order that
+/// matches, op 22 first, op 21's read finds 19 Clean and gives its value;
+/// a walk that kept its plan runs 9 again and closes the cycle a second
+/// time.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_replans_past_a_ring_a_cycle_unwind_landed_unrun() {
+    let case = gen_case(0x886d3, true, true);
+    let phases = phases(&case, 0x886d3);
+    let overlap = phases
+        .iter()
+        .position(|p| p.ops().contains(&21) && p.ops().contains(&22))
+        .unwrap();
+    let reader = if phases[overlap].of(0) == Some(21) {
+        0
+    } else {
+        1
+    };
+    let mut shaped = 0;
+    quiet(|| {
+        for (frames, bytes) in [(Some(3), 16384), (None, 16384), (Some(2), 0)] {
+            for _ in 0..4 {
+                let (at9, held, landed) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let rig = |live: &Live<Shared>| {
+                    let (at9, held, landed, world, ended) = (
+                        at9.clone(),
+                        held.clone(),
+                        landed.clone(),
+                        live.world.clone(),
+                        live.ended.clone(),
+                    );
+                    let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                    let (n9, n19) = (slot(9), slot(19));
+                    let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                        let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                            return;
+                        };
+                        if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                            return;
+                        }
+                        let rt = world.rt(0);
+                        let begun = std::time::Instant::now();
+                        let within = || begun.elapsed() < std::time::Duration::from_secs(10);
+                        if t != reader {
+                            if p == ParkPoint::BeforeComputeOne(n19) {
+                                while !at9.load(SeqCst) && within() {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                            return;
+                        }
+                        if p != ParkPoint::BeforeComputeOne(n9) || held.swap(true, SeqCst) {
+                            return;
+                        }
+                        let unclean = rt.nodes.get(n19.0).state() != NodeState::Clean;
+                        at9.store(true, SeqCst);
+                        while !ended.lock().unwrap().contains(&22) && within() {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        landed.store(
+                            unclean
+                                && ended.lock().unwrap().contains(&22)
+                                && rt.nodes.get(n19.0).state() == NodeState::Clean
+                                && rt.nodes.get(n9.0).state() == NodeState::New,
+                            SeqCst,
+                        );
+                    });
+                    assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                };
+                let serial = Serial::new(&case, &phases);
+                let verdict = Mutex::new(None);
+                let got = run_two_until(&case, &phases, frames, bytes, &rig, &|p, prefix, live| {
+                    let v = serial.at_overlap("0x886d3", prefix, live);
+                    let stop = p == overlap || v.is_some();
+                    *verdict.lock().unwrap() = v;
+                    stop
+                });
+                shaped += usize::from(landed.load(SeqCst));
+                serial.check("0x886d3", &got, verdict.into_inner().unwrap());
+            }
+        }
+    });
+    assert!(
+        shaped > 0,
+        "op 21 never planned from 19 New and reached 9 after op 22 ended with 19 Clean and 9 New"
+    );
+}
+
 /// Runs `f` with panic messages from closures silenced: the generated
 /// graphs panic on purpose.
 fn quiet(f: impl FnOnce()) {
