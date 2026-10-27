@@ -544,6 +544,11 @@ pub(crate) enum MemberRead {
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ADOPTED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
 /// `stamp`, given a value no other note took if it has none.
 fn noted(stamp: &mut u64) -> u64 {
     if *stamp == 0 {
@@ -836,6 +841,8 @@ impl HeldMap {
         for (m, real) in verdicts {
             if let Some(e) = self.claims.get_mut(&(key.0, m)) {
                 if adopted && real {
+                    #[cfg(test)]
+                    ADOPTED.with(|a| a.borrow_mut().push(m));
                     e.adopt();
                 } else if !real {
                     e.drop_basis();

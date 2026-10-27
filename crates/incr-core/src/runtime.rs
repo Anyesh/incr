@@ -240,6 +240,9 @@ pub(crate) enum ParkPoint {
     /// In a collection operator's rebuild, just after it read an
     /// upstream's snapshot and released that upstream's guard.
     RebuildAfterSnapshot,
+    /// In `member_run`, after the member's closure returned and before its
+    /// run is recorded on its claim.
+    MemberBeforeRecord(NodeId),
     /// In `compute_one`, after a Stale publish landed `New` and before
     /// the retry, with the attempt's bag carried along.
     StaleRetry(NodeId),

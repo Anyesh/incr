@@ -1103,6 +1103,7 @@ impl<C: Cells> Runtime<C> {
                 return result.map(|_| None);
             }
         }
+        self.park(ParkPoint::MemberBeforeRecord(id));
         let look = Look::here();
         let rt = self.runtime_id;
         let (replaced, spec_buf) = cycle_state::with_held(|h| {
