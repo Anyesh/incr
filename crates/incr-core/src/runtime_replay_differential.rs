@@ -1360,6 +1360,9 @@ struct Live<C: Cells> {
     /// The closure runs each operation's thread ended, by operation, in
     /// a two-thread run.
     evals: Mutex<HashMap<usize, Vec<Eval>>>,
+    /// The operations that have ended in a two-thread run, for a park hook
+    /// that holds one thread until the other's operation is over.
+    ended: Arc<Mutex<HashSet<usize>>>,
 }
 
 /// After an operation: every query's state, every node's dependencies in
@@ -1387,6 +1390,7 @@ impl<C: Cells> Live<C> {
             retired: Mutex::new(Vec::new()),
             queries: [case.queries, case.queries2],
             evals: Mutex::new(HashMap::new()),
+            ended: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1676,7 +1680,9 @@ fn run_two_until(
                     if let Some(i) = phase.of(t) {
                         TWO_PHASE.with(|c| c.set(p));
                         let op = &case.ops[i];
-                        match catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op)))) {
+                        let r = catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op))));
+                        live.ended.lock().unwrap().insert(i);
+                        match r {
                             Ok((out, ran)) => {
                                 outs.lock().unwrap()[i] = Some(out);
                                 live.evals.lock().unwrap().insert(i, ran);
