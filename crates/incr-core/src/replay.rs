@@ -1127,8 +1127,8 @@ impl Direct {
 #[derive(Default)]
 pub(crate) struct Directs {
     boundary: u32,
-    /// Sized to the highest position used until none is live, so a chain
-    /// that pushes and drops at its top does not regrow it each time.
+    /// Sized to the highest position the context has used, empty or not, so
+    /// a deep direct that goes and comes back finds its position made.
     at: Vec<Few<Direct>>,
     live: usize,
     /// Positions by maker, dropped lazily as in [`Pending::by_maker`].
@@ -1274,13 +1274,10 @@ impl Directs {
                 self.unlist_node(node, i as u32);
             }
         }
-        if self.live == 0 {
-            debug_assert!(
-                self.by_maker.is_empty() && self.by_node.is_empty(),
-                "a direct list outlived its directs"
-            );
-            self.at.clear();
-        }
+        debug_assert!(
+            self.live != 0 || (self.by_maker.is_empty() && self.by_node.is_empty()),
+            "a direct list outlived its directs"
+        );
     }
 
     /// Sends the read `key` to its compute, unless a direct one already
