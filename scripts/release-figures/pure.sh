@@ -7,6 +7,7 @@ rel=$1
 shift
 runs=${PURE_RUNS:-30000}
 secs=${PURE_SECS:-1200}
+end=$((SECONDS + ${PURE_TOTAL_SECS:-6000}))
 runner=${RUNNER_NAME:-unknown}
 wt=$root/../pure-$rel
 if ! { git fetch -q --depth=1 origin "$rel" || git fetch -q --depth=1 https://github.com/Anyesh/incr.git "$rel"; } ||
@@ -30,20 +31,27 @@ fi
 failed=0
 for c in "$@"; do
   start=$SECONDS
-  o=$(B7_MODE=two B7_RUNS=$runs B7_PROJECT=1 B7_CASE=$c timeout "$secs" "$b" --ignored --exact b7_run --nocapture 2>&1)
+  left=$((end - start))
+  if ((left <= 0)); then
+    echo "PURE-SKIPPED $c $rel past PURE_TOTAL_SECS runner=$runner"
+    failed=1
+    continue
+  fi
+  cap=$((left < secs ? left : secs))
+  o=$(B7_MODE=two B7_RUNS=$runs B7_PROJECT=1 B7_CASE=$c timeout "$cap" "$b" --ignored --exact b7_run --nocapture 2>&1)
   rc=$?
   w=$((SECONDS - start))
   s=$(grep -aP "^\Q$c\E\ttwo-summary\t" <<<"$o" | cut -f3)
   h=$(grep -aP "^\Q$c\E\ttwo-HANG\t" <<<"$o" | cut -f3)
-  if ! grep -aqx '# api full projected true' <<<"$o"; then
+  if ((rc == 124)); then
+    echo "PURE-TIMEOUT $c $rel after $cap s runner=$runner"
+    failed=1
+  elif ! grep -aqx '# api full projected true' <<<"$o"; then
     echo "PURE-RUN-FAILED $c rc=$rc not projected: $(grep -a '^# api' <<<"$o" | head -n 1)"
     failed=1
   elif [[ -n $s ]] && ((rc == 0)); then
     echo "PURE $c $rel $s wall-s $w runner=$runner"
     [[ $s == "runs $runs "* ]] || { echo "PURE-SHORT $c $s of $runs"; failed=1; }
-  elif ((rc == 124)); then
-    echo "PURE-TIMEOUT $c $rel after $secs s runner=$runner"
-    failed=1
   elif [[ -n $h ]]; then
     echo "PURE-HANG $c $rel $h runner=$runner"
     failed=1
