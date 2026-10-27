@@ -381,13 +381,11 @@ impl Notes {
     /// first `len` entries of its log still noted at removal `epoch`, at
     /// their depths above the copy's base, but those its cut took. When
     /// the copy of the log noted last went to the same place, at an epoch
-    /// no later, under the same cut, and no note has gone since, the
-    /// entries it held are noted already, under whichever key delivered
-    /// them, so only later ones are: a second note of a node at the same
-    /// place retires with the first, and one deeper retires with its own
-    /// frame, as each note of a whole renote does. One-text panics can
-    /// share a payload address and so one log, whose copies would
-    /// otherwise each note every earlier panic's landings again.
+    /// no later, under the same cut, and no note has gone since, only the
+    /// later entries are noted, under `key`. The earlier ones stay under
+    /// the key that noted them, so a removal of one key's notes does not
+    /// reach the other's. A second note of a node at the same place
+    /// retires with the first, and one deeper with its own frame.
     pub(crate) fn note_copy(
         &mut self,
         rt: RuntimeId,

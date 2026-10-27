@@ -1735,11 +1735,12 @@ thread_local! {
 /// As above with one text for every panic: each panic raises again the
 /// box the reader caught last, so the panics share a payload key and a
 /// note log per address whatever the allocator does, and each kept read's
-/// copy holds every landing caught on its log before it. The retry must not pay that prefix again per
-/// read. `through` puts a query between the frame and each panicking
+/// copy holds every landing caught on its log before it. The retry must
+/// not pay that prefix again per read. `through` puts a query between the frame and each panicking
 /// one, so every copy also holds landings a level deeper, which each
 /// later caught panic's landings take from it.
 fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool, frames: u32, len: usize) -> u64 {
+    LAST_FAN.with(|l| l.borrow_mut().take());
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);

@@ -430,9 +430,8 @@ impl Landings {
     fn retire(&mut self, cidx: u32, ev: &Retire, resumed: Option<PayloadKey>) {
         let source = self.source;
         let ours = |p: PayloadKey| source == Some(p) || resumed == Some(p);
-        // Panics of one text at one address share a log, so a copy's log
-        // holds every earlier one's notes: reading it per event is
-        // quadratic.
+        // A shared copy's log can hold many other copies' notes, so a
+        // positional event lowers its bounds instead of reading it.
         if let Nodes::Shared { depth, cut, .. } = &mut self.nodes {
             let top = match *ev {
                 Retire::Above(at) => Some(i64::from(at)),
