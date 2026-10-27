@@ -178,6 +178,9 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// At an outermost exit that holds landings, before it checks the
+    /// cycle verdicts its attempt may have taken.
+    VerdictCheck,
     /// In a read's walk loop, after the walk and before the slot read.
     AfterWalk(NodeId),
     /// In `compute_attempts`, after the claim CAS and before the check for

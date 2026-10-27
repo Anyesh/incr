@@ -389,6 +389,7 @@ impl<C: Cells> Runtime<C> {
             match catch_unwind(AssertUnwindSafe(&mut *f)) {
                 Ok(r) => {
                     if outermost && !C::SINGLE_THREADED && hold::active() {
+                        self.park(ParkPoint::VerdictCheck);
                         if self.verdict_superseded() {
                             self.rerun_superseded(r);
                             continue;
@@ -452,6 +453,7 @@ impl<C: Cells> Runtime<C> {
         // its read's outcome, which every landing it made is part of,
         // unless a waiter took one of them over first.
         if outermost && !C::SINGLE_THREADED && hold::active() {
+            self.park(ParkPoint::VerdictCheck);
             if self.verdict_superseded() {
                 self.rerun_superseded(payload);
                 return None;
