@@ -3490,6 +3490,24 @@ fn seed_e126d92b8f_repeated_runs_keep_their_deliveries() {
     }
 }
 
+/// 0xcc82 at 3 frames, shrunk to 10 reading 11 reading 18: a doom below
+/// a later run of 11 discarded it at the root of 10's walk of 11, and the
+/// retry's read of 11 counted 11's runs from none, so the rerun took the
+/// first run's seq and resumed the walk that run's read of 18 was given.
+/// 18 never ran and kept the group record the unbounded run takes it out
+/// of.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_cc82_root_retry_reads_no_earlier_runs_delivery() {
+    for cross in [false, true] {
+        let case = gen_case(0xcc82, cross, false);
+        quiet(|| {
+            differential::<Local>(&case, 0xcc82);
+            differential::<Shared>(&case, 0xcc82);
+        });
+    }
+}
+
 /// 0x16d87, shrunk: a fresh `TryGet(18)`, which unbounded gets a cycle of
 /// six participants. At budget 1, a speculative run's walk memoized 10
 /// under the frame at position 1, so 11's later read of 10 computed it
@@ -7766,6 +7784,20 @@ fn stale_dep_split_seed_matches_unbounded() {
                 "Shared, budget {frames}"
             );
         }
+    });
+}
+
+/// 0x6feb7: a doom discarded a walk root's own compute, a cycle episode,
+/// and the retry walked the root again, computing a former member against
+/// the root's new value; a later retry's Clean read resumed that walk's
+/// rest and landed three nodes Clean that the unbounded run leaves Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_discarded_walk_root_is_computed_again_not_walked() {
+    let case = gen_case(0x6feb7, false, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x6feb7);
+        differential::<Shared>(&case, 0x6feb7);
     });
 }
 

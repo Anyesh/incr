@@ -1289,7 +1289,7 @@ impl<C: Cells> Runtime<C> {
         replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .any(|x| x.pending.frame_awaits(frame))
+                .any(|x| x.pending.frame_awaits(frame) || x.directs.frame_awaits(frame))
         })
     }
 
@@ -1304,9 +1304,10 @@ impl<C: Cells> Runtime<C> {
         let frame = (f.node.0, self.nodes.get(f.node.0).generation(), f.cidx);
         let listed = |ordinal, parts| {
             replay::with(|c| {
-                c.iter()
-                    .filter(|x| x.rt == rt)
-                    .any(|x| x.pending.read_awaits(frame, reading, ordinal, parts))
+                c.iter().filter(|x| x.rt == rt).any(|x| {
+                    x.pending.read_awaits(frame, reading, ordinal, parts)
+                        || x.directs.read_awaits(frame, reading, ordinal, parts)
+                })
             })
         };
         if !listed(None, None) {
@@ -2983,7 +2984,7 @@ impl<C: Cells> Runtime<C> {
                     })),
                 }
             }
-            Some(Delivered::Walk(..) | Delivered::Direct) => {
+            Some(Delivered::Walk(..)) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             None => catch_unwind(AssertUnwindSafe(|| {
@@ -4077,6 +4078,8 @@ impl<C: Cells> Runtime<C> {
                         for i in x.pending.of_maker(level).into_iter().chain(own) {
                             x.pending.set_taken(i, false);
                         }
+                        x.directs.rearm_maker(level);
+                        x.directs.rearm_frame((entry.node, entry.generation, at));
                     }
                 });
             } else {
@@ -4850,6 +4853,7 @@ impl<C: Cells> Runtime<C> {
                 for i in x.pending.of_frame(node, generation, cidx) {
                     x.pending.set_taken(i, false);
                 }
+                x.directs.rearm_frame((node, generation, cidx));
             }
         });
     }
@@ -4859,7 +4863,10 @@ impl<C: Cells> Runtime<C> {
         let ended: Vec<Delivery> = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == id)
-                .map(|x| x.pending.extract_frame(node, generation, cidx))
+                .map(|x| {
+                    x.directs.remove_frame((node, generation, cidx));
+                    x.pending.extract_frame(node, generation, cidx)
+                })
                 .unwrap_or_default()
         });
         drop(ended);
@@ -4933,6 +4940,7 @@ impl<C: Cells> Runtime<C> {
             for x in c.iter_mut().filter(|x| x.rt == rt) {
                 for &slot in released {
                     let generation = self.nodes.get(slot).generation();
+                    x.directs.remove_node(slot, generation);
                     dropped.extend(x.pending.extract_node(slot, generation));
                     x.end_node_runs(slot, generation);
                 }
@@ -4958,7 +4966,10 @@ impl<C: Cells> Runtime<C> {
         let ended: Vec<Delivery> = replay::with(|c| {
             c.iter_mut()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.pending.extract_frame(root.0, generation, cidx))
+                .flat_map(|x| {
+                    x.directs.remove_frame((root.0, generation, cidx));
+                    x.pending.extract_frame(root.0, generation, cidx)
+                })
                 .collect()
         });
         // No retry reads the ended run's frame again, so its unread reads
@@ -5251,12 +5262,8 @@ impl<C: Cells> Runtime<C> {
                 let mut resumed = None;
                 for x in c.iter_mut().filter(|x| x.rt == rt) {
                     x.direct = None;
-                    if let Some(i) = x
-                        .pending
-                        .find_keyed(&key, |d| !d.taken() && matches!(d.what, Delivered::Direct))
-                    {
-                        x.pending.set_taken(i, true);
-                        resumed = Some(x.pending.get(i).runs.clone());
+                    if let Some(runs) = x.directs.take(&key) {
+                        resumed = Some(runs);
                         x.direct = Some((slot, handle.generation(), f.cidx));
                     }
                     x.resume = None;
@@ -5294,7 +5301,7 @@ impl<C: Cells> Runtime<C> {
                 payload,
                 nodes,
             } => (cycle, poison, attributed, payload, nodes),
-            Delivered::Walk(..) | Delivered::Direct => {
+            Delivered::Walk(..) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             Delivered::Landed(value, poison) => {
@@ -5829,11 +5836,15 @@ impl<C: Cells> Runtime<C> {
             }
             Computed::Discarded => match self.walk_discarded(visit) {
                 Some(after) => after,
+                None if is_root => {
+                    self.stash_root_direct(root);
+                    return Err(computed);
+                }
                 None => {
                     // The discarded compute is a frame the reading frame's
                     // retry runs again.
                     walk.repush(entry);
-                    self.stash_walk(root, (!is_root).then_some(walk), Some(entry.id.0));
+                    self.stash_walk(root, Some(walk), Some(entry.id.0));
                     return Err(computed);
                 }
             },
@@ -5856,8 +5867,35 @@ impl<C: Cells> Runtime<C> {
     /// resumes `walk`, the rest of it, or with none left, takes the root's
     /// landing as the read's outcome.
     fn stash_walk(&self, root: NodeId, walk: Option<&mut Walk>, pushed: Option<u32>) {
-        // A doomed frame's walk reads past placeholders, and a speculative
-        // run's retry takes no delivery.
+        self.at_blocked_read(root, |c, i, v| match walk {
+            Some(walk) => {
+                let runs = replay::run_snapshot(c, self.runtime_id, v);
+                c[i].deliver_walk(v, std::mem::take(walk), pushed, runs);
+            }
+            None => c[i].pending.remove_walks(&ReadKey::blocked(v)),
+        });
+    }
+
+    /// A doom discarded the compute of `root` its reading frame's walk
+    /// ended at: the retry runs that compute directly, counting its runs
+    /// from those that ended, so it takes the seq after them and none of
+    /// their deliveries.
+    fn stash_root_direct(&self, root: NodeId) {
+        self.at_blocked_read(root, |c, i, v| {
+            let runs = replay::run_snapshot(c, self.runtime_id, v);
+            c[i].redeliver_direct(v, runs);
+        });
+    }
+
+    /// Runs `f` on the innermost virtual frame of this runtime blocked in
+    /// the active frame's read of `root`, with its context's index. A
+    /// doomed frame's walk reads past placeholders, and a speculative
+    /// run's retry takes no delivery, so neither reaches `f`.
+    fn at_blocked_read(
+        &self,
+        root: NodeId,
+        f: impl FnOnce(&mut Vec<replay::Context>, usize, &VFrame),
+    ) {
         if replay::speculative() {
             return;
         }
@@ -5875,16 +5913,7 @@ impl<C: Cells> Runtime<C> {
                     .find(|v| v.cidx == at && v.reading == reading)
                     .cloned()
                 {
-                    match walk {
-                        Some(walk) => {
-                            let runs = replay::run_snapshot(c, rt, &v);
-                            c[i].deliver_walk(&v, std::mem::take(walk), pushed, runs);
-                        }
-                        None => {
-                            let key = ReadKey::blocked(&v);
-                            c[i].pending.remove_walks(&key);
-                        }
-                    }
+                    f(c, i, &v);
                     return;
                 }
             }

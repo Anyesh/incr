@@ -154,6 +154,81 @@ cycle_100k_tests! {
     shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
 }
 
+/// A ring's retries redeliver each discarded walk root's direct read, one
+/// per doom: the delivery index work that costs stays per doom, not per
+/// delivery its maker made, so it does not grow with the budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn redelivered_root_reads_cost_the_same_at_any_budget() {
+    let work = |frames: u32| {
+        let units = Arc::new(Mutex::new(0));
+        let out = units.clone();
+        on_stack(1 << 30, move || {
+            let n = 5_000;
+            let rt = Runtime::<Local>::new();
+            rt.set_placeholder(0_i64);
+            rt.set_max_frames(frames);
+            let runs = counters(n);
+            let iterations = Arc::new(AtomicU32::new(0));
+            let members = ring(
+                &rt,
+                n,
+                Strategy::Fallback,
+                &runs,
+                &iterations,
+                |rt, next, _| (rt.get(next) + 1).min(5),
+            );
+            crate::replay::take_note_work();
+            assert_eq!(rt.get(members[0]), 3);
+            *out.lock().unwrap() = crate::replay::take_note_work();
+        });
+        let units = *units.lock().unwrap();
+        units
+    };
+    let (narrow, wide) = (work(256), work(4096));
+    assert!(
+        wide * 4 <= narrow * 5,
+        "{narrow} units of note work at budget 256, {wide} at 4096"
+    );
+}
+
+/// A ring's root dooms each leave a direct delivery for the root's read
+/// until the run that made it ends, one per virtual frame below it: they
+/// cost no more than the virtual frames do, and the context's other
+/// deliveries stay as few as at a budget the ring never dooms under.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn redelivered_root_reads_hold_a_direct_per_virtual_frame() {
+    for frames in [256, 4096] {
+        let peak = Arc::new(Mutex::new((0, 0, 0)));
+        let out = peak.clone();
+        on_stack(1 << 30, move || {
+            let n = 5_000;
+            let rt = Runtime::<Local>::new();
+            rt.set_placeholder(0_i64);
+            rt.set_max_frames(frames);
+            let runs = counters(n);
+            let iterations = Arc::new(AtomicU32::new(0));
+            let members = ring(
+                &rt,
+                n,
+                Strategy::Fallback,
+                &runs,
+                &iterations,
+                |rt, next, _| (rt.get(next) + 1).min(5),
+            );
+            crate::replay::take_peak_live();
+            assert_eq!(rt.get(members[0]), 3);
+            *out.lock().unwrap() = crate::replay::take_peak_live();
+        });
+        let (live, directs, depth) = *peak.lock().unwrap();
+        assert!(
+            live <= 1 && (1..=depth).contains(&directs),
+            "at budget {frames}: {live} deliveries and {directs} direct ones live at once, {depth} virtual frames"
+        );
+    }
+}
+
 thread_local! {
     static DEEPEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
