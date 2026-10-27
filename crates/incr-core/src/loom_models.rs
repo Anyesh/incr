@@ -3414,6 +3414,12 @@ fn hand_over_races_publication_of_a_ring_of_three_at_a_first_entry_exit() {
     hand_over_races_publication_at(true, 3, false, &NESTED_RING_EXIT_RACE);
 }
 
+/// CI runs the two Failed variants at bound 1: at bound 2 neither finishes
+/// in its 90 minutes, the wound, retraction and retry of a Failed ring
+/// widening the schedules. Bound 1 reaches both ends of the race but
+/// misses a wounded attempt publishing its Failed landing, which bound 2
+/// catches; `runtime::hold_tests::shared_wounded_publication_of_a_failed_ring_publishes_nothing`
+/// pins that path.
 #[test]
 fn hand_over_races_a_failed_publication_at_the_outermost_exit() {
     hand_over_races_publication_at(false, 2, true, &FAILED_EXIT_RACE);
