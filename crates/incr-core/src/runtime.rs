@@ -1508,6 +1508,9 @@ pub struct Runtime<C: Cells> {
     pub(crate) root_replans: std::sync::atomic::AtomicU32,
     #[cfg(all(test, not(loom)))]
     pub(crate) verdict_reruns: std::sync::atomic::AtomicU32,
+    /// Entries `note_past_sets` recorded, for tests.
+    #[cfg(test)]
+    pub(crate) past_note_work: std::sync::atomic::AtomicU64,
     /// Waits on another thread's doom reservation, for tests.
     #[cfg(test)]
     pub(crate) reservation_waits: std::sync::atomic::AtomicU32,
@@ -1640,6 +1643,8 @@ impl<C: Cells> Runtime<C> {
             root_replans: std::sync::atomic::AtomicU32::new(0),
             #[cfg(all(test, not(loom)))]
             verdict_reruns: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            past_note_work: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             reservation_waits: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -6542,6 +6547,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
         }
+        self.deps_installed(id.0);
         // The union keeps the old deps as its prefix.
         let kept = inner
             .released_deps

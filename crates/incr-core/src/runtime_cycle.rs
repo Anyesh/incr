@@ -2810,11 +2810,13 @@ impl<C: Cells> Runtime<C> {
                     if let Some(displaced) = node.install_deps(new) {
                         bag.push_dep_list(displaced);
                     }
+                    self.deps_installed(id.0);
                     continue;
                 }
                 if let Some(displaced) = node.install_deps(new) {
                     bag.push_dep_list(displaced);
                 }
+                self.deps_installed(id.0);
                 for o in &old {
                     if !new.contains(o) {
                         inner.dependents[o.0 as usize].remove(id);
