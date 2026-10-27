@@ -690,6 +690,9 @@ impl<C: Cells> Runtime<C> {
                 self.0.dep_stack.pop_frame();
             }
         }
+        if !C::SINGLE_THREADED {
+            reserve::callback_code();
+        }
         let ctl = ComputeCtl::new(0);
         self.dep_stack
             .push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &ctl, u32::MAX);
@@ -2042,13 +2045,13 @@ impl<C: Cells> Runtime<C> {
         discarding: bool,
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> Option<reserve::Peers> {
         let mut keep = Vec::new();
         if kind == Some(UnwindKind::Discard) {
             self.virtually_owned(cidx, &mut keep);
         }
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, kind, subtree, &keep, false, payload, bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &keep, false, payload, bag)
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
@@ -2077,7 +2080,7 @@ impl<C: Cells> Runtime<C> {
         doom: bool,
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> Option<reserve::Peers> {
         // The unwinding frame, of node `subtree`, owns the claims owned at
         // its position by it, and those owned above.
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
@@ -2113,11 +2116,20 @@ impl<C: Cells> Runtime<C> {
                 .collect()
         });
         if entries.is_empty() {
-            return;
+            return None;
         }
         self.count_release(entries.iter().map(|&(slot, _)| slot));
         entries.sort_unstable_by_key(|(slot, _)| *slot);
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
+        // One episode: the unwinding frame's node and what it released.
+        let peers = (!discarding && kind.is_none() && self.lists_walks()).then(|| {
+            reserve::Peers::new(
+                released
+                    .iter()
+                    .copied()
+                    .chain(subtree.filter(|&n| n != u32::MAX)),
+            )
+        });
         let stamp_rev = self.current_revision();
         let verify_rev = C::walked(&self.walk, &self.revision);
         let look = Look::here();
@@ -2154,7 +2166,9 @@ impl<C: Cells> Runtime<C> {
             }
             // A cycle's retry may run a member again; a user panic ends its run.
             if !discarding && kind.is_none() {
-                self.note_unwound_landing(id, self.nodes.get(slot));
+                if let Some(peers) = &peers {
+                    self.note_unwound_landing(id, self.nodes.get(slot), peers);
+                }
                 self.end_reservation(id, self.nodes.get(slot));
             }
             // A discarded claim's run is one the unbounded run never makes,
@@ -2174,6 +2188,7 @@ impl<C: Cells> Runtime<C> {
         if kind.is_none() {
             self.end_released_runs(&released);
         }
+        peers
     }
 
     /// The discard landing of a claim this thread holds: the node lands as

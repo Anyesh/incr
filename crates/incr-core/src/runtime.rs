@@ -1844,6 +1844,9 @@ impl<C: Cells> Runtime<C> {
             let arena_inner = arena;
             let compute: ComputeFn<C> = Box::new(
                 move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
+                    if !C::SINGLE_THREADED {
+                        reserve::user_code((rt.runtime_id, slot));
+                    }
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
                     let outcome = match ctl.flags.get()
@@ -6005,27 +6008,38 @@ impl<C: Cells> Runtime<C> {
         self.land_as(id, node, target, flagged, false)
     }
 
-    /// Ends this thread's context reservation of `id` if its run `landed`
-    /// settled, as the unbounded run's frame releases its claim there. A
-    /// Dirty replay landing or a Dirty read ends it through
+    /// Ends this thread's context reservation and walk listings of `id` if
+    /// its run `landed` settled, as the unbounded run's frame releases its
+    /// claim there. A Dirty replay landing or a Dirty read ends it through
     /// [`Self::end_unowed_reservation`] unless this thread runs the node
     /// again; any other unsettled landing keeps it until a later run lands
     /// the node settled or the context is removed.
     pub(super) fn end_reservation_landed(&self, id: NodeId, node: &NodeData<C>, landed: NodeState) {
-        if landed.is_settled() {
-            self.end_reservation(id, node);
+        if landed.is_settled() && self.ends_reservations() {
+            let claim = (self.runtime_id, id.0);
+            reserve::end_landed(claim, node.generation());
+            reserve::end_walk_landed(claim, node.generation());
         }
     }
 
-    /// Keeps `id`, which a user panic's unwind just landed New or Dirty, for
-    /// this thread's read ([`reserve::note_walk`]): a walk that contains the
-    /// panic runs it again after the context holding it has ended.
-    pub(super) fn note_unwound_landing(&self, id: NodeId, node: &NodeData<C>) {
-        if !C::SINGLE_THREADED
-            && self.budgeted()
-            && matches!(node.state(), NodeState::New | NodeState::Dirty)
-        {
-            reserve::note_walk((self.runtime_id, id.0), node.generation());
+    /// Whether this thread's walks list what a user panic's unwind lands
+    /// unsettled ([`Self::note_unwound_landing`]).
+    pub(super) fn lists_walks(&self) -> bool {
+        !C::SINGLE_THREADED && self.budgeted() && reserve::walking()
+    }
+
+    /// Keeps `id`, which a user panic's unwind just landed New or Dirty with
+    /// `peers`, for this thread's read ([`reserve::note_walk`]): a walk that
+    /// contains the panic runs it again after the context holding it has
+    /// ended. Only where [`Self::lists_walks`].
+    pub(super) fn note_unwound_landing(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        peers: &reserve::Peers,
+    ) {
+        if matches!(node.state(), NodeState::New | NodeState::Dirty) {
+            reserve::note_walk((self.runtime_id, id.0), node.generation(), peers);
         }
     }
 
@@ -6035,10 +6049,15 @@ impl<C: Cells> Runtime<C> {
     /// landing, and a later set lands that reader Dirty by its claim
     /// watermark.
     pub(super) fn end_reservation(&self, id: NodeId, node: &NodeData<C>) {
-        if C::SINGLE_THREADED || !reserve::any() || replay::speculative() {
-            return;
+        if self.ends_reservations() {
+            reserve::end_landed((self.runtime_id, id.0), node.generation());
         }
-        reserve::end_landed((self.runtime_id, id.0), node.generation());
+    }
+
+    /// Whether this thread may hold a reservation a landing ends: none
+    /// under `Local`, none in a speculative run.
+    fn ends_reservations(&self) -> bool {
+        !C::SINGLE_THREADED && reserve::any() && !replay::speculative()
     }
 
     /// [`Self::land`] of a claim released as if its run never happened, so
