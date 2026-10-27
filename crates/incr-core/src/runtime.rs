@@ -636,6 +636,8 @@ pub(crate) struct EpisodeLog {
     /// The highest landed episode and release numbers whose slots the log
     /// no longer holds.
     evicted: [Option<u32>; 2],
+    /// [`Self::evicted`] of `ended` entries.
+    evicted_ended: [Option<u32>; 2],
 }
 
 impl EpisodeLog {
@@ -659,6 +661,9 @@ impl EpisodeLog {
             if self.entries.len() == EPISODE_LOG_LEN {
                 if let Some(old) = self.entries.pop_front() {
                     self.evicted[usize::from(old.released)] = Some(old.number);
+                    if old.ended {
+                        self.evicted_ended[usize::from(old.released)] = Some(old.number);
+                    }
                 }
             }
             self.entries.push_back(Logged {
@@ -698,8 +703,8 @@ impl EpisodeLog {
     /// its entries being evicted.
     fn ended_with(&self, landed: u32, released: u32, slot: u32) -> bool {
         let after = |n: u32, since: u32| n.wrapping_sub(since) as i32 > 0;
-        if self.evicted[0].is_some_and(|n| after(n, landed))
-            || self.evicted[1].is_some_and(|n| after(n, released))
+        if self.evicted_ended[0].is_some_and(|n| after(n, landed))
+            || self.evicted_ended[1].is_some_and(|n| after(n, released))
         {
             return true;
         }
@@ -1163,7 +1168,8 @@ impl Walk {
 
     /// Plans afresh from the root, which another thread landed since the
     /// walk planned it (a claim the walk waited out, a New plan that met it
-    /// Dirty, or a landing its claim found in the episode log), as a read
+    /// Dirty, a replaced group, or a landing its claim found in the episode
+    /// log), as a read
     /// that came after that landing would: where the walk enters a cycle of
     /// recorded deps depends on its visit count at the switch to exact mode,
     /// and which queued entries a Failed root passes depends on the Failed
@@ -4040,8 +4046,6 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     revisited.push(cur);
                     if is_root {
-                        // Each restart follows another read's publication of
-                        // the root since the plan, which ended that read.
                         walk.restart();
                         planned = self.planned();
                     }
@@ -4475,10 +4479,12 @@ impl<C: Cells> Runtime<C> {
         self.give_back(node, dirty, true);
     }
 
-    /// [`Self::unclaim_unrun`], marking the node unrun only if `unrun`.
+    /// [`Self::unclaim_unrun`], marking the node unrun only if `mark`;
+    /// otherwise its mark, and its held entry's, stay as the claim found
+    /// them.
     #[cold]
     #[inline(never)]
-    fn give_back(&self, node: &NodeData<C>, dirty: bool, unrun: bool) {
+    fn give_back(&self, node: &NodeData<C>, dirty: bool, mark: bool) {
         let back = if dirty {
             NodeState::Dirty
         } else {
@@ -4487,11 +4493,13 @@ impl<C: Cells> Runtime<C> {
         // The owner's re-claim of its own held node goes back to the view.
         if !C::SINGLE_THREADED
             && hold::active()
-            && hold::land(state::cell_key::<C>(node.state_cell()), back, back, unrun)
+            && hold::land_marking(state::cell_key::<C>(node.state_cell()), back, back, mark)
         {
             return;
         }
-        node.set_unrun(unrun);
+        if mark {
+            node.set_unrun(true);
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
                 state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);

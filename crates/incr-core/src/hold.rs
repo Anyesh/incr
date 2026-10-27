@@ -582,6 +582,16 @@ pub(crate) fn defer_trace(cell: usize, action: TraceAction) -> Option<TraceActio
 
 /// Records a landing of a node with an entry; false if it has none.
 pub(crate) fn land(cell: usize, target: NodeState, flagged: NodeState, unrun: bool) -> bool {
+    land_with(cell, target, flagged, Some(unrun))
+}
+
+/// [`land`] of a give-back, which marks the entry unrun only if `mark`
+/// and otherwise leaves its mark as the claim found it.
+pub(crate) fn land_marking(cell: usize, target: NodeState, flagged: NodeState, mark: bool) -> bool {
+    land_with(cell, target, flagged, mark.then_some(true))
+}
+
+fn land_with(cell: usize, target: NodeState, flagged: NodeState, unrun: Option<bool>) -> bool {
     with(|h| {
         h.seq += 1;
         let seq = h.seq;
@@ -591,7 +601,9 @@ pub(crate) fn land(cell: usize, target: NodeState, flagged: NodeState, unrun: bo
         e.seq = seq;
         e.target = target;
         e.flagged = flagged;
-        e.unrun = unrun;
+        if let Some(unrun) = unrun {
+            e.unrun = unrun;
+        }
         e.reclaimed = false;
         attempt::hold_progress();
         true
