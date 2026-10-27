@@ -254,15 +254,18 @@ impl Held {
         &self.s
     }
 
-    /// Replaces the current value, returning the one it replaces.
-    pub(crate) fn replace_s(&mut self, s: Option<Erased>) -> Option<Erased> {
+    /// Replaces the current value, set under `look`, returning the one it
+    /// replaces.
+    pub(crate) fn replace_s(&mut self, s: Option<Erased>, look: Look) -> Option<Erased> {
         self.s_stamp = 0;
-        self.s_spec = s.is_some() && replay::speculative();
+        self.s_spec = s.is_some() && look.speculative;
         std::mem::replace(&mut self.s, s)
     }
 
     pub(crate) fn take_s(&mut self) -> Option<Erased> {
-        self.replace_s(None)
+        self.s_stamp = 0;
+        self.s_spec = false;
+        self.s.take()
     }
 
     /// For a change to how the claim reads (its episode, or whether it is
@@ -752,7 +755,7 @@ impl HeldMap {
         &mut self,
         key: &(RuntimeId, u32),
         look: Look,
-        clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
+        clean: &impl Fn(NodeId) -> Option<(u32, u64)>,
     ) -> Option<(Seen<&mut Held>, Option<Unbuilt>)> {
         if self.spec_written && !look.speculative {
             self.adopt_if_real(key, clean);

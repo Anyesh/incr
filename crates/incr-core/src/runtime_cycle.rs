@@ -1206,14 +1206,8 @@ impl<C: Cells> Runtime<C> {
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
         held.wrote = ctl.wrote.get() != 0;
-        let look = Look::here();
-        // A compute frame's notes may be an earlier frame's at this
-        // position, so a speculative one keeps no basis.
-        if value_code::thread_word() & value_code::SPEC_READS_BIT != 0 {
-            cycle_state::with_held(|h| h.drop_spec_reads(rt, cidx));
-        }
         let (replaced, spec_buf) = held.record(
-            look,
+            Look::here(),
             deps,
             ctl.buf.take(),
             !ctl.children.get().is_null(),
@@ -1558,7 +1552,7 @@ impl<C: Cells> Runtime<C> {
                 for (m, s) in &strategies {
                     let v0 =
                         self.attributed(*m, cidx, bag, || self.callback(|| s.v0(Some(&cycle))));
-                    let old = self.take_held(*m, |e| e.replace_s(Some(v0)));
+                    let old = self.take_held(*m, |e| e.replace_s(Some(v0), look));
                     self.drop_member_value(*m, cidx, old, bag);
                 }
                 // s_{k-1} of each Fixpoint member, for the convergence test and
@@ -1687,10 +1681,11 @@ impl<C: Cells> Runtime<C> {
 
                         // 4. The strategy members' next values.
                         let mut converged = vec![true; r.strategies.len()];
+                        let look = Look::here();
                         for (i, (m, s)) in r.strategies.iter().enumerate() {
                             let (out, spec_buf) = cycle_state::with_held(|h| {
                                 let (mut seen, spec_buf) = h
-                                    .look(&(rt, *m), Look::here(), &|d| self.clean_stamp(d))
+                                    .look(&(rt, *m), look, &|d| self.clean_stamp(d))
                                     .expect("incr-core: an episode member is held");
                                 (seen.take_buf(), spec_buf)
                             });
@@ -1714,7 +1709,7 @@ impl<C: Cells> Runtime<C> {
                             converged[i] = self.attributed(*m, cidx, bag, || {
                                 self.callback(|| s.converged(&s_prev, &next))
                             });
-                            self.take_held(*m, |e| e.replace_s(Some(next)));
+                            self.take_held(*m, |e| e.replace_s(Some(next), look));
                             let older = r.prev[i].replace(s_prev);
                             self.drop_member_value(*m, cidx, older, bag);
                         }
@@ -1731,7 +1726,7 @@ impl<C: Cells> Runtime<C> {
                                 let landed = self.attributed(*m, cidx, bag, || {
                                     self.callback(|| s.on_limit(&r.cycle, last))
                                 });
-                                self.take_held(*m, |e| e.replace_s(Some(landed)));
+                                self.take_held(*m, |e| e.replace_s(Some(landed), look));
                             }
                         }
 
@@ -1748,7 +1743,7 @@ impl<C: Cells> Runtime<C> {
                                         value_code::run(|| s.same(p, c))
                                     })
                                 });
-                                self.take_held(*m, |e| e.replace_s(cur));
+                                self.take_held(*m, |e| e.replace_s(cur, look));
                                 !same
                             })
                         });

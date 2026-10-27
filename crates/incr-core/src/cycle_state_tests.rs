@@ -293,7 +293,7 @@ fn a_strategy_member_read_holds_until_its_current_value_moves() {
         let mut h = HeldMap::new();
         h.insert((rt, 5), Held::new(0, 1, true, true));
         h.insert((rt, 6), Held::new(0, 1, false, true));
-        h.get_mut(&(rt, 5)).unwrap().replace_s(value(1));
+        h.get_mut(&(rt, 5)).unwrap().replace_s(value(1), Look::REAL);
         h.note_spec_current_read(rt, 10, 5);
         let none = |_: NodeId| None;
         let deps = vec![(NodeId(5), 0)];
@@ -314,7 +314,7 @@ fn a_strategy_member_read_holds_until_its_current_value_moves() {
     assert!(settled.is_none());
     assert_eq!(read(seen.buf()), Some(7));
     let mut h = reader();
-    h.get_mut(&(rt, 5)).unwrap().replace_s(value(2));
+    h.get_mut(&(rt, 5)).unwrap().replace_s(value(2), Look::REAL);
     let (_, settled) = h.look(&(rt, 6), Look::REAL, &none).unwrap();
     assert_eq!(read_unbuilt(&settled), Some(7));
 }
