@@ -2556,20 +2556,34 @@ cost on compute rows; the earlier held-landing sections measured walks.
   +12, `delete_strict` +8. `fanout_shared_4`: `wait_out_set` +234,
   `get_slow` +79, `release` +72, the `ComputeFn` wrapper +71,
   `delete_erased` +48.
-- Local pays nothing. At one codegen unit `fanout_local_4` is 18772 on
-  both and `delete_single_local` 799 against 800; per line, every
-  source line of `delete_strict` costs the same on both, and the one
-  instruction sits on line 0 (no source line, register allocation).
-  Every guard is behind `C::SINGLE_THREADED` or a no-op on a thread
-  with no attempt word.
-- Contained panics: scale icount tops out at 1.0784
-  (`shared_contained_chain_stays_linear_at_budget_16`, 1.0405 at
-  budget 2, 1.0009 Local), the same on the branch alone (+423.9M
-  against +427.7M instructions). Panics, raises and `resume_unwind`s are
-  equal to base; each failed landing adds one `_Unwind_Resume` and
-  three `rust_eh_personality` calls, about 30k instructions per
-  contained panic, in the same frames (gdb, `8efe5cb8-2e6d92`). The
-  `ComputeFn` wrapper's guard is one cleanup pad (-79.5M without it,
-  `854fdfd5-6301ba`); `read_walk`'s guard adds no unwind call
+- Local pays nothing. At one codegen unit (`33c30fd6-2327e7`)
+  `fanout_local_4` is 18772 on both and `delete_single_local` 800 on 17
+  against 799 on 16. Per source line of that build's
+  `delete_single_local` (`33c30fd6-28b694`, line tables), each file's
+  lines cost the same on both once moved line numbers are matched, and
+  the one instruction is code with no source line (`runtime.rs:0` +1,
+  `alloc.rs:0` +1, `icount.rs:0` -1). Every guard is behind
+  `C::SINGLE_THREADED` or a no-op on a thread with no attempt word.
+- Contained panics, Shared only. Scale icount on the port
+  (`33c30fd6-e8670d`): `shared_contained_chain_stays_linear_at_budget_16`
+  1.0784 (+432.6M instructions), 1.0402 at budget 2, the Local
+  contained chains at most 1.0049; the branch alone against 9
+  (`686405c7-c43a94`) is 1.0771 (+424.3M) at budget 16. Callgrind on
+  that test (`8efe5cb8-df2203`, the
+  branch on increment 15 against 15): raises (14455) and
+  `resume_unwind`s (14449) equal base, and over its 14003 failed
+  landings `_Unwind_Resume` rises by 14003 (49028 to 63031) and
+  `rust_eh_personality` by 42009 (246066 to 288075), one more resume and
+  three more personality calls per failed landing, raised from the same
+  frames (gdb backtraces, `8efe5cb8-2e6d92`): about 31k instructions per
+  failed landing. The `ComputeFn` wrapper's guard is one cleanup pad:
+  without it (`854fdfd5-6301ba`) `_Unwind_Resume` is back to 49028,
+  `rust_eh_personality` falls by 14009 and the test by 79.5M
+  instructions. `read_walk`'s guard adds no unwind call
   (`854fdfd5-7279b7`). Growth class is unchanged.
-- Scale timing totals 0.994 (`33c30fd6-9b2bbf`).
+- Scale timing totals 0.994 (`33c30fd6-9b2bbf`). Its largest rows are
+  Shared: `shared_contained_chain_stays_linear_at_budget_16` 1.085 (wall
+  1.076), `shared_nested_caught_chain_stays_linear_at_budget_1` 1.080
+  (wall 1.059), `shared_same_text_fan_through_a_frame_over_chain_stays_linear`
+  1.064 (wall 1.069), `shared_failed_entry_fan_in` 1.059 (wall 1.028)
+  and the contained chain at budget 2 1.048 (wall 1.041).
