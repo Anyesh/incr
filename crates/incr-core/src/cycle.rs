@@ -463,6 +463,10 @@ const PATH_KEPT: u8 = 1;
 const READS_COUNTED: u8 = 2;
 /// [`ComputeCtl::marks`]: see [`ComputeCtl::looked_up_unrecorded`].
 const LOOKED_UP_UNRECORDED: u8 = 4;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::read_stashes`].
+const STASH_READ: u8 = 8;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::spec_unchecked`].
+const SPEC_UNCHECKED: u8 = 16;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -476,7 +480,8 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
-    /// `PATH_KEPT` and `READS_COUNTED`, which only get set.
+    /// `PATH_KEPT`, `READS_COUNTED`, `LOOKED_UP_UNRECORDED`, `STASH_READ`
+    /// and `SPEC_UNCHECKED`, which only get set.
     marks: Cell<u8>,
     /// The frame's dep count at its last read that could unwind into it:
     /// a dep past it was read after.
@@ -552,6 +557,28 @@ impl ComputeCtl {
 
     pub(crate) fn count_reads(&self) {
         self.marks.set(self.marks.get() | READS_COUNTED);
+    }
+
+    /// Whether this speculative frame read a stash, kept in
+    /// `replay::keep_spec_read` under this control block. A fresh one at a
+    /// popped frame's address says no.
+    pub(crate) fn read_stashes(&self) -> bool {
+        self.marks.get() & STASH_READ != 0
+    }
+
+    pub(crate) fn mark_stash_read(&self) {
+        self.marks.set(self.marks.get() | STASH_READ);
+    }
+
+    /// Whether this speculative frame read something no stash of it can
+    /// stand over: a read that named no checked source. Unlike
+    /// `KEPT_UNCHECKED`, it leaves a member run's basis to its own checks.
+    pub(crate) fn spec_unchecked(&self) -> bool {
+        self.marks.get() & SPEC_UNCHECKED != 0
+    }
+
+    pub(crate) fn mark_spec_unchecked(&self) {
+        self.marks.set(self.marks.get() | SPEC_UNCHECKED);
     }
 
     /// Whether a `BUFFERED` frame made a lookup that records no dep, which

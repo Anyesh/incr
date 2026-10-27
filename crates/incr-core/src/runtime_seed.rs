@@ -56,7 +56,7 @@ impl<C: Cells> Runtime<C> {
         };
         // A speculative run may have landed the node back New with a stash,
         // which stands for the run the seed replaces. A stash that read it
-        // read a value the seed replaces with no new revision, so the
+        // holds a value the seed replaces with no new revision, so the
         // reshape count ends it.
         if C::u32_load_relaxed(&self.stash_count) != 0 {
             let mut bag = Deferred::new();
