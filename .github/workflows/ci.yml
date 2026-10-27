@@ -182,6 +182,8 @@ jobs:
           - { model: "loom_models::loom_checked_read_vs_change", bound: 2 }
           - { model: "loom_models::loom_speculative_changes_vs_check", bound: 2 }
           - { model: "loom_models::loom_speculative_change_passes_check", bound: 2 }
+          - { model: "loom_models::loom_memo_ends_before_a_later_landings_changed_at", bound: 3 }
+          - { model: "loom_models::loom_memo_ends_before_another_threads_landings_changed_at", bound: 3 }
           - { model: "loom_models::hand_over_races_publication", bound: 2 }
           - { model: "loom_models::hand_over_races_reclaim", bound: 2 }
           - { model: "loom_models::hand_over_waits_out_a_holder_that_progresses", bound: 2 }
