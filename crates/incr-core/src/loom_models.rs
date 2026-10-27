@@ -3632,3 +3632,47 @@ fn loom_memo_ends_before_a_later_landings_changed_at() {
         assert!(!node.memo_at(|| 6));
     });
 }
+
+/// [`loom_memo_ends_before_a_later_landings_changed_at`] with the later
+/// landing on another thread: its `max_changed_at` reads the bit with a
+/// relaxed load, which sees the memo only through the claim's acquire of
+/// the first landing's store.
+#[test]
+fn loom_memo_ends_before_another_threads_landings_changed_at() {
+    use crate::state::{store, try_transition};
+    run(|| {
+        let node: Arc<NodeData<Loom>> = Arc::new(NodeData::new_query(0, 0));
+        let first = {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let state = node.state_cell();
+                try_transition::<Loom>(state, NodeState::New, NodeState::Computing).unwrap();
+                node.max_changed_at(5);
+                node.set_memo(5);
+                store::<Loom>(state, NodeState::Dirty);
+            })
+        };
+        let second = {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let state = node.state_cell();
+                if try_transition::<Loom>(state, NodeState::Dirty, NodeState::Computing).is_ok() {
+                    node.max_changed_at(6);
+                    node.set_verified_at(0);
+                    store::<Loom>(state, NodeState::Dirty);
+                }
+            })
+        };
+        if node.state() == NodeState::Dirty {
+            assert!(
+                !node.memo_at(|| 6),
+                "a reader at 6 took the memo for 5 with another thread's later changed_at"
+            );
+        }
+        first.join().unwrap();
+        second.join().unwrap();
+        if node.changed_at() == 6 {
+            assert!(!node.memo_at(|| 6));
+        }
+    });
+}
