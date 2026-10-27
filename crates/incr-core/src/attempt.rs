@@ -279,7 +279,7 @@ impl Attempt {
         if patience.since.is_some_and(|t| t.elapsed() < STUCK_FOR) {
             return false;
         }
-        patience.checks >= STUCK_AFTER && self.wound_in_flight(claim)
+        patience.checks >= STUCK_AFTER && self.take_over(claim, Some(flight.2))
     }
 
     /// A waiter on this attempt, which met it at `claim`: wounds it if its
@@ -287,7 +287,14 @@ impl Attempt {
     /// owner may be in user code that waits on the waiter, unless the
     /// owner waits in the registry older than the waiter
     /// ([`crate::waits::take_over_in_order`]). True if it is wounded now.
+    #[cfg(test)]
     pub(crate) fn wound_in_flight(&self, claim: Claim) -> bool {
+        self.take_over(claim, None)
+    }
+
+    /// [`Self::wound_in_flight`], refused if the owner's flights count has
+    /// moved from `seen` when the registry lock is taken.
+    fn take_over(&self, claim: Claim, seen: Option<u32>) -> bool {
         let w = self.word.state.load(Ordering::Acquire);
         if !self.current(w) || w & (IN_FLIGHT | HOLDING) == 0 {
             return false;
@@ -298,7 +305,10 @@ impl Attempt {
         crate::waits::take_over_in_order(
             Arc::as_ptr(&self.word) as usize,
             crate::cycle_state::ticket_now(),
-            || self.wound_now(claim),
+            || {
+                seen.is_none_or(|f| self.word.flights.load(Ordering::Relaxed) == f)
+                    && self.wound_now(claim)
+            },
         )
     }
 

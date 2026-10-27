@@ -3954,6 +3954,12 @@ impl<C: Cells> Runtime<C> {
         let mut unchecked = None;
         #[cfg(test)]
         let mut revisited: Vec<NodeId> = Vec::new();
+        // A holder's walk is engine progress as its pops are: a waiter that
+        // took it for one held in user code would wound an owner that moves
+        // on its own.
+        const PROGRESS_POPS: u32 = 64;
+        let holding = !C::SINGLE_THREADED && hold::active();
+        let mut pops: u32 = 0;
 
         while let Some(Entry {
             id: cur,
@@ -4096,6 +4102,12 @@ impl<C: Cells> Runtime<C> {
             #[cfg(test)]
             self.walk_pops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if holding {
+                pops = pops.wrapping_add(1);
+                if pops.is_multiple_of(PROGRESS_POPS) {
+                    crate::attempt::hold_progress();
+                }
+            }
             if walk.is_visited(cur) {
                 continue;
             }
