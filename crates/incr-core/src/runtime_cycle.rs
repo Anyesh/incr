@@ -1026,9 +1026,12 @@ impl<C: Cells> Runtime<C> {
             self.dep_stack.settle_foreign_keeping(true);
         }
         let mut began = None;
-        if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+        let word = value_code::thread_word();
+        if word & value_code::SPEC_READS_BIT != 0 {
             // Notes at this position or above are an earlier frame's.
             cycle_state::with_held(|h| h.drop_spec_reads(self.runtime_id, cidx));
+        }
+        if word & value_code::REPLAY_BIT != 0 {
             self.start_run(id, cidx, &ctl);
             if let Some(low) = self.take_low(id, cidx) {
                 ctl.lower(low);
@@ -1205,9 +1208,8 @@ impl<C: Cells> Runtime<C> {
         held.wrote = ctl.wrote.get() != 0;
         let look = Look::here();
         // A compute frame's notes may be an earlier frame's at this
-        // position, so a speculative one keeps no basis. Notes are made only
-        // inside a replay context.
-        if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+        // position, so a speculative one keeps no basis.
+        if value_code::thread_word() & value_code::SPEC_READS_BIT != 0 {
             cycle_state::with_held(|h| h.drop_spec_reads(rt, cidx));
         }
         let (replaced, spec_buf) = held.record(

@@ -859,7 +859,17 @@ impl HeldMap {
     pub(crate) fn drop_spec_reads(&mut self, rt: RuntimeId, at: u32) {
         if !self.spec_reads.is_empty() {
             self.spec_reads.retain(|(r, c, ..)| *r != rt || *c < at);
+            self.mark_spec_reads();
         }
+    }
+
+    fn push_spec_read(&mut self, read: (RuntimeId, u32, u32, MemberRead)) {
+        self.spec_reads.push(read);
+        self.mark_spec_reads();
+    }
+
+    fn mark_spec_reads(&self) {
+        value_code::set_bits(value_code::SPEC_READS_BIT, !self.spec_reads.is_empty());
     }
 
     /// Notes a speculative run's read, at position `at`, of member `slot`'s
@@ -867,7 +877,7 @@ impl HeldMap {
     pub(crate) fn note_spec_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
         if let Some(e) = self.claims.get_mut(&(rt, slot)) {
             let read = MemberRead::Buffer(noted(&mut e.stamp));
-            self.spec_reads.push((rt, at, slot, read));
+            self.push_spec_read((rt, at, slot, read));
         }
     }
 
@@ -876,15 +886,14 @@ impl HeldMap {
     pub(crate) fn note_spec_current_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
         if let Some(e) = self.claims.get_mut(&(rt, slot)) {
             let read = MemberRead::Current(noted(&mut e.s_stamp));
-            self.spec_reads.push((rt, at, slot, read));
+            self.push_spec_read((rt, at, slot, read));
         }
     }
 
     /// Notes a speculative run's read, at position `at`, of member `slot`
     /// as `cycle`, its episode's.
     pub(crate) fn note_spec_cycle_read(&mut self, rt: RuntimeId, at: u32, slot: u32, cycle: Cycle) {
-        self.spec_reads
-            .push((rt, at, slot, MemberRead::Cycle(cycle)));
+        self.push_spec_read((rt, at, slot, MemberRead::Cycle(cycle)));
     }
 
     /// The basis of a speculative run at position `at` that read `deps`,
@@ -908,6 +917,7 @@ impl HeldMap {
             !mine
         });
         self.spec_reads = reads;
+        self.mark_spec_reads();
         let mut basis = Basis {
             held,
             clean: Vec::new(),
@@ -1253,6 +1263,11 @@ pub(crate) fn with_held<R>(f: impl FnOnce(&mut HeldMap) -> R) -> R {
         ENTRY.with(|e| e.held_any.set(true));
         let r = f(&mut h);
         ENTRY.with(|e| e.held_any.set(!h.is_empty()));
+        debug_assert_eq!(
+            value_code::thread_word() & value_code::SPEC_READS_BIT != 0,
+            !h.spec_reads.is_empty(),
+            "incr-core: the thread word tells whether speculative reads are noted"
+        );
         r
     })
 }
