@@ -633,6 +633,7 @@ struct Logged {
     released: bool,
     /// Logged by a publication, which ends its read.
     ended: bool,
+    unwound: bool,
 }
 
 /// The slots the latest landed episodes and releases of held claims
@@ -651,16 +652,18 @@ pub(crate) struct EpisodeLog {
 impl EpisodeLog {
     #[cfg(all(test, not(loom)))]
     fn push(&mut self, released: bool, number: u32, by: u32, slots: impl IntoIterator<Item = u32>) {
-        self.push_as(released, !released, number, by, slots);
+        self.push_as(released, !released, false, number, by, slots);
     }
 
     /// `by` is 0 for a release this thread made of another thread's
     /// claims, which no thread's walks count as their own. `ended` marks
-    /// what a publication, which ends its read, logs.
+    /// what a publication, which ends its read, logs; `unwound` a cycle
+    /// unwind's release.
     fn push_as(
         &mut self,
         released: bool,
         ended: bool,
+        unwound: bool,
         number: u32,
         by: u32,
         slots: impl IntoIterator<Item = u32>,
@@ -680,6 +683,7 @@ impl EpisodeLog {
                 by,
                 released,
                 ended,
+                unwound,
             });
         }
     }
@@ -693,6 +697,15 @@ impl EpisodeLog {
     /// releases numbered after `since` landed, or `None` if the log may
     /// have evicted some of them.
     fn others_since(&self, released: bool, since: u32) -> Option<HashSet<u32, FxBuildHasher>> {
+        self.others_since_marked(released, false, since)
+    }
+
+    fn others_since_marked(
+        &self,
+        released: bool,
+        unwound: bool,
+        since: u32,
+    ) -> Option<HashSet<u32, FxBuildHasher>> {
         let after = |n: u32| n.wrapping_sub(since) as i32 > 0;
         if self.evicted[usize::from(released)].is_some_and(after) {
             return None;
@@ -700,7 +713,9 @@ impl EpisodeLog {
         let me = cycle_state::thread_key();
         Some(
             (self.entries.iter())
-                .filter(|e| e.released == released && e.by != me && after(e.number))
+                .filter(|e| {
+                    e.released == released && e.unwound == unwound && e.by != me && after(e.number)
+                })
                 .map(|e| e.slot)
                 .collect(),
         )
@@ -729,6 +744,12 @@ impl EpisodeLog {
     /// of `planned` unrun, or may have, its slots being evicted.
     fn reached(&self, since: u32, mut planned: impl Iterator<Item = u32>) -> bool {
         self.others_since(true, since)
+            .is_none_or(|released| !released.is_empty() && planned.any(|s| released.contains(&s)))
+    }
+
+    /// [`Self::reached`] for the releases of cycle unwinds.
+    fn unwound_reached(&self, since: u32, mut planned: impl Iterator<Item = u32>) -> bool {
+        self.others_since_marked(true, true, since)
             .is_none_or(|released| !released.is_empty() && planned.any(|s| released.contains(&s)))
     }
 }
@@ -4564,7 +4585,34 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn release_reached(&self, walk: &Walk, cur: NodeId, planned: Planned) -> bool {
         let since = (planned.all / RELEASED) as u32;
-        self.episode_log.read().reached(since, walk.plan_slots(cur))
+        let (held, unwound) = {
+            let log = self.episode_log.read();
+            let held = log.reached(since, walk.plan_slots(cur));
+            (
+                held,
+                !held && log.unwound_reached(since, walk.plan_slots(cur)),
+            )
+        };
+        held || unwound && self.plan_landed(walk)
+    }
+
+    /// Whether a node `walk` expanded and has yet to compute has landed
+    /// since, or its slot was recycled: a walk planned now would stop
+    /// there, so the rest of the plan below it may be one no walk makes.
+    #[cold]
+    #[inline(never)]
+    fn plan_landed(&self, walk: &Walk) -> bool {
+        walk.work.iter().any(|e| {
+            e.is_pending() && {
+                let node = self.nodes.get(e.id.0);
+                let cell = node.state_cell();
+                node.generation() != e.generation
+                    || matches!(
+                        self.seen(cell, state::load::<C>(cell)),
+                        NodeState::Clean | NodeState::Cyclic | NodeState::Failed
+                    )
+            }
+        })
     }
 
     /// After a claim CAS of `id` at `generation` succeeded: whether another
@@ -5632,6 +5680,12 @@ impl<C: Cells> Runtime<C> {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
             self.unfailed_landing(id, node.generation(), attempt.cidx);
+            // A cycle unwind is in the unbounded run too: a walk another
+            // thread planned through this claim replans if a node its plan
+            // expanded landed meanwhile, as one planned now would stop there.
+            if kind == Some(UnwindKind::Cycle) {
+                self.count_unwound_release(id.0);
+            }
             self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
         } else {
             // Publish the union of the old deps and whatever was recorded

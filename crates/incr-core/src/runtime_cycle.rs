@@ -2180,6 +2180,14 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// [`Self::count_release`] of the claim of `slot` a cycle unwind lands
+    /// unrun, which a walk acts on only if its plan went stale meanwhile.
+    pub(super) fn count_unwound_release(&self, slot: u32) {
+        if !C::SINGLE_THREADED {
+            self.count_episodes_marked(true, true, false, true, RELEASED, [slot]);
+        }
+    }
+
     /// Counts `episodes` landed episodes, before their `slots` land.
     pub(super) fn count_landed(&self, episodes: u64, slots: impl IntoIterator<Item = u32>) {
         self.count_episodes(false, true, true, episodes * super::LANDED, slots);
@@ -2199,6 +2207,18 @@ impl<C: Cells> Runtime<C> {
         add: u64,
         slots: impl IntoIterator<Item = u32>,
     ) {
+        self.count_episodes_marked(released, own, ended, false, add, slots);
+    }
+
+    fn count_episodes_marked(
+        &self,
+        released: bool,
+        own: bool,
+        ended: bool,
+        unwound: bool,
+        add: u64,
+        slots: impl IntoIterator<Item = u32>,
+    ) {
         let log = (!C::SINGLE_THREADED).then(|| self.episode_log.write());
         if own {
             cycle_state::own_episode(self.runtime_id, add);
@@ -2211,7 +2231,7 @@ impl<C: Cells> Runtime<C> {
                 after as u32
             };
             let by = if own { cycle_state::thread_key() } else { 0 };
-            log.push_as(released, ended, number, by, slots);
+            log.push_as(released, ended, unwound, number, by, slots);
         }
     }
 

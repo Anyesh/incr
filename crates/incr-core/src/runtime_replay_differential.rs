@@ -1360,6 +1360,9 @@ struct Live<C: Cells> {
     /// The closure runs each operation's thread ended, by operation, in
     /// a two-thread run.
     evals: Mutex<HashMap<usize, Vec<Eval>>>,
+    /// The operations that have ended in a two-thread run, for a park hook
+    /// that holds one thread until the other's operation is over.
+    ended: Arc<Mutex<HashSet<usize>>>,
 }
 
 /// After an operation: every query's state, every node's dependencies in
@@ -1387,6 +1390,7 @@ impl<C: Cells> Live<C> {
             retired: Mutex::new(Vec::new()),
             queries: [case.queries, case.queries2],
             evals: Mutex::new(HashMap::new()),
+            ended: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1676,7 +1680,9 @@ fn run_two_until(
                     if let Some(i) = phase.of(t) {
                         TWO_PHASE.with(|c| c.set(p));
                         let op = &case.ops[i];
-                        match catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op)))) {
+                        let r = catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op))));
+                        live.ended.lock().unwrap().insert(i);
+                        match r {
                             Ok((out, ran)) => {
                                 outs.lock().unwrap()[i] = Some(out);
                                 live.evals.lock().unwrap().insert(i, ran);
@@ -8773,6 +8779,194 @@ fn hook() {
             }
         }));
     });
+}
+
+/// 0x886d3's ops 21 and 22 with op 21's walk planned from 19 while 19 is
+/// New: op 21 holds before its claim of 9 until op 22 has ended, and op
+/// 22 holds before it computes 19 until op 21 is there. Op 22's doom
+/// driver lands 19 Clean, its read of 9 on the stack closes the ring, and
+/// the cycle unwind lands 9, 10 and 11 New unrun. In the only order that
+/// matches, op 22 first, op 21's read finds 19 Clean and gives its value;
+/// a walk that kept its plan runs 9 again and closes the cycle a second
+/// time.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_replans_past_a_ring_a_cycle_unwind_landed_unrun() {
+    let case = gen_case(0x886d3, true, true);
+    let phases = phases(&case, 0x886d3);
+    let overlap = phases
+        .iter()
+        .position(|p| p.ops().contains(&21) && p.ops().contains(&22))
+        .unwrap();
+    let reader = if phases[overlap].of(0) == Some(21) {
+        0
+    } else {
+        1
+    };
+    let mut shaped = 0;
+    quiet(|| {
+        for (frames, bytes) in [(Some(3), 16384), (None, 16384), (Some(2), 0)] {
+            for _ in 0..4 {
+                let (at9, held, landed) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let rig = |live: &Live<Shared>| {
+                    let (at9, held, landed, world, ended) = (
+                        at9.clone(),
+                        held.clone(),
+                        landed.clone(),
+                        live.world.clone(),
+                        live.ended.clone(),
+                    );
+                    let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                    let (n9, n19) = (slot(9), slot(19));
+                    let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                        let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                            return;
+                        };
+                        if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                            return;
+                        }
+                        let rt = world.rt(0);
+                        let begun = std::time::Instant::now();
+                        let within = || begun.elapsed() < std::time::Duration::from_secs(10);
+                        if t != reader {
+                            if p == ParkPoint::BeforeComputeOne(n19) {
+                                while !at9.load(SeqCst) && within() {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                            return;
+                        }
+                        if p != ParkPoint::BeforeComputeOne(n9) || held.swap(true, SeqCst) {
+                            return;
+                        }
+                        let unclean = rt.nodes.get(n19.0).state() != NodeState::Clean;
+                        at9.store(true, SeqCst);
+                        while !ended.lock().unwrap().contains(&22) && within() {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        landed.store(
+                            unclean
+                                && ended.lock().unwrap().contains(&22)
+                                && rt.nodes.get(n19.0).state() == NodeState::Clean
+                                && rt.nodes.get(n9.0).state() == NodeState::New,
+                            SeqCst,
+                        );
+                    });
+                    assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                };
+                let serial = Serial::new(&case, &phases);
+                let verdict = Mutex::new(None);
+                let got = run_two_until(&case, &phases, frames, bytes, &rig, &|p, prefix, live| {
+                    let v = serial.at_overlap("0x886d3", prefix, live);
+                    let stop = p == overlap || v.is_some();
+                    *verdict.lock().unwrap() = v;
+                    stop
+                });
+                shaped += usize::from(landed.load(SeqCst));
+                serial.check("0x886d3", &got, verdict.into_inner().unwrap());
+            }
+        }
+    });
+    assert!(
+        shaped > 0,
+        "op 21 never planned from 19 New and reached 9 after op 22 ended with 19 Clean and 9 New"
+    );
+}
+
+/// 0x4b004's ops 14 (`Get(8)`) and 15 (`Get(3)`): op 14's walk plans
+/// through 2 and holds before its claim of 2 until op 15 has ended, whose
+/// cycle unwind lands the ring 7, 8, 2 unrun and counts the release. Op 14
+/// then replans from its root; the plan reaches 2 under a taint, as a
+/// verify only, once per path to it. Each such verify lands 2 Dirty again
+/// for the root's compute, so the walk must not verify it again for every
+/// repeated entry. Outcomes go unchecked: the seed's op 15 face, a separate
+/// defect, fails a few runs in a hundred without the release count too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_replan_verifies_an_unrun_ring_member_once() {
+    let case = gen_case(0x4b004, true, true);
+    let phases = phases(&case, 0x4b004);
+    let overlap = phases
+        .iter()
+        .position(|p| p.ops().contains(&14) && p.ops().contains(&15))
+        .unwrap();
+    let reader = if phases[overlap].of(0) == Some(14) {
+        0
+    } else {
+        1
+    };
+    // A run takes the shape about one time in three under a full suite's
+    // load, so each budget runs until it has taken it twice.
+    const RUNS_PER_BUDGET: usize = 16;
+    let mut shaped = 0;
+    quiet(|| {
+        for (frames, bytes) in [(Some(3), 0), (None, 0)] {
+            let mut here = 0;
+            for _ in 0..RUNS_PER_BUDGET {
+                if here == 2 {
+                    break;
+                }
+                let (held, released, passes) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicUsize::new(0)),
+                );
+                let rig = |live: &Live<Shared>| {
+                    let (held, released, passes, world, ended) = (
+                        held.clone(),
+                        released.clone(),
+                        passes.clone(),
+                        live.world.clone(),
+                        live.ended.clone(),
+                    );
+                    let n2 = NodeId(world.handle(0, 2).erased().slot());
+                    let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                        if TWO_PHASE.with(std::cell::Cell::get) != overlap
+                            || TWO_THREAD.with(std::cell::Cell::get) != Some(reader)
+                            || p != ParkPoint::BeforeComputeOne(n2)
+                        {
+                            return;
+                        }
+                        if held.swap(true, SeqCst) {
+                            if released.load(SeqCst) {
+                                passes.fetch_add(1, SeqCst);
+                            }
+                            return;
+                        }
+                        let begun = std::time::Instant::now();
+                        while !ended.lock().unwrap().contains(&15)
+                            && begun.elapsed() < std::time::Duration::from_secs(10)
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        released.store(ended.lock().unwrap().contains(&15), SeqCst);
+                    });
+                    assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                };
+                let serial = Serial::new(&case, &phases);
+                let got = run_two_until(&case, &phases, frames, bytes, &rig, &|p, prefix, live| {
+                    p == overlap || serial.at_overlap("0x4b004", prefix, live).is_some()
+                });
+                if released.load(SeqCst) && got[15].0 == Out::Panic("cycle".into()) {
+                    shaped += 1;
+                    here += 1;
+                    let passes = passes.load(SeqCst);
+                    assert!(
+                        passes <= case.specs.len(),
+                        "op 14's replanned walk reached 2 {passes} times after the release"
+                    );
+                }
+            }
+        }
+    });
+    assert!(
+        shaped > 0,
+        "op 14 never held before 2 until op 15 had ended with the cycle"
+    );
 }
 
 /// Runs `f` with panic messages from closures silenced: the generated

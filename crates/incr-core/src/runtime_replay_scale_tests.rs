@@ -177,6 +177,47 @@ cycle_100k_tests! {
     shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
 }
 
+/// Two threads read one 100k Fallback ring at budget 256, from member 0
+/// and from member n / 2, so each walk meets the other thread's cycle
+/// unwinds; the ring lands as one thread's read lands it. Member n / 2 has
+/// no strategy, so its read is a `try_get`, which gets the cycle if that
+/// thread discovers it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_fallback_cycle_100k_read_from_two_threads() {
+    let n = 100_000;
+    let rt = Runtime::<Shared>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(256);
+    let runs = counters(n);
+    let iterations = Arc::new(AtomicU32::new(0));
+    let members = ring(
+        &rt,
+        n,
+        Strategy::Fallback,
+        &runs,
+        &iterations,
+        |rt, next, _| (rt.get(next) + 1).min(5),
+    );
+    let (head, middle) = std::thread::scope(|s| {
+        let stack = || std::thread::Builder::new().stack_size(16 << 20);
+        let head = stack().spawn_scoped(s, || rt.get(members[0]));
+        let middle = stack().spawn_scoped(s, || rt.try_get(members[n / 2]));
+        (head.expect("spawn").join(), middle.expect("spawn").join())
+    });
+    assert_eq!(head.unwrap(), 3);
+    let middle = middle.unwrap();
+    assert!(matches!(middle, Ok(5) | Err(_)), "{middle:?}");
+    assert_eq!(rt.get(members[0]), 3);
+    for (k, &m) in members.iter().enumerate().skip(1) {
+        assert_eq!(rt.get(m), if k == n - 1 { 4 } else { 5 }, "member {k}");
+    }
+    for &m in &members {
+        assert_eq!(rt.state_of(m), NodeState::Clean);
+    }
+    rt.assert_invariant_i();
+}
+
 /// The deep budget the redelivered root read tests run a 5,000-member
 /// ring under. TSan's shadow stack holds 64Ki calls per thread and does not
 /// check its end, so a deeper call stack corrupts TSan's own memory; a
