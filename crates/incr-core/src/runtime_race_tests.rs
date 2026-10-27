@@ -3007,3 +3007,126 @@ fn a_failed_tests_scoped_parked_thread_is_released() {
     });
     assert!(released);
 }
+
+thread_local! {
+    static CLONE_GATE: RefCell<Option<Gate>> = const { RefCell::new(None) };
+}
+
+/// Parks at this thread's armed [`CLONE_GATE`] while cloning: a read that
+/// pinned the slot waits there, before its dirty-read check.
+#[derive(Debug, PartialEq)]
+struct PinnedClone(u64);
+
+impl Clone for PinnedClone {
+    fn clone(&self) -> Self {
+        CLONE_GATE.with(|g| {
+            if let Some(gate) = g.borrow().as_ref() {
+                gate.park_in_user_code();
+            }
+        });
+        PinnedClone(self.0)
+    }
+}
+
+/// Case D: top's speculative run verifies Dirty mid before a set's walk (no
+/// stash), pins mid's 0 and parks in the clone; the main thread then lands
+/// mid = 7 Dirty (superseded by the new dep z) and stashes it unchanged. At
+/// input 13, leaf = 1 and mid = z = 7, so every serial order gives top = 8.
+#[test]
+fn shared_dirty_read_pinned_before_an_unchanged_stash_is_not_adopted() {
+    let mut rt = Rt::new();
+    rt.all_replayable = false;
+    let rt = Arc::new(rt);
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let leaf = rt.create_query(move |rt: &Rt| rt.get(input) / 10);
+    let z = rt.create_query(|_: &Rt| 7_u64);
+    let mid = rt.create_query(move |rt: &Rt| {
+        if rt.get(leaf) == 0 {
+            PinnedClone(0)
+        } else {
+            PinnedClone(rt.get(z))
+        }
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+    let top = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Rt| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            rt.get(mid).0 + 1
+        })
+    };
+    let top2 = rt.create_query(move |rt: &Rt| rt.get(mid).0 + 2);
+    let doomed_reader = |then: Incr<u64>| {
+        let b = rt.create_query(|_: &Rt| 5_u64);
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let x = rt.get(b);
+                if x == 0 {
+                    rt.get(then)
+                } else {
+                    x
+                }
+            },
+            super::replay_tests::replayable(),
+        )
+    };
+    let (reader, reader2) = (doomed_reader(top), doomed_reader(top2));
+    assert_eq!(rt.get(mid), PinnedClone(0));
+    rt.set(input, 2);
+    assert_eq!(rt.get(leaf), 0);
+    assert_eq!(rt.state_of(mid), NodeState::Dirty);
+
+    let (bumped, walked, cloning) = (Gate::new(), Gate::new(), Gate::new());
+    park_at(
+        &rt,
+        vec![
+            (ParkPoint::SetAfterBump, bumped.clone()),
+            (ParkPoint::SetAfterWalk, walked.clone()),
+        ],
+    );
+    let setter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set(input, 13))
+    };
+    bumped.wait_parked();
+    cloning.arm();
+    let pinned = {
+        let (rt, cloning) = (Arc::clone(&rt), cloning.clone());
+        thread::spawn(move || {
+            CLONE_GATE.with(|g| *g.borrow_mut() = Some(cloning));
+            rt.get(reader)
+        })
+    };
+    cloning.wait_parked();
+    bumped.release();
+    walked.wait_parked();
+    assert_eq!(rt.get(mid), PinnedClone(7));
+    assert_eq!(
+        rt.state_of(mid),
+        NodeState::Dirty,
+        "mid's landing over its new dep z is not superseded"
+    );
+    walked.release();
+    setter.join().unwrap();
+    assert_eq!(rt.get(reader2), 5);
+    cloning.release();
+    assert_eq!(pinned.join().unwrap(), 5);
+
+    let speculative = runs.load(Ordering::SeqCst);
+    let value = rt.get(top);
+    let real = runs.load(Ordering::SeqCst) - speculative;
+    assert_eq!(
+        value,
+        8,
+        "top read mid's pinned pre-set 0: {speculative} speculative run(s), {real} real \
+         ({})",
+        if real == 0 {
+            "a stash was adopted"
+        } else {
+            "no stash adopted"
+        }
+    );
+    rt.assert_invariant_i();
+}
