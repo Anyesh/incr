@@ -516,7 +516,7 @@ impl<C: Cells> Runtime<C> {
         waits::await_winner(C::backoff, |(rt, slot)| {
             #[cfg(all(test, not(loom)))]
             if rt == self.runtime_id {
-                waits::OWN_CLAIM_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                waits::OWN_CLAIM_CHECKS.add(rt);
             }
             rt == self.runtime_id
                 && !matches!(
