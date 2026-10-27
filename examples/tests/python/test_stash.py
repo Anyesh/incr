@@ -239,7 +239,7 @@ def test_a_read_in_finally_during_a_wound_is_given_up_with_the_run(
     assert results == {w: 1, o: 2}
     assert seen[w] == ["_IncrEngineUnwind"]
     assert runs[o] == []
-    assert_discarded_then_lands_its_own_outcome(rt, cleanup[w], w, raises, runs[w])
+    assert_given_up_unrun_then_lands_its_own_outcome(rt, cleanup[w], w, raises, runs[w])
     assert capfd.readouterr().err == ""
 
 
