@@ -614,7 +614,6 @@ fn shared_concurrent_reads_of_a_warm_cycle_match_the_single_thread_result() {
                     catch_unwind(AssertUnwindSafe(|| rt.get(node))).map_err(panic_message)
                 };
                 let (b, m) = thread::scope(|s| {
-                    let _released = release_parked_on_unwind();
                     let b = s.spawn(|| read(below));
                     let m = s.spawn(|| read(m));
                     (b.join().unwrap(), m.join().unwrap())

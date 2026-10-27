@@ -30,11 +30,12 @@ type Rt = Runtime<Shared>;
 pub(super) const PARK_TIMEOUT: Duration = Duration::from_secs(10);
 
 thread_local! {
-    /// The gates a test's thread made. Only that thread releases a thread
-    /// parked on one, so when it ends, failed or not, they are let go: a
-    /// failed test then fails alone instead of aborting the binary at the
-    /// park timeout. A scope joins its threads before the test thread ends,
-    /// so a scope that drives gates holds [`release_parked_on_unwind`].
+    /// The gates a test's thread made, let go when it ends, failed or not,
+    /// since a test drives its gates from that thread: a failed test then
+    /// fails alone instead of aborting the binary at the park timeout. A
+    /// scope joins its threads before the test thread ends, so a scope that
+    /// drives gates holds [`release_parked_on_unwind`], and a driver on
+    /// another thread holds [`Gate::released_on_unwind`].
     static MADE_HERE: MadeHere = const { MadeHere(RefCell::new(Vec::new())) };
 }
 
@@ -142,8 +143,12 @@ impl Gate {
         self.0.release_tx.lock().unwrap().send(()).unwrap();
     }
 
-    /// Disarms the gate and releases a thread parked on it, as its driver
-    /// is gone.
+    /// Lets the gate go if this thread panics: for a driver that is not
+    /// the thread that made the gate.
+    pub(crate) fn released_on_unwind(&self) -> OnUnwind<impl FnMut() + '_> {
+        OnUnwind(|| self.let_go())
+    }
+
     fn let_go(&self) {
         self.0.armed.store(false, Ordering::SeqCst);
         self.release();
