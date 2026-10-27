@@ -2007,7 +2007,11 @@ fn walk_listing(reader: WalkReader) {
         let mut early = (reader != WalkReader::Joined).then(|| spawn(&rt));
         {
             let _read = crate::reserve::Root::arm(true, (rt.runtime_id, q.slot()));
-            crate::reserve::note_walk((rt.runtime_id, n.slot()), n.generation(), &[n.slot()]);
+            crate::reserve::note_walk(
+                (rt.runtime_id, n.slot()),
+                n.generation(),
+                &crate::reserve::Peers::new([n.slot()]),
+            );
             match reader {
                 WalkReader::Joined => {
                     crate::reserve::user_code((rt.runtime_id, q.slot()));

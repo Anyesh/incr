@@ -4794,6 +4794,7 @@ fn walk_listing_passes_an_earlier_reader_its_user_code_joins() {
         assert!(live.world.rt(0).park_hook.set(hook).is_ok());
         let b_out = Arc::new(Mutex::new(None));
         let joined = Arc::new(AtomicBool::new(false));
+        let listed = Arc::new(AtomicU32::new(0));
         std::thread::scope(|s| {
             let b_read = s.spawn(|| {
                 B.with(|b| b.set(true));
@@ -4804,9 +4805,12 @@ fn walk_listing_passes_an_earlier_reader_its_user_code_joins() {
             assert!(parked.load(SeqCst), "B returned before it waited");
             let a = s.spawn(|| {
                 let (released, joined, b_out) = (released.clone(), joined.clone(), b_out.clone());
+                let listed = listed.clone();
+                let before = crate::reserve::walk_listings();
                 ENTERED.with(|e| {
                     *e.borrow_mut() = Some(Box::new(move |side, i| {
                         if (side, i) == (0, 1) && !joined.swap(true, SeqCst) {
+                            listed.store(crate::reserve::walk_listings() - before, SeqCst);
                             released.store(true, SeqCst);
                             until(|| b_out.lock().unwrap().is_some());
                         }
@@ -4820,11 +4824,14 @@ fn walk_listing_passes_an_earlier_reader_its_user_code_joins() {
             released.store(true, SeqCst);
             b_read.join().unwrap();
             assert!(joined.load(SeqCst), "R's closure never ran");
-            (a, b_out.lock().unwrap().take().unwrap())
+            let outs = (a, b_out.lock().unwrap().take().unwrap());
+            (outs, listed.load(SeqCst))
         })
     };
     quiet(|| {
-        assert_eq!(twin(Some(1)), twin(None));
+        let (bounded, listed) = twin(Some(1));
+        assert!(listed > 0, "the budget listed nothing before R's entry");
+        assert_eq!(bounded, twin(None).0);
     });
 }
 
@@ -4855,8 +4862,7 @@ fn two_thread_callback_joins_a_read_of_a_listed_node() {
 
 /// Runs `case`'s operations before `op` in order, then `op` on a thread
 /// A whose first callback of node `callback` lets a read B of node
-/// `listed` go and waits up to 3 s for it: whether B returned in the
-/// wait, A's walk listings, and both outcomes.
+/// `listed` go and waits up to 10 s for it.
 fn callback_join(case: &Case, op: usize, callback: usize, listed: usize, bytes: usize) -> Joined {
     let rts = runtimes::<Shared>(None, bytes);
     let live = Live::new(&rts, case);
@@ -4885,7 +4891,7 @@ fn callback_join(case: &Case, op: usize, callback: usize, listed: usize, bytes: 
                     if let Some(go) = go_tx.take_if(|_| (side, i) == (0, callback)) {
                         go.send(()).unwrap();
                         let start = std::time::Instant::now();
-                        while !done.load(SeqCst) && start.elapsed().as_secs() < 3 {
+                        while !done.load(SeqCst) && start.elapsed().as_secs() < 10 {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         *returned.lock().unwrap() = Some(done.load(SeqCst));

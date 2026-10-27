@@ -21,13 +21,15 @@
 //! Dirty node would replace it with a value no serial order gives the read.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(not(loom))]
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use crate::fx::FxBuildHasher;
 #[cfg(not(loom))]
 use crate::fx::FxHasher;
+use crate::handle::RuntimeId;
 use crate::waits::Claim;
 
 #[cfg(not(loom))]
@@ -158,8 +160,8 @@ thread_local! {
     /// [`SEQ`] as this thread's current op left the Clean fast path; 0
     /// before its first.
     static OP: Cell<u64> = const { Cell::new(0) };
-    /// Walk listings awake until this thread next enters user code.
-    static WOKEN: RefCell<Vec<Woken>> = const { RefCell::new(Vec::new()) };
+    /// This thread's awake walk listings, by the release that made them.
+    static WOKEN: RefCell<Vec<Release>> = const { RefCell::new(Vec::new()) };
     static ANY_WOKEN: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -170,7 +172,7 @@ loom::thread_local! {
     static ROOT: Cell<u64> = Cell::new(0);
     static ROOTS: Cell<u32> = Cell::new(0);
     static OP: Cell<u64> = Cell::new(0);
-    static WOKEN: RefCell<Vec<Woken>> = RefCell::new(Vec::new());
+    static WOKEN: RefCell<Vec<Release>> = RefCell::new(Vec::new());
     static ANY_WOKEN: Cell<bool> = Cell::new(false);
 }
 
@@ -319,21 +321,51 @@ pub(crate) fn note_root(claim: Claim, generation: u32) {
     ROOTS.with(|n| n.set(n.get() + 1));
 }
 
+/// The slots of one unwind's release, sorted: the nodes whose frames the
+/// unbounded run holds in one episode. Shared by the release's listings.
+#[derive(Clone)]
+pub(crate) struct Peers(Rc<[u32]>);
+
+impl Peers {
+    pub(crate) fn new(slots: impl IntoIterator<Item = u32>) -> Self {
+        let mut slots: Vec<u32> = slots.into_iter().collect();
+        slots.sort_unstable();
+        slots.dedup();
+        Self(slots.into())
+    }
+
+    fn contains(&self, slot: u32) -> bool {
+        self.0.binary_search(&slot).is_ok()
+    }
+}
+
+/// One release's walk listings still awake: claims the walk group of
+/// `context` lists, each with the stamp this thread's other reservation
+/// of the node had before the listing woke it, or since ([`AWAKE`] for
+/// none or awake), kept awake through the closures of `peers` of `rt`.
+struct Release {
+    context: u64,
+    rt: RuntimeId,
+    peers: Peers,
+    woken: HashMap<(Claim, u32), u64, FxBuildHasher>,
+}
+
 /// Reserves `claim`, which a user panic's unwind inside this thread's
 /// innermost read just landed New or Dirty, until the read lands it
 /// settled or ends. A walk entry's contained unwind lands claims its walk
 /// runs again outside any doom's scope, and the context whose end follows
 /// the containment no longer holds them. The listing holds every op while
 /// the unbounded run would still hold the node in its frame: through
-/// engine code and the closures of `peers`, the slots the unwind
-/// released with it, whose frames sit in the same episode. It ends where
-/// this thread next enters another closure ([`user_code`]) or any cycle
-/// callback ([`callback_code`]), where the unbounded run holds no frame of
-/// it, so a reader that code joins, begun before or after, passes. A reservation of the node this thread already
-/// held goes back to its stamp. The read's own node is [`note_root`]'s.
+/// engine code and the closures of `peers`, the slots the unwind released
+/// with it, whose frames sit in the same episode. It ends where this
+/// thread next enters another closure ([`user_code`]) or any cycle
+/// callback ([`callback_code`]), where the unbounded run holds no frame
+/// of it, so a reader that code joins, begun before or after, passes. A
+/// reservation of the node this thread already held goes back to its
+/// stamp. The read's own node is [`note_root`]'s.
 #[cold]
 #[inline(never)]
-pub(crate) fn note_walk(claim: Claim, generation: u32, peers: &[u32]) {
+pub(crate) fn note_walk(claim: Claim, generation: u32, peers: &Peers) {
     let key = ROOT.with(Cell::get);
     if key == 0 || key == root_key(claim) {
         return;
@@ -372,37 +404,35 @@ pub(crate) fn note_walk(claim: Claim, generation: u32, peers: &[u32]) {
         }
         Some(was)
     });
-    if let Some(was) = listed {
-        ROOTS.with(|n| n.set(n.get() + 1));
-        WOKEN.with(|w| {
-            w.borrow_mut().push(Woken {
-                claim: (claim, generation),
-                was,
-                peers: peers.to_vec(),
-            })
-        });
-        ANY_WOKEN.with(|a| a.set(true));
-        #[cfg(all(test, not(loom)))]
-        WALK_LISTINGS.with(|n| n.set(n.get() + 1));
-    }
+    let Some(was) = listed else {
+        return;
+    };
+    ROOTS.with(|n| n.set(n.get() + 1));
+    WOKEN.with(|w| {
+        let mut w = w.borrow_mut();
+        let same = |r: &Release| r.context == context && Rc::ptr_eq(&r.peers.0, &peers.0);
+        if !w.last().is_some_and(same) {
+            w.push(Release {
+                context,
+                rt: claim.0,
+                peers: peers.clone(),
+                woken: HashMap::default(),
+            });
+        }
+        let release = w.last_mut().expect("a release was just pushed");
+        release.woken.insert((claim, generation), was);
+    });
+    ANY_WOKEN.with(|a| a.set(true));
+    #[cfg(all(test, not(loom)))]
+    WALK_LISTINGS.with(|n| n.set(n.get() + 1));
 }
 
-/// A walk listing awake until its thread next enters user code outside
-/// `peers`, the stamp this thread's reservation of the node had before the
-/// listing woke it ([`AWAKE`] for none), and the slots whose user code
-/// keeps it awake.
-struct Woken {
-    claim: (Claim, u32),
-    was: u64,
-    peers: Vec<u32>,
-}
-
-/// This thread is about to run the user code of `entering`: its walk
+/// This thread is about to run the closure of `entering`: its walk
 /// listings end here unless `entering` is one of their peers.
 #[inline(always)]
 pub(crate) fn user_code(entering: Claim) {
     if ANY_WOKEN.with(Cell::get) {
-        end_woken(|(rt, slot)| (rt, slot) == entering);
+        end_woken(Some(entering));
     }
 }
 
@@ -412,25 +442,36 @@ pub(crate) fn user_code(entering: Claim) {
 #[inline(always)]
 pub(crate) fn callback_code() {
     if ANY_WOKEN.with(Cell::get) {
-        end_woken(|_| false);
+        end_woken(None);
     }
 }
 
+/// Ends the walk listings of every release `entering` is no peer of.
 #[cold]
 #[inline(never)]
-fn end_woken(keeps: impl Fn(Claim) -> bool) {
-    let woken = WOKEN.with(|w| std::mem::take(&mut *w.borrow_mut()));
-    let (kept, ended): (Vec<_>, Vec<_>) = woken
-        .into_iter()
-        .partition(|w| w.peers.iter().any(|&peer| keeps((w.claim.0 .0, peer))));
-    ANY_WOKEN.with(|a| a.set(!kept.is_empty()));
-    WOKEN.with(|w| *w.borrow_mut() = kept);
-    for w in ended {
-        end_walk(w);
+fn end_woken(entering: Option<Claim>) {
+    let mut ended = Vec::new();
+    WOKEN.with(|w| {
+        let mut w = w.borrow_mut();
+        #[cfg(all(test, not(loom)))]
+        WALK_WORK.with(|n| n.set(n.get() + w.len() as u64));
+        w.retain_mut(|r| {
+            let keep = entering.is_some_and(|(rt, slot)| r.rt == rt && r.peers.contains(slot));
+            if !keep {
+                ended.extend(r.woken.drain().map(|(c, was)| (r.context, c, was)));
+            }
+            keep
+        });
+        ANY_WOKEN.with(|a| a.set(!w.is_empty()));
+    });
+    #[cfg(all(test, not(loom)))]
+    WALK_WORK.with(|n| n.set(n.get() + ended.len() as u64));
+    for (context, claim, was) in ended {
+        end_walk(context, claim, was);
     }
 }
 
-/// Ends this thread's walk listing of `claim`, which its run just landed
+/// Ends this thread's walk listings of `claim`, which its run just landed
 /// settled, as the unbounded run's frame releases its claim there.
 #[cold]
 #[inline(never)]
@@ -439,42 +480,46 @@ pub(crate) fn end_walk_landed(claim: Claim, generation: u32) {
         return;
     }
     let claim = (claim, generation);
-    let woken = WOKEN.with(|w| {
+    let mut ended = Vec::new();
+    WOKEN.with(|w| {
         let mut w = w.borrow_mut();
-        let at = w.iter().position(|w| w.claim == claim);
-        let woken = at.map(|at| w.swap_remove(at));
+        w.retain_mut(|r| {
+            if let Some(was) = r.woken.remove(&claim) {
+                ended.push((r.context, was));
+            }
+            !r.woken.is_empty()
+        });
         ANY_WOKEN.with(|a| a.set(!w.is_empty()));
-        woken
     });
-    end_walk(woken.unwrap_or(Woken {
-        claim,
-        was: AWAKE,
-        peers: Vec::new(),
-    }));
+    for (context, was) in ended {
+        end_walk(context, claim, was);
+    }
 }
 
-/// Takes `claim` out of this thread's walk groups and ends its listing,
-/// leaving a reservation another group of the thread still holds at the
-/// stamp it had before the listing woke it.
-fn end_walk(Woken { claim, was, .. }: Woken) {
+/// Takes `claim` out of this thread's walk group of `context`, whose
+/// listing of it ended, leaving a reservation another group of the thread
+/// holds at `was` once no walk group lists it.
+fn end_walk(context: u64, claim: (Claim, u32), was: u64) {
     let ended = MINE.try_with(|m| {
         let mut groups = m.0.borrow_mut();
-        let mut found = 0;
-        for g in groups
-            .iter_mut()
-            .filter(|g| g.context & WALK != 0 && g.context != ROOT_READ)
-        {
-            if g.claims.remove(&claim) {
-                found += 1;
-            }
+        let at = groups.iter().position(|g| g.context == context)?;
+        if !groups[at].claims.remove(&claim) {
+            return None;
         }
-        groups.retain(|g| g.context & WALK == 0 || g.context == ROOT_READ || !g.claims.is_empty());
-        (found != 0).then(|| (found, m.token()))
+        if groups[at].claims.is_empty() {
+            groups.swap_remove(at);
+        }
+        let walked = groups
+            .iter()
+            .any(|g| g.context & WALK != 0 && g.context != ROOT_READ && g.claims.contains(&claim));
+        Some((m.token(), walked))
     });
-    if let Ok(Some((found, token))) = ended {
-        ROOTS.with(|n| n.set(n.get() - found));
+    if let Ok(Some((token, walked))) = ended {
+        ROOTS.with(|n| n.set(n.get() - 1));
         unlist([claim], token, true);
-        restamp([(claim, was)], token);
+        if !walked {
+            restamp([(claim, was)], token);
+        }
     }
 }
 
@@ -529,21 +574,57 @@ fn end_root(key: u64) {
         let mut woken = Vec::new();
         let _ = WOKEN.try_with(|w| {
             let mut w = w.borrow_mut();
-            w.retain(|w| {
-                let keep = !ended.contains(&w.claim);
+            w.retain_mut(|r| {
+                let keep = r.context != (WALK | key);
                 if !keep {
-                    woken.push((w.claim, w.was));
+                    woken.extend(r.woken.drain());
                 }
                 keep
             });
             let _ = ANY_WOKEN.try_with(|a| a.set(!w.is_empty()));
         });
         unlist(ended, token, true);
+        woken.retain(|&(claim, _)| !walk_listed(claim));
         restamp(woken, token);
     }
 }
 
+/// Whether a walk group of this thread lists `claim`.
+fn walk_listed(claim: (Claim, u32)) -> bool {
+    MINE.try_with(|m| {
+        m.0.borrow()
+            .iter()
+            .any(|g| g.context & WALK != 0 && g.context != ROOT_READ && g.claims.contains(&claim))
+    })
+    .unwrap_or(false)
+}
+
+/// Sets the stamp under each awake walk listing of `claim` to `stamp`,
+/// where `only_awake` keeps one already set. Whether any listing does.
+fn set_woken_stamp(claim: (Claim, u32), stamp: impl Fn() -> u64, only_awake: bool) -> bool {
+    if !ANY_WOKEN.try_with(Cell::get).unwrap_or(false) {
+        return false;
+    }
+    WOKEN
+        .try_with(|w| {
+            let mut found = false;
+            for r in w.borrow_mut().iter_mut() {
+                if let Some(was) = r.woken.get_mut(&claim) {
+                    if !only_awake || *was == AWAKE {
+                        *was = stamp();
+                    }
+                    found = true;
+                }
+            }
+            found
+        })
+        .unwrap_or(false)
+}
+
 fn list(context: u64, claim: Claim, generation: u32, again: bool) {
+    // The reservation under an awake listing is awake again, whatever an
+    // earlier context's rest left there.
+    set_woken_stamp((claim, generation), || AWAKE, false);
     MINE.with(|m| {
         let token = m.token();
         {
@@ -641,20 +722,11 @@ pub(crate) fn rest(claim: Claim, generation: u32) {
         return;
     }
     // An awake walk listing keeps the node awake; the rest takes effect
-    // where the listing ends.
-    let listed = WOKEN.try_with(|w| {
-        w.borrow_mut()
-            .iter_mut()
-            .find(|w| w.claim == (claim, generation))
-            .map(|w| {
-                if w.was == AWAKE {
-                    w.was = SEQ.fetch_add(1, Ordering::SeqCst);
-                }
-            })
-            .is_some()
-    });
-    if !matches!(listed, Ok(true)) {
-        e.2 = SEQ.fetch_add(1, Ordering::SeqCst);
+    // where the last one ends.
+    let stamp = std::cell::OnceCell::new();
+    let at = || *stamp.get_or_init(|| SEQ.fetch_add(1, Ordering::SeqCst));
+    if !set_woken_stamp((claim, generation), at, true) {
+        e.2 = at();
     }
 }
 
@@ -747,6 +819,14 @@ pub(crate) fn adopt(context: u64) {
 thread_local! {
     static CONTEXT_ENDS: Cell<u32> = const { Cell::new(0) };
     static WALK_LISTINGS: Cell<u32> = const { Cell::new(0) };
+    static WALK_WORK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Releases looked at and listings ended at this thread's entries into
+/// user code since the last call, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_walk_work() -> u64 {
+    WALK_WORK.with(|n| n.replace(0))
 }
 
 /// Walk listings this thread made, for tests.
@@ -790,6 +870,8 @@ pub(crate) fn end_context(context: u64) {
 /// its own node included: none of its contexts outlives this.
 pub(crate) fn end_all() {
     ROOTS.with(|n| n.set(0));
+    WOKEN.with(|w| w.borrow_mut().clear());
+    ANY_WOKEN.with(|a| a.set(false));
     let (groups, token) = MINE.with(|m| (std::mem::take(&mut *m.0.borrow_mut()), m.token()));
     for g in groups {
         unlist(g.claims.keys(), token, false);

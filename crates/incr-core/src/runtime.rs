@@ -5629,31 +5629,37 @@ impl<C: Cells> Runtime<C> {
         self.land_as(id, node, target, flagged, false)
     }
 
-    /// Ends this thread's context reservation and walk listing of `id` if
+    /// Ends this thread's context reservation and walk listings of `id` if
     /// its run `landed` settled, as the unbounded run's frame releases its
-    /// claim there. A
-    /// Dirty replay landing or a Dirty read ends it through
+    /// claim there. A Dirty replay landing or a Dirty read ends it through
     /// [`Self::end_unowed_reservation`] unless this thread runs the node
     /// again; any other unsettled landing keeps it until a later run lands
     /// the node settled or the context is removed.
     pub(super) fn end_reservation_landed(&self, id: NodeId, node: &NodeData<C>, landed: NodeState) {
-        if landed.is_settled() {
-            self.end_reservation(id, node);
-            if !C::SINGLE_THREADED && reserve::any() && !replay::speculative() {
-                reserve::end_walk_landed((self.runtime_id, id.0), node.generation());
-            }
+        if landed.is_settled() && !C::SINGLE_THREADED && reserve::any() && !replay::speculative() {
+            let claim = (self.runtime_id, id.0);
+            reserve::end_landed(claim, node.generation());
+            reserve::end_walk_landed(claim, node.generation());
         }
+    }
+
+    /// Whether this thread's walks list what a user panic's unwind lands
+    /// unsettled ([`Self::note_unwound_landing`]).
+    pub(super) fn lists_walks(&self) -> bool {
+        !C::SINGLE_THREADED && self.budgeted()
     }
 
     /// Keeps `id`, which a user panic's unwind just landed New or Dirty with
     /// `peers`, for this thread's read ([`reserve::note_walk`]): a walk that
     /// contains the panic runs it again after the context holding it has
-    /// ended.
-    pub(super) fn note_unwound_landing(&self, id: NodeId, node: &NodeData<C>, peers: &[u32]) {
-        if !C::SINGLE_THREADED
-            && self.budgeted()
-            && matches!(node.state(), NodeState::New | NodeState::Dirty)
-        {
+    /// ended. Only where [`Self::lists_walks`].
+    pub(super) fn note_unwound_landing(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        peers: &reserve::Peers,
+    ) {
+        if matches!(node.state(), NodeState::New | NodeState::Dirty) {
             reserve::note_walk((self.runtime_id, id.0), node.generation(), peers);
         }
     }

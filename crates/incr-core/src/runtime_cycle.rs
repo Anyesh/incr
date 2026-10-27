@@ -2016,6 +2016,15 @@ impl<C: Cells> Runtime<C> {
         self.count_release();
         entries.sort_unstable_by_key(|(slot, _)| *slot);
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
+        // One episode: the unwinding frame's node and what it released.
+        let peers = (!discarding && kind.is_none() && self.lists_walks()).then(|| {
+            reserve::Peers::new(
+                released
+                    .iter()
+                    .copied()
+                    .chain(subtree.filter(|&n| n != u32::MAX)),
+            )
+        });
         let stamp_rev = self.current_revision();
         let verify_rev = C::walked(&self.walk, &self.revision);
         let look = Look::here();
@@ -2052,7 +2061,9 @@ impl<C: Cells> Runtime<C> {
             }
             // A cycle's retry may run a member again; a user panic ends its run.
             if !discarding && kind.is_none() {
-                self.note_unwound_landing(id, self.nodes.get(slot), &released);
+                if let Some(peers) = &peers {
+                    self.note_unwound_landing(id, self.nodes.get(slot), peers);
+                }
                 self.end_reservation(id, self.nodes.get(slot));
             }
             // A discarded claim's run is one the unbounded run never makes,

@@ -363,11 +363,11 @@ fn outside(rt: &Rt) -> crate::waits::Claim {
 /// whenever it began.
 #[test]
 fn a_walk_listing_ends_at_its_threads_next_entry_into_user_code() {
-    use crate::reserve::{note_walk, user_code, Root};
+    use crate::reserve::{note_walk, user_code, Peers, Root};
     let rt = Rt::new();
     let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
     let read = Root::arm(true, root);
-    note_walk(n, 1, &[]);
+    note_walk(n, 1, &Peers::new([]));
     assert!(
         checked(begun_op(n)),
         "an op begun after the listing passed before any user code"
@@ -386,11 +386,11 @@ fn a_walk_listing_ends_at_its_threads_next_entry_into_user_code() {
 /// under, and ends at the next entry of other user code.
 #[test]
 fn a_walk_listing_stays_awake_through_its_peers_user_code() {
-    use crate::reserve::{note_walk, user_code, Root};
+    use crate::reserve::{note_walk, user_code, Peers, Root};
     let rt = Rt::new();
     let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
     let read = Root::arm(true, root);
-    note_walk(n, 1, &[5, 7]);
+    note_walk(n, 1, &Peers::new([5, 7]));
     user_code((rt.runtime_id, 5));
     assert!(checked(begun_op(n)), "a peer's user code ended the listing");
     user_code(outside(&rt));
@@ -403,11 +403,11 @@ fn a_walk_listing_stays_awake_through_its_peers_user_code() {
 /// unbounded run, holding no frame of it there, lets pass.
 #[test]
 fn a_walk_listing_ends_at_its_threads_next_cycle_callback() {
-    use crate::reserve::{note_walk, Root};
+    use crate::reserve::{note_walk, Peers, Root};
     let rt = Rt::new();
     let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
     let read = Root::arm(true, root);
-    note_walk(n, 1, &[7]);
+    note_walk(n, 1, &Peers::new([7]));
     let before = begun_op(n);
     rt.callback(|| ());
     assert!(!checked(before), "the callback left the listing");
@@ -419,11 +419,11 @@ fn a_walk_listing_ends_at_its_threads_next_cycle_callback() {
 /// waits no longer than the unbounded run's claim.
 #[test]
 fn a_walk_listing_ends_at_its_nodes_settled_landing() {
-    use crate::reserve::{end_walk_landed, note_walk, Root};
+    use crate::reserve::{end_walk_landed, note_walk, Peers, Root};
     let rt = Rt::new();
     let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
     let read = Root::arm(true, root);
-    note_walk(n, 1, &[]);
+    note_walk(n, 1, &Peers::new([]));
     let before = begun_op(n);
     end_walk_landed(n, 1);
     assert!(!checked(before), "the settled landing left the listing");
@@ -435,7 +435,7 @@ fn a_walk_listing_ends_at_its_nodes_settled_landing() {
 /// thread runs user code leaves the walk listing awake.
 #[test]
 fn a_context_ending_before_user_code_leaves_its_walk_listing_awake() {
-    use crate::reserve::{end_contexts, note, note_walk, user_code, Root, Scope};
+    use crate::reserve::{end_contexts, note, note_walk, user_code, Peers, Root, Scope};
     let rt = Rt::new();
     let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
     let read = Root::arm(true, root);
@@ -443,7 +443,7 @@ fn a_context_ending_before_user_code_leaves_its_walk_listing_awake() {
         let _scope = Scope::new(Some(5));
         note(n, 1);
     }
-    note_walk(n, 1, &[]);
+    note_walk(n, 1, &Peers::new([]));
     end_contexts();
     assert!(
         checked(begun_op(n)),
@@ -464,7 +464,7 @@ fn a_context_ending_before_user_code_leaves_its_walk_listing_awake() {
 /// the thread may join, passes again, and one begun before still waits.
 #[test]
 fn a_walk_listing_over_a_rested_reservation_leaves_its_stamp() {
-    use crate::reserve::{end_contexts, note, note_walk, rest, user_code, Root, Scope};
+    use crate::reserve::{end_contexts, note, note_walk, rest, user_code, Peers, Root, Scope};
     let rt = Rt::new();
     let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
     let read = Root::arm(true, root);
@@ -475,7 +475,7 @@ fn a_walk_listing_over_a_rested_reservation_leaves_its_stamp() {
     let before = begun_op(n);
     rest(n, 1);
     let between = begun_op(n);
-    note_walk(n, 1, &[]);
+    note_walk(n, 1, &Peers::new([]));
     assert!(
         checked(begun_op(n)),
         "an op begun after the listing passed before any user code"
@@ -495,13 +495,13 @@ fn a_walk_listing_over_a_rested_reservation_leaves_its_stamp() {
 /// effect where the listing ends, not before.
 #[test]
 fn a_rest_under_an_awake_walk_listing_waits_for_its_end() {
-    use crate::reserve::{end_contexts, note, note_walk, rest, user_code, Root, Scope};
+    use crate::reserve::{end_contexts, note, note_walk, rest, user_code, Peers, Root, Scope};
     let rt = Rt::new();
     let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
     let read = Root::arm(true, root);
     let scope = Scope::new(Some(5));
     note(n, 1);
-    note_walk(n, 1, &[]);
+    note_walk(n, 1, &Peers::new([]));
     let before = begun_op(n);
     rest(n, 1);
     assert!(
@@ -512,6 +512,117 @@ fn a_rest_under_an_awake_walk_listing_waits_for_its_end() {
     assert!(checked(before), "an op begun before the rest passed");
     assert!(!checked(begun_op(n)), "an op begun after the rest waited");
     drop(scope);
+    end_contexts();
+    drop(read);
+    assert!(!reserved_elsewhere(n));
+}
+
+/// One release of `k` nodes, each listed with all `k` as peers, kept
+/// awake through an entry of each and ended at an entry outside: the work
+/// stays linear in `k`.
+#[test]
+fn the_walk_listings_of_one_release_stay_linear() {
+    use crate::reserve::{note_walk, take_walk_work, user_code, Peers, Root};
+    for k in [1000, 2000, 4000] {
+        let rt = Rt::new();
+        let read = Root::arm(true, (rt.runtime_id, u32::MAX));
+        let peers = Peers::new(0..k);
+        for slot in 0..k {
+            note_walk((rt.runtime_id, slot), 1, &peers);
+        }
+        take_walk_work();
+        for slot in 0..k {
+            user_code((rt.runtime_id, slot));
+        }
+        user_code((rt.runtime_id, k));
+        let work = take_walk_work();
+        assert!(work <= 3 * u64::from(k), "{work} units for {k} listings");
+        assert!(!reserved_elsewhere((rt.runtime_id, 0)));
+        drop(read);
+    }
+}
+
+/// A nested read's walk listing of a node the enclosing read's walk also
+/// lists ends with the nested read's peers and its end, and leaves the
+/// enclosing listing awake until that one's own end.
+#[test]
+fn a_nested_reads_walk_listing_leaves_the_enclosing_one_awake() {
+    use crate::reserve::{note_walk, user_code, Peers, Root};
+    let rt = Rt::new();
+    let n = (rt.runtime_id, 7);
+    let outer = Root::arm(true, (rt.runtime_id, 3));
+    note_walk(n, 1, &Peers::new([5]));
+    let inner = Root::arm(true, (rt.runtime_id, 4));
+    note_walk(n, 1, &Peers::new([6]));
+    user_code((rt.runtime_id, 5));
+    assert!(
+        checked(begun_op(n)),
+        "the nested listing's end ended the enclosing one"
+    );
+    drop(inner);
+    assert!(
+        checked(begun_op(n)),
+        "the nested read's end ended the enclosing listing"
+    );
+    user_code(outside(&rt));
+    assert!(!checked(begun_op(n)), "the enclosing listing stayed awake");
+    drop(outer);
+    assert!(!reserved_elsewhere(n));
+}
+
+/// Ending every reservation of the thread, as a wound does, ends its walk
+/// listings too: a context's later rest of the node takes effect at once.
+#[test]
+fn ending_every_reservation_ends_the_walk_listings() {
+    use crate::reserve::{end_all, end_contexts, note, note_walk, rest, Peers, Root, Scope};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    note_walk(n, 1, &Peers::new([5]));
+    end_all();
+    let scope = Scope::new(Some(5));
+    note(n, 1);
+    let before = begun_op(n);
+    rest(n, 1);
+    assert!(checked(before), "an op begun before the rest passed");
+    assert!(
+        !checked(begun_op(n)),
+        "an ended listing kept the rested node awake"
+    );
+    drop(scope);
+    end_contexts();
+    drop(read);
+    assert!(!reserved_elsewhere(n));
+}
+
+/// A walk listing over a context's rested reservation of the node, whose
+/// context ends while it is awake, leaves a later context's reservation of
+/// the node awake where it ends: the earlier stamp was the ended context's.
+#[test]
+fn a_walk_listings_end_leaves_a_later_contexts_reservation_awake() {
+    use crate::reserve::{
+        end_context, end_contexts, note, note_walk, rest, user_code, Peers, Root, Scope,
+    };
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let read = Root::arm(true, root);
+    {
+        let _scope = Scope::new(Some(5));
+        note(n, 1);
+    }
+    rest(n, 1);
+    note_walk(n, 1, &Peers::new([]));
+    end_context(5);
+    {
+        let _scope = Scope::new(Some(6));
+        note(n, 1);
+    }
+    let after = begun_op(n);
+    user_code(outside(&rt));
+    assert!(
+        checked(after),
+        "the listing's end rested the later context's reservation"
+    );
     end_contexts();
     drop(read);
     assert!(!reserved_elsewhere(n));
