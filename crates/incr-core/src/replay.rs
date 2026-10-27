@@ -1275,18 +1275,25 @@ impl Directs {
     /// The directs at position `i`, gone ones included.
     fn all_at(&self, i: usize) -> impl Iterator<Item = &Direct> {
         let first = self.slot(i).filter(|d| d.node != EMPTY);
-        let more = (first.is_some())
+        let more = (first.is_some() && !self.more_at.is_empty())
             .then(|| self.more_at.get(&(i as u32)))
             .flatten()
             .map_or(&[][..], Vec::as_slice);
         first.into_iter().chain(more)
     }
 
-    fn at(&self, cidx: u32) -> impl Iterator<Item = &Direct> {
-        let i = self.position(cidx);
-        i.into_iter()
-            .flat_map(|i| self.all_at(i))
-            .filter(|d| !self.dead(d))
+    /// The first live direct of the frame at `cidx` that `pick` accepts.
+    fn find_at(&self, cidx: u32, pick: impl Fn(&Direct) -> bool) -> Option<&Direct> {
+        let i = self.position(cidx)?;
+        let first = self.slot(i).filter(|d| d.node != EMPTY)?;
+        let found = |d: &&Direct| pick(d) && !self.dead(d);
+        if found(&first) {
+            return Some(first);
+        }
+        if self.more_at.is_empty() {
+            return None;
+        }
+        self.more_at.get(&(i as u32))?.iter().find(found)
     }
 
     /// Applies `f` to each direct of the frame at `cidx` that `pick`
@@ -1303,7 +1310,8 @@ impl Directs {
         let released = &self.released;
         let alive = |d: &Direct| {
             d.node != EMPTY
-                && (released.get(&(d.node, d.generation))).is_none_or(|&s| d.stamp >= s)
+                && (released.is_empty()
+                    || (released.get(&(d.node, d.generation))).is_none_or(|&s| d.stamp >= s))
                 && pick(d)
         };
         let mut none = Few::None;
@@ -1334,7 +1342,10 @@ impl Directs {
         if visit(first) {
             return;
         }
-        if let Some(more) = self.more_at.get_mut(&(i as u32)) {
+        if let Some(more) = (!self.more_at.is_empty())
+            .then(|| self.more_at.get_mut(&(i as u32)))
+            .flatten()
+        {
             for d in more {
                 if visit(d) {
                     return;
@@ -1344,7 +1355,7 @@ impl Directs {
     }
 
     fn get(&self, key: &ReadKey) -> Option<&Direct> {
-        self.at(key.cidx).find(|d| d.is(key))
+        self.find_at(key.cidx, |d| d.is(key))
     }
 
     fn runs_of(&self, i: usize, d: &Direct) -> RunSlot {
@@ -1482,35 +1493,40 @@ impl Directs {
     /// picks. A caller removing all of a maker's drops its list itself
     /// (`maker_listed` false).
     fn remove_at(&mut self, i: usize, maker_listed: bool, f: impl Fn(&Direct) -> bool) {
-        let mut gone = Vec::new();
-        let mut kept: Vec<Direct> = Vec::new();
         let Some(first) = self.slot(i).copied().filter(|d| d.node != EMPTY) else {
             return;
         };
-        let more = self.more_at.remove(&(i as u32)).unwrap_or_default();
-        for d in std::iter::once(first).chain(more) {
-            if f(&d) {
-                gone.push(d);
-            } else {
-                kept.push(d);
-            }
+        let mut gone = Few::None;
+        let mut more = if self.more_at.is_empty() {
+            None
+        } else {
+            self.more_at.remove(&(i as u32))
+        };
+        if let Some(v) = more.as_mut() {
+            v.retain(|d| {
+                let out = f(d);
+                if out {
+                    gone.push(*d);
+                }
+                !out
+            });
         }
-        if gone.is_empty() {
-            if kept.len() > 1 {
-                self.more_at.insert(i as u32, kept.split_off(1));
-            }
-            return;
+        if f(&first) {
+            gone.push(first);
+            let next = match more.as_mut().filter(|v| !v.is_empty()) {
+                Some(v) => v.remove(0),
+                None => VACANT,
+            };
+            *self
+                .slot_mut(i)
+                .expect("a position holding directs is made") = next;
         }
-        let mut kept = kept.into_iter();
-        *self
-            .slot_mut(i)
-            .expect("a position holding directs is made") = kept.next().unwrap_or(VACANT);
-        let rest: Vec<Direct> = kept.collect();
-        if !rest.is_empty() {
-            self.more_at.insert(i as u32, rest);
+        if let Some(v) = more.filter(|v| !v.is_empty()) {
+            self.more_at.insert(i as u32, v);
         }
+        let gone = gone.as_slice();
         self.live -= gone.len();
-        for d in &gone {
+        for d in gone {
             if d.owner & MORE_RUNS != 0 {
                 self.more_runs.remove(&(i as u32, d.stamp));
             }
@@ -1645,7 +1661,10 @@ impl Directs {
         if let Some(d) = self.slot_mut(i).filter(|d| d.node != EMPTY && pick(d)) {
             d.set_taken(false);
         }
-        if let Some(more) = self.more_at.get_mut(&(i as u32)) {
+        if let Some(more) = (!self.more_at.is_empty())
+            .then(|| self.more_at.get_mut(&(i as u32)))
+            .flatten()
+        {
             for d in more.iter_mut().filter(|d| pick(d)) {
                 d.set_taken(false);
             }
@@ -1695,7 +1714,7 @@ impl Directs {
 
     /// As [`Pending::frame_awaits`].
     pub(crate) fn frame_awaits(&self, (node, generation, cidx): (u32, u32, u32)) -> bool {
-        self.at(cidx).any(|d| !d.taken() && d.of(node, generation))
+        (self.find_at(cidx, |d| !d.taken() && d.of(node, generation))).is_some()
     }
 
     /// As [`Pending::read_awaits`].
@@ -1706,13 +1725,14 @@ impl Directs {
         ordinal: Option<u32>,
         parts: Option<(u64, Option<u64>, u32)>,
     ) -> bool {
-        self.at(cidx).any(|d| {
+        let found = self.find_at(cidx, |d| {
             !d.taken()
                 && d.of(node, generation)
                 && d.reading == reading
                 && ordinal.is_none_or(|o| d.ordinal == o)
                 && parts.is_none_or(|p| (d.path, d.episode(), d.seq) == p)
-        })
+        });
+        found.is_some()
     }
 }
 
