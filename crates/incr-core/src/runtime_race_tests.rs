@@ -27,7 +27,13 @@ use crate::state::NodeState;
 type Rt = Runtime<Shared>;
 
 /// A park point that never gets reached would otherwise hang the test.
-pub(super) const PARK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Under Miri the clock advances with every interpreted step of every
+/// thread, so a timeout sized for native runs ends far sooner.
+pub(super) const PARK_TIMEOUT: Duration = if cfg!(miri) {
+    Duration::from_secs(120)
+} else {
+    Duration::from_secs(10)
+};
 
 thread_local! {
     /// The gates a test's thread made, let go when it ends, failed or not,
