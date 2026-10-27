@@ -865,7 +865,7 @@ fn wound_inside_a_driver_entry() {
         "no entry ran in the wounded context after the wound"
     );
     drop(entries);
-    super::wound_tests::assert_wounded();
+    super::wound_tests::assert_wounded(s.rt.runtime_id);
     assert_eq!(crate::waits::registered_on(s.rt.runtime_id), 0);
     s.rt.assert_invariant_i();
 }
@@ -4673,7 +4673,7 @@ fn joined_over_a_payload() -> JoinedOverAPayload {
 fn shared_retry_joins_a_reader_that_takes_a_held_payload_over() {
     let s = joined_over_a_payload();
     s.rt.set_max_frames(2);
-    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
+    let wounds = crate::attempt::TAKE_OVERS.on(s.rt.runtime_id);
     hook(
         &s.rt,
         vec![(ParkPoint::BeforeEntry(id(s.w)), s.gate.clone())],
@@ -4691,7 +4691,7 @@ fn shared_retry_joins_a_reader_that_takes_a_held_payload_over() {
     assert!(!s.stalled.load(SeqCst), "the joined read waited: {first:?}");
     let (joined, again) = joins.split_first().expect("the joined read returned");
     assert!(again.iter().all(failed), "{joins:?}");
-    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst) - wounds;
+    let wounds = crate::attempt::TAKE_OVERS.on(s.rt.runtime_id) - wounds;
     assert!(
         again.len() <= wounds as usize,
         "{} reruns for {wounds} wounds",
@@ -4743,7 +4743,7 @@ fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
         )
     };
     hook(&rt, vec![(ParkPoint::BeforeClaim(id(y)), at_claim.clone())]);
-    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
+    let wounds = crate::attempt::TAKE_OVERS.on(rt.runtime_id);
     in_w.arm();
     let first = {
         let (rt, w) = (rt.clone(), w);
@@ -4757,7 +4757,7 @@ fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
     };
     at_claim.wait_parked();
     assert!(
-        crate::attempt::TAKE_OVERS.load(SeqCst) > wounds,
+        crate::attempt::TAKE_OVERS.on(rt.runtime_id) > wounds,
         "the other read took nothing over"
     );
     in_w.release();
@@ -4875,7 +4875,7 @@ fn shared_taken_reader_of_a_held_cycle_keeps_no_held_mark() {
         })
     };
     hook(&rt, vec![(ParkPoint::BeforeClaim(id(c)), at_claim.clone())]);
-    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
+    let wounds = crate::attempt::TAKE_OVERS.on(rt.runtime_id);
     in_w.arm();
     let first = {
         let (rt, w) = (rt.clone(), w);
@@ -4889,7 +4889,7 @@ fn shared_taken_reader_of_a_held_cycle_keeps_no_held_mark() {
     };
     at_claim.wait_parked();
     assert!(
-        crate::attempt::TAKE_OVERS.load(SeqCst) > wounds,
+        crate::attempt::TAKE_OVERS.on(rt.runtime_id) > wounds,
         "the other read took nothing over"
     );
     in_w.release();

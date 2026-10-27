@@ -1,7 +1,7 @@
 //! Wound-wait under `Shared`: claim waits that close a waits-for cycle
 //! across threads wound the younger thread, which releases its claims and
 //! retries. Each test runs in a child process, because a regression hangs
-//! and because the wound counter is process-wide.
+//! and because `waits::registered` counts the waiters of every runtime.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,13 +23,13 @@ use crate::waits;
 /// instead of being killed.
 const POLL_DEADLINE: Duration = Duration::from_secs(4);
 
-/// Asserts the cycle was resolved by wounds. Usually one: a retry that
-/// takes its released claims back before the older thread does, which
-/// `await_winner`'s head start makes rare but cannot rule out under load,
-/// is wounded again over the same cycle, which costs a retry and never
-/// changes a value.
-pub(crate) fn assert_wounded() {
-    assert!(waits::WOUNDS.load(Ordering::Relaxed) >= 1);
+/// Asserts a cycle through `rt`'s claims was resolved by wounds. Usually
+/// one: a retry that takes its released claims back before the older
+/// thread does, which `await_winner`'s head start makes rare but cannot
+/// rule out under load, is wounded again over the same cycle, which costs
+/// a retry and never changes a value.
+pub(crate) fn assert_wounded(rt: RuntimeId) {
+    assert!(waits::WOUNDS.on(rt) >= 1);
 }
 
 pub(crate) fn wait_registered(rt: RuntimeId, n: usize) {
@@ -274,7 +274,7 @@ fn stale_edge_waits_for_cycle(a_first: bool) {
         assert!(message.contains("dependency cycle"), "{message}");
         assert_eq!(g.rt.get(q), 4);
     }
-    assert_wounded();
+    assert_wounded(g.rt.runtime_id);
     g.rt.assert_invariant_i();
 }
 
@@ -317,7 +317,7 @@ fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
         );
     }
     assert_eq!(g.rt.get(q), 4);
-    assert_wounded();
+    assert_wounded(g.rt.runtime_id);
     g.rt.assert_invariant_i();
 }
 
@@ -399,7 +399,7 @@ fn shared_wound_under_stabilize_is_retried() {
             assert_eq!(thread_a.join().unwrap(), 4);
             thread_b.join().unwrap().unwrap();
             assert_eq!(*fired.lock().unwrap(), vec![4]);
-            assert_wounded();
+            assert_wounded(g.rt.runtime_id);
         },
     )
     .assert_clean();
@@ -434,7 +434,7 @@ fn shared_wound_on_the_second_of_three_observers() {
             let mut fired = fired.lock().unwrap().clone();
             fired.sort_unstable();
             assert_eq!(fired, vec![(0, 8), (1, 4), (2, 9)]);
-            assert_wounded();
+            assert_wounded(g.rt.runtime_id);
         },
     )
     .assert_clean();
@@ -454,7 +454,7 @@ fn shared_swallowed_wound_after_the_write() {
             assert_eq!(thread_a.join().unwrap(), 4);
             assert_eq!(thread_b.join().unwrap().unwrap(), 40);
             assert_eq!(g.rt.get(d), 40);
-            assert_wounded();
+            assert_wounded(g.rt.runtime_id);
             g.rt.assert_invariant_i();
         },
     )
@@ -562,7 +562,7 @@ fn shared_swallowed_wound_on_a_first_compute() {
             let (thread_a, thread_b) = g.run(true, move |rt| rt.get(q));
             assert_eq!(thread_a.join().unwrap(), 4);
             assert_eq!(thread_b.join().unwrap().unwrap(), 4);
-            assert_wounded();
+            assert_wounded(g.rt.runtime_id);
             g.rt.set(g.k, 10);
             assert_eq!(g.rt.get(q), 12);
             assert_eq!(g.rt.get(g.a), 12);
@@ -584,7 +584,7 @@ fn call_after_a_caught_wound_raises_it_again(after: After) {
     let (thread_a, thread_b) = g.run(true, move |rt| rt.get(q));
     assert_eq!(thread_a.join().unwrap(), 4);
     assert_eq!(thread_b.join().unwrap().unwrap(), 4);
-    assert_wounded();
+    assert_wounded(g.rt.runtime_id);
     let raised = AFTER_CATCH.lock().unwrap().clone();
     assert!(
         !raised.is_empty() && raised.iter().all(|&r| r == (true, 0)),
@@ -701,7 +701,7 @@ fn shared_swallowed_wound_in_a_recompute_whose_dep_cuts_off() {
             // The setup's run, B's wounded run and its retry: O never
             // runs `q`, whose read of `x` would be a cycle on O's stack.
             assert_eq!(q_runs.load(Ordering::Relaxed), 3);
-            assert_wounded();
+            assert_wounded(rt.runtime_id);
             rt.assert_invariant_i();
         },
     )
@@ -872,7 +872,7 @@ impl Duel {
 
     fn concurrent(shape: GroupShape, a_older: bool) -> Vec<Result<i64, String>> {
         let g = Duel::new(shape);
-        let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+        let wounds = waits::WOUNDS.on(g.rt.runtime_id);
         let first = if a_older { &g.b_gate } else { &g.a_gate };
         first.arm();
         let (a, b) = thread::scope(|s| {
@@ -895,7 +895,7 @@ impl Duel {
             (a.join().unwrap(), b.join().unwrap())
         });
         assert!(
-            waits::WOUNDS.load(Ordering::Relaxed) > wounds,
+            waits::WOUNDS.on(g.rt.runtime_id) > wounds,
             "{shape:?} a_older {a_older}: no wound"
         );
         let outcome = g.outcome(a, b);
@@ -1338,7 +1338,7 @@ impl Dissolve {
     /// The outcome, the runtime's `unwound_landings`, and `r`'s slot.
     fn concurrent(z_reads_b: bool) -> Concurrent {
         let g = Dissolve::new();
-        let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+        let wounds = waits::WOUNDS.on(g.rt.runtime_id);
         g.early.arm();
         let (a, b) = thread::scope(|s| {
             let _released = release_parked_on_unwind();
@@ -1363,7 +1363,7 @@ impl Dissolve {
             g.late.release();
             (a.join().unwrap(), b.join().unwrap())
         });
-        assert!(waits::WOUNDS.load(Ordering::Relaxed) > wounds, "no wound");
+        assert!(waits::WOUNDS.on(g.rt.runtime_id) > wounds, "no wound");
         let landings = g.rt.unwound_landings.lock().unwrap().clone();
         let outcome = g.outcome(a, b);
         g.rt.assert_invariant_i();
@@ -1456,8 +1456,8 @@ fn shared_wound_after_clean_landings_of_released_members_keeps_their_group() {
 /// `Local` entry and checks in its head start whether A took the claim,
 /// which is the `Shared` runtime's.
 fn stale_edge_waits_for_cycle_under_local(a_first: bool) {
-    let checks = waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed);
     let g = StaleEdge::new(QReads::Plain, false);
+    let checks = waits::OWN_CLAIM_CHECKS.on(g.rt.runtime_id);
     let q = g.q;
     let shared = Arc::clone(&g.rt);
     let (thread_a, thread_b) = g.run(a_first, move |_| {
@@ -1476,9 +1476,9 @@ fn stale_edge_waits_for_cycle_under_local(a_first: bool) {
         assert!(message.contains("dependency cycle"), "{message}");
         assert_eq!(g.rt.get(q), 4);
     }
-    assert_wounded();
+    assert_wounded(g.rt.runtime_id);
     assert!(
-        !a_first || waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed) > checks,
+        !a_first || waits::OWN_CLAIM_CHECKS.on(g.rt.runtime_id) > checks,
         "the wounded thread's head start never checked the claim its winner waited on"
     );
     g.rt.assert_invariant_i();
@@ -1645,7 +1645,8 @@ fn cut_exit_retracts(wound: CutWound) {
     let old = group_record(&g.rt, g.r).expect("r is forced into a group");
     let (a_thread, b_thread) = (Arc::new(OnceLock::new()), Arc::new(OnceLock::new()));
     let at_retraction: Arc<OnceLock<(Vec<String>, Vec<bool>)>> = Arc::new(OnceLock::new());
-    let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+    let rt_id = g.rt.runtime_id;
+    let wounds = waits::WOUNDS.on(rt_id);
     {
         let rt = Arc::downgrade(&g.rt);
         let members = [g.r, g.z, g.y, g.w];
@@ -1659,9 +1660,7 @@ fn cut_exit_retracts(wound: CutWound) {
                     .map(|m| group_record(&rt, m).is_some_and(|r| Arc::ptr_eq(&r, &old)))
                     .into();
                 let _ = at_retraction.set((rt.stale_group_records(), in_old));
-            } else if me == b_thread.get().copied()
-                && waits::WOUNDS.load(Ordering::Relaxed) > wounds
-            {
+            } else if me == b_thread.get().copied() && waits::WOUNDS.on(rt_id) > wounds {
                 // B holds still from A's wound until A's retraction is seen,
                 // so nothing B lands can hide or fake the retracted records.
                 let deadline = Instant::now() + POLL_DEADLINE;
@@ -1711,10 +1710,7 @@ fn cut_exit_retracts(wound: CutWound) {
         }
         (a.join().unwrap(), b.join().unwrap())
     });
-    assert!(
-        waits::WOUNDS.load(Ordering::Relaxed) > wounds,
-        "{wound:?}: no wound"
-    );
+    assert!(waits::WOUNDS.on(rt_id) > wounds, "{wound:?}: no wound");
     if let CutWound::AfterR = wound {
         assert!(!g.r_alone.load(Ordering::SeqCst), "r never ran alone");
         assert_eq!(
@@ -1835,7 +1831,7 @@ fn shared_kept_value_of_a_swallowed_wound_stays_with_its_node() {
                     _ => {
                         let sum = rt.get(x) + rt.get(p) + rt.get(u);
                         // A's retry, after the first wound, parks once here.
-                        if waits::WOUNDS.load(Ordering::Relaxed) > 0 {
+                        if waits::WOUNDS.on(rt.runtime_id) > 0 {
                             gr.park();
                         }
                         sum + rt.get(q2)
@@ -1861,7 +1857,7 @@ fn shared_kept_value_of_a_swallowed_wound_stays_with_its_node() {
             let b2_thread = Arc::new(OnceLock::new());
             let r_released = Arc::new(AtomicBool::new(false));
             let u_retracted: Arc<OnceLock<Option<i64>>> = Arc::new(OnceLock::new());
-            let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+            let wounds = waits::WOUNDS.on(rt.runtime_id);
             {
                 let weak = Arc::downgrade(&rt);
                 let (a_thread, b2_thread) = (a_thread.clone(), b2_thread.clone());
@@ -1938,10 +1934,7 @@ fn shared_kept_value_of_a_swallowed_wound_stays_with_its_node() {
             wait_on(y, "B never waited on y");
             gp.release();
             gr.wait_parked();
-            assert!(
-                waits::WOUNDS.load(Ordering::Relaxed) > wounds,
-                "no first wound"
-            );
+            assert!(waits::WOUNDS.on(rt.runtime_id) > wounds, "no first wound");
             gq2.release();
             wait_on(v, "B2 never waited on v");
             r_released.store(true, Ordering::SeqCst);
