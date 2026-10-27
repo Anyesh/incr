@@ -3339,7 +3339,7 @@ pub(crate) fn count_speculative_wait_drop() {
 }
 
 /// The speculative wait drops this thread counted since the last take.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 pub(crate) fn take_speculative_wait_drops() -> u32 {
     SPECULATIVE_WAIT_DROPS.with(|d| d.replace(0))
 }
