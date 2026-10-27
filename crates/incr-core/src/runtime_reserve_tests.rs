@@ -864,6 +864,22 @@ fn message(got: std::thread::Result<u64>) -> String {
     }
 }
 
+/// Silences P's panic, which a guard's read raises inside an unwind, and
+/// leaves every other panic to the default hook. The default hook prints a
+/// full backtrace for a panic inside an unwind, and under TSan symbolizing
+/// it takes 14 to 20 s, past the child's timeout.
+fn quiet_p_booms() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<&str>() != Some(&"p boom") {
+                default(info);
+            }
+        }));
+    });
+}
+
 /// T holds a guard whose destructor reads P, which panics, and `try_get`s
 /// C, which closes a cycle of its own, catching both; T's read of A unwinds
 /// a cycle through T. The destructor's reads must leave the cycle's unwind
@@ -871,6 +887,7 @@ fn message(got: std::thread::Result<u64>) -> String {
 /// without the guard, the guard catches P's panic and C's cycle as `Err`,
 /// and C stays a cycle, not a failure.
 fn a_destructors_read_keeps_a_cycles_unwind<C: Cells>() {
+    quiet_p_booms();
     let mut reports = Vec::new();
     for guarded in [false, true] {
         let rt = Runtime::<C>::new();
