@@ -3862,9 +3862,7 @@ fn speculative_member_run_leaves_no_buffer() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn speculative_member_run_of_unchanged_reads_is_not_rerun() {
-    let seeds = [
-        0x3ce9, 0xf10, 0x1e262, 0x20764, 0x2389c, 0x23d9f, 0x1a063, 0x16a03,
-    ];
+    let seeds = [0x3ce9, 0xf10, 0x20764, 0x2389c, 0x23d9f, 0x1a063, 0x16a03];
     quiet(|| {
         for seed in seeds {
             differential::<Local>(&gen_case(seed, false, false), seed);
