@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::observe_impl::observed_is_clear;
-use super::race_tests::{park_at, Gate};
+use super::race_tests::{park_at, spawn_joined, Gate, Joined};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, QueryOpts};
@@ -35,9 +35,9 @@ fn observed_leaf(rt: &Rt) -> (Incr<u64>, Incr<u64>, Arc<AtomicBool>) {
     (x, q, fired)
 }
 
-fn stabilize_on_a_thread(rt: &Arc<Rt>) -> thread::JoinHandle<bool> {
+fn stabilize_on_a_thread(rt: &Arc<Rt>) -> Joined<bool> {
     let rt = Arc::clone(rt);
-    thread::spawn(move || {
+    spawn_joined("stabilizer", move || {
         let ok = catch_unwind(AssertUnwindSafe(|| rt.stabilize())).is_ok();
         ok && observed_is_clear()
     })

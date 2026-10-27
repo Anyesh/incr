@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::race_tests::{await_reservation_wait, id, Gate};
+use super::race_tests::{await_reservation_wait, id, spawn_joined, Gate, Joined};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::{run_in_child, run_in_child_within, Outcome as ChildOutcome};
@@ -309,14 +309,14 @@ fn a_read_and_a_context_both_reserving_a_node_keep_it_until_both_end() {
     assert!(!reserved_elsewhere(claim));
 }
 
-type BegunOp = (mpsc::Sender<()>, thread::JoinHandle<bool>);
+type BegunOp = (mpsc::Sender<()>, Joined<bool>);
 
 /// Another thread's op, begun before this returns, that checks the
 /// reservation of `claim` once [`checked`] lets it.
 fn begun_op(claim: crate::waits::Claim) -> BegunOp {
     let (ready_tx, ready) = mpsc::channel();
     let (go, go_rx) = mpsc::channel::<()>();
-    let op = thread::spawn(move || {
+    let op = spawn_joined("op", move || {
         crate::reserve::op_begin();
         ready_tx.send(()).unwrap();
         go_rx.recv().unwrap();

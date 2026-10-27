@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::observe_impl::observed_is_clear;
-use super::race_tests::{id, park_at, release_parked_on_unwind, Gate};
+use super::race_tests::{id, park_at, release_parked_on_unwind, spawn_joined, Gate, Joined};
 use super::{GroupInfo, NodeId, ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
@@ -188,10 +188,7 @@ impl StaleEdge {
         &self,
         a_first: bool,
         b: impl FnOnce(&Runtime<Shared>) -> R + Send + 'static,
-    ) -> (
-        thread::JoinHandle<i64>,
-        thread::JoinHandle<thread::Result<R>>,
-    ) {
+    ) -> (Joined<i64>, Joined<thread::Result<R>>) {
         self.run_parking_b(a_first, None, b)
     }
 
@@ -202,15 +199,12 @@ impl StaleEdge {
         a_first: bool,
         b_exit: Option<Gate>,
         b: impl FnOnce(&Runtime<Shared>) -> R + Send + 'static,
-    ) -> (
-        thread::JoinHandle<i64>,
-        thread::JoinHandle<thread::Result<R>>,
-    ) {
+    ) -> (Joined<i64>, Joined<thread::Result<R>>) {
         self.a_gate.arm();
         let thread_a = {
             let rt = Arc::clone(&self.rt);
             let a = self.a;
-            thread::spawn(move || rt.get(a))
+            spawn_joined("A", move || rt.get(a))
         };
         self.a_gate.wait_parked();
         let b_thread = Arc::new(OnceLock::new());
@@ -237,7 +231,7 @@ impl StaleEdge {
         }
         let thread_b = {
             let rt = Arc::clone(&self.rt);
-            thread::spawn(move || {
+            spawn_joined("B", move || {
                 b_thread.set(thread::current().id()).unwrap();
                 catch_unwind(AssertUnwindSafe(|| b(&rt)))
             })

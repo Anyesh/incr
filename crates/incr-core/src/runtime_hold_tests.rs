@@ -5,7 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use super::race_tests::{park_at, Gate};
+use super::race_tests::{park_at, spawn_joined, Gate, Joined};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
@@ -1362,7 +1362,7 @@ fn read_failed_ring_member(rt: &Runtime<Shared>, w: Incr<i64>) -> i64 {
 fn failed_ring_hand_over_at_publication() -> ((i64, i64), usize) {
     let rt = Arc::new(Runtime::<Shared>::new());
     let (x, w) = failed_ring(&rt);
-    let reader: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<i64>>>> = Arc::default();
+    let reader: Arc<std::sync::Mutex<Option<Joined<i64>>>> = Arc::default();
     let t = {
         let (weak, reader) = (Arc::downgrade(&rt), reader.clone());
         rt.create_query(move |rt| {
@@ -1370,7 +1370,7 @@ fn failed_ring_hand_over_at_publication() -> ((i64, i64), usize) {
             let mut slot = reader.lock().unwrap();
             if slot.is_none() {
                 let other = weak.upgrade().unwrap();
-                *slot = Some(std::thread::spawn(move || {
+                *slot = Some(spawn_joined("reader", move || {
                     read_failed_ring_member(&other, w)
                 }));
             }
@@ -3751,12 +3751,12 @@ fn retracted_held_read_shape(frames: u32) -> RetractedHeldRead {
     let _release = super::race_tests::ReleaseOnUnwind(vec![parked.clone()]);
     let t1 = {
         let rt = rt.clone();
-        std::thread::spawn(move || (rt.get(r), crate::hold::held_count()))
+        spawn_joined("t1", move || (rt.get(r), crate::hold::held_count()))
     };
     parked.wait_parked();
     let t2 = {
         let rt = rt.clone();
-        std::thread::spawn(move || (rt.get(g), crate::hold::held_count()))
+        spawn_joined("t2", move || (rt.get(g), crate::hold::held_count()))
     };
     // A parked holder is never taken over, so thread 2 stays registered
     // on d until the release.
