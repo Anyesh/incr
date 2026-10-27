@@ -10695,3 +10695,96 @@ fn a_rerun_reader_takes_no_spent_record_at_any_byte_width() {
         }
     });
 }
+
+/// Seed 0x8ecc1, shrunk by `replay_shrink`: at budget 2, query 6 ends op 2
+/// Failed with deps [7] where the unbounded run has [7, 27]. Unbounded, 6
+/// runs inside 9's panicking group and is released New over the union with
+/// what it read; bounded, it runs in an attempt abandoned over placeholders
+/// and its read of 27 is dropped.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_8ecc1_abandoned_member_keeps_its_reads() {
+    let c = || replayable(Expr::Const(0), Strat::None);
+    let read = |n: usize| Expr::Read(n, false);
+    let specs = vec![
+        c(),
+        c(),
+        c(),
+        c(),
+        c(),
+        replayable(Expr::Catch(Box::new(read(6))), Strat::None),
+        replayable(
+            Expr::Add(Box::new(read(7)), Box::new(Expr::Read(27, true))),
+            Strat::None,
+        ),
+        replayable(read(8), Strat::None),
+        replayable(read(9), Strat::None),
+        Spec::Query {
+            expr: Expr::Add(
+                Box::new(read(28)),
+                Box::new(Expr::PanicIf(Box::new(read(18)), 3)),
+            ),
+            replay: true,
+            bare: true,
+            strategy: Strat::Fallback(4),
+        },
+        replayable(read(11), Strat::None),
+        replayable(Expr::Read(13, true), Strat::None),
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: false,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: read(19),
+            replay: true,
+            bare: true,
+            strategy: Strat::None,
+        },
+        c(),
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: false,
+            bare: false,
+            strategy: Strat::None,
+        },
+        c(),
+        replayable(
+            read(18),
+            Strat::Fixpoint {
+                initial: 1,
+                limit: 1,
+            },
+        ),
+        replayable(read(19), Strat::None),
+        Spec::Query {
+            expr: Expr::Add(Box::new(Expr::Read(5, true)), Box::new(read(20))),
+            replay: false,
+            bare: false,
+            strategy: Strat::Fallback(3),
+        },
+        replayable(Expr::Read(21, true), Strat::None),
+        replayable(Expr::Read(22, true), Strat::None),
+        replayable(read(23), Strat::None),
+        replayable(read(17), Strat::None),
+        c(),
+        c(),
+        c(),
+        Spec::Input(0),
+        Spec::Input(1),
+    ];
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 27,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(10), Op::Set(28, 3), Op::TryGet(5)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x8ecc1);
+        differential::<Shared>(&case, 0x8ecc1);
+    });
+}
