@@ -269,36 +269,68 @@ fn stale_edge_waits_for_cycle(a_first: bool) {
 
 /// B, the older thread, closes the cycle and its unwind releases the
 /// members before its outermost exit, so A's retry can land them first.
-/// B read nothing after the cycle, so its outcome stays the cycle: the
-/// order with B's read first.
+/// B read nothing after the cycle, so its outcome stays the cycle, the
+/// order with B's read first, at every frame budget.
+fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
+    let g = StaleEdge::new(QReads::Plain, false);
+    if let Some(n) = budget {
+        g.rt.set_max_frames(n);
+    }
+    let q = g.q;
+    let exit = Gate::new();
+    let (thread_a, thread_b) = g.run_parking_b(false, Some(exit.clone()), move |rt| rt.get(q));
+    exit.wait_parked();
+    let deadline = Instant::now() + POLL_DEADLINE;
+    while !thread_a.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "A never finished while B was parked"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    exit.release();
+    assert_eq!(thread_a.join().unwrap(), 4);
+    let message = panic_message(thread_b.join().unwrap().unwrap_err());
+    assert!(message.contains("dependency cycle"), "{message}");
+    assert_eq!(g.rt.verdict_reruns.load(Ordering::Relaxed), 0);
+    assert_eq!(g.rt.get(q), 4);
+    assert_wounded();
+    g.rt.assert_invariant_i();
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_older_threads_uncaught_cycle_stands_over_a_later_landing() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_over_a_later_landing",
-        || {
-            let g = StaleEdge::new(QReads::Plain, false);
-            let q = g.q;
-            let exit = Gate::new();
-            let (thread_a, thread_b) =
-                g.run_parking_b(false, Some(exit.clone()), move |rt| rt.get(q));
-            exit.wait_parked();
-            let deadline = Instant::now() + POLL_DEADLINE;
-            while !thread_a.is_finished() {
-                assert!(
-                    Instant::now() < deadline,
-                    "A never finished while B was parked"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
-            exit.release();
-            assert_eq!(thread_a.join().unwrap(), 4);
-            let message = panic_message(thread_b.join().unwrap().unwrap_err());
-            assert!(message.contains("dependency cycle"), "{message}");
-            assert_eq!(g.rt.get(q), 4);
-            assert_wounded();
-            g.rt.assert_invariant_i();
-        },
+        || older_threads_uncaught_cycle_stands(None),
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_1() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_1",
+        || older_threads_uncaught_cycle_stands(Some(1)),
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_2() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_2",
+        || older_threads_uncaught_cycle_stands(Some(2)),
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_3() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_3",
+        || older_threads_uncaught_cycle_stands(Some(3)),
     );
 }
 
