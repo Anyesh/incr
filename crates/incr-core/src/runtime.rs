@@ -6428,18 +6428,19 @@ impl<C: Cells> Runtime<C> {
     /// first could pair an old stamp with a newer `Clean`.
     /// [`Self::observed_clean`] that counts only published landings, for
     /// a stash's adoption, whose value must not rest on an own held dep.
-    /// Node `dep`'s generation and `changed_at` while it is Clean.
-    pub(super) fn clean_stamp(&self, dep: NodeId) -> Option<(u32, u64)> {
-        let node = self.nodes.get(dep.0);
-        (node.state() == NodeState::Clean).then(|| (node.generation(), node.changed_at()))
-    }
-
     pub(super) fn published_clean(&self, dep: NodeId, rev: u64) -> bool {
         let node = self.nodes.get(dep.0);
         let state = node.state();
         (state.is_settled()
             || state == NodeState::Dirty && self.unchanged_stash(dep.0, node.generation()))
             && node.changed_at() <= rev
+    }
+
+    /// Node `dep`'s generation and `changed_at` while it is Clean, the
+    /// state loaded first as in [`Self::published_clean`].
+    pub(super) fn clean_stamp(&self, dep: NodeId) -> Option<(u32, u64)> {
+        let node = self.nodes.get(dep.0);
+        (node.state() == NodeState::Clean).then(|| (node.generation(), node.changed_at()))
     }
 
     fn observed_clean(&self, dep: NodeId, rev: u64) -> bool {

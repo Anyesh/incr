@@ -779,7 +779,8 @@ impl<C: Cells> Runtime<C> {
                 .find(|f| f.node.0 == slot && f.rt() == rt)
                 .map(|f| f.cidx)
         });
-        let held = self.look_held(slot, Look::here(), |e| {
+        let look = Look::here();
+        let held = self.look_held(slot, look, |e| {
             (
                 e.anchor(),
                 e.in_cu,
@@ -838,7 +839,7 @@ impl<C: Cells> Runtime<C> {
         // R0: an unseeded member that still reads another such member.
         if let Some((anchor, true, _, Some(cycle), _)) = &held {
             ctl.lower(*anchor);
-            if replay::speculative() {
+            if look.is_speculative() {
                 cycle_state::with_held(|h| h.note_spec_cycle_read(rt, at, slot, cycle.clone()));
             }
             return Some(Err(cycle.clone()));
@@ -848,7 +849,7 @@ impl<C: Cells> Runtime<C> {
             let value = match &held {
                 Some((_, _, _, Some(_), _)) => {
                     let value = self.held_value::<T>(slot, true);
-                    if replay::speculative() {
+                    if look.is_speculative() {
                         cycle_state::with_held(|h| h.note_spec_current_read(rt, at, slot));
                     }
                     value
@@ -923,7 +924,7 @@ impl<C: Cells> Runtime<C> {
         }
         ctl.lower(anchor);
         let value = self.held_value::<T>(slot, false);
-        if replay::speculative() {
+        if look.is_speculative() {
             cycle_state::with_held(|h| h.note_spec_read(rt, at, slot));
         }
         Some(Ok(value))
@@ -1026,6 +1027,8 @@ impl<C: Cells> Runtime<C> {
         }
         let mut began = None;
         if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+            // Notes at this position or above are an earlier frame's.
+            cycle_state::with_held(|h| h.drop_spec_reads(self.runtime_id, cidx));
             self.start_run(id, cidx, &ctl);
             if let Some(low) = self.take_low(id, cidx) {
                 ctl.lower(low);
@@ -1098,22 +1101,32 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let look = Look::here();
-        let real_reads = result.is_ok() && !ctl.has(cycle::UNREAL_READS);
+        let rt = self.runtime_id;
         let (replaced, spec_buf) = cycle_state::with_held(|h| {
-            let basis = h
-                .take_basis(self.runtime_id, cidx, &deps, &|d| self.clean_stamp(d))
-                .filter(|_| real_reads);
-            let e = h
-                .get_mut(&(self.runtime_id, slot))
+            let basis = if look.is_speculative()
+                && result.is_ok()
+                && !ctl.has(cycle::UNREAL_READS)
+                && !ctl.looked_up_unrecorded()
+            {
+                h.take_basis(rt, cidx, &deps, &|d| self.clean_stamp(d))
+            } else {
+                h.drop_spec_reads(rt, cidx);
+                None
+            };
+            let out = h
+                .record(
+                    &(rt, slot),
+                    look,
+                    deps,
+                    ctl.buf.take(),
+                    !ctl.children.get().is_null(),
+                    ctl.poison(),
+                    basis,
+                )
                 .expect("incr-core: a member run's node is held");
-            let out = e.record(
-                look,
-                deps,
-                ctl.buf.take(),
-                !ctl.children.get().is_null(),
-                ctl.poison(),
-                basis,
-            );
+            let e = h
+                .get_mut(&(rt, slot))
+                .expect("incr-core: a member run's node is held");
             e.hold |= ctl.has(cycle::HOLD);
             // An engine unwind is no fault of the member's.
             if result.is_err() && cycle_state::unwind_kind().is_none() {
@@ -1193,16 +1206,17 @@ impl<C: Cells> Runtime<C> {
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
         held.wrote = ctl.wrote.get() != 0;
-        let basis =
-            cycle_state::with_held(|h| h.take_basis(rt, cidx, &deps, &|d| self.clean_stamp(d)))
-                .filter(|_| !ctl.has(cycle::UNREAL_READS));
+        let look = Look::here();
+        // A compute frame's notes may be an earlier frame's at this
+        // position, so a speculative one keeps no basis.
+        cycle_state::with_held(|h| h.drop_spec_reads(rt, cidx));
         let (replaced, spec_buf) = held.record(
-            Look::here(),
+            look,
             deps,
             ctl.buf.take(),
             !ctl.children.get().is_null(),
             ctl.poison(),
-            basis,
+            None,
         );
         debug_assert!(
             replaced.is_none() && spec_buf.is_none(),
@@ -1528,6 +1542,7 @@ impl<C: Cells> Runtime<C> {
                             e.episode = Some(cycle.clone());
                             e.ep = id;
                             e.in_cu = ep.cu.binary_search(m).is_ok();
+                            e.renew_stamp();
                             e.clear_installed();
                             spec_buf
                         })
@@ -1913,6 +1928,7 @@ impl<C: Cells> Runtime<C> {
                     e.episode = None;
                     e.ep = 0;
                     e.in_cu = false;
+                    e.renew_stamp();
                     e.take_s()
                 })
                 .collect()

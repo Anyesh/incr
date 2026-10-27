@@ -103,7 +103,7 @@ pub(crate) struct Held {
     buf: Option<Erased>,
     /// A seeded member's current value inside an episode.
     s: Option<Erased>,
-    /// Renewed whenever `s` is replaced, as `stamp` is for the buffer.
+    /// `stamp`'s counterpart for `s`.
     s_stamp: u64,
     /// `s` was set under speculation.
     s_spec: bool,
@@ -138,8 +138,9 @@ pub(crate) struct Held {
     /// While the buffer and run record come from a run made under
     /// speculation: the record from before that run's write.
     pre_spec: Option<Box<RunRecord>>,
-    /// Renewed whenever the buffer is written or taken, so a reader's note
-    /// of it tells whether the buffer it read is still the one held.
+    /// 0 until a speculative run's read of the buffer notes it, and 0
+    /// again once the buffer is written or taken, so a noted stamp tells
+    /// whether the buffer read is still the one held.
     stamp: u64,
     /// What the last speculative run read, if it read only real state: a
     /// look outside speculation adopts the run while all of it is unchanged.
@@ -170,7 +171,7 @@ impl Held {
             first,
             buf: None,
             s: None,
-            s_stamp: next_stamp(),
+            s_stamp: 0,
             s_spec: false,
             deps: Vec::new(),
             last: Vec::new(),
@@ -185,7 +186,7 @@ impl Held {
             ep: 0,
             in_cu: false,
             pre_spec: None,
-            stamp: next_stamp(),
+            stamp: 0,
             basis: None,
         }
     }
@@ -207,13 +208,23 @@ impl Held {
         basis: Option<Basis>,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
+            // Every speculative run since the first is merged into the
+            // record, so an adoption rests on all of their reads.
+            self.basis = match (self.pre_spec.is_some(), self.basis.take(), basis) {
+                (false, _, basis) => basis.map(Box::new),
+                (true, Some(mut kept), Some(basis)) => {
+                    kept.held.extend(basis.held);
+                    kept.clean.extend(basis.clean);
+                    Some(kept)
+                }
+                _ => None,
+            };
             self.keep_record();
-            self.basis = basis.map(Box::new);
             None
         } else {
             self.settle()
         };
-        self.stamp = next_stamp();
+        self.stamp = 0;
         for &d in &deps {
             if !self.deps.contains(&d) {
                 self.deps.push(d);
@@ -248,7 +259,7 @@ impl Held {
 
     /// Replaces the current value, returning the one it replaces.
     pub(crate) fn replace_s(&mut self, s: Option<Erased>) -> Option<Erased> {
-        self.s_stamp = next_stamp();
+        self.s_stamp = 0;
         self.s_spec = s.is_some() && replay::speculative();
         std::mem::replace(&mut self.s, s)
     }
@@ -257,9 +268,16 @@ impl Held {
         self.replace_s(None)
     }
 
+    /// For a change to how the claim reads (its episode, or whether it is
+    /// one of the members that read each other): a buffer read before is
+    /// no longer what a read now gives.
+    pub(crate) fn renew_stamp(&mut self) {
+        self.stamp = 0;
+    }
+
     /// Takes the buffer to drop it, leaving the run record as it is.
     pub(crate) fn discard_buf(&mut self) -> Option<Discarded> {
-        self.stamp = next_stamp();
+        self.stamp = 0;
         self.buf.take().map(|buf| Discarded {
             _values: (Some(buf), None),
         })
@@ -313,7 +331,7 @@ impl Held {
     fn settle(&mut self) -> Option<Unbuilt> {
         let r = self.pre_spec.take()?;
         self.basis = None;
-        self.stamp = next_stamp();
+        self.stamp = 0;
         self.deps = r.deps;
         self.last = r.last;
         self.installed = r.installed;
@@ -339,6 +357,10 @@ impl Look {
     const SPECULATIVE: Self = Self { speculative: true };
     #[cfg(all(test, not(loom)))]
     const REAL: Self = Self { speculative: false };
+
+    pub(crate) fn is_speculative(self) -> bool {
+        self.speculative
+    }
 
     /// A look from this thread's run.
     pub(crate) fn here() -> Self {
@@ -403,7 +425,7 @@ impl<H: Borrow<Held>> Seen<H> {
 impl<H: BorrowMut<Held>> Seen<H> {
     pub(crate) fn take_buf(&mut self) -> Option<Erased> {
         let e = self.0.borrow_mut();
-        e.stamp = next_stamp();
+        e.stamp = 0;
         e.buf.take()
     }
 
@@ -454,8 +476,12 @@ pub(crate) enum MemberRead {
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
 
-fn next_stamp() -> u64 {
-    NEXT_STAMP.fetch_add(1, Ordering::Relaxed)
+/// `stamp`, given a value no other note took if it has none.
+fn noted(stamp: &mut u64) -> u64 {
+    if *stamp == 0 {
+        *stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
+    }
+    *stamp
 }
 
 /// A claim's run record, kept while a speculative run's is written over it.
@@ -551,6 +577,9 @@ pub(crate) struct HeldMap {
     /// `(rt, reader position, member, read)` of each read of a held member
     /// a speculative run made, until that run records.
     spec_reads: Vec<(RuntimeId, u32, u32, MemberRead)>,
+    /// Some claim may hold a speculative run's record; false again once the
+    /// map is empty, so a thread that never speculates looks up once.
+    spec_written: bool,
 }
 
 struct Group {
@@ -577,6 +606,7 @@ impl HeldMap {
             by_virtual_owner: BTreeSet::new(),
             next_group: 1,
             spec_reads: Vec::new(),
+            spec_written: false,
         }
     }
 
@@ -669,6 +699,7 @@ impl HeldMap {
         let displaced = self.remove(&key);
         self.by_anchor.insert((key.0, held.anchor, key.1));
         let g = self.new_group(key.0, std::mem::take(&mut held.owner));
+        self.spec_written |= held.spec_written();
         self.claims.insert(key, held);
         self.join(key, g);
         displaced
@@ -686,6 +717,9 @@ impl HeldMap {
             .expect("incr-core: the claim is held");
         self.by_anchor.remove(&(key.0, e.anchor, key.1));
         e.owner = owner;
+        if self.claims.is_empty() {
+            self.spec_written = false;
+        }
         Some(e)
     }
 
@@ -709,12 +743,15 @@ impl HeldMap {
         look: Look,
         clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
     ) -> Option<(Seen<&mut Held>, Option<Unbuilt>)> {
-        if !look.speculative && self.claims.get(key)?.spec_written() {
-            let mut runs = Vec::new();
-            if self.adoptable(key.0, key.1, clean, &mut runs) {
-                for m in runs {
-                    if let Some(e) = self.claims.get_mut(&(key.0, m)) {
+        if self.spec_written && !look.speculative && self.claims.get(key)?.spec_written() {
+            let mut verdicts = HashMap::default();
+            let adopted = self.adoptable(key.0, key.1, clean, &mut verdicts);
+            for (m, real) in verdicts {
+                if let Some(e) = self.claims.get_mut(&(key.0, m)) {
+                    if adopted && real {
                         e.adopt();
+                    } else if !real {
+                        e.basis = None;
                     }
                 }
             }
@@ -727,19 +764,33 @@ impl HeldMap {
     /// unchanged, each Clean node at its generation and `changed_at`, each
     /// member's buffer the one read and itself real, and each member read
     /// as its episode's cycle still in that episode as such a member.
-    /// `runs` collects the claims checked, a claim already there counting
-    /// as real.
+    /// `verdicts` keeps each claim's answer. Buffer reads form no cycle: a
+    /// record resets the claim's stamp after its reads, so of two claims
+    /// each reading the other's current buffer one would have recorded
+    /// after the other's read.
     fn adoptable(
         &self,
         rt: RuntimeId,
         slot: u32,
         clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
-        runs: &mut Vec<u32>,
+        verdicts: &mut HashMap<u32, bool, FxBuildHasher>,
     ) -> bool {
-        if runs.contains(&slot) {
-            return true;
+        if let Some(&real) = verdicts.get(&slot) {
+            return real;
         }
-        runs.push(slot);
+        verdicts.insert(slot, true);
+        let real = self.reads_real(rt, slot, clean, verdicts);
+        verdicts.insert(slot, real);
+        real
+    }
+
+    fn reads_real(
+        &self,
+        rt: RuntimeId,
+        slot: u32,
+        clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
+        verdicts: &mut HashMap<u32, bool, FxBuildHasher>,
+    ) -> bool {
         let Some(e) = self.claims.get(&(rt, slot)) else {
             return false;
         };
@@ -758,7 +809,7 @@ impl HeldMap {
                     self.claims
                         .get(&(rt, *m))
                         .is_some_and(|r| r.stamp == *stamp)
-                        && self.adoptable(rt, *m, clean, runs)
+                        && self.adoptable(rt, *m, clean, verdicts)
                 }
                 MemberRead::Current(stamp) => self
                     .claims
@@ -771,11 +822,36 @@ impl HeldMap {
             })
     }
 
+    /// [`Held::record`] on claim `key`, if held.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record(
+        &mut self,
+        key: &(RuntimeId, u32),
+        look: Look,
+        deps: Vec<(NodeId, u32)>,
+        buf: Option<Erased>,
+        opened: bool,
+        poison: u16,
+        basis: Option<Basis>,
+    ) -> Option<(Option<Erased>, Option<Unbuilt>)> {
+        let e = self.claims.get_mut(key)?;
+        self.spec_written |= look.speculative;
+        Some(e.record(look, deps, buf, opened, poison, basis))
+    }
+
+    /// Drops the reads noted at position `at` or above, of a run that
+    /// keeps no basis.
+    pub(crate) fn drop_spec_reads(&mut self, rt: RuntimeId, at: u32) {
+        if !self.spec_reads.is_empty() {
+            self.spec_reads.retain(|(r, c, ..)| *r != rt || *c < at);
+        }
+    }
+
     /// Notes a speculative run's read, at position `at`, of member `slot`'s
     /// buffer.
     pub(crate) fn note_spec_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
-        if let Some(e) = self.claims.get(&(rt, slot)) {
-            let read = MemberRead::Buffer(e.stamp);
+        if let Some(e) = self.claims.get_mut(&(rt, slot)) {
+            let read = MemberRead::Buffer(noted(&mut e.stamp));
             self.spec_reads.push((rt, at, slot, read));
         }
     }
@@ -783,8 +859,8 @@ impl HeldMap {
     /// Notes a speculative run's read, at position `at`, of strategy member
     /// `slot`'s current value.
     pub(crate) fn note_spec_current_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
-        if let Some(e) = self.claims.get(&(rt, slot)) {
-            let read = MemberRead::Current(e.s_stamp);
+        if let Some(e) = self.claims.get_mut(&(rt, slot)) {
+            let read = MemberRead::Current(noted(&mut e.s_stamp));
             self.spec_reads.push((rt, at, slot, read));
         }
     }

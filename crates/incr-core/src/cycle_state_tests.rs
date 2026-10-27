@@ -166,16 +166,14 @@ fn speculative_reader(rt: RuntimeId) -> HeldMap {
     h.insert((rt, 5), Held::new(0, 1, false, true));
     h.insert((rt, 6), Held::new(0, 1, false, true));
     let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
-    h.get_mut(&(rt, 5))
-        .unwrap()
-        .record(Look::REAL, vec![], value(1), false, 0, None);
+    h.record(&(rt, 5), Look::REAL, vec![], value(1), false, 0, None)
+        .unwrap();
     h.note_spec_read(rt, 10, 5);
     let deps = vec![(NodeId(5), 0), (NodeId(3), 0)];
     let basis = h.take_basis(rt, 10, &deps, &clean);
     assert!(basis.is_some());
-    h.get_mut(&(rt, 6))
-        .unwrap()
-        .record(Look::SPECULATIVE, deps, value(7), false, 0, basis);
+    h.record(&(rt, 6), Look::SPECULATIVE, deps, value(7), false, 0, basis)
+        .unwrap();
     h
 }
 
@@ -194,9 +192,8 @@ fn a_real_look_adopts_a_speculative_run_of_unchanged_real_reads() {
 fn a_real_look_settles_a_speculative_run_whose_member_ran_again() {
     let rt = RuntimeId::allocate();
     let mut h = speculative_reader(rt);
-    h.get_mut(&(rt, 5))
-        .unwrap()
-        .record(Look::REAL, vec![], value(2), false, 0, None);
+    h.record(&(rt, 5), Look::REAL, vec![], value(2), false, 0, None)
+        .unwrap();
     let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
     let (seen, settled) = h.look(&(rt, 6), Look::REAL, &clean).unwrap();
     assert_eq!(read_unbuilt(&settled), Some(7));
@@ -225,14 +222,16 @@ fn a_real_look_adopts_the_speculative_runs_a_reader_rests_on() {
     h.note_spec_read(rt, 11, 6);
     let none = |_: NodeId| None;
     let basis = h.take_basis(rt, 11, &[(NodeId(6), 0)], &none);
-    h.get_mut(&(rt, 7)).unwrap().record(
+    h.record(
+        &(rt, 7),
         Look::SPECULATIVE,
         vec![(NodeId(6), 0)],
         value(8),
         false,
         0,
         basis,
-    );
+    )
+    .unwrap();
     let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
     let (seen, settled) = h.look(&(rt, 7), Look::REAL, &clean).unwrap();
     assert!(settled.is_none());
@@ -256,9 +255,8 @@ fn a_member_read_as_its_episode_cycle_holds_while_the_episode_stands() {
         let deps = vec![(NodeId(5), 0)];
         let basis = h.take_basis(rt, 10, &deps, &none);
         assert!(basis.is_some());
-        h.get_mut(&(rt, 6))
-            .unwrap()
-            .record(Look::SPECULATIVE, deps, value(7), false, 0, basis);
+        h.record(&(rt, 6), Look::SPECULATIVE, deps, value(7), false, 0, basis)
+            .unwrap();
         h
     };
     let none = |_: NodeId| None;
@@ -288,9 +286,8 @@ fn a_strategy_member_read_holds_until_its_current_value_moves() {
         let none = |_: NodeId| None;
         let deps = vec![(NodeId(5), 0)];
         let basis = h.take_basis(rt, 10, &deps, &none);
-        h.get_mut(&(rt, 6))
-            .unwrap()
-            .record(Look::SPECULATIVE, deps, value(7), false, 0, basis);
+        h.record(&(rt, 6), Look::SPECULATIVE, deps, value(7), false, 0, basis)
+            .unwrap();
         h
     };
     let none = |_: NodeId| None;
@@ -305,6 +302,43 @@ fn a_strategy_member_read_holds_until_its_current_value_moves() {
 }
 
 #[test]
+fn a_claim_inserted_with_a_speculative_record_is_settled_at_a_real_look() {
+    let rt = RuntimeId::allocate();
+    let mut h = HeldMap::new();
+    let mut e = Held::new(0, 1, false, true);
+    e.record(Look::SPECULATIVE, vec![], value(7), false, 0, None);
+    h.insert((rt, 6), e);
+    let none = |_: NodeId| None;
+    let (_, settled) = h.look(&(rt, 6), Look::REAL, &none).unwrap();
+    assert_eq!(read_unbuilt(&settled), Some(7));
+}
+
+#[test]
+fn an_adoption_rests_on_every_speculative_run_since_the_first() {
+    let rt = RuntimeId::allocate();
+    let mut h = HeldMap::new();
+    h.insert((rt, 6), Held::new(0, 1, false, true));
+    h.record(
+        &(rt, 6),
+        Look::SPECULATIVE,
+        vec![],
+        value(6),
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
+    let deps = vec![(NodeId(3), 0)];
+    let basis = h.take_basis(rt, 10, &deps, &clean);
+    assert!(basis.is_some());
+    h.record(&(rt, 6), Look::SPECULATIVE, deps, value(7), false, 0, basis)
+        .unwrap();
+    let (_, settled) = h.look(&(rt, 6), Look::REAL, &clean).unwrap();
+    assert_eq!(read_unbuilt(&settled), Some(7));
+}
+
+#[test]
 fn a_speculative_run_with_an_unnoted_member_read_is_settled() {
     let rt = RuntimeId::allocate();
     let mut h = HeldMap::new();
@@ -314,9 +348,8 @@ fn a_speculative_run_with_an_unnoted_member_read_is_settled() {
     let deps = vec![(NodeId(5), 0)];
     let basis = h.take_basis(rt, 10, &deps, &none);
     assert!(basis.is_none());
-    h.get_mut(&(rt, 6))
-        .unwrap()
-        .record(Look::SPECULATIVE, deps, value(7), false, 0, basis);
+    h.record(&(rt, 6), Look::SPECULATIVE, deps, value(7), false, 0, basis)
+        .unwrap();
     let (_, settled) = h.look(&(rt, 6), Look::REAL, &none).unwrap();
     assert_eq!(read_unbuilt(&settled), Some(7));
 }
