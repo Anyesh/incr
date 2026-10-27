@@ -1331,7 +1331,8 @@ struct History<'a> {
 type EnteredHook = Box<dyn FnMut(usize, usize)>;
 
 /// [`callback_join`]'s result: whether B returned while the callback
-/// waited, A's walk listings, and A's and B's outcomes.
+/// waited, A's walk listings before the callback, and A's and B's
+/// outcomes.
 type Joined = (
     bool,
     u32,
@@ -4850,7 +4851,10 @@ fn two_thread_callback_joins_a_read_of_a_listed_node() {
             let unbounded = callback_join(&case, op, callback, listed, 0);
             let bounded = callback_join(&case, op, callback, listed, 16 * 1024);
             assert!(unbounded.0, "{seed:#x}: B waited unbounded");
-            assert!(bounded.1 > 0, "{seed:#x}: the budget listed nothing");
+            assert!(
+                bounded.1 > 0,
+                "{seed:#x}: the budget listed nothing before the callback"
+            );
             assert_eq!(
                 (bounded.0, bounded.2),
                 (unbounded.0, unbounded.2),
@@ -4873,6 +4877,7 @@ fn callback_join(case: &Case, op: usize, callback: usize, listed: usize, bytes: 
     let (go_tx, go) = std::sync::mpsc::channel::<()>();
     let done = Arc::new(AtomicBool::new(false));
     let returned = Arc::new(Mutex::new(None));
+    let listings = Arc::new(AtomicU32::new(0));
     std::thread::scope(|s| {
         let b = {
             let done = done.clone();
@@ -4884,11 +4889,13 @@ fn callback_join(case: &Case, op: usize, callback: usize, listed: usize, bytes: 
             })
         };
         let a = s.spawn(|| {
-            let (done, returned) = (done.clone(), returned.clone());
+            let (done, returned, listings) = (done.clone(), returned.clone(), listings.clone());
             let mut go_tx = Some(go_tx);
+            let before = crate::reserve::walk_listings();
             CALLED.with(|c| {
                 *c.borrow_mut() = Some(Box::new(move |side, i| {
                     if let Some(go) = go_tx.take_if(|_| (side, i) == (0, callback)) {
+                        listings.store(crate::reserve::walk_listings() - before, SeqCst);
                         go.send(()).unwrap();
                         let start = std::time::Instant::now();
                         while !done.load(SeqCst) && start.elapsed().as_secs() < 10 {
@@ -4898,14 +4905,13 @@ fn callback_join(case: &Case, op: usize, callback: usize, listed: usize, bytes: 
                     }
                 }));
             });
-            let listings = crate::reserve::walk_listings();
             let a = apply(&case.ops[op]);
             CALLED.with(|c| c.borrow_mut().take());
-            (a, crate::reserve::walk_listings() - listings)
+            a
         });
-        let (a, listings) = a.join().unwrap();
+        let a = a.join().unwrap();
         let returned = returned.lock().unwrap().expect("the callback never ran");
-        (returned, listings, (a, b.join().unwrap()))
+        (returned, listings.load(SeqCst), (a, b.join().unwrap()))
     })
 }
 

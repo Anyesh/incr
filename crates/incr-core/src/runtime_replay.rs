@@ -4474,8 +4474,7 @@ impl<C: Cells> Runtime<C> {
         };
         self.count_release();
         let (e, spec_buf) = e.into_look(Look::here());
-        let released =
-            self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
+        let peers = self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
         let id = NodeId(slot);
         let stamp_rev = self.current_revision();
         if discarding {
@@ -4501,7 +4500,7 @@ impl<C: Cells> Runtime<C> {
                 bag,
             );
             if self.lists_walks() {
-                let peers = reserve::Peers::new(released.into_iter().chain([slot]));
+                let peers = peers.map_or_else(|| reserve::Peers::new([slot]), |p| p.and(slot));
                 self.note_unwound_landing(id, node, &peers);
             }
             self.end_reservation(id, node);

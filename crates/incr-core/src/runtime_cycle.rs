@@ -1953,7 +1953,7 @@ impl<C: Cells> Runtime<C> {
         discarding: bool,
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) -> Vec<u32> {
+    ) -> Option<reserve::Peers> {
         let mut keep = Vec::new();
         if kind == Some(UnwindKind::Discard) {
             self.virtually_owned(cidx, &mut keep);
@@ -1978,7 +1978,7 @@ impl<C: Cells> Runtime<C> {
         keep: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
-    ) -> Vec<u32> {
+    ) -> Option<reserve::Peers> {
         // The unwinding frame, of node `subtree`, owns the claims owned at
         // its position by it, and those owned above.
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
@@ -2011,7 +2011,7 @@ impl<C: Cells> Runtime<C> {
                 .collect()
         });
         if entries.is_empty() {
-            return Vec::new();
+            return None;
         }
         self.count_release();
         entries.sort_unstable_by_key(|(slot, _)| *slot);
@@ -2083,7 +2083,7 @@ impl<C: Cells> Runtime<C> {
         if kind.is_none() {
             self.end_released_runs(&released);
         }
-        released
+        peers
     }
 
     /// The discard landing of a claim this thread holds: the node lands as

@@ -570,6 +570,61 @@ fn a_nested_reads_walk_listing_leaves_the_enclosing_one_awake() {
     assert!(!reserved_elsewhere(n));
 }
 
+/// A nested read that ends while its walk listing of a node is awake
+/// leaves the enclosing read's listing of it awake.
+#[test]
+fn a_nested_reads_end_leaves_the_enclosing_walk_listing_awake() {
+    use crate::reserve::{note_walk, user_code, Peers, Root};
+    let rt = Rt::new();
+    let n = (rt.runtime_id, 7);
+    let outer = Root::arm(true, (rt.runtime_id, 3));
+    note_walk(n, 1, &Peers::new([5]));
+    let inner = Root::arm(true, (rt.runtime_id, 4));
+    note_walk(n, 1, &Peers::new([5]));
+    drop(inner);
+    assert!(
+        checked(begun_op(n)),
+        "the nested read's end ended the enclosing listing"
+    );
+    user_code(outside(&rt));
+    assert!(!checked(begun_op(n)), "the enclosing listing stayed awake");
+    drop(outer);
+    assert!(!reserved_elsewhere(n));
+}
+
+/// Walk listings of a node by an enclosing and a nested read over a
+/// context's rested reservation of it, the enclosing one ending first:
+/// the nested one's end leaves the reservation at its rest's stamp.
+#[test]
+fn nested_walk_listings_ending_outer_first_leave_the_rest_stamp() {
+    use crate::reserve::{end_contexts, note, note_walk, rest, user_code, Peers, Root, Scope};
+    let rt = Rt::new();
+    let n = (rt.runtime_id, 7);
+    let outer = Root::arm(true, (rt.runtime_id, 3));
+    {
+        let _scope = Scope::new(Some(5));
+        note(n, 1);
+    }
+    let before = begun_op(n);
+    rest(n, 1);
+    let between = begun_op(n);
+    note_walk(n, 1, &Peers::new([5]));
+    let inner = Root::arm(true, (rt.runtime_id, 4));
+    note_walk(n, 1, &Peers::new([6]));
+    user_code((rt.runtime_id, 6));
+    assert!(
+        checked(begun_op(n)),
+        "the nested listing ended with the enclosing one"
+    );
+    user_code(outside(&rt));
+    assert!(!checked(between), "the rest's stamp was lost");
+    assert!(checked(before), "the context's hold was dropped");
+    drop(inner);
+    end_contexts();
+    drop(outer);
+    assert!(!reserved_elsewhere(n));
+}
+
 /// Ending every reservation of the thread, as a wound does, ends its walk
 /// listings too: a context's later rest of the node takes effect at once.
 #[test]

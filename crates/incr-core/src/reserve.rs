@@ -334,6 +334,15 @@ impl Peers {
         Self(slots.into())
     }
 
+    /// These and `slot`, the same set if it is one of them.
+    pub(crate) fn and(self, slot: u32) -> Self {
+        if self.contains(slot) {
+            self
+        } else {
+            Self::new(self.0.iter().copied().chain([slot]))
+        }
+    }
+
     fn contains(&self, slot: u32) -> bool {
         self.0.binary_search(&slot).is_ok()
     }
@@ -341,8 +350,9 @@ impl Peers {
 
 /// One release's walk listings still awake: claims the walk group of
 /// `context` lists, each with the stamp this thread's other reservation
-/// of the node had before the listing woke it, or since ([`AWAKE`] for
-/// none or awake), kept awake through the closures of `peers` of `rt`.
+/// of the node had before the first listing of it woke it, or since
+/// ([`AWAKE`] for none or awake), the same in every release that lists it,
+/// kept awake through the closures of `peers` of `rt`.
 struct Release {
     context: u64,
     rt: RuntimeId,
@@ -419,12 +429,24 @@ pub(crate) fn note_walk(claim: Claim, generation: u32, peers: &Peers) {
                 woken: HashMap::default(),
             });
         }
+        // A listing by an enclosing read already woke it: the stamp under
+        // both is the one that read saw.
+        let was = w
+            .iter()
+            .find_map(|r| r.woken.get(&(claim, generation)).copied())
+            .unwrap_or(was);
         let release = w.last_mut().expect("a release was just pushed");
         release.woken.insert((claim, generation), was);
     });
     ANY_WOKEN.with(|a| a.set(true));
     #[cfg(all(test, not(loom)))]
     WALK_LISTINGS.with(|n| n.set(n.get() + 1));
+}
+
+/// Whether this thread is inside a read, whose walk [`note_walk`] lists
+/// what an unwind lands unsettled.
+pub(crate) fn walking() -> bool {
+    ROOT.with(Cell::get) != 0
 }
 
 /// This thread is about to run the closure of `entering`: its walk
@@ -509,15 +531,12 @@ fn end_walk(context: u64, claim: (Claim, u32), was: u64) {
         if groups[at].claims.is_empty() {
             groups.swap_remove(at);
         }
-        let walked = groups
-            .iter()
-            .any(|g| g.context & WALK != 0 && g.context != ROOT_READ && g.claims.contains(&claim));
-        Some((m.token(), walked))
+        Some(m.token())
     });
-    if let Ok(Some((token, walked))) = ended {
+    if let Ok(Some(token)) = ended {
         ROOTS.with(|n| n.set(n.get() - 1));
         unlist([claim], token, true);
-        if !walked {
+        if !walk_listed(claim) {
             restamp([(claim, was)], token);
         }
     }
