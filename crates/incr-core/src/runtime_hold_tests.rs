@@ -1219,7 +1219,7 @@ fn shared_holder_waiting_on_a_claim_of_a_reader_of_its_held_panic_landing_finish
         let claimed = claimed.clone();
         rt.create_query(move |rt: &Runtime<Shared>| {
             claimed.park();
-            catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(1, |v| v)
+            catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_or(1)
         })
     };
     let d = {
