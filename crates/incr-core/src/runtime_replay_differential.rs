@@ -4628,6 +4628,19 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
     });
 }
 
+/// 0x7b5e6, two threads: at one frame op 0's `Get(0)` gives 10004 where
+/// every order of the overlapping reads panics "boom 0:6".
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_lazy_doomed_frame_placeholder_seeds() {
+    let case = gen_case(0x7b5e6, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x7b5e6);
+        }
+    });
+}
+
 /// 0x761 and 0x8c2, two-thread cases on one thread, Shared at one frame:
 /// a wound at any claim gives the unbounded run's outcome, as its
 /// retraction puts each held landing back as its claim found it.
