@@ -203,7 +203,6 @@ impl<C: Cells> Runtime<C> {
         let kept = ctl.and_then(hold::take_kept);
         let cell = state::cell_key::<C>(node.state_cell());
         let verified_at = Some(node.verified_at());
-        node.set_held_mark(true);
         if let Some(own) = hold::open(
             cell,
             self.runtime_id,
@@ -214,6 +213,9 @@ impl<C: Cells> Runtime<C> {
             kept,
         ) {
             bag.push_erased(own);
+        }
+        if hold::holds(cell) {
+            node.set_held_mark(true);
         }
     }
 
