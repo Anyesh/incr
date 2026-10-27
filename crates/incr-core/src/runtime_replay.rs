@@ -1202,6 +1202,7 @@ impl<C: Cells> Runtime<C> {
         mut stash: Stash,
         revision: u64,
     ) -> Result<bool, Stash> {
+        stash.spec_reads.sort_unstable();
         let (displaced, ended) = {
             let mut s = self.stashes.write();
             if self.current_revision() != revision {
@@ -6340,8 +6341,9 @@ pub(super) struct Stash {
     index: Option<StashedIndex>,
     /// Given at insert, unique in the runtime.
     serial: u64,
-    /// The run's reads of other stashes, as `(slot, generation, serial)`:
-    /// each such dep must land from that stash for this one to stand.
+    /// The run's reads of other stashes, as `(slot, generation, serial)`,
+    /// sorted at insert: each such dep must land from that stash for this
+    /// one to stand.
     spec_reads: Vec<(u32, u32, u64)>,
 }
 
@@ -6361,9 +6363,9 @@ impl Stash {
     /// The serial of the stash the run read dep `d` at `generation` from.
     fn read_serial(&self, d: NodeId, generation: u32) -> Option<u64> {
         self.spec_reads
-            .iter()
-            .find(|&&(slot, g, _)| slot == d.0 && g == generation)
-            .map(|&(_, _, serial)| serial)
+            .binary_search_by_key(&(d.0, generation), |&(slot, g, _)| (slot, g))
+            .ok()
+            .map(|i| self.spec_reads[i].2)
     }
 }
 

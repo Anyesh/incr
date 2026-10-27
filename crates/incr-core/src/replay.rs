@@ -2139,7 +2139,7 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
     static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
-    static SPEC_READS: RefCell<Vec<SpecRead>> = const { RefCell::new(Vec::new()) };
+    static SPEC_READS: RefCell<SpecReads> = RefCell::new(HashMap::default());
     static SPEC_PENDING: Cell<Option<SpecPending>> = const { Cell::new(None) };
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
@@ -2170,7 +2170,7 @@ thread_local! {
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
     static CHECKED_READS: RefCell<Vec<CheckedRead>> = RefCell::new(Vec::new());
-    static SPEC_READS: RefCell<Vec<SpecRead>> = RefCell::new(Vec::new());
+    static SPEC_READS: RefCell<SpecReads> = RefCell::new(HashMap::default());
     static SPEC_PENDING: Cell<Option<SpecPending>> = Cell::new(None);
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
@@ -2400,15 +2400,13 @@ pub(crate) struct SpecPending {
     source: SpecSource,
 }
 
-/// A speculative frame's read of a node's stash.
-struct SpecRead {
-    rt: RuntimeId,
-    cidx: u32,
-    ctl: *const crate::cycle::ComputeCtl,
-    slot: u32,
-    generation: u32,
-    serial: u64,
-}
+/// Speculative frames' reads of other stashes, by frame (runtime,
+/// position and control block) and then by node, to each stash's serial.
+/// A frame that pops without taking its reads leaves them until the
+/// thread's replay context ends; a frame its control block's address
+/// reuses clears them on its first read.
+type SpecReads =
+    HashMap<(RuntimeId, u32, usize), HashMap<(u32, u32), u64, FxBuildHasher>, FxBuildHasher>;
 
 /// Opens a speculative frame's read of node `slot` at `generation` of
 /// `rt`, `Unchecked` until a listed source names its own; returns the
@@ -2445,41 +2443,25 @@ pub(crate) fn close_spec_read(outer: Option<SpecPending>) -> SpecSource {
 }
 
 /// Keeps the frame of `ctl` at `cidx` of `rt`'s read of node `slot` at
-/// `generation` from its stash `serial`. The reads of popped frames above
-/// it go, and so do an earlier frame's of the same control block on the
-/// frame's first one (`fresh`); another frame at its position, as a member
-/// run at its episode root's, keeps its own. False if the frame read
-/// another stash of the node, whose adoption both reads cannot share.
+/// `generation` from its stash `serial`; an earlier frame's reads under the
+/// same control block at the position go on the frame's first one
+/// (`fresh`). False if the frame read another stash of the node, whose
+/// adoption both reads cannot share.
 pub(crate) fn keep_spec_read(
     rt: RuntimeId,
     cidx: u32,
     ctl: *const crate::cycle::ComputeCtl,
-    (slot, generation): (u32, u32),
+    node: (u32, u32),
     serial: u64,
     fresh: bool,
 ) -> bool {
     SPEC_READS.with(|d| {
         let mut d = d.borrow_mut();
-        d.retain(|e| e.rt != rt || e.cidx < cidx || e.cidx == cidx && (e.ctl != ctl || !fresh));
-        let ours = |e: &&SpecRead| {
-            e.rt == rt
-                && e.cidx == cidx
-                && e.ctl == ctl
-                && e.slot == slot
-                && e.generation == generation
-        };
-        if let Some(e) = d.iter().find(ours) {
-            return e.serial == serial;
+        let reads = d.entry((rt, cidx, ctl as usize)).or_default();
+        if fresh {
+            reads.clear();
         }
-        d.push(SpecRead {
-            rt,
-            cidx,
-            ctl,
-            slot,
-            generation,
-            serial,
-        });
-        true
+        *reads.entry(node).or_insert(serial) == serial
     })
 }
 
@@ -2493,19 +2475,14 @@ pub(crate) fn spec_read_of(
     generation: u32,
 ) -> bool {
     SPEC_READS.with(|d| {
-        d.borrow().iter().any(|e| {
-            e.rt == rt
-                && e.cidx == cidx
-                && e.ctl == ctl
-                && e.slot == slot
-                && e.generation == generation
-        })
+        d.borrow()
+            .get(&(rt, cidx, ctl as usize))
+            .is_some_and(|reads| reads.contains_key(&(slot, generation)))
     })
 }
 
 /// The stash reads of the frame of `ctl` at `cidx` of `rt`, which is
-/// popping, as `(slot, generation, serial)`, taken with those of popped
-/// frames above it.
+/// popping, as `(slot, generation, serial)`.
 pub(crate) fn take_spec_reads(
     rt: RuntimeId,
     cidx: u32,
@@ -2513,12 +2490,13 @@ pub(crate) fn take_spec_reads(
 ) -> Vec<(u32, u32, u64)> {
     SPEC_READS.with(|d| {
         d.borrow_mut()
-            .extract_if(.., |e| {
-                e.rt == rt && (e.cidx > cidx || e.cidx == cidx && e.ctl == ctl)
+            .remove(&(rt, cidx, ctl as usize))
+            .map_or_else(Vec::new, |reads| {
+                reads
+                    .into_iter()
+                    .map(|((slot, generation), serial)| (slot, generation, serial))
+                    .collect()
             })
-            .filter(|e| e.cidx == cidx)
-            .map(|e| (e.slot, e.generation, e.serial))
-            .collect()
     })
 }
 
