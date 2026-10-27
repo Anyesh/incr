@@ -277,6 +277,34 @@ fn a_member_read_as_its_episode_cycle_holds_while_the_episode_stands() {
 }
 
 #[test]
+fn a_strategy_member_read_holds_until_its_current_value_moves() {
+    let rt = RuntimeId::allocate();
+    let reader = || {
+        let mut h = HeldMap::new();
+        h.insert((rt, 5), Held::new(0, 1, true, true));
+        h.insert((rt, 6), Held::new(0, 1, false, true));
+        h.get_mut(&(rt, 5)).unwrap().replace_s(value(1));
+        h.note_spec_current_read(rt, 10, 5);
+        let none = |_: NodeId| None;
+        let deps = vec![(NodeId(5), 0)];
+        let basis = h.take_basis(rt, 10, &deps, &none);
+        h.get_mut(&(rt, 6))
+            .unwrap()
+            .record(Look::SPECULATIVE, deps, value(7), false, 0, basis);
+        h
+    };
+    let none = |_: NodeId| None;
+    let mut h = reader();
+    let (seen, settled) = h.look(&(rt, 6), Look::REAL, &none).unwrap();
+    assert!(settled.is_none());
+    assert_eq!(read(seen.buf()), Some(7));
+    let mut h = reader();
+    h.get_mut(&(rt, 5)).unwrap().replace_s(value(2));
+    let (_, settled) = h.look(&(rt, 6), Look::REAL, &none).unwrap();
+    assert_eq!(read_unbuilt(&settled), Some(7));
+}
+
+#[test]
 fn a_speculative_run_with_an_unnoted_member_read_is_settled() {
     let rt = RuntimeId::allocate();
     let mut h = HeldMap::new();

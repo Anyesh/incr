@@ -102,7 +102,11 @@ pub(crate) struct Held {
     /// The last run's value, or for a seeded member its last output.
     buf: Option<Erased>,
     /// A seeded member's current value inside an episode.
-    pub(crate) s: Option<Erased>,
+    s: Option<Erased>,
+    /// Renewed whenever `s` is replaced, as `stamp` is for the buffer.
+    s_stamp: u64,
+    /// `s` was set under speculation.
+    s_spec: bool,
     /// Every dep any run of this claim recorded, for the stale check.
     deps: Vec<(NodeId, u32)>,
     /// The deps of the last run: its reads of other members are the
@@ -166,6 +170,8 @@ impl Held {
             first,
             buf: None,
             s: None,
+            s_stamp: next_stamp(),
+            s_spec: false,
             deps: Vec::new(),
             last: Vec::new(),
             installed: Vec::new(),
@@ -233,6 +239,22 @@ impl Held {
     pub(crate) fn into_look(mut self, look: Look) -> (Seen<Held>, Option<Unbuilt>) {
         let spec_buf = self.settle_for(look);
         (Seen(self), spec_buf)
+    }
+
+    /// A seeded member's current value inside an episode.
+    pub(crate) fn s(&self) -> &Option<Erased> {
+        &self.s
+    }
+
+    /// Replaces the current value, returning the one it replaces.
+    pub(crate) fn replace_s(&mut self, s: Option<Erased>) -> Option<Erased> {
+        self.s_stamp = next_stamp();
+        self.s_spec = s.is_some() && replay::speculative();
+        std::mem::replace(&mut self.s, s)
+    }
+
+    pub(crate) fn take_s(&mut self) -> Option<Erased> {
+        self.replace_s(None)
     }
 
     /// Takes the buffer to drop it, leaving the run record as it is.
@@ -426,6 +448,8 @@ pub(crate) enum MemberRead {
     /// The member's episode's cycle, as an unseeded member that reads
     /// another such member gets it.
     Cycle(Cycle),
+    /// A strategy member's current value, by its stamp.
+    Current(u64),
 }
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
@@ -736,6 +760,10 @@ impl HeldMap {
                         .is_some_and(|r| r.stamp == *stamp)
                         && self.adoptable(rt, *m, clean, runs)
                 }
+                MemberRead::Current(stamp) => self
+                    .claims
+                    .get(&(rt, *m))
+                    .is_some_and(|r| r.s_stamp == *stamp && !r.s_spec),
                 MemberRead::Cycle(cycle) => self
                     .claims
                     .get(&(rt, *m))
@@ -748,6 +776,15 @@ impl HeldMap {
     pub(crate) fn note_spec_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
         if let Some(e) = self.claims.get(&(rt, slot)) {
             let read = MemberRead::Buffer(e.stamp);
+            self.spec_reads.push((rt, at, slot, read));
+        }
+    }
+
+    /// Notes a speculative run's read, at position `at`, of strategy member
+    /// `slot`'s current value.
+    pub(crate) fn note_spec_current_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
+        if let Some(e) = self.claims.get(&(rt, slot)) {
+            let read = MemberRead::Current(e.s_stamp);
             self.spec_reads.push((rt, at, slot, read));
         }
     }

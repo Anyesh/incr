@@ -846,7 +846,13 @@ impl<C: Cells> Runtime<C> {
         // R2: a strategy member reads as its current value.
         if C::u8_load_relaxed(self.nodes.get_with_flags(slot).1) & HAS_STRATEGY != 0 {
             let value = match &held {
-                Some((_, _, _, Some(_), _)) => self.held_value::<T>(slot, true),
+                Some((_, _, _, Some(_), _)) => {
+                    let value = self.held_value::<T>(slot, true);
+                    if replay::speculative() {
+                        cycle_state::with_held(|h| h.note_spec_current_read(rt, at, slot));
+                    }
+                    value
+                }
                 _ => self.discovery_value::<T>(slot, p),
             };
             ctl.lower(p);
@@ -942,7 +948,7 @@ impl<C: Cells> Runtime<C> {
     /// A clone of a held node's current value (`s`) or buffer.
     fn held_value<T: Value>(&self, slot: u32, current: bool) -> T {
         self.look_held(slot, Look::here(), |seen| {
-            let v = if current { &seen.s } else { seen.buf() };
+            let v = if current { seen.s() } else { seen.buf() };
             let v = v
                 .as_ref()
                 .expect("incr-core: a held member has a value to read");
@@ -1535,7 +1541,7 @@ impl<C: Cells> Runtime<C> {
                 for (m, s) in &strategies {
                     let v0 =
                         self.attributed(*m, cidx, bag, || self.callback(|| s.v0(Some(&cycle))));
-                    let old = self.take_held(*m, |e| e.s.replace(v0));
+                    let old = self.take_held(*m, |e| e.replace_s(Some(v0)));
                     self.drop_member_value(*m, cidx, old, bag);
                 }
                 // s_{k-1} of each Fixpoint member, for the convergence test and
@@ -1682,7 +1688,7 @@ impl<C: Cells> Runtime<C> {
                             }
                             let out = out.expect("incr-core: a member run buffers its value");
                             let s_prev = self
-                                .take_held(*m, |e| e.s.take())
+                                .take_held(*m, |e| e.take_s())
                                 .expect("incr-core: a strategy member has a value");
                             let k = r.k;
                             let next = self.attributed(*m, cidx, bag, || {
@@ -1691,7 +1697,7 @@ impl<C: Cells> Runtime<C> {
                             converged[i] = self.attributed(*m, cidx, bag, || {
                                 self.callback(|| s.converged(&s_prev, &next))
                             });
-                            self.take_held(*m, |e| e.s = Some(next));
+                            self.take_held(*m, |e| e.replace_s(Some(next)));
                             let older = r.prev[i].replace(s_prev);
                             self.drop_member_value(*m, cidx, older, bag);
                         }
@@ -1703,12 +1709,12 @@ impl<C: Cells> Runtime<C> {
                         for (i, (m, s)) in r.strategies.iter().enumerate() {
                             if !converged[i] {
                                 let last = self
-                                    .take_held(*m, |e| e.s.take())
+                                    .take_held(*m, |e| e.take_s())
                                     .expect("incr-core: a strategy member has a value");
                                 let landed = self.attributed(*m, cidx, bag, || {
                                     self.callback(|| s.on_limit(&r.cycle, last))
                                 });
-                                self.take_held(*m, |e| e.s = Some(landed));
+                                self.take_held(*m, |e| e.replace_s(Some(landed)));
                             }
                         }
 
@@ -1717,7 +1723,7 @@ impl<C: Cells> Runtime<C> {
                         // Fixpoint member moved.
                         let moved = r.strategies.iter().enumerate().any(|(i, (m, s))| {
                             r.prev[i].as_ref().is_some_and(|p| {
-                                let cur = self.take_held(*m, |e| e.s.take());
+                                let cur = self.take_held(*m, |e| e.take_s());
                                 let same = cur.as_ref().is_some_and(|c| {
                                     self.attributed(*m, cidx, bag, || {
                                         let _user = (!C::SINGLE_THREADED)
@@ -1725,7 +1731,7 @@ impl<C: Cells> Runtime<C> {
                                         value_code::run(|| s.same(p, c))
                                     })
                                 });
-                                self.take_held(*m, |e| e.s = cur);
+                                self.take_held(*m, |e| e.replace_s(cur));
                                 !same
                             })
                         });
@@ -1907,7 +1913,7 @@ impl<C: Cells> Runtime<C> {
                     e.episode = None;
                     e.ep = 0;
                     e.in_cu = false;
-                    e.s.take()
+                    e.take_s()
                 })
                 .collect()
         });
@@ -2667,7 +2673,7 @@ impl<C: Cells> Runtime<C> {
                 entries[i].1.changed = true;
             } else {
                 let e = &mut entries[i].1;
-                let value = if e.seeded { e.s.take() } else { e.take_buf() }
+                let value = if e.seeded { e.take_s() } else { e.take_buf() }
                     .expect("incr-core: a landing member has a value");
                 let first = e.first;
                 let wrote = Cell::new(0_u8);
@@ -2802,7 +2808,7 @@ impl<C: Cells> Runtime<C> {
             if kind.is_none() {
                 self.end_reservation(id, self.nodes.get(*m));
             }
-            bag.push_erased(Box::new((e.take_buf(), e.s.take())));
+            bag.push_erased(Box::new((e.take_buf(), e.take_s())));
         }
         if !contain {
             self.note_unwound_read(&*payload, kind);
