@@ -2535,6 +2535,7 @@ thread_local! {
     static PEAK_DIRECTS: Cell<usize> = const { Cell::new(0) };
     static PEAK_VSTACK: Cell<usize> = const { Cell::new(0) };
     static PATH_STEPS: Cell<u64> = const { Cell::new(0) };
+    static TICKET_CHECKS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Counts `units` elements a pass over this thread's notes, their copies,
@@ -2586,6 +2587,21 @@ pub(crate) fn path_steps(frames: usize) {
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_path_steps() -> u64 {
     PATH_STEPS.with(|n| n.replace(0))
+}
+
+/// Counts `members` ticket members a test build's ticket check looked at.
+#[inline(always)]
+pub(crate) fn ticket_checks(members: usize) {
+    #[cfg(all(test, not(loom)))]
+    TICKET_CHECKS.with(|n| n.set(n.get() + members as u64));
+    #[cfg(not(all(test, not(loom))))]
+    let _ = members;
+}
+
+/// The members [`ticket_checks`] counted on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_ticket_checks() -> u64 {
+    TICKET_CHECKS.with(|n| n.replace(0))
 }
 
 /// Virtual frames pushed on this thread for a node that already had one

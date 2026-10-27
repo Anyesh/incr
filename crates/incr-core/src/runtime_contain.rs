@@ -570,6 +570,7 @@ impl<C: Cells> Runtime<C> {
     /// it: every change from that landing releases it.
     fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {
         let members = ticket.members.lock();
+        crate::replay::ticket_checks(members.members.len());
         let live = members.members.iter().filter(|m| m.gone == u64::MAX);
         let mut n = 0;
         for m in live {
