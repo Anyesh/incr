@@ -18,7 +18,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
-use crate::cycle_state::{Episode, Held, HeldMap, Look, Round, Seen, Step};
+use crate::cycle_state::{Basis, Episode, Held, HeldMap, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
 use crate::{attempt, hold, reserve, set_stack, waits};
 
@@ -1106,12 +1106,8 @@ impl<C: Cells> Runtime<C> {
         let look = Look::here();
         let rt = self.runtime_id;
         let (replaced, spec_buf) = cycle_state::with_held(|h| {
-            let basis = if look.is_speculative()
-                && result.is_ok()
-                && !ctl.has(cycle::UNREAL_READS)
-                && !ctl.looked_up_unrecorded()
-            {
-                h.take_basis(rt, cidx, &deps, &|d| self.clean_stamp(d))
+            let basis = if look.is_speculative() {
+                self.spec_basis(h, cidx, &deps, result.is_ok(), &ctl)
             } else {
                 h.drop_spec_reads(rt, cidx);
                 None
@@ -1144,6 +1140,26 @@ impl<C: Cells> Runtime<C> {
             self.end_run(id, cidx);
         }
         result.map(|_| Some(ctl.lowlink.get()))
+    }
+
+    /// The basis of a speculative member run at `cidx` that read `deps`, if
+    /// it ended well and read only real state; drops its notes either way.
+    #[cold]
+    #[inline(never)]
+    fn spec_basis(
+        &self,
+        h: &mut HeldMap,
+        cidx: u32,
+        deps: &[(NodeId, u32)],
+        ok: bool,
+        ctl: &ComputeCtl,
+    ) -> Option<Basis> {
+        if ok && !ctl.has(cycle::UNREAL_READS) && !ctl.looked_up_unrecorded() {
+            h.take_basis(self.runtime_id, cidx, deps, &|d| self.clean_stamp(d))
+        } else {
+            h.drop_spec_reads(self.runtime_id, cidx);
+            None
+        }
     }
 
     /// A member run a doom discarded: it stood on placeholders, so nothing
@@ -1204,11 +1220,6 @@ impl<C: Cells> Runtime<C> {
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
         held.wrote = ctl.wrote.get() != 0;
-        // A compute frame's notes may be an earlier frame's at this
-        // position, so a speculative one keeps no basis.
-        if value_code::thread_word() & value_code::SPEC_READS_BIT != 0 {
-            cycle_state::with_held(|h| h.drop_spec_reads(rt, cidx));
-        }
         let (replaced, spec_buf) = held.record(
             Look::here(),
             deps,
@@ -1221,7 +1232,12 @@ impl<C: Cells> Runtime<C> {
             "incr-core: a new claim replaces nothing"
         );
         held.own(cidx, id.0, None);
-        let displaced = cycle_state::with_held(|h| h.insert((rt, id.0), held));
+        let displaced = cycle_state::with_held(|h| {
+            // A compute frame's notes may be an earlier frame's at this
+            // position, so a speculative one keeps no basis.
+            h.drop_spec_reads(rt, cidx);
+            h.insert((rt, id.0), held)
+        });
         debug_assert!(displaced.is_none(), "incr-core: node {} held twice", id.0);
         if lowlink < cidx {
             self.pass_down(cidx, lowlink);
