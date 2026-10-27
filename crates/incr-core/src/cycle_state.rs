@@ -103,10 +103,6 @@ pub(crate) struct Held {
     buf: Option<Erased>,
     /// A seeded member's current value inside an episode.
     s: Option<Erased>,
-    /// `stamp`'s counterpart for `s`.
-    s_stamp: u64,
-    /// `s` was set under speculation.
-    s_spec: bool,
     /// Every dep any run of this claim recorded, for the stale check.
     deps: Vec<(NodeId, u32)>,
     /// The deps of the last run: its reads of other members are the
@@ -138,10 +134,22 @@ pub(crate) struct Held {
     /// While the buffer and run record come from a run made under
     /// speculation: the record from before that run's write.
     pre_spec: Option<Box<RunRecord>>,
+    /// None until speculation reads or sets a value of the claim, so a
+    /// thread without a budget never writes one.
+    marks: Option<Box<Marks>>,
+}
+
+/// What speculation noted of a claim's values.
+#[derive(Default)]
+struct Marks {
     /// 0 until a speculative run's read of the buffer notes it, and 0
     /// again once the buffer is written or taken, so a noted stamp tells
     /// whether the buffer read is still the one held.
     stamp: u64,
+    /// `stamp`'s counterpart for `s`.
+    s_stamp: u64,
+    /// `s` was set under speculation.
+    s_spec: bool,
 }
 
 impl Held {
@@ -168,8 +176,6 @@ impl Held {
             first,
             buf: None,
             s: None,
-            s_stamp: 0,
-            s_spec: false,
             deps: Vec::new(),
             last: Vec::new(),
             installed: Vec::new(),
@@ -183,15 +189,15 @@ impl Held {
             ep: 0,
             in_cu: false,
             pre_spec: None,
-            stamp: 0,
+            marks: None,
         }
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
     /// child index and its frame's `POISONED` and `HANDLED` flags
     /// (`poison`). Under speculation it first
-    /// keeps the record it replaces, and `basis` is what the run read if
-    /// it read only real state; outside, it settles first. Returns
+    /// keeps the record it replaces, and no look adopts the run; outside,
+    /// it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
     /// caller to drop outside the held map.
     pub(crate) fn record(
@@ -201,27 +207,14 @@ impl Held {
         buf: Option<Erased>,
         opened: bool,
         poison: u16,
-        basis: Option<Basis>,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
-            let first = self.pre_spec.is_none();
-            let kept = self.keep_record();
-            // Every speculative run since the first is merged into the
-            // record, so an adoption rests on all of their reads.
-            kept.basis = match (first, kept.basis.take(), basis) {
-                (true, _, basis) => basis,
-                (false, Some(mut kept), Some(basis)) => {
-                    kept.held.extend(basis.held);
-                    kept.clean.extend(basis.clean);
-                    Some(kept)
-                }
-                _ => None,
-            };
+            self.keep_record().basis = None;
             None
         } else {
             self.settle()
         };
-        self.stamp = 0;
+        self.unmark_buf();
         for &d in &deps {
             if !self.deps.contains(&d) {
                 self.deps.push(d);
@@ -234,6 +227,33 @@ impl Held {
         self.opened = opened;
         self.poison |= poison;
         (std::mem::replace(&mut self.buf, buf), spec_buf)
+    }
+
+    /// [`Self::record`] of a speculative run that read only real state,
+    /// `basis`. Every speculative run since the first is merged into the
+    /// kept record, so an adoption rests on all of their reads.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn record_with_basis(
+        &mut self,
+        deps: Vec<(NodeId, u32)>,
+        buf: Option<Erased>,
+        opened: bool,
+        poison: u16,
+        basis: Basis,
+    ) -> (Option<Erased>, Option<Unbuilt>) {
+        let earlier = self.pre_spec.as_mut().map(|r| r.basis.take());
+        let out = self.record(Look::SPECULATIVE, deps, buf, opened, poison);
+        self.keep_record().basis = match earlier {
+            None => Some(basis),
+            Some(Some(mut kept)) => {
+                kept.held.extend(basis.held);
+                kept.clean.extend(basis.clean);
+                Some(kept)
+            }
+            Some(None) => None,
+        };
+        out
     }
 
     /// The claim's run as `look` sees it, and the value a settle dropped,
@@ -257,14 +277,21 @@ impl Held {
     /// Replaces the current value, set under `look`, returning the one it
     /// replaces.
     pub(crate) fn replace_s(&mut self, s: Option<Erased>, look: Look) -> Option<Erased> {
-        self.s_stamp = 0;
-        self.s_spec = s.is_some() && look.speculative;
+        if let Some(m) = &mut self.marks {
+            m.s_stamp = 0;
+            m.s_spec = false;
+        }
+        if look.speculative && s.is_some() {
+            self.marks().s_spec = true;
+        }
         std::mem::replace(&mut self.s, s)
     }
 
     pub(crate) fn take_s(&mut self) -> Option<Erased> {
-        self.s_stamp = 0;
-        self.s_spec = false;
+        if let Some(m) = &mut self.marks {
+            m.s_stamp = 0;
+            m.s_spec = false;
+        }
         self.s.take()
     }
 
@@ -272,12 +299,27 @@ impl Held {
     /// one of the members that read each other): a buffer read before is
     /// no longer what a read now gives.
     pub(crate) fn renew_stamp(&mut self) {
-        self.stamp = 0;
+        self.unmark_buf();
+    }
+
+    fn unmark_buf(&mut self) {
+        if let Some(m) = &mut self.marks {
+            m.stamp = 0;
+        }
+    }
+
+    fn marks(&mut self) -> &mut Marks {
+        self.marks.get_or_insert_with(Box::default)
+    }
+
+    /// The buffer's noted stamp, 0 if none is.
+    fn buf_stamp(&self) -> u64 {
+        self.marks.as_ref().map_or(0, |m| m.stamp)
     }
 
     /// Takes the buffer to drop it, leaving the run record as it is.
     pub(crate) fn discard_buf(&mut self) -> Option<Discarded> {
-        self.stamp = 0;
+        self.unmark_buf();
         self.buf.take().map(|buf| Discarded {
             _values: (Some(buf), None),
         })
@@ -341,7 +383,7 @@ impl Held {
     /// value it buffered, as the unbounded run may never make that run.
     fn settle(&mut self) -> Option<Unbuilt> {
         let r = self.pre_spec.take()?;
-        self.stamp = 0;
+        self.unmark_buf();
         self.deps = r.deps;
         self.last = r.last;
         self.installed = r.installed;
@@ -363,7 +405,6 @@ pub(crate) struct Look {
 }
 
 impl Look {
-    #[cfg(all(test, not(loom)))]
     const SPECULATIVE: Self = Self { speculative: true };
     #[cfg(all(test, not(loom)))]
     const REAL: Self = Self { speculative: false };
@@ -435,7 +476,7 @@ impl<H: Borrow<Held>> Seen<H> {
 impl<H: BorrowMut<Held>> Seen<H> {
     pub(crate) fn take_buf(&mut self) -> Option<Erased> {
         let e = self.0.borrow_mut();
-        e.stamp = 0;
+        e.unmark_buf();
         e.buf.take()
     }
 
@@ -835,13 +876,14 @@ impl HeldMap {
                 MemberRead::Buffer(stamp) => {
                     self.claims
                         .get(&(rt, *m))
-                        .is_some_and(|r| r.stamp == *stamp)
+                        .is_some_and(|r| r.buf_stamp() == *stamp)
                         && self.adoptable(rt, *m, clean, verdicts)
                 }
                 MemberRead::Current(stamp) => self
                     .claims
                     .get(&(rt, *m))
-                    .is_some_and(|r| r.s_stamp == *stamp && !r.s_spec),
+                    .and_then(|r| r.marks.as_ref())
+                    .is_some_and(|m| m.s_stamp == *stamp && !m.s_spec),
                 MemberRead::Cycle(cycle) => self
                     .claims
                     .get(&(rt, *m))
@@ -879,7 +921,7 @@ impl HeldMap {
     /// buffer.
     pub(crate) fn note_spec_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
         if let Some(e) = self.claims.get_mut(&(rt, slot)) {
-            let read = MemberRead::Buffer(noted(&mut e.stamp));
+            let read = MemberRead::Buffer(noted(&mut e.marks().stamp));
             self.push_spec_read((rt, at, slot, read));
         }
     }
@@ -888,7 +930,7 @@ impl HeldMap {
     /// `slot`'s current value.
     pub(crate) fn note_spec_current_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
         if let Some(e) = self.claims.get_mut(&(rt, slot)) {
-            let read = MemberRead::Current(noted(&mut e.s_stamp));
+            let read = MemberRead::Current(noted(&mut e.marks().s_stamp));
             self.push_spec_read((rt, at, slot, read));
         }
     }

@@ -1119,14 +1119,12 @@ impl<C: Cells> Runtime<C> {
             let e = h
                 .recording(&(rt, slot), look)
                 .expect("incr-core: a member run's node is held");
-            let out = e.record(
-                look,
-                deps,
-                ctl.buf.take(),
-                !ctl.children.get().is_null(),
-                ctl.poison(),
-                basis,
-            );
+            let (buf, opened, poison) =
+                (ctl.buf.take(), !ctl.children.get().is_null(), ctl.poison());
+            let out = match basis {
+                Some(basis) => e.record_with_basis(deps, buf, opened, poison, basis),
+                None => e.record(look, deps, buf, opened, poison),
+            };
             e.hold |= ctl.has(cycle::HOLD);
             // An engine unwind is no fault of the member's.
             if result.is_err() && cycle_state::unwind_kind().is_none() {
@@ -1212,7 +1210,6 @@ impl<C: Cells> Runtime<C> {
             ctl.buf.take(),
             !ctl.children.get().is_null(),
             ctl.poison(),
-            None,
         );
         debug_assert!(
             replaced.is_none() && spec_buf.is_none(),

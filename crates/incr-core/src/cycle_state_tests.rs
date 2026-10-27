@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use super::{
-    left_rec_since, note_rec_left, own_episode, own_episodes, recs_left_count, Held, HeldMap, Look,
-    OWN_EPISODES,
+    left_rec_since, note_rec_left, own_episode, own_episodes, recs_left_count, Basis, Held,
+    HeldMap, Look, OWN_EPISODES,
 };
 use crate::cycle::{self, Cycle, Erased};
 use crate::deferred::Unbuilt;
@@ -24,10 +24,18 @@ fn read_unbuilt(b: &Option<Unbuilt>) -> Option<u32> {
         .map(|v| *v.value().downcast_ref::<u32>().expect("a u32"))
 }
 
+/// A speculative member run's record, as `member_run` makes it.
+fn record_spec(e: &mut Held, deps: Vec<(NodeId, u32)>, buf: Option<Erased>, basis: Option<Basis>) {
+    match basis {
+        Some(basis) => e.record_with_basis(deps, buf, false, 0, basis),
+        None => e.record(Look::SPECULATIVE, deps, buf, false, 0),
+    };
+}
+
 #[test]
 fn a_real_look_settles_what_a_speculative_run_wrote() {
     let mut e = Held::new(0, 1, false, true);
-    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, 0, None);
+    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, 0);
     assert!(replaced.is_none() && spec.is_none());
     let (replaced, spec) = e.record(
         Look::SPECULATIVE,
@@ -35,7 +43,6 @@ fn a_real_look_settles_what_a_speculative_run_wrote() {
         value(7777),
         true,
         cycle::POISONED,
-        None,
     );
     assert_eq!(read(&replaced), Some(1));
     assert!(spec.is_none());
@@ -66,7 +73,6 @@ fn a_real_write_settles_before_it_records() {
         value(1),
         false,
         cycle::POISONED,
-        None,
     );
     e.record(
         Look::SPECULATIVE,
@@ -74,9 +80,8 @@ fn a_real_write_settles_before_it_records() {
         value(7777),
         false,
         0,
-        None,
     );
-    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(4), 0)], value(5), true, 0, None);
+    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(4), 0)], value(5), true, 0);
     assert!(replaced.is_none());
     assert_eq!(read_unbuilt(&spec), Some(7777));
     let (seen, settled) = e.look(Look::REAL);
@@ -91,14 +96,13 @@ fn a_real_write_settles_before_it_records() {
 #[test]
 fn an_adopted_speculative_run_survives_a_real_look() {
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, 0, None);
+    e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, 0);
     e.record(
         Look::SPECULATIVE,
         vec![(NodeId(3), 0)],
         value(7777),
         false,
         0,
-        None,
     );
     e.adopt();
     let (seen, settled) = e.into_look(Look::REAL);
@@ -110,22 +114,14 @@ fn an_adopted_speculative_run_survives_a_real_look() {
 #[test]
 fn a_settle_restores_the_record_from_before_the_first_speculative_run() {
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, 0, None);
-    e.record(
-        Look::SPECULATIVE,
-        vec![(NodeId(3), 0)],
-        value(7),
-        true,
-        0,
-        None,
-    );
+    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, 0);
+    e.record(Look::SPECULATIVE, vec![(NodeId(3), 0)], value(7), true, 0);
     let (replaced, _) = e.record(
         Look::SPECULATIVE,
         vec![(NodeId(4), 0)],
         value(8),
         false,
         cycle::POISONED,
-        None,
     );
     assert_eq!(read(&replaced), Some(7));
     let (seen, settled) = e.look(Look::REAL);
@@ -139,15 +135,8 @@ fn a_settle_restores_the_record_from_before_the_first_speculative_run() {
 #[test]
 fn a_speculative_look_or_a_discard_keeps_the_mark() {
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, 0, None);
-    e.record(
-        Look::SPECULATIVE,
-        vec![(NodeId(3), 0)],
-        value(7),
-        false,
-        0,
-        None,
-    );
+    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, 0);
+    e.record(Look::SPECULATIVE, vec![(NodeId(3), 0)], value(7), false, 0);
     assert!(e.discard_buf().is_some());
     assert!(e.spec_written());
     let (seen, settled) = e.into_look(Look::SPECULATIVE);
@@ -168,17 +157,15 @@ fn speculative_reader(rt: RuntimeId) -> HeldMap {
     let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
     h.recording(&(rt, 5), Look::REAL)
         .unwrap()
-        .record(Look::REAL, vec![], value(1), false, 0, None);
+        .record(Look::REAL, vec![], value(1), false, 0);
     h.note_spec_read(rt, 10, 5);
     let deps = vec![(NodeId(5), 0), (NodeId(3), 0)];
     let basis = h.take_basis(rt, 10, &deps, &clean);
     assert!(basis.is_some());
-    h.recording(&(rt, 6), Look::SPECULATIVE).unwrap().record(
-        Look::SPECULATIVE,
+    record_spec(
+        h.recording(&(rt, 6), Look::SPECULATIVE).unwrap(),
         deps,
         value(7),
-        false,
-        0,
         basis,
     );
     h
@@ -201,7 +188,7 @@ fn a_real_look_settles_a_speculative_run_whose_member_ran_again() {
     let mut h = speculative_reader(rt);
     h.recording(&(rt, 5), Look::REAL)
         .unwrap()
-        .record(Look::REAL, vec![], value(2), false, 0, None);
+        .record(Look::REAL, vec![], value(2), false, 0);
     let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
     let (seen, settled) = h.look(&(rt, 6), Look::REAL, &clean).unwrap();
     assert_eq!(read_unbuilt(&settled), Some(7));
@@ -230,12 +217,10 @@ fn a_real_look_adopts_the_speculative_runs_a_reader_rests_on() {
     h.note_spec_read(rt, 11, 6);
     let none = |_: NodeId| None;
     let basis = h.take_basis(rt, 11, &[(NodeId(6), 0)], &none);
-    h.recording(&(rt, 7), Look::SPECULATIVE).unwrap().record(
-        Look::SPECULATIVE,
+    record_spec(
+        h.recording(&(rt, 7), Look::SPECULATIVE).unwrap(),
         vec![(NodeId(6), 0)],
         value(8),
-        false,
-        0,
         basis,
     );
     let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
@@ -261,12 +246,10 @@ fn a_member_read_as_its_episode_cycle_holds_while_the_episode_stands() {
         let deps = vec![(NodeId(5), 0)];
         let basis = h.take_basis(rt, 10, &deps, &none);
         assert!(basis.is_some());
-        h.recording(&(rt, 6), Look::SPECULATIVE).unwrap().record(
-            Look::SPECULATIVE,
+        record_spec(
+            h.recording(&(rt, 6), Look::SPECULATIVE).unwrap(),
             deps,
             value(7),
-            false,
-            0,
             basis,
         );
         h
@@ -298,12 +281,10 @@ fn a_strategy_member_read_holds_until_its_current_value_moves() {
         let none = |_: NodeId| None;
         let deps = vec![(NodeId(5), 0)];
         let basis = h.take_basis(rt, 10, &deps, &none);
-        h.recording(&(rt, 6), Look::SPECULATIVE).unwrap().record(
-            Look::SPECULATIVE,
+        record_spec(
+            h.recording(&(rt, 6), Look::SPECULATIVE).unwrap(),
             deps,
             value(7),
-            false,
-            0,
             basis,
         );
         h
@@ -324,7 +305,7 @@ fn a_claim_inserted_with_a_speculative_record_is_settled_at_a_real_look() {
     let rt = RuntimeId::allocate();
     let mut h = HeldMap::new();
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::SPECULATIVE, vec![], value(7), false, 0, None);
+    e.record(Look::SPECULATIVE, vec![], value(7), false, 0);
     h.insert((rt, 6), e);
     let none = |_: NodeId| None;
     let (_, settled) = h.look(&(rt, 6), Look::REAL, &none).unwrap();
@@ -342,18 +323,15 @@ fn an_adoption_rests_on_every_speculative_run_since_the_first() {
         value(6),
         false,
         0,
-        None,
     );
     let clean = |d: NodeId| (d == NodeId(3)).then_some((0, 4));
     let deps = vec![(NodeId(3), 0)];
     let basis = h.take_basis(rt, 10, &deps, &clean);
     assert!(basis.is_some());
-    h.recording(&(rt, 6), Look::SPECULATIVE).unwrap().record(
-        Look::SPECULATIVE,
+    record_spec(
+        h.recording(&(rt, 6), Look::SPECULATIVE).unwrap(),
         deps,
         value(7),
-        false,
-        0,
         basis,
     );
     let (_, settled) = h.look(&(rt, 6), Look::REAL, &clean).unwrap();
@@ -370,12 +348,10 @@ fn a_speculative_run_with_an_unnoted_member_read_is_settled() {
     let deps = vec![(NodeId(5), 0)];
     let basis = h.take_basis(rt, 10, &deps, &none);
     assert!(basis.is_none());
-    h.recording(&(rt, 6), Look::SPECULATIVE).unwrap().record(
-        Look::SPECULATIVE,
+    record_spec(
+        h.recording(&(rt, 6), Look::SPECULATIVE).unwrap(),
         deps,
         value(7),
-        false,
-        0,
         basis,
     );
     let (_, settled) = h.look(&(rt, 6), Look::REAL, &none).unwrap();
