@@ -2730,6 +2730,11 @@ impl<C: Cells> Runtime<C> {
     /// call makes it return the old node's value, read before the delete,
     /// or panic as stale; it never returns the new occupant's value and
     /// never runs a closure against the occupant.
+    ///
+    /// Called from a closure of another runtime, it returns the node's
+    /// current value but records no dependency in the calling runtime,
+    /// which keeps serving its memo until one of its own inputs changes;
+    /// a `set` on this runtime does not make it recompute.
     pub fn get<T: Value>(&self, handle: Incr<T>) -> T {
         if handle.runtime_id() != self.runtime_id {
             return self.read_mismatch(handle);
