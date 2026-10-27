@@ -636,6 +636,8 @@ impl Pending {
             self.file_passed(i);
         }
         self.live += 1;
+        #[cfg(all(test, not(loom)))]
+        PEAK_LIVE.with(|p| p.set(p.get().max(self.live)));
     }
 
     pub(crate) fn remove(&mut self, i: usize) -> Delivery {
@@ -1436,6 +1438,8 @@ impl Context {
         }
         stack.push((pos, frame.generation));
         self.vstack.push(frame);
+        #[cfg(all(test, not(loom)))]
+        PEAK_VSTACK.with(|p| p.set(p.get().max(self.vstack.len())));
     }
 
     /// The highest virtual frame below position `cidx`.
@@ -1862,6 +1866,9 @@ loom::thread_local! {
 thread_local! {
     static VINDEX_REPUSHES: Cell<u64> = const { Cell::new(0) };
     static NOTE_WORK: Cell<u64> = const { Cell::new(0) };
+    static PEAK_LIVE: Cell<usize> = const { Cell::new(0) };
+    static PEAK_DIRECTS: Cell<usize> = const { Cell::new(0) };
+    static PEAK_VSTACK: Cell<usize> = const { Cell::new(0) };
     static PATH_STEPS: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -1888,6 +1895,17 @@ fn without_note_work(f: impl FnOnce()) {
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_note_work() -> u64 {
     NOTE_WORK.with(|n| n.replace(0))
+}
+
+/// The most deliveries, direct ones and virtual frames one context on
+/// this thread held at once since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_peak_live() -> (usize, usize, usize) {
+    (
+        PEAK_LIVE.with(|p| p.replace(0)),
+        PEAK_DIRECTS.with(|p| p.replace(0)),
+        PEAK_VSTACK.with(|p| p.replace(0)),
+    )
 }
 
 /// Counts `frames` stack frames a frame's path was folded over.
