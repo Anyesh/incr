@@ -1476,7 +1476,7 @@ impl<C: Cells> Runtime<C> {
                 // A doomed frame has read a placeholder, so the unbounded
                 // run may never make this read: what it computes natively
                 // is speculative, as an entry pushed here would be.
-                _speculating = Some(replay::Speculating::enter());
+                _speculating = Some(replay::Speculating::enter(self.runtime_id));
             } else {
                 if word & value_code::REPLAY_BIT != 0 {
                     if let Some(read) = self.judge_virtual(handle, f, kind) {
@@ -1491,11 +1491,11 @@ impl<C: Cells> Runtime<C> {
                     mode |= ARMED;
                 }
             }
-        } else if self.dep_stack.other_top_doomed(self.runtime_id) {
+        } else if let Some(chain) = self.dep_stack.other_top_doomed(self.runtime_id) {
             // Another runtime's doomed frame reads this one: its
             // placeholder may have led it to a read the unbounded run never
             // makes, as a doomed frame's own native read is.
-            _speculating = Some(replay::Speculating::enter());
+            _speculating = Some(replay::Speculating::enter(chain));
         }
         // A speculative run of a runtime with no context, read from another
         // runtime's doomed frame, runs in VIRT mode too, so that its
@@ -3928,7 +3928,9 @@ impl<C: Cells> Runtime<C> {
                             &self.dep_stack,
                             self.dep_stack.place_next_at(cidx, level > 0),
                         );
-                        let _speculating = entry.spec.then(replay::Speculating::enter);
+                        let _speculating = entry
+                            .spec
+                            .then(|| replay::Speculating::enter(self.runtime_id));
                         self.member_run(entry.node, cidx, true, entry.walked, !entry.r5)
                     };
                     drop(replay::run_ended(
@@ -4018,7 +4020,9 @@ impl<C: Cells> Runtime<C> {
             }
             let placement = self.dep_stack.place_next_at(at, level > 0);
             let ran = {
-                let _speculating = entry.spec.then(replay::Speculating::enter);
+                let _speculating = entry
+                    .spec
+                    .then(|| replay::Speculating::enter(self.runtime_id));
                 catch_unwind(AssertUnwindSafe(|| {
                     if level == 0 {
                         // The target is the walk entry whose compute was
@@ -4287,7 +4291,7 @@ impl<C: Cells> Runtime<C> {
             *kept = above;
             taint_memo::restore(own);
             let ran = {
-                let _speculating = v.spec.then(replay::Speculating::enter);
+                let _speculating = v.spec.then(|| replay::Speculating::enter(self.runtime_id));
                 self.member_run(v.node, v.cidx, true, v.walked, true)
             };
             drop(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));

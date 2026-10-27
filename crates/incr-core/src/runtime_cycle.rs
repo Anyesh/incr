@@ -564,6 +564,19 @@ impl<C: Cells> Runtime<C> {
         also: Option<NodeId>,
         mut done: impl FnMut() -> bool,
     ) {
+        // A speculative run may read what the unbounded run never reads, so
+        // a wait it registered could close a waits-for cycle, or a take-over
+        // wound an owner, that the unbounded run never has; the wound would
+        // retry the real attempt and lose what it saw. The run drops its
+        // chain instead.
+        if replay::speculating_in(self.runtime_id) {
+            if done() {
+                return;
+            }
+            #[cfg(test)]
+            replay::count_speculative_wait_drop();
+            self.drop_unwind();
+        }
         let mut holds: Vec<waits::Claim> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
