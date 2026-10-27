@@ -543,7 +543,7 @@ mod wounds {
                 (&w_gate, &m_gate)
             };
             first.release();
-            wait_registered(1);
+            wait_registered(rt.runtime_id, 1);
             second.release();
             assert_eq!(episode.join().unwrap(), 5);
             assert_eq!(reader.join().unwrap(), 0);
