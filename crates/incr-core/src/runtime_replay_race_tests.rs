@@ -2090,11 +2090,12 @@ fn shared_vframe_reader_under_a_native_read_races_for_the_payload() {
     );
 }
 
-/// As `shared_vframe_reader_waits_under_a_native_read`, with W's retry
-/// parked at its read of X while the other thread reads X. Y's Failed
-/// landing is held by the driver's entry, so the other thread claims X and
-/// waits on Y, and the retry's read of X then waits on that claim. The
-/// driver is wounded out of the cycle, which retracts its held Y; the
+/// As `shared_vframe_reader_under_a_native_read_races_for_the_payload`,
+/// with W's retry parked at its read of X while the other thread reads X.
+/// Y's Failed landing is held by the driver's entry, so the other thread
+/// claims X and waits on Y, and the retry's read of X then waits on that
+/// claim. The other thread's wait registers first, so the driver is the
+/// one wounded out of the cycle, which retracts its held Y; the
 /// other thread lands Y and X Failed, and the retry reads X Failed. All
 /// three end Failed, as in the unbounded run, with the closure's payload
 /// on one of the two reads.
@@ -2120,7 +2121,7 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
                 entered.store(true, SeqCst);
             } else if p == ParkPoint::GetAfterHandleCheck(x) && entered.load(SeqCst) {
                 read.park();
-            } else if p == ParkPoint::ComputeWaits(x) {
+            } else if p == ParkPoint::ComputeWaits(x) && !wounded.load(SeqCst) {
                 waited.store(true, SeqCst);
             } else if p == ParkPoint::WoundRetracted {
                 wounded.store(true, SeqCst);
@@ -2149,10 +2150,21 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
         spawn(move || outcome(|| rt.get(x)))
     };
     at_y.wait_parked();
-    assert_eq!(rt.state_of(s.x), NodeState::Computing);
-    let before = rt.reservation_waits.load(SeqCst);
+    assert_eq!(
+        rt.state_of(s.x),
+        NodeState::Computing,
+        "the other thread did not claim X before Y"
+    );
     at_y.release();
-    await_reservation_wait(&rt, before);
+    // Before the parked driver's own timeout, whose abort would hide this assert.
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
+    while !crate::waits::waited_on((rt.runtime_id, s.y.slot())) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the other thread never waited on Y's held claim"
+        );
+        thread::yield_now();
+    }
     read.release();
     let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
     let (mut first, mut other) = (Some(first), Some(other));
@@ -2176,6 +2188,8 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
         }
     }
     let (first, other) = (got_first.unwrap(), got_other.unwrap());
+    assert_eq!(other, Err("y boom".to_string()));
+    assert!(failed(&first), "{first:?}");
     assert!(waited.load(SeqCst), "the retry never waited on X's claim");
     assert!(
         wounded.load(SeqCst),
