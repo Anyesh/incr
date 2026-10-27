@@ -454,6 +454,7 @@ impl<C: Cells> Runtime<C> {
         let unchanged = !attempt.first
             && attempt.verify_rev == attempt.stamp_rev
             && match catch_unwind(AssertUnwindSafe(|| {
+                let _user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
                 self.arenas
                     .erased(node.type_tag())
                     .equals_erased(node.arena_slot(), &*value)
