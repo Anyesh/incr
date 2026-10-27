@@ -3762,7 +3762,11 @@ impl<C: Cells> Runtime<C> {
                             // A held landing's note over this node can be
                             // newer than the walk (`note_held_failed_deps`);
                             // the flip's lock orders it before this load.
-                            let past = self.failed_past.load(std::sync::atomic::Ordering::Relaxed);
+                            let past = if C::SINGLE_THREADED {
+                                past
+                            } else {
+                                self.failed_past.load(std::sync::atomic::Ordering::Relaxed)
+                            };
                             if past & contain_impl::past_bit(id.0) != 0 {
                                 self.take_past_sets(id, &mut queue);
                             }
