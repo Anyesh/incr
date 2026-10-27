@@ -337,7 +337,7 @@ impl Attempt {
     /// owner may be in user code that waits on the waiter, unless the
     /// owner waits in the registry older than the waiter
     /// ([`crate::waits::take_over_in_order`]). True if it is wounded now.
-    #[cfg(all(test, not(loom)))]
+    #[cfg(test)]
     pub(crate) fn wound_in_flight(&self, claim: Claim) -> bool {
         self.take_over(claim, None)
     }
