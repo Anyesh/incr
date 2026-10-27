@@ -2476,3 +2476,43 @@ is within 1% (Local compute rows +0.2% to +0.7%, Shared compute rows
   912 bytes, the others from 1,156 to 1,256 and 888 to 1,156, so each
   unwind through a walk frame runs a longer CFA program. The two
   budget-1 `nested_caught` rows fall (0.98, 0.97).
+
+## A read revisits a node another read published or released since its plan
+
+`w/T10-wide-two-b0939-w7` (tip `70ca13f9`, on increment 6 `95cef4e8`)
+publishes a held release without the unrun mark and checks the root's
+claim against the episode count its walk planned under. Bench rows with
+`icount.sh` on this box; scale tests as `gh-scale-icount.sh`, the
+failed-entry row also under callgrind on a GitHub runner.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 99 / 193 | 99 / 193 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `simple_count/shared/1000` | 4,688.74 | 4,704.59 | +15.85 |
+| `chain_shared/propagate/4` | 10,765.19 | 10,798.19 | +33 |
+| `shared_failed_entry_fan_in` (scale, callgrind) | 1,790,512,577 | 1,827,052,354 | +2.0% |
+
+Gate: every hard gate counts the same as the base, and every Local row is
+within 0.02% (`delete_owned_tree_local` -0.22%). Shared compute rows rise
+0.24% to 0.48%, Shared scale rows without panics at most 0.7%, scale
+icount totals 0.997 and scale timing 0.984.
+
+- Shared, about +15 per get that computes: the root's claim now reads
+  `episodes_landed` and, when the walk landed anything, this thread's
+  share of it (`cycle_state::own_episodes`, a thread-local lookup), in
+  `landed_since_plan` (Intel PT on `chain_shared/propagate/4`: +26 at
+  that line, +6 in `others_since`, the rest moved lines at the
+  `compute_one` call).
+- Panicking Shared scale rows (`failed_entry` 1.020, `contained_chain`
+  1.011, `nested_caught` and `panicking_chain` up to 1.010): callgrind
+  on `shared_failed_entry_fan_in` counts the engine's own functions within
+  0.1M of the base, and `_Unwind_RaiseException` and `_Unwind_Resume`
+  run exactly as often, so the change adds no `resume_unwind` or second
+  unwind of a panic. The +36.5M is in the unwinder's per-frame work:
+  libgcc's CFA program interpretation +35.2M and `rust_eh_personality`'s
+  call-site scan +12.1M, less 11.8M in `_dl_find_object`. No engine function
+  is added or outlined and their FDEs barely move (`clean_walk` +28
+  bytes, `first_entry` +68), so a panic crosses the same frames and does
+  more work in some of them.
