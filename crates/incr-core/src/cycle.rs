@@ -471,6 +471,9 @@ pub struct ComputeCtl {
     pub(crate) wrote: Cell<u8>,
     /// `PATH_KEPT` and `READS_COUNTED`, which only get set.
     marks: Cell<u8>,
+    /// The frame's dep count at its last read that could unwind into it:
+    /// a dep past it was read after.
+    pub(crate) read_at: Cell<u32>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
@@ -510,6 +513,7 @@ impl ComputeCtl {
             buf: Cell::new(None),
             wrote: Cell::new(0),
             marks: Cell::new(0),
+            read_at: Cell::new(0),
             children: Cell::new(std::ptr::null()),
             keep,
             path: Cell::new(MaybeUninit::uninit()),

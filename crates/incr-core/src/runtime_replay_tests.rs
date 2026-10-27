@@ -1055,6 +1055,61 @@ fn shared_speculative_cycle_is_recomputed() {
     speculative_cycle_is_recomputed::<Shared>(true);
 }
 
+/// `c`, reached only by `r`'s speculative run, catches the cycle of `d`,
+/// which landed Cyclic alone before. The real claim of `c` runs its
+/// closure, as the unbounded run does, and does not adopt a stash of the
+/// speculative run: the attempt that catches a cycle notes it
+/// (`cycle_caught`).
+fn speculative_caught_cycle_is_rerun<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let d_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let d_of_d = d_cell.clone();
+    let d = rt.create_query_with(
+        move |rt| rt.try_get(*d_of_d.get().unwrap()).map_or(0, |v| v + 1),
+        replayable(),
+    );
+    d_cell.set(d).unwrap();
+    assert!(rt.try_get(d).is_err());
+    assert_eq!(rt.state_of(d), NodeState::Cyclic);
+    let runs = Arc::new([AtomicU32::new(0), AtomicU32::new(0)]);
+    let counted = runs.clone();
+    let c = rt.create_query_with(
+        move |rt| {
+            counted[usize::from(!rt.computing_speculative())].fetch_add(1, SeqCst);
+            rt.try_get(d).unwrap_or(7) + 1
+        },
+        replayable(),
+    );
+    let b = rt.create_query(|_| 5_u64);
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(runs[0].load(SeqCst), 1, "c ran speculatively");
+    assert_eq!(runs[1].load(SeqCst), 0);
+    assert_eq!(rt.get(c), 8);
+    assert_eq!(
+        runs[1].load(SeqCst),
+        1,
+        "the real claim of c adopted a stash over a caught cycle"
+    );
+}
+
+local_and_shared!(
+    speculative_caught_cycle_is_rerun,
+    local_speculative_caught_cycle_is_rerun,
+    shared_speculative_caught_cycle_is_rerun
+);
+
 /// `r`'s speculative run computes the replayable `p` over the Native `n`,
 /// which reads input `d`, and stashes both. `d` is deleted, so the real
 /// claim of `p` takes `n`'s stash and fails it on `d`'s generation: `n`
