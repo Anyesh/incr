@@ -1121,7 +1121,8 @@ impl<C: Cells> Runtime<C> {
         }
         let mut keep = Vec::new();
         self.virtually_owned(cidx + 1, &mut keep);
-        self.keep_kept_children(cidx + 1, &mut keep);
+        let kept = self.kept_children(cidx + 1, &keep, u32::MAX);
+        keep.extend(kept.all);
         self.release_held_except(cidx + 1, &keep, &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
@@ -2058,22 +2059,22 @@ impl<C: Cells> Runtime<C> {
         self.release_held_where(cidx, true, Some(UnwindKind::Discard), None, keep, None, bag);
     }
 
-    /// Adds to `keep` the claims a doom's discard at `cidx` would release
+    /// The claims a doom's discard at `cidx`, keeping `keep`, would release
     /// that were deferred by a run whose own claim stays held, as a
     /// suspended episode keeps its member run's: they stay held with it,
-    /// as the unbounded run holds them. Returns whether one is anchored at
-    /// `cidx`, where a held root must take them.
-    pub(super) fn keep_kept_children(&self, cidx: u32, keep: &mut Vec<u32>) -> bool {
+    /// as the unbounded run holds them. `root` is the doomed node.
+    pub(super) fn kept_children(&self, cidx: u32, keep: &[u32], root: u32) -> KeptChildren {
         let rt = self.runtime_id;
         cycle_state::with_held(|h| {
             if h.is_empty() {
-                return false;
+                return KeptChildren::default();
             }
             let released = releasable(h, rt, cidx, None, keep);
-            let kept = children_of_kept(h, rt, cidx, &released);
-            let here = kept.iter().any(|m| h[&(rt, *m)].anchor() == cidx);
-            keep.extend(kept);
-            here
+            KeptChildren {
+                all: children_of_kept(h, rt, cidx, &released, None),
+                above: children_of_kept(h, rt, cidx, &released, Some(cidx)),
+                releases_root: released.contains(&root),
+            }
         })
     }
 
@@ -3039,9 +3040,27 @@ fn releasable(
     slots
 }
 
+/// See [`Runtime::kept_children`].
+#[derive(Default)]
+pub(super) struct KeptChildren {
+    pub(super) all: Vec<u32>,
+    /// [`Self::all`] without those anchored at the doom's position and
+    /// those kept only through them.
+    pub(super) above: Vec<u32>,
+    /// Whether the discard releases the doomed node's own claim.
+    pub(super) releases_root: bool,
+}
+
 /// The claims in a doom's `released` deferred by a run above `cidx` whose
-/// own claim the discard keeps, transitively.
-fn children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &[u32]) -> Vec<u32> {
+/// own claim the discard keeps, transitively, leaving out those anchored at
+/// `skip` and what they alone keep.
+fn children_of_kept(
+    h: &HeldMap,
+    rt: RuntimeId,
+    cidx: u32,
+    released: &[u32],
+    skip: Option<u32>,
+) -> Vec<u32> {
     if released.is_empty() {
         return Vec::new();
     }
@@ -3064,7 +3083,8 @@ fn children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &[u32]) -> 
     let mut children = Vec::new();
     while let Some(n) = kept.pop() {
         for m in owned.remove(&n).unwrap_or_default() {
-            if out.remove(&m) {
+            if out.contains(&m) && Some(h[&(rt, m)].anchor()) != skip {
+                out.remove(&m);
                 children.push(m);
                 kept.push(m);
             }

@@ -3548,7 +3548,7 @@ impl<C: Cells> Runtime<C> {
             attempt.verify_rev,
         );
         let mut keep = Vec::new();
-        let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
+        let rooted = self.keep_doomed(id, attempt.cidx, &mut keep);
         let dropping = self.dropping(attempt.cidx);
         // This thread's contexts compute again every claim this discard
         // releases, unless the covering one drops their chain.
@@ -3604,24 +3604,31 @@ impl<C: Cells> Runtime<C> {
         })
     }
 
-    /// The claims that virtual frames at or above `cidx` own since the
-    /// mark, added to `keep`: the unbounded run's frames are still on the
+    /// The claims a doom of `id` at `cidx` keeps, added to `keep`, and the
+    /// path of the virtual frame of `id` there when the doomed run is to
+    /// stay held to root them. Virtual frames at or above `cidx` keep what
+    /// they own since the mark: the unbounded run's frames are still on the
     /// stack with them held while the blocked read runs, so the entries
     /// above read them held, not New. When some are anchored at `cidx`, or
     /// a waiting episode's member run read the frame there, the doomed run
-    /// of `id` there roots them, and the path of its virtual frame is
-    /// returned. So it does for the children of kept claims
-    /// ([`Self::keep_kept_children`]) anchored there, which are kept only
-    /// when a held claim of `id` roots them.
-    fn keep_virtual(&self, id: NodeId, cidx: u32, keep: &mut Vec<u32>) -> Option<u64> {
+    /// roots them. The children of kept claims stay too
+    /// ([`Self::kept_children`]); those anchored at `cidx` need a held claim
+    /// of `id` to root them, its own if the discard keeps it or the doomed
+    /// run's, and are released otherwise, with what they alone keep.
+    fn keep_doomed(&self, id: NodeId, cidx: u32, keep: &mut Vec<u32>) -> Option<u64> {
         let rt = self.runtime_id;
         let owned = self.virtually_owned(cidx, keep) || replay::suspended_low_at(rt, cidx);
-        let virtual_only = keep.len();
-        let children_here = self.keep_kept_children(cidx, keep);
+        let kept = self.kept_children(cidx, keep, id.0);
         if cycle_state::holds(rt, id.0) {
+            keep.extend(if kept.releases_root {
+                kept.above
+            } else {
+                kept.all
+            });
             return None;
         }
-        let path = (owned || children_here)
+        let here = kept.all.len() != kept.above.len();
+        let path = (owned || here)
             .then(|| {
                 replay::with(|c| {
                     c.iter()
@@ -3632,9 +3639,7 @@ impl<C: Cells> Runtime<C> {
                 })
             })
             .flatten();
-        if path.is_none() {
-            keep.truncate(virtual_only);
-        }
+        keep.extend(if path.is_some() { kept.all } else { kept.above });
         path
     }
 
