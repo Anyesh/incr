@@ -1179,6 +1179,7 @@ impl Directs {
             .position(key.cidx)
             .expect("incr-core: a direct read is its context's frame's");
         if self.at.len() <= i {
+            note_work(i + 1 - self.at.len());
             self.at.resize_with(i + 1, Few::default);
         }
         self.at[i].push(Direct {
@@ -4210,6 +4211,37 @@ pub(crate) fn innermost(c: &[Context], rt: RuntimeId) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::notes::Notes;
+
+    /// A deep direct that goes with its maker's run and comes back with the
+    /// next doom is held at its position again without making the
+    /// positions below it again.
+    #[test]
+    #[cfg(not(loom))]
+    fn a_deep_direct_held_again_makes_no_positions_again() {
+        let depth = 100_000;
+        let key = ReadKey {
+            node: 1,
+            generation: 0,
+            cidx: depth,
+            reading: 2,
+            ordinal: 1,
+            path: 3,
+            seq: 0,
+            episode: None,
+            foreign: None,
+        };
+        let mut directs = Directs::new(0);
+        take_note_work();
+        for _ in 0..10 {
+            directs.deliver(key, 0, RunSlot::default());
+            directs.remove_maker(0);
+        }
+        let units = take_note_work();
+        assert!(
+            units < 2 * u64::from(depth),
+            "{units} units of note work for 10 holds of a direct at position {depth}"
+        );
+    }
 
     /// A cut that takes a node's newer, deeper note and keeps its older one
     /// leaves the older stamp: the frame's containment names only the
