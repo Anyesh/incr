@@ -3856,6 +3856,110 @@ fn speculative_member_run_leaves_no_buffer() {
     });
 }
 
+/// Seeds where a cycle member's run inside a doomed frame was made under
+/// speculation and the frame's real look reran it: at budget 1 the
+/// member's Native query ran twice where the unbounded run runs it once.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_member_run_of_unchanged_reads_is_not_rerun() {
+    let seeds = [0x3ce9, 0xf10, 0x20764, 0x2389c, 0x23d9f, 0x1a063, 0x16a03];
+    quiet(|| {
+        for seed in seeds {
+            differential::<Local>(&gen_case(seed, false, false), seed);
+        }
+        differential::<Shared>(&gen_case(0x20764, false, false), 0x20764);
+    });
+}
+
+/// 0x30e8 under `Shared` at budgets 1 and 2: op 12's second speculative
+/// member run is member 6's, which reads 7 Clean. Another thread sets input
+/// 25 and lands 7 again before that run is recorded. No real look may adopt
+/// the run, which read 7's old value, and `Get(0)` after both returns what
+/// the unbounded run gives with the set before or after op 12.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_speculative_member_run_over_a_dep_landed_again_before_its_record_is_not_adopted() {
+    let case = gen_case(0x30e8, false, false);
+    let op = 12;
+    let reference = |set_first: bool, v: u64| {
+        let mut c = case.clone();
+        c.ops = case.ops[..op].to_vec();
+        if set_first {
+            c.ops
+                .extend([Op::Set(25, v), case.ops[op].clone(), Op::Get(0)]);
+        } else {
+            c.ops
+                .extend([case.ops[op].clone(), Op::Set(25, v), Op::Get(0)]);
+        }
+        let mut trace = Vec::new();
+        quiet(|| trace = run::<Shared>(&c, None, 0));
+        trace.pop().expect("the read ran").0
+    };
+    for frames in [1, 2] {
+        for v in [2, 4, 6] {
+            let rts = runtimes::<Shared>(Some(frames), 0);
+            let live = Live::new(&rts, &case);
+            let world = live.world.clone();
+            let member = NodeId(world.handle(0, 6).erased().slot());
+            let armed = Arc::new(AtomicBool::new(false));
+            let a = armed.clone();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let r = runs.clone();
+            let raced = Arc::new(Mutex::new(None));
+            let s = raced.clone();
+            let installed = rts[0].park_hook.set(Box::new(move |p| {
+                let ParkPoint::MemberBeforeRecord(id) = p else {
+                    return;
+                };
+                if !a.load(SeqCst) || !crate::replay::speculative() || r.fetch_add(1, SeqCst) != 1 {
+                    return;
+                }
+                let w = world.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let setter = std::thread::spawn(move || {
+                    set_out(w.rt(0), w.handle(0, 25), v);
+                    let _ = tx.send(read_out(w.rt(0), w.handle(0, 7), false));
+                });
+                let landed = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+                *s.lock().unwrap() = Some((id, landed, setter));
+            }));
+            assert!(installed.is_ok());
+            reset_thread();
+            crate::cycle_state::ADOPTED.with(|a| a.borrow_mut().clear());
+            let mut after = None;
+            quiet(|| {
+                for o in &case.ops[..op] {
+                    let _ = catch_unwind(AssertUnwindSafe(|| live.apply(o)));
+                }
+                crate::cycle_state::ADOPTED.with(|a| a.borrow_mut().clear());
+                armed.store(true, SeqCst);
+                let _ = catch_unwind(AssertUnwindSafe(|| live.apply(&case.ops[op])));
+                armed.store(false, SeqCst);
+                after = Some(live.apply(&Op::Get(0)));
+            });
+            let (id, landed, setter) = raced
+                .lock()
+                .unwrap()
+                .take()
+                .expect("op 12 made a second speculative member run");
+            setter.join().expect("the setter ran");
+            let after = after.expect("the read ran");
+            let at = format!("budget {frames}, v {v}");
+            assert_eq!(id, member, "{at}: the second speculative member run is 6's");
+            assert!(landed, "{at}: 7 landed again before the record");
+            assert!(
+                !crate::cycle_state::ADOPTED.with(|a| a.borrow().contains(&member.0)),
+                "{at}: a real look adopted member 6's run over 7's old value"
+            );
+            let (set_first, op_first) = (reference(true, v), reference(false, v));
+            assert!(
+                after == set_first || after == op_first,
+                "{at}: Get(0) after the set gives {after:?}, the unbounded run {set_first:?} (set first) or {op_first:?} (op 12 first)"
+            );
+        }
+    }
+}
+
 /// 0x1dd5_ac14_6f19_4569 with every query bare and [`Bare`] given a
 /// placeholder, whose `Drop` panics on a value only a speculative run
 /// builds. At budget 1 a speculative run buffers 9999 on a member, and

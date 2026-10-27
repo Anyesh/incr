@@ -594,8 +594,13 @@ pub trait DepStack: sealed::Sealed + 'static {
         if self.top_keeps_foreign(tagged, node, ctl) {
             ctl.raise(UNREGENERABLE);
         }
-        if ctl.has(SPECULATIVE) {
-            ctl.raise(KEPT_UNCHECKED);
+        if ctl.has(SPECULATIVE | BUFFERED) {
+            if ctl.has(SPECULATIVE) {
+                ctl.raise(KEPT_UNCHECKED);
+            }
+            if ctl.has(BUFFERED) {
+                ctl.look_up_unrecorded();
+            }
         }
     }
 
