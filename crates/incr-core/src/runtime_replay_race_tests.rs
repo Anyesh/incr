@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use super::race_tests::{await_reservation_wait, id, Gate};
+use super::race_tests::{await_reservation_wait, id, Gate, PARK_TIMEOUT};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
@@ -2082,6 +2082,98 @@ fn shared_vframe_reader_waits_under_a_native_read() {
     assert!(
         (first == own && failed(&other)) || (other == own && failed(&first)),
         "{first:?}, {other:?}"
+    );
+}
+
+/// As `shared_vframe_reader_waits_under_a_native_read`, with the other
+/// thread's run of X parked in its Failed landing after the payload's
+/// record is out and before the state store, while W's retry reads X. The
+/// other thread's read starts once the retry's pops have left X's
+/// reservation at rest, so it passes it; the store waits until the
+/// driver's read returned or waits on X's claim. The payload is W's only
+/// once X reads Failed: taken while X is Computing, W's publish finds X
+/// unsettled and W lands Dirty where the unbounded run leaves all three
+/// Failed.
+#[test]
+fn shared_vframe_reader_takes_an_owed_payload_after_the_landing_store() {
+    let s = delivery_shape(Panics::Out, Some(Panics::Out));
+    let rt = s.rt.clone();
+    rt.set_max_frames(2);
+    let (stored, read) = (Gate::new(), Gate::new());
+    let driver = Arc::new(OnceLock::new());
+    let waited = Arc::new(AtomicBool::new(false));
+    let installed = rt.park_hook.set(Box::new({
+        let (entry, stored, read, driver, waited) = (
+            s.gate.clone(),
+            stored.clone(),
+            read.clone(),
+            driver.clone(),
+            waited.clone(),
+        );
+        let (top, x) = (id(s.top), id(s.x));
+        move |p| {
+            let on_driver = || driver.get() == Some(&thread::current().id());
+            if p == ParkPoint::BeforeEntry(top) {
+                let _ = driver.set(thread::current().id());
+                entry.park();
+            } else if p == ParkPoint::FailedBeforeStore(x) && !on_driver() {
+                stored.park();
+            } else if p == ParkPoint::GetAfterHandleCheck(x) && on_driver() {
+                read.park();
+            } else if p == ParkPoint::ComputeWaits(x) && on_driver() {
+                waited.store(true, SeqCst);
+            }
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
+    let first = {
+        let (rt, top) = (rt.clone(), s.top);
+        spawn(move || outcome(|| rt.get(top)))
+    };
+    s.gate.wait_parked();
+    assert_eq!(rt.state_of(s.y), NodeState::Failed);
+    read.arm();
+    s.gate.release();
+    read.wait_parked();
+    stored.arm();
+    let other = {
+        let (rt, x) = (rt.clone(), s.x);
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    stored.wait_parked();
+    assert_eq!(rt.state_of(s.x), NodeState::Computing);
+    read.release();
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
+    let mut pending = first;
+    let first = loop {
+        match pending.join_within(Duration::from_millis(10)) {
+            Ok(first) => break first,
+            Err(first) if waited.load(SeqCst) => {
+                stored.release();
+                break first.join();
+            }
+            Err(first) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the reader neither returned nor waited on X's claim"
+                );
+                pending = first;
+            }
+        }
+    };
+    stored.release();
+    let other = other.join();
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+
+    let u = delivery_shape(Panics::Out, Some(Panics::Out));
+    u.rt.set_max_frames(u32::MAX);
+    let want_first = outcome(|| u.rt.get(u.top));
+    let want_other = outcome(|| u.rt.get(u.x));
+    assert_racing_reads([&first, &other], [&want_first, &want_other]);
+    assert_eq!(
+        (rt.state_of(s.x), rt.state_of(s.y), rt.state_of(s.top)),
+        (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.top))
     );
 }
 

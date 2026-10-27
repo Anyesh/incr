@@ -25,7 +25,7 @@ use crate::state::NodeState;
 type Rt = Runtime<Shared>;
 
 /// A park point that never gets reached would otherwise hang the test.
-const PARK_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const PARK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One-shot rendezvous. The thread under test calls [`Gate::park`]; the
 /// driver calls [`Gate::wait_parked`], acts, then [`Gate::release`]. A

@@ -246,6 +246,10 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a run that did not land Clean released its
     /// claim, with the attempt's bag carried along.
     UnsettledLanding(NodeId),
+    /// In `land_failed`, after a landing meant as Failed published the
+    /// record of the payload it lets out and before `land_single` stores
+    /// its state or holds it for publication.
+    FailedBeforeStore(NodeId),
     /// In `land_failed` or a held publication, after a landing meant as
     /// Failed released its claim landing otherwise.
     FailedLandedOtherwise(NodeId),
@@ -4644,8 +4648,17 @@ impl<C: Cells> Runtime<C> {
                 return Computed::Gone;
             }
             // After the load, so a landing that passed the held payload's
-            // failure on is seen whatever state it left the node in since.
-            if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
+            // failure on is seen in the state it left the node in, unless
+            // the load saw another thread's claim: that landing passes it
+            // on before the node reads landed (its store, or a held
+            // landing's publication), and a reader raising it then would
+            // publish the node as an unsettled dep, so it waits for it.
+            if MODE & VIRT != 0
+                && !C::SINGLE_THREADED
+                && !walked
+                && (!matches!(observed, NodeState::Computing | NodeState::ComputingDirty)
+                    || cycle_state::holds(self.runtime_id, id.0))
+            {
                 if let Some(payload) = self.owed_payload(id, g0.unwrap_or(node.generation())) {
                     self.raise_owed(payload, bag);
                 }
@@ -5627,6 +5640,9 @@ impl<C: Cells> Runtime<C> {
         } else {
             None
         };
+        if landing == NodeState::Failed {
+            self.park(ParkPoint::FailedBeforeStore(id));
+        }
         let landed = self.land_single(id, node, flags, landing, flagged);
         if !C::SINGLE_THREADED && landed == NodeState::Failed {
             cycle_state::note_failed_here(self.runtime_id, id.0, node.generation());
