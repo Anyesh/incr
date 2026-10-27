@@ -3610,20 +3610,32 @@ impl<C: Cells> Runtime<C> {
     /// above read them held, not New. When some are anchored at `cidx`, or
     /// a waiting episode's member run read the frame there, the doomed run
     /// of `id` there roots them, and the path of its virtual frame is
-    /// returned.
+    /// returned. So it does for the children of kept claims
+    /// ([`Self::keep_kept_children`]) anchored there, which are kept only
+    /// when a held claim of `id` roots them.
     fn keep_virtual(&self, id: NodeId, cidx: u32, keep: &mut Vec<u32>) -> Option<u64> {
         let rt = self.runtime_id;
-        let rooted = self.virtually_owned(cidx, keep) || replay::suspended_low_at(rt, cidx);
-        if !rooted || cycle_state::holds(rt, id.0) {
+        let owned = self.virtually_owned(cidx, keep) || replay::suspended_low_at(rt, cidx);
+        let virtual_only = keep.len();
+        let children_here = self.keep_kept_children(cidx, keep);
+        if cycle_state::holds(rt, id.0) {
             return None;
         }
-        replay::with(|c| {
-            c.iter()
-                .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
-                .find(|v| v.cidx == cidx && v.node == id.0)
-                .map(|v| v.path)
-        })
+        let path = (owned || children_here)
+            .then(|| {
+                replay::with(|c| {
+                    c.iter()
+                        .filter(|x| x.rt == rt)
+                        .flat_map(|x| x.vstack.iter())
+                        .find(|v| v.cidx == cidx && v.node == id.0)
+                        .map(|v| v.path)
+                })
+            })
+            .flatten();
+        if path.is_none() {
+            keep.truncate(virtual_only);
+        }
+        path
     }
 
     /// Adds to `keep` the claims anchored at or above `cidx` that virtual

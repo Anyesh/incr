@@ -1121,6 +1121,7 @@ impl<C: Cells> Runtime<C> {
         }
         let mut keep = Vec::new();
         self.virtually_owned(cidx + 1, &mut keep);
+        self.keep_kept_children(cidx + 1, &mut keep);
         self.release_held_except(cidx + 1, &keep, &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
@@ -2023,7 +2024,7 @@ impl<C: Cells> Runtime<C> {
         kind: Option<UnwindKind>,
         bag: &mut Deferred<C>,
     ) {
-        self.release_held_where(cidx, discarding, kind, None, &[], false, None, bag);
+        self.release_held_where(cidx, discarding, kind, None, &[], None, bag);
     }
 
     /// [`Self::release_held_from`] for a frame at `cidx` that unwound with
@@ -2048,22 +2049,32 @@ impl<C: Cells> Runtime<C> {
             self.virtually_owned(cidx, &mut keep);
         }
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, kind, subtree, &keep, false, payload, bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &keep, payload, bag);
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
-    /// the claims in `keep` and those [`keep_children_of_kept`] keeps.
+    /// the claims in `keep`.
     pub(super) fn release_held_except(&self, cidx: u32, keep: &[u32], bag: &mut Deferred<C>) {
-        self.release_held_where(
-            cidx,
-            true,
-            Some(UnwindKind::Discard),
-            None,
-            keep,
-            true,
-            None,
-            bag,
-        );
+        self.release_held_where(cidx, true, Some(UnwindKind::Discard), None, keep, None, bag);
+    }
+
+    /// Adds to `keep` the claims a doom's discard at `cidx` would release
+    /// that were deferred by a run whose own claim stays held, as a
+    /// suspended episode keeps its member run's: they stay held with it,
+    /// as the unbounded run holds them. Returns whether one is anchored at
+    /// `cidx`, where a held root must take them.
+    pub(super) fn keep_kept_children(&self, cidx: u32, keep: &mut Vec<u32>) -> bool {
+        let rt = self.runtime_id;
+        cycle_state::with_held(|h| {
+            if h.is_empty() {
+                return false;
+            }
+            let released = releasable(h, rt, cidx, None, keep);
+            let kept = children_of_kept(h, rt, cidx, &released);
+            let here = kept.iter().any(|m| h[&(rt, *m)].anchor() == cidx);
+            keep.extend(kept);
+            here
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2074,7 +2085,6 @@ impl<C: Cells> Runtime<C> {
         kind: Option<UnwindKind>,
         subtree: Option<u32>,
         keep: &[u32],
-        doom: bool,
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
@@ -2082,32 +2092,11 @@ impl<C: Cells> Runtime<C> {
         // its position by it, and those owned above.
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
         let rt = self.runtime_id;
-        // A suspended episode's members wait for its member run's virtual
-        // frame, whatever frame runs at that position meanwhile: only the
-        // episode's resumption, or its context abandoning it, releases them.
-        // So do the claims its member runs deferred to its root, which the
-        // resumption joins.
         let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             if h.is_empty() {
                 return Vec::new();
             }
-            let mut slots = h.anchored_from(rt, cidx);
-            if let Some(node) = subtree {
-                for g in h.owners(rt, cidx, u32::MAX) {
-                    if h.owner(g).owned_by(cidx, node, path) {
-                        slots.extend_from_slice(h.members(g));
-                    }
-                }
-                slots.sort_unstable();
-                slots.dedup();
-            }
-            slots.retain(|m| {
-                !keep.contains(m) && h.get(&(rt, *m)).is_some_and(|e| released_at(rt, e, cidx))
-            });
-            if doom {
-                keep_children_of_kept(h, rt, cidx, &mut slots);
-            }
-            slots
+            releasable(h, rt, cidx, subtree.map(|node| (node, path)), keep)
                 .into_iter()
                 .map(|m| (m, h.remove(&(rt, m)).expect("the slot was just listed")))
                 .collect()
@@ -3019,13 +3008,42 @@ fn cycle_panic(cycle: Cycle) -> ! {
     panic!("{message}");
 }
 
-/// Takes out of a doom's `released` the claims deferred by a run above
-/// `cidx` whose own claim the discard keeps, as a suspended episode keeps
-/// its member run's: they stay held with it, as the unbounded run holds
-/// them.
-fn keep_children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &mut Vec<u32>) {
+/// The claims of `rt` an unwind from `cidx` releases, other than those in
+/// `keep`: those anchored at or above it, and, for the run of `node` at
+/// `path` given in `subtree`, those owned at its position by it or owned
+/// above. A suspended episode's members wait for its member run's virtual
+/// frame, whatever frame runs at that position meanwhile: only the
+/// episode's resumption, or its context abandoning it, releases them. So do
+/// the claims its member runs deferred to its root, which the resumption
+/// joins.
+fn releasable(
+    h: &HeldMap,
+    rt: RuntimeId,
+    cidx: u32,
+    subtree: Option<(u32, Option<u64>)>,
+    keep: &[u32],
+) -> Vec<u32> {
+    let mut slots = h.anchored_from(rt, cidx);
+    if let Some((node, path)) = subtree {
+        for g in h.owners(rt, cidx, u32::MAX) {
+            if h.owner(g).owned_by(cidx, node, path) {
+                slots.extend_from_slice(h.members(g));
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+    }
+    slots.retain(|m| {
+        !keep.contains(m) && h.get(&(rt, *m)).is_some_and(|e| released_at(rt, e, cidx))
+    });
+    slots
+}
+
+/// The claims in a doom's `released` deferred by a run above `cidx` whose
+/// own claim the discard keeps, transitively.
+fn children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &[u32]) -> Vec<u32> {
     if released.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut owned: HashMap<u32, Vec<u32>> = HashMap::new();
     for g in h.owners(rt, cidx.saturating_add(1), u32::MAX) {
@@ -3035,7 +3053,7 @@ fn keep_children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &mut V
             .extend_from_slice(h.members(g));
     }
     if owned.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut out: HashSet<u32> = released.iter().copied().collect();
     let mut kept: Vec<u32> = owned
@@ -3043,14 +3061,16 @@ fn keep_children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &mut V
         .copied()
         .filter(|n| h.contains_key(&(rt, *n)) && !out.contains(n))
         .collect();
+    let mut children = Vec::new();
     while let Some(n) = kept.pop() {
         for m in owned.remove(&n).unwrap_or_default() {
             if out.remove(&m) {
+                children.push(m);
                 kept.push(m);
             }
         }
     }
-    released.retain(|m| out.contains(m));
+    children
 }
 
 /// Whether an unwind from position `cidx` releases held claim `e`: an
