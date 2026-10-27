@@ -90,7 +90,15 @@ struct StaleEdge {
 
 impl StaleEdge {
     fn new(reads: QReads, q_new: bool) -> Self {
-        let rt = Arc::new(Runtime::<Shared>::new());
+        Self::with_replay(reads, q_new, false)
+    }
+
+    /// [`Self::new`] with every query replayable if `replayable`, so a frame
+    /// budget replays its reads.
+    fn with_replay(reads: QReads, q_new: bool, replayable: bool) -> Self {
+        let mut rt = Runtime::<Shared>::new();
+        rt.all_replayable = replayable;
+        let rt = Arc::new(rt);
         let s = rt.create_input(0_i64);
         let t = rt.create_input(0_i64);
         let u = rt.create_input(0_i64);
@@ -272,7 +280,7 @@ fn stale_edge_waits_for_cycle(a_first: bool) {
 /// B read nothing after the cycle, so its outcome stays the cycle, the
 /// order with B's read first, at every frame budget.
 fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
-    let g = StaleEdge::new(QReads::Plain, false);
+    let g = StaleEdge::with_replay(QReads::Plain, false, budget.is_some());
     if let Some(n) = budget {
         g.rt.set_max_frames(n);
     }
@@ -295,7 +303,7 @@ fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
     assert_eq!(g.rt.verdict_reruns.load(Ordering::Relaxed), 0);
     if budget.is_some() {
         assert!(
-            !g.rt.entries.lock().unwrap().is_empty(),
+            !g.rt.entries.lock().unwrap().is_empty() || !g.rt.deliveries.lock().unwrap().is_empty(),
             "the budget replayed no read"
         );
     }
