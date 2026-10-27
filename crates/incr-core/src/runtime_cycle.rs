@@ -2815,19 +2815,23 @@ impl<C: Cells> Runtime<C> {
     /// of one must make the decision a read before the claims would have
     /// made. They stay in their group unless `leave`, when they land out
     /// of it, unverified (see `leave_group`), held if this thread holds
-    /// landings: a retraction puts the record back with the state.
-    pub(super) fn release_group_claims<'a>(
-        &self,
-        claimed: impl IntoIterator<Item = &'a u32>,
-        leave: bool,
-        bag: &mut Deferred<C>,
-    ) {
+    /// landings: a retraction puts the record back with the state. A claim
+    /// a waiter took publishes at once, past any retraction, so then they
+    /// all stay.
+    pub(super) fn release_group_claims<'a, I>(&self, claimed: I, leave: bool, bag: &mut Deferred<C>)
+    where
+        I: IntoIterator<Item = &'a u32>,
+        I::IntoIter: Clone,
+    {
         let rt = self.runtime_id;
+        let claimed = claimed.into_iter();
+        let held = !C::SINGLE_THREADED && hold::active();
+        let leave = leave && !(held && claimed.clone().any(|&c| reserve::taken((rt, c))));
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
             let (node, flags) = self.nodes.get_with_flags(c);
             if leave {
-                if !C::SINGLE_THREADED && hold::active() {
+                if held {
                     self.open_hold(NodeId(c), node, false, None, bag);
                 }
                 self.land_single_as(
