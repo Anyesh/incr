@@ -70,6 +70,54 @@ pub(crate) fn release_parked_on_unwind() -> OnUnwind<impl FnMut()> {
     OnUnwind(|| MADE_HERE.with(MadeHere::let_go))
 }
 
+/// A test's spawned thread that a driver dropping it by a panic lets go
+/// and joins, so a failed test does not leave it running into the next
+/// one (under Miri its steps would eat the next test's park timeout).
+pub(crate) struct Joined<T>(Option<thread::JoinHandle<T>>);
+
+pub(crate) fn spawn_joined<T: Send + 'static>(
+    name: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Joined<T> {
+    Joined(Some(
+        thread::Builder::new().name(name.into()).spawn(f).unwrap(),
+    ))
+}
+
+impl<T> Joined<T> {
+    pub(crate) fn join(mut self) -> thread::Result<T> {
+        self.0.take().unwrap().join()
+    }
+
+    pub(crate) fn thread(&self) -> &thread::Thread {
+        self.0.as_ref().unwrap().thread()
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.0.as_ref().unwrap().is_finished()
+    }
+}
+
+impl<T> Drop for Joined<T> {
+    fn drop(&mut self) {
+        let Some(handle) = self.0.take().filter(|_| thread::panicking()) else {
+            return;
+        };
+        MADE_HERE.with(MadeHere::let_go);
+        // A thread stuck outside a gate stays detached rather than hang the
+        // binary; the test has already failed.
+        let deadline = std::time::Instant::now() + PARK_TIMEOUT;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if handle.is_finished() {
+            // The driver's panic is the test's failure; this thread's own
+            // outcome adds nothing to it.
+            drop(handle.join());
+        }
+    }
+}
+
 /// One-shot rendezvous. The thread under test calls [`Gate::park`]; the
 /// driver calls [`Gate::wait_parked`], acts, then [`Gate::release`]. A
 /// gate only parks once it is armed, so a closure can carry one through
@@ -729,7 +777,7 @@ fn b2_delete_and_recycle_while_publisher_is_parked() {
 /// `Dead` but its generation is not bumped and its slot not released.
 /// The returned waiter gate parks a second delete of `v` once it reaches
 /// the wait on that claim.
-fn park_delete_after_claim(rt: &Arc<Rt>, v: Incr<u64>) -> (Gate, Gate, thread::JoinHandle<()>) {
+fn park_delete_after_claim(rt: &Arc<Rt>, v: Incr<u64>) -> (Gate, Gate, Joined<()>) {
     let claimed = Gate::new();
     let waiter = Gate::new();
     park_at(
@@ -741,7 +789,7 @@ fn park_delete_after_claim(rt: &Arc<Rt>, v: Incr<u64>) -> (Gate, Gate, thread::J
     );
     let deleter = {
         let rt = Arc::clone(rt);
-        thread::spawn(move || rt.delete_node(v))
+        spawn_joined("deleter", move || rt.delete_node(v))
     };
     claimed.wait_parked();
     (claimed, waiter, deleter)
@@ -1586,16 +1634,14 @@ fn local_dep_that_recycles_the_walk_root_panics_stale() {
 
 /// Parks a `get(v)` on another thread at `point`; the join handle yields
 /// the value or the panic message.
-fn park_get(
-    rt: &Arc<Rt>,
-    v: Incr<u64>,
-    point: ParkPoint,
-) -> (Gate, thread::JoinHandle<Result<u64, String>>) {
+fn park_get(rt: &Arc<Rt>, v: Incr<u64>, point: ParkPoint) -> (Gate, Joined<Result<u64, String>>) {
     let gate = Gate::new();
     park_at(rt, vec![(point, gate.clone())]);
     let reader = {
         let rt = Arc::clone(rt);
-        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(v))).map_err(panic_message))
+        spawn_joined("reader", move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(v))).map_err(panic_message)
+        })
     };
     gate.wait_parked();
     (gate, reader)
@@ -2948,17 +2994,18 @@ fn walks_under_releases(walkers: usize, releasers: usize, release: fn(&Rt)) -> A
     let releasing: Vec<_> = (0..releasers)
         .map(|_| {
             let (rt, done) = (rt.clone(), done.clone());
-            thread::spawn(move || {
+            spawn_joined("releaser", move || {
                 while !done.load(Ordering::Relaxed) {
                     release(&rt);
                 }
             })
         })
         .collect();
+    let _stop = OnUnwind(|| done.store(true, Ordering::Relaxed));
     let walking: Vec<_> = (0..walkers)
         .map(|_| {
             let rt = rt.clone();
-            thread::spawn(move || {
+            spawn_joined("walker", move || {
                 let input = rt.create_input(0_u64);
                 let mut top = rt.create_query(move |rt| rt.get(input));
                 for _ in 1..DEPTH {
@@ -3064,6 +3111,31 @@ fn a_failed_tests_scoped_parked_thread_is_released() {
         });
     });
     assert!(released);
+}
+
+/// A failed driver's [`Joined`] thread has ended by the time the driver
+/// has, though it still had work after its release.
+#[test]
+fn a_failed_tests_joined_thread_ends_with_the_test() {
+    let ended = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&ended);
+    let driver = thread::Builder::new()
+        .name("failing driver".into())
+        .spawn(move || {
+            let gate = Gate::new();
+            gate.arm();
+            let parked = gate.clone();
+            let _thread = spawn_joined("parked", move || {
+                parked.park();
+                thread::sleep(Duration::from_millis(50));
+                seen.store(true, Ordering::SeqCst);
+            });
+            gate.wait_parked();
+            panic!("the test fails while a thread is parked");
+        })
+        .unwrap();
+    assert!(driver.join().is_err(), "the driver panics");
+    assert!(ended.load(Ordering::SeqCst));
 }
 
 thread_local! {
@@ -3231,18 +3303,14 @@ fn race_verdict_taken_then_landed(catchers: usize) -> (Option<u64>, u32) {
     gate.arm();
     let first = {
         let rt = Arc::clone(&rt);
-        thread::Builder::new()
-            .name("A".into())
-            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(top))).ok())
-            .unwrap()
+        spawn_joined("A", move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(top))).ok()
+        })
     };
     gate.wait_parked();
     let second = {
         let rt = Arc::clone(&rt);
-        thread::Builder::new()
-            .name("B".into())
-            .spawn(move || rt.get(z))
-            .unwrap()
+        spawn_joined("B", move || rt.get(z))
     };
     assert_eq!(second.join().unwrap(), 15);
     gate.release();
