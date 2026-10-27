@@ -237,6 +237,10 @@ fn wake_walk(claim: (Claim, u32)) {
 }
 
 fn end_awake_walks(claims: impl IntoIterator<Item = (Claim, u32)>) {
+    let mut claims = claims.into_iter().peekable();
+    if claims.peek().is_none() {
+        return;
+    }
     let mut awake = awake_walks();
     for claim in claims {
         if let Some(n) = awake.get_mut(&claim) {
