@@ -302,9 +302,15 @@ fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
     assert!(message.contains("dependency cycle"), "{message}");
     assert_eq!(g.rt.verdict_reruns.load(Ordering::Relaxed), 0);
     if budget.is_some() {
-        assert!(
-            !g.rt.entries.lock().unwrap().is_empty() || !g.rt.deliveries.lock().unwrap().is_empty(),
-            "the budget replayed no read"
+        let replayed = (
+            g.rt.dooms.lock().unwrap().len(),
+            g.rt.entries.lock().unwrap().len(),
+            g.rt.deliveries.lock().unwrap().len(),
+        );
+        assert_ne!(
+            replayed,
+            (0, 0, 0),
+            "the budget replayed no read (dooms, entries, deliveries)"
         );
     }
     assert_eq!(g.rt.get(q), 4);

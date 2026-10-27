@@ -5149,10 +5149,10 @@ impl<C: Cells> Runtime<C> {
                         verify_rev,
                     };
                     if let Err(payload) = &result {
-                        if word & value_code::UNWIND_MASK != 0 {
-                            if cycle_impl::read_past_cycle(&**payload, &deps, reading, &ctl) {
-                                self.note_cycle_caught(Some(&ctl));
-                            }
+                        if word & value_code::UNWIND_MASK != 0
+                            && cycle_impl::read_past_cycle(&**payload, &deps, reading, &ctl)
+                        {
+                            self.note_cycle_caught(Some(&ctl));
                         }
                     }
                     if let Some(dropped) =
