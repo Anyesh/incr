@@ -985,11 +985,13 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A new dep of a Failed landing that may have moved since the
-    /// landing's run read it at `rev`: a walk left it Dirty, it changed
-    /// after `rev`, or another thread computes it now. One its attempt left
-    /// New, such as a cycle's discard, did not move. A held one moved only
-    /// if it changed: the run read its held landing, Dirty or not, and a
-    /// set since then flagged its word or walked its pending edges.
+    /// landing's run read it at `rev`: a set since `rev` left it Dirty, it
+    /// changed after `rev`, or another thread computes it now. One its
+    /// attempt left New, such as a cycle's discard, or Dirty with no set
+    /// since, such as a budget's unrun release, did not move. A held one
+    /// moved only if it changed: the run read its held landing, Dirty or
+    /// not, and a set since then flagged its word or walked its pending
+    /// edges.
     pub(super) fn moved_since_read(&self, d: NodeId, held: &Targets, rev: u64) -> bool {
         let dep = self.nodes.get(d.0);
         let raw = state::load::<C>(dep.state_cell());
@@ -998,7 +1000,7 @@ impl<C: Cells> Runtime<C> {
             _ if is_computing(raw) => return true,
             _ => raw,
         };
-        now == NodeState::Dirty || dep.changed_at() > rev
+        (now == NodeState::Dirty && self.current_revision() > rev) || dep.changed_at() > rev
     }
 
     /// Every entry goes back to what it replaced, and its node lands as
