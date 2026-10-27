@@ -483,6 +483,9 @@ pub struct ComputeCtl {
     /// The frame's path once found (`kept_path`), left unwritten until
     /// then so a push pays nothing for it.
     path: Cell<MaybeUninit<u64>>,
+    /// `Runtime::reshapes` as a speculative run of the frame began, which
+    /// its stash holds at.
+    pub(crate) reshapes: Cell<u64>,
 }
 
 /// Lives inside its runtime (a speculative frame's, beside its run) and
@@ -512,6 +515,7 @@ impl ComputeCtl {
             children: Cell::new(std::ptr::null()),
             keep,
             path: Cell::new(MaybeUninit::uninit()),
+            reshapes: Cell::new(0),
         }
     }
 

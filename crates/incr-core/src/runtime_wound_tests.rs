@@ -10,11 +10,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::observe_impl::observed_is_clear;
-use super::race_tests::{id, park_at, Gate};
+use super::race_tests::{id, park_at, release_parked_on_unwind, Gate};
 use super::{GroupInfo, NodeId, ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
-use crate::handle::Incr;
+use crate::handle::{Incr, RuntimeId};
 use crate::state::NodeState;
 use crate::waits;
 
@@ -32,8 +32,8 @@ pub(crate) fn assert_wounded() {
     assert!(waits::WOUNDS.load(Ordering::Relaxed) >= 1);
 }
 
-pub(crate) fn wait_registered(n: usize) {
-    while waits::registered() < n {
+pub(crate) fn wait_registered(rt: RuntimeId, n: usize) {
+    while waits::registered_on(rt) < n {
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -203,7 +203,7 @@ impl StaleEdge {
             (&self.b_gate, &self.a_gate)
         };
         first.release();
-        wait_registered(1);
+        wait_registered(self.rt.runtime_id, 1);
         second.release();
         (thread_a, thread_b)
     }
@@ -563,7 +563,7 @@ fn shared_swallowed_wound_in_a_recompute_whose_dep_cuts_off() {
             claim.release();
             q_gate.wait_parked();
             x_gate.release();
-            wait_registered(1);
+            wait_registered(rt.runtime_id, 1);
             q_gate.release();
 
             assert_eq!(thread_o.join().unwrap(), 5);
@@ -747,6 +747,7 @@ impl Duel {
         let first = if a_older { &g.b_gate } else { &g.a_gate };
         first.arm();
         let (a, b) = thread::scope(|s| {
+            let _released = release_parked_on_unwind();
             let g = &g;
             let parked = |n: Incr<i64>| {
                 let read = s.spawn(move || g.read(n));
@@ -760,7 +761,7 @@ impl Duel {
                 let a = parked(g.w);
                 (a, s.spawn(|| g.read(g.m)))
             };
-            wait_registered(1);
+            wait_registered(g.rt.runtime_id, 1);
             first.release();
             (a.join().unwrap(), b.join().unwrap())
         });
@@ -958,6 +959,7 @@ impl Released {
         let g = Released::new(release);
         g.gate.arm();
         let (a, b) = thread::scope(|s| {
+            let _released = release_parked_on_unwind();
             let g = &g;
             let b = s.spawn(move || g.read(g.m));
             g.gate.wait_parked();
@@ -971,7 +973,7 @@ impl Released {
                 g.read(g.r)
             });
             let deadline = Instant::now() + POLL_DEADLINE;
-            while waits::registered() == 0 {
+            while waits::registered_on(g.rt.runtime_id) == 0 {
                 match g
                     .visits
                     .lock()
@@ -1210,6 +1212,7 @@ impl Dissolve {
         let wounds = waits::WOUNDS.load(Ordering::Relaxed);
         g.early.arm();
         let (a, b) = thread::scope(|s| {
+            let _released = release_parked_on_unwind();
             let g = &g;
             let a = s.spawn(move || g.read(g.r));
             g.early.wait_parked();
@@ -1402,6 +1405,7 @@ fn shared_released_member_waits_for_the_cut_owners_read() {
             );
             released.arm();
             let (states, b_waited, b_done_early, a, b) = thread::scope(|s| {
+                let _released = release_parked_on_unwind();
                 let g = &g;
                 let a = s.spawn(move || g.read(g.r));
                 released.wait_parked();
@@ -1548,6 +1552,7 @@ fn cut_exit_retracts(wound: CutWound) {
     };
     g.early.arm();
     let (a, b) = thread::scope(|s| {
+        let _released = release_parked_on_unwind();
         let g = &g;
         let a = s.spawn(|| {
             a_thread.set(thread::current().id()).unwrap();

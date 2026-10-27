@@ -1427,6 +1427,11 @@ pub(crate) fn ticket(next: impl FnOnce() -> u64) -> u64 {
     })
 }
 
+/// This thread's wound-wait ticket, 0 until its first registration.
+pub(crate) fn ticket_now() -> u64 {
+    ENTRY.with(|e| e.ticket.get())
+}
+
 /// Whether a take-over of this thread's outermost entry met a claim.
 #[inline(always)]
 pub(crate) fn any_taken() -> bool {

@@ -369,6 +369,12 @@ fn run_parked(build: Build<Shared>, call: Call, nth: usize) -> Result<(bool, boo
     armed.store(true, MemOrdering::SeqCst);
     let mut parked = false;
     std::thread::scope(|scope| {
+        let _released = crate::runtime::OnUnwind(|| {
+            armed.store(false, MemOrdering::SeqCst);
+            release_tx
+                .send(())
+                .expect("the park hook holds the receiver");
+        });
         let node = probe.node;
         let rt = &rt;
         scope.spawn(move || {

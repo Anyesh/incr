@@ -512,7 +512,7 @@ mod wounds {
     use std::thread;
 
     use super::*;
-    use crate::runtime::race_tests::Gate;
+    use crate::runtime::race_tests::{release_parked_on_unwind, Gate};
     use crate::runtime::wound_tests::{assert_wounded, wait_registered};
 
     fn wound_at(on: usize, episode_older: bool) {
@@ -531,6 +531,7 @@ mod wounds {
         let rt = &*ep.rt;
         let (m, w) = (ep.m, ep.w);
         thread::scope(|scope| {
+            let _released = release_parked_on_unwind();
             m_gate.arm();
             let episode = scope.spawn(move || rt.get(m));
             m_gate.wait_parked();
@@ -543,7 +544,7 @@ mod wounds {
                 (&w_gate, &m_gate)
             };
             first.release();
-            wait_registered(1);
+            wait_registered(rt.runtime_id, 1);
             second.release();
             assert_eq!(episode.join().unwrap(), 5);
             assert_eq!(reader.join().unwrap(), 0);
