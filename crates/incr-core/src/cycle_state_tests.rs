@@ -144,7 +144,7 @@ fn a_speculative_look_or_a_discard_keeps_the_mark() {
 fn a_look_here_follows_the_thread_speculation() {
     assert_eq!(Look::here(), Look::REAL);
     assert_eq!(Look::here_or(true), Look::SPECULATIVE);
-    let _speculating = replay::Speculating::enter();
+    let _speculating = replay::Speculating::enter(RuntimeId::SENTINEL);
     assert_eq!(Look::here(), Look::SPECULATIVE);
     assert_eq!(Look::here_or(false), Look::SPECULATIVE);
 }

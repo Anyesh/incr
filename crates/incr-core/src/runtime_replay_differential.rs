@@ -1588,6 +1588,8 @@ thread_local! {
     static TWO_THREAD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// The phase a two-thread run's thread is in.
     static TWO_PHASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The speculative wait drops of the two-thread runs this thread made.
+    static TWO_WAIT_DROPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Thread 0's call at the end of each read phase with two reads, by the
@@ -1618,10 +1620,11 @@ fn run_two_until(
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let stop = AtomicBool::new(false);
     let barrier = Barrier::new(2);
+    let drops = AtomicU32::new(0);
     std::thread::scope(|s| {
         for t in 0..2 {
-            let (live, outs, snaps, failures, stop, barrier) =
-                (&live, &outs, &snaps, &failures, &stop, &barrier);
+            let (live, outs, snaps, failures, stop, barrier, drops) =
+                (&live, &outs, &snaps, &failures, &stop, &barrier, &drops);
             s.spawn(move || {
                 reset_thread();
                 TWO_THREAD.with(|c| c.set(Some(t)));
@@ -1695,9 +1698,11 @@ fn run_two_until(
                     }
                 }
                 TWO_THREAD.with(|c| c.set(None));
+                drops.fetch_add(crate::replay::take_speculative_wait_drops(), Relaxed);
             });
         }
     });
+    TWO_WAIT_DROPS.with(|d| d.set(d.get() + drops.into_inner()));
     let failures = failures.into_inner().unwrap();
     assert!(failures.is_empty(), "{failures:#?}");
     let (outs, snaps) = (outs.into_inner().unwrap(), snaps.into_inner().unwrap());
@@ -4629,16 +4634,24 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
 }
 
 /// 0x7b5e6, two threads: at one frame op 0's `Get(0)` gives 10004 where
-/// every order of the overlapping reads panics "boom 0:6".
+/// every order of the overlapping reads panics "boom 0:6". The speculative
+/// entry a lazy doomed frame pushed for a read the unbounded run never makes
+/// waited on the other thread, closed a waits-for cycle, and the wound
+/// retried the attempt that had seen the panic; its run drops instead.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_lazy_doomed_frame_placeholder_seeds() {
+    TWO_WAIT_DROPS.with(|d| d.set(0));
     let case = gen_case(0x7b5e6, false, true);
     quiet(|| {
         for _ in 0..8 {
             differential_two(&case, 0x7b5e6);
         }
     });
+    assert!(
+        TWO_WAIT_DROPS.with(|d| d.get()) > 0,
+        "no speculative run dropped at a wait"
+    );
 }
 
 /// 0x761 and 0x8c2, two-thread cases on one thread, Shared at one frame:

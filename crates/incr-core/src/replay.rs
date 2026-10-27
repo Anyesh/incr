@@ -2153,6 +2153,7 @@ thread_local! {
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static THREAD_TAG: Cell<u64> = const { Cell::new(0) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
+    static SPECULATING_IN: RefCell<Vec<RuntimeId>> = const { RefCell::new(Vec::new()) };
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
@@ -2179,6 +2180,7 @@ loom::thread_local! {
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static THREAD_TAG: Cell<u64> = Cell::new(0);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
+    static SPECULATING_IN: RefCell<Vec<RuntimeId>> = RefCell::new(Vec::new());
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
@@ -3300,21 +3302,46 @@ pub(crate) fn frame_records(rt: RuntimeId, slot: u32, generation: u32) -> bool {
     })
 }
 
-/// Counts a speculative entry's run while it lives; dropping it, by an
-/// unwind included, gives the count back.
+/// Counts a speculative run while it lives, with the runtime whose chain
+/// speculates; dropping it, by an unwind included, gives both back.
 pub(crate) struct Speculating(());
 
 impl Speculating {
-    pub(crate) fn enter() -> Self {
+    pub(crate) fn enter(chain: RuntimeId) -> Self {
         SPECULATIVE.with(|s| s.set(s.get() + 1));
+        SPECULATING_IN.with(|c| c.borrow_mut().push(chain));
         Self(())
     }
 }
 
 impl Drop for Speculating {
     fn drop(&mut self) {
+        SPECULATING_IN.with(|c| c.borrow_mut().pop());
         SPECULATIVE.with(|s| s.set(s.get() - 1));
     }
+}
+
+/// Whether a speculative run on this thread speculates in a chain of `rt`.
+pub(crate) fn speculating_in(rt: RuntimeId) -> bool {
+    speculative() && SPECULATING_IN.with(|c| c.borrow().contains(&rt))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SPECULATIVE_WAIT_DROPS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Counts, on this thread, a speculative run dropped where it would
+/// register a claim wait.
+#[cfg(test)]
+pub(crate) fn count_speculative_wait_drop() {
+    SPECULATIVE_WAIT_DROPS.with(|d| d.set(d.get() + 1));
+}
+
+/// The speculative wait drops this thread counted since the last take.
+#[cfg(test)]
+pub(crate) fn take_speculative_wait_drops() -> u32 {
+    SPECULATIVE_WAIT_DROPS.with(|d| d.replace(0))
 }
 
 /// Runs `f` on the thread's contexts without changing them, so the replay
