@@ -3237,16 +3237,13 @@ fn released_at(rt: RuntimeId, e: &Held, cidx: u32) -> bool {
     !replay::is_suspended(e.ep) && !replay::waits_for_suspended(rt, e.anchor(), cidx)
 }
 
-/// A run that unwinds with a cycle's kind and its own payload, having read
-/// past the read the cycle came in through: its closure caught the cycle,
-/// so the kind is stale and the panic is the closure's, as `read_cold`
-/// makes it at a non-Clean read. A Clean read leaves the kind alone, so the
-/// pop clears it here.
+/// Whether the popped frame read past the read a cycle unwound into it
+/// through, even if it then raised the cycle again. A frame that unwinds
+/// with a cycle's kind and its own payload after such a read caught the
+/// cycle, so the kind is stale and is cleared here, as `read_cold` clears
+/// it at a non-Clean read.
 #[cold]
 #[inline(never)]
-/// Clears a caught cycle's stale kind (see `read_cold`) when the closure
-/// read past it; true if the frame read on past the cycle, even if it then
-/// raised the cycle again.
 pub(super) fn read_past_cycle(
     payload: &(dyn Any + Send),
     deps: &[(NodeId, u32)],
