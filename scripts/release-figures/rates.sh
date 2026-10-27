@@ -40,10 +40,11 @@ for t in ${trees//,/ }; do
 done
 export ENVS=$envs SEED=$seed MATCH=$match
 # One run: "<tree index> pass", "<k> match | <text>" (a failure whose text
-# holds MATCH, or any failure when MATCH is *), "<k> fail | <text>" (another
-# failure text) or "<k> other <panic or timeout>" (no differential verdict).
+# holds every " && "-separated part of MATCH, or any failure when MATCH is
+# *), "<k> fail | <text>" (another failure text) or "<k> other <panic or
+# timeout>" (no differential verdict).
 one() {
-  local o rc t
+  local o rc t part rest
   o=$(env $ENVS REPLAY_CHECK=$SEED timeout 600 "$2" --ignored --exact runtime::replay_differential::replay_scan --test-threads=1 2>&1)
   rc=$?
   if ((rc == 0)); then echo "$1 pass"; return; fi
@@ -51,10 +52,14 @@ one() {
   t=$(grep -aE -A3 '^seed 0x[0-9a-f]+[,:]' <<<"$o" | head -n 4 | sed -E 's/^seed 0x[0-9a-f]+, //' | cut -c1-600 | paste -sd'|')
   if [[ -z $t ]]; then
     echo "$1 other $(grep -a -E -A2 "panicked" <<<"$o" | head -n 3 | paste -sd'|' | cut -c1-300)"
-  elif [[ $MATCH == '*' || $t == *"$MATCH"* ]]; then
-    echo "$1 match | $t"
   else
-    echo "$1 fail | $t"
+    rest=$MATCH
+    while [[ -n $rest && $rest != '*' ]]; do
+      part=${rest%% && *}
+      [[ $rest == *" && "* ]] && rest=${rest#* && } || rest=""
+      [[ $t == *"$part"* ]] || { echo "$1 fail | $t"; return; }
+    done
+    echo "$1 match | $t"
   fi
 }
 export -f one
