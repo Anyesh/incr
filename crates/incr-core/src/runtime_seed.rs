@@ -54,6 +54,13 @@ impl<C: Cells> Runtime<C> {
                 return Err((err, value));
             }
         };
+        // A speculative run may have landed the node back New with a stash,
+        // which stands for the run the seed replaces.
+        if C::u32_load_relaxed(&self.stash_count) != 0 {
+            let mut bag = Deferred::new();
+            self.drop_stash(id, q.generation(), &mut bag);
+            bag.drain_isolated();
+        }
         let arena = self
             .arenas
             .tagged_arena::<T>(node.type_tag())
