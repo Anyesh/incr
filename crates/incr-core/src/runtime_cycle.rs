@@ -292,6 +292,7 @@ impl<C: Cells> Runtime<C> {
         if cycle_state::depth() == 0 {
             cycle_panic(cycle);
         }
+        self.dep_stack.note_raise();
         // A closure that swallowed its wound reads on; its cycle must not
         // take the wound's place in flight, or a catch returns it. A drop
         // the wound's own unwind runs gets the cycle: a raise there aborts,
@@ -1019,7 +1020,6 @@ impl<C: Cells> Runtime<C> {
         if kind == ReadKind::TryGet && cycle_state::unwind_kind() == Some(UnwindKind::Cycle) {
             if let Some(unwind) = payload.downcast_ref::<CycleUnwind>() {
                 cycle_state::take_unwind_kind();
-                cycle_state::note_cycle_caught();
                 return unwind.0.clone();
             }
         }
@@ -1127,7 +1127,7 @@ impl<C: Cells> Runtime<C> {
         {
             result = Err(Box::new(WoundUnwind));
         }
-        let (deps, reading) = self.dep_stack.pop_frame_reading();
+        let (deps, reading, read_at) = self.dep_stack.pop_frame_reading();
         let word = value_code::thread_word();
         // A member run starts after its episode root's pop, so nothing
         // below it drops what it kept.
@@ -1136,7 +1136,7 @@ impl<C: Cells> Runtime<C> {
         }
         if let Err(payload) = &result {
             if word & value_code::UNWIND_MASK != 0 {
-                clear_caught_cycle(&**payload, &deps, reading);
+                clear_caught_cycle(&**payload, &deps, reading, read_at);
             }
         }
         if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
@@ -3229,17 +3229,25 @@ fn released_at(rt: RuntimeId, e: &Held, cidx: u32) -> bool {
 /// pop clears it here.
 #[cold]
 #[inline(never)]
-pub(super) fn clear_caught_cycle(payload: &(dyn Any + Send), deps: &[(NodeId, u32)], reading: u64) {
-    if cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
+pub(super) fn clear_caught_cycle(
+    payload: &(dyn Any + Send),
+    deps: &[(NodeId, u32)],
+    reading: u64,
+    read_at: u32,
+) {
+    if cycle_state::unwind_kind() != Some(UnwindKind::Cycle) {
+        return;
+    }
+    // Read on past the cycle, even if the closure then raised it again.
+    if deps.len() > read_at as usize {
+        cycle_state::note_cycle_caught();
+    }
+    if !payload.is::<CycleUnwind>()
         && deps
             .last()
             .is_some_and(|&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) != reading)
     {
-        // Read past the cycle, even if the closure raised the cycle again.
-        cycle_state::note_cycle_caught();
-        if !payload.is::<CycleUnwind>() {
-            cycle_state::set_unwind_kind(None);
-        }
+        cycle_state::set_unwind_kind(None);
     }
 }
 

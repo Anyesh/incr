@@ -50,6 +50,9 @@ pub struct Frame {
     /// owns the control block and pops the frame before it returns.
     pub(crate) ctl: *const ComputeCtl,
     pub(crate) cidx: u32,
+    /// `deps`' length at the frame's last read that could unwind into it:
+    /// a dep past it was read after.
+    pub(crate) read_at: u32,
     /// The node the frame's closure is blocked reading, as
     /// `slot | generation << 32`, stored by every nested non-Clean read
     /// before it nests: a doom that marks this frame names it.
@@ -367,6 +370,7 @@ impl Frames {
             deps: Vec::with_capacity(4),
             ctl,
             cidx,
+            read_at: 0,
             reading: 0,
         }
     }
@@ -436,6 +440,15 @@ pub trait DepStack: sealed::Sealed + 'static {
         self.with(|s| s.push(Frames::frame(node, rt, ctl, cidx)))
     }
 
+    /// The top frame raises from its own code here, after any read so far.
+    fn note_raise(&self) {
+        self.with(|s| {
+            if let Some(top) = s.frames.last_mut() {
+                top.read_at = top.deps.len() as u32;
+            }
+        });
+    }
+
     /// Pop the top frame and return the deps it recorded, each with the
     /// generation it was read at.
     #[inline(always)]
@@ -444,15 +457,15 @@ pub trait DepStack: sealed::Sealed + 'static {
     }
 
     /// [`Self::pop_frame`], with the frame's last non-Clean read (see
-    /// `Frame::reading`).
+    /// `Frame::reading`) and `Frame::read_at`.
     #[inline(always)]
-    fn pop_frame_reading(&self) -> (Vec<(NodeId, u32)>, u64) {
+    fn pop_frame_reading(&self) -> (Vec<(NodeId, u32)>, u64, u32) {
         let frame = self.with(|s| {
             let f = s
                 .frames
                 .pop()
                 .expect("incr-core: pop_frame on an empty stack");
-            (f.deps, f.reading)
+            (f.deps, f.reading, f.read_at)
         });
         crate::lock_order::leave_frame();
         frame
@@ -699,13 +712,15 @@ pub trait DepStack: sealed::Sealed + 'static {
             let depth = s.frames.len() as u32;
             let top = match s.frames.last_mut() {
                 Some(top) if top.is_of(rt) => top,
-                Some(_) => {
+                Some(top) => {
+                    top.read_at = top.deps.len() as u32;
                     s.foreign_non_clean_read();
                     return None;
                 }
                 None => return None,
             };
             top.deps.push((dep, generation));
+            top.read_at = top.deps.len() as u32;
             top.reading = u64::from(dep.0) | (u64::from(generation) << 32);
             Some(ActiveRead {
                 node: top.node,
@@ -1157,7 +1172,10 @@ mod tests {
         s.settle_foreign_keeping(false);
         assert_eq!(s.record_dep(rt(1), NodeId(5), 2, 4), 4);
         s.pop_frame();
-        assert_eq!(s.pop_frame_reading(), (vec![(NodeId(5), 2)], 5 | 2 << 32));
+        assert_eq!(
+            s.pop_frame_reading(),
+            (vec![(NodeId(5), 2)], 5 | 2 << 32, 1)
+        );
     }
 
     /// A frame that ends its diversion records Clean reads in place again.

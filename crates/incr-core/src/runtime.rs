@@ -2797,10 +2797,14 @@ impl<C: Cells> Runtime<C> {
 
     #[inline(never)]
     fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
-        cycle_state::KeptUnwind::around_read(
+        let read = cycle_state::KeptUnwind::around_read(
             || self.read_slow(handle, observed, ReadKind::TryGet),
             || self.reads_in_lazy_frame(),
-        )
+        );
+        if read.is_err() && cycle_state::depth() > 0 {
+            cycle_state::note_cycle_caught();
+        }
+        read
     }
 
     /// The cycle of the group `handle` landed in last, if its last
@@ -5127,7 +5131,7 @@ impl<C: Cells> Runtime<C> {
                 {
                     result = Err(Box::new(cycle::WoundUnwind));
                 }
-                let (deps, reading) = self.dep_stack.pop_frame_reading();
+                let (deps, reading, read_at) = self.dep_stack.pop_frame_reading();
                 let word = value_code::thread_word();
                 if word
                     & (value_code::MEMO_BIT
@@ -5146,7 +5150,7 @@ impl<C: Cells> Runtime<C> {
                     };
                     if let Err(payload) = &result {
                         if word & value_code::UNWIND_MASK != 0 {
-                            cycle_impl::clear_caught_cycle(&**payload, &deps, reading);
+                            cycle_impl::clear_caught_cycle(&**payload, &deps, reading, read_at);
                         }
                     }
                     if let Some(dropped) =
