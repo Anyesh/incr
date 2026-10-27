@@ -1124,8 +1124,8 @@ impl Walk {
     }
 
     /// Plans afresh from the root, which another thread landed since the
-    /// walk planned it (a claim the walk waited out, or a New plan that met
-    /// it Dirty), as a read that came after that landing would: where the
+    /// walk planned it (a claim the walk waited out, a New plan that met it
+    /// Dirty, or a landing its claim found in the episode log), as a read that came after that landing would: where the
     /// walk enters a cycle of recorded deps depends on its visit count at
     /// the switch to exact mode, and which queued entries a Failed root
     /// passes depends on the Failed landings since the walk began. No state
@@ -4359,14 +4359,17 @@ impl<C: Cells> Runtime<C> {
         all != planned.all && self.others_landed(planned, all)
     }
 
-    /// Whether another thread may have landed `compute_one`'s node since
-    /// the walk planned it: a claim wait ended, or, for the root, whose
-    /// claim no entry check covers, an episode landed or held claims were
-    /// released since the plan. A walk's later read of such a landing
-    /// expands the deps it left first.
-    #[inline(always)]
-    fn landed_since_plan(&self, spins: u32, walked: bool, planned: Option<Planned>) -> bool {
-        spins != 0 || (!walked && planned.is_some_and(|p| self.others_since(p)))
+    /// Whether another thread's episode or release since `planned` landed
+    /// `root`, or may have, its slots being evicted.
+    #[cold]
+    #[inline(never)]
+    fn root_reached(&self, planned: Planned, root: NodeId) -> bool {
+        let log = self.episode_log.read();
+        let reached = |released: bool, since: u32| {
+            log.others_since(released, since)
+                .is_none_or(|slots| slots.contains(&root.0))
+        };
+        reached(false, planned.all as u32) || reached(true, (planned.all / RELEASED) as u32)
     }
 
     #[cold]
@@ -4731,7 +4734,7 @@ impl<C: Cells> Runtime<C> {
                     // The thread waited on ran the node and left it New with
                     // the deps it read, which a later read expands first.
                     if seen != Seen::Unwalked
-                        && self.landed_since_plan(spins, walked, planned)
+                        && spins != 0
                         && g0.is_none_or(|g| g == node.generation())
                         && !node.unrun()
                     {
@@ -4744,7 +4747,7 @@ impl<C: Cells> Runtime<C> {
                 // The generation check below would end a recycled root.
                 NodeState::Dirty
                     if seen != Seen::Unwalked
-                        && self.landed_since_plan(spins, walked, planned)
+                        && spins != 0
                         && g0.is_none_or(|g| g == node.generation())
                         // A claim released unrun leaves its thread's read
                         // going on, which may still come after this one.
@@ -4885,6 +4888,19 @@ impl<C: Cells> Runtime<C> {
                 if self.replan(p) {
                     self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Replan;
+                }
+            }
+            // No entry check covers the root, so its claim checks for
+            // another thread's landing of it since the plan, whose deps a
+            // read after that landing expands first.
+            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED && !walked) {
+                if seen != Seen::Unwalked
+                    && !node.unrun()
+                    && self.others_since(p)
+                    && self.root_reached(p, id)
+                {
+                    self.unclaim_unrun(node, claimed_dirty);
+                    return Computed::Revisit;
                 }
             }
 
