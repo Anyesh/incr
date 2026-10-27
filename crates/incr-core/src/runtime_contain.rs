@@ -710,22 +710,22 @@ impl<C: Cells> Runtime<C> {
                 notes.push((id.0, generation));
             }
             self.failed_past.fetch_or(past_bit(dep.0), Relaxed);
-            self.scan_below(&mut t, dep, &past);
+            self.scan_below(&mut t, dep);
         }
     }
 
-    /// Records, once per node until a take passes it, the Dirty deps below
-    /// `dep` with the nodes that read them. A node scanned before keeps the
-    /// deps it had: its deps change only by a run, after a set below it
-    /// that a take on its way up ended.
-    fn scan_below(&self, t: &mut Tickets, dep: NodeId, past: &impl Fn(NodeId) -> bool) {
+    /// Records, once per node until a take passes it, the deps below `dep`
+    /// a walk may stop at with the nodes that read them. A node scanned
+    /// before keeps the deps it had: its deps change only by a run, after a
+    /// set below it that a take on its way up ended.
+    fn scan_below(&self, t: &mut Tickets, dep: NodeId) {
         let mut stack = vec![dep];
         while let Some(node) = stack.pop() {
             if !t.scanned.insert(node.0) {
                 continue;
             }
             self.nodes.get(node.0).for_each_dep(|below| {
-                if past(below) {
+                if self.stops_walks(below) {
                     #[cfg(test)]
                     self.past_note_work.fetch_add(1, Relaxed);
                     let above = t.above.entry(below.0).or_default();
@@ -755,8 +755,16 @@ impl<C: Cells> Runtime<C> {
     fn unscan(&self, id: u32) {
         let mut t = self.tickets.write();
         if t.scanned.remove(&id) {
-            self.scan_below(&mut t, NodeId(id), &|d| self.left_past(d));
+            self.scan_below(&mut t, NodeId(id));
         }
+    }
+
+    /// A node below a noted dep that a later walk may stop at: Dirty, or
+    /// still Computing, which a budget's unwind lands Dirty before the
+    /// unbounded run's landing does, so the scans of both agree (0x9593).
+    fn stops_walks(&self, dep: NodeId) -> bool {
+        state::load::<C>(self.nodes.get(dep.0).state_cell()) == NodeState::Computing
+            || self.left_past(dep)
     }
 
     /// Recounts the bits only while few slots are noted, so a take stays
