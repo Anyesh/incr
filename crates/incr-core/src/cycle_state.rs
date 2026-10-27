@@ -781,6 +781,14 @@ impl HeldMap {
             .is_some()
     }
 
+    /// Whether a frame at or above `from` owns a claim of `rt`.
+    pub(crate) fn any_owned_from(&self, rt: RuntimeId, from: u32) -> bool {
+        self.by_owner
+            .range(Self::span(rt, from, u32::MAX, 0, u64::MAX))
+            .next()
+            .is_some()
+    }
+
     pub(crate) fn owner(&self, g: u64) -> &Owner {
         &self.groups[&g].owner
     }
