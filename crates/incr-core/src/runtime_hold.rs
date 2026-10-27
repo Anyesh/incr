@@ -782,7 +782,10 @@ impl<C: Cells> Runtime<C> {
                 self.ticket_mark(),
             )
         });
-        let landed = self.land_now(id, node, target, e.flagged, e.unrun);
+        // Publication ends the entry whose read released it unrun, so no
+        // run of that read is still to come: a waiter takes it as a landing.
+        node.set_unrun(false);
+        let landed = self.land_marked(id, node, target, e.flagged, e.unrun);
         *stopped = None;
         // A set flagged the held Failed landing, as `land_failed` handles at
         // an unheld one.

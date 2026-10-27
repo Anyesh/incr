@@ -3992,7 +3992,7 @@ impl<C: Cells> Runtime<C> {
                     visit,
                     Some(generation),
                     !is_root,
-                    (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
+                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur)))
                         .then_some(planned),
                     seen,
                 );
@@ -4002,6 +4002,7 @@ impl<C: Cells> Runtime<C> {
                     revisited.push(cur);
                     if is_root {
                         walk.restart();
+                        planned = self.planned();
                     }
                     walk.revisit(cur, generation);
                     continue;
@@ -4349,8 +4350,23 @@ impl<C: Cells> Runtime<C> {
         if *FORCE_REPLAN || FORCE_REPLAN_HERE.with(std::cell::Cell::get) {
             return true;
         }
+        self.others_since(planned)
+    }
+
+    #[inline(always)]
+    fn others_since(&self, planned: Planned) -> bool {
         let all = C::u64_load_acquire(&self.episodes_landed);
         all != planned.all && self.others_landed(planned, all)
+    }
+
+    /// Whether another thread may have landed `compute_one`'s node since
+    /// the walk planned it: a claim wait ended, or, for the root, whose
+    /// claim no entry check covers, an episode landed or held claims were
+    /// released since the plan. A walk's later read of such a landing
+    /// expands the deps it left first.
+    #[inline(always)]
+    fn landed_since_plan(&self, spins: u32, walked: bool, planned: Option<Planned>) -> bool {
+        spins != 0 || (!walked && planned.is_some_and(|p| self.others_since(p)))
     }
 
     #[cold]
@@ -4604,8 +4620,8 @@ impl<C: Cells> Runtime<C> {
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
     ///
-    /// `planned` is what a walk entry under `Shared` was planned under, and
-    /// `seen` what the walk's visit found of an untainted entry.
+    /// `planned` is what a walk's entry or root under `Shared` was planned
+    /// under, and `seen` what the walk's visit found of an untainted entry.
     #[inline(always)]
     fn compute_one<const MODE: u8>(
         &self,
@@ -4715,7 +4731,7 @@ impl<C: Cells> Runtime<C> {
                     // The thread waited on ran the node and left it New with
                     // the deps it read, which a later read expands first.
                     if seen != Seen::Unwalked
-                        && spins != 0
+                        && self.landed_since_plan(spins, walked, planned)
                         && g0.is_none_or(|g| g == node.generation())
                         && !node.unrun()
                     {
@@ -4728,7 +4744,7 @@ impl<C: Cells> Runtime<C> {
                 // The generation check below would end a recycled root.
                 NodeState::Dirty
                     if seen != Seen::Unwalked
-                        && spins != 0
+                        && self.landed_since_plan(spins, walked, planned)
                         && g0.is_none_or(|g| g == node.generation())
                         // A claim released unrun leaves its thread's read
                         // going on, which may still come after this one.
@@ -4864,7 +4880,7 @@ impl<C: Cells> Runtime<C> {
             // bumped first: the episode may have landed Clean a node this
             // plan reaches the node through, which a walk planned now
             // skips. A claim not ordered after an episode may run before it.
-            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
+            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED && walked) {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
                     self.unclaim_unrun(node, claimed_dirty);
@@ -6093,6 +6109,19 @@ impl<C: Cells> Runtime<C> {
         unrun: bool,
     ) -> NodeState {
         node.set_unrun(unrun);
+        self.land_marked(id, node, target, flagged, unrun)
+    }
+
+    /// [`Self::land_now`] with the node's unrun mark already set.
+    #[inline(always)]
+    fn land_marked(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
         if !C::SINGLE_THREADED && unrun {
             reserve::note((self.runtime_id, id.0), node.generation());
         }
