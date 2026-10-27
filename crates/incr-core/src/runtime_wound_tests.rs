@@ -317,7 +317,7 @@ fn older_threads_uncaught_cycle_stands(budget: Option<u32>) {
         );
     }
     assert_eq!(g.rt.get(q), 4);
-    assert_wounded();
+    assert_wounded(g.rt.runtime_id);
     g.rt.assert_invariant_i();
 }
 
