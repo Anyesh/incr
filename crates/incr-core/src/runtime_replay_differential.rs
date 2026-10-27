@@ -6006,6 +6006,133 @@ fn two_thread_waiter_revisits_a_release_published_at_its_reads_end() {
     .assert_clean();
 }
 
+/// 0xb0939's `after` order with a third reader: once op 3 published 1 New
+/// with its deps, a third thread's `TryGet(2)` claims 1 in its walk, and a
+/// fourth thread lands a cycle episode of its own queries before the
+/// claim's episode check, so the claim goes back unrun. Op 4, whose plan of root 1
+/// predates op 3's publication, claims 1 only after that give-back, and
+/// must still expand 1's deps first: `Cycle([4, 5, 6])`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn three_thread_root_check_survives_a_third_readers_unrun_give_back() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::three_thread_root_check_survives_a_third_readers_unrun_give_back",
+        || {
+            #[derive(Default)]
+            struct Park {
+                published: AtomicBool,
+                parked: AtomicBool,
+                forced: AtomicBool,
+                unclaims: AtomicU32,
+                unrun: AtomicBool,
+                given_back: AtomicBool,
+                claimed: AtomicBool,
+                third: Mutex<Option<std::thread::JoinHandle<()>>>,
+            }
+            let case = gen_case(0xb0939, false, true);
+            let phases = phases(&case, 0xb0939);
+            let overlap = phases.iter().position(|p| p.ops() == [3, 4]).unwrap();
+            assert_eq!(phases[overlap].of(1), Some(4));
+            let patience = std::time::Duration::from_secs(2);
+            quiet(|| {
+                for round in 0..4 {
+                    let park = Arc::new(Park::default());
+                    let rig = |live: &Live<Shared>| {
+                        let (park, world) = (park.clone(), live.world.clone());
+                        let n1 = NodeId(world.handle(0, 1).erased().slot());
+                        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                            if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                                return;
+                            }
+                            let t = std::time::Instant::now();
+                            match TWO_THREAD.with(std::cell::Cell::get) {
+                                Some(0) if p == ParkPoint::HeldPublished(n1) => {
+                                    park.published.store(true, SeqCst);
+                                }
+                                Some(1)
+                                    if p == ParkPoint::BeforeComputeOne(n1)
+                                        && !park.parked.swap(true, SeqCst) =>
+                                {
+                                    until(|| park.published.load(SeqCst) || t.elapsed() > patience);
+                                    let (park2, world) = (park.clone(), world.clone());
+                                    *park.third.lock().unwrap() = Some(std::thread::spawn(move || {
+                                        TWO_THREAD.with(|c| c.set(Some(2)));
+                                        TWO_PHASE.with(|c| c.set(overlap));
+                                        let rt = world.rt(0);
+                                        let _ = catch_unwind(AssertUnwindSafe(|| {
+                                            try_value(rt, world.handle(0, 2))
+                                        }));
+                                        park2.given_back.store(true, SeqCst);
+                                    }));
+                                    until(|| park.given_back.load(SeqCst) || t.elapsed() > patience);
+                                }
+                                Some(1) if p == ParkPoint::BeforeReservationCheck(n1) => {
+                                    park.claimed.store(true, SeqCst);
+                                }
+                                Some(2)
+                                    if p == ParkPoint::AfterWalkClaim(n1)
+                                        && !park.forced.swap(true, SeqCst) =>
+                                {
+                                    park.unclaims.store(
+                                        world.rt(0).unrun_unclaims.load(SeqCst),
+                                        SeqCst,
+                                    );
+                                    std::thread::scope(|s| {
+                                        s.spawn(|| {
+                                            let rt = world.rt(0);
+                                            let ring: Arc<std::sync::OnceLock<[Incr<u64>; 2]>> =
+                                                Arc::new(std::sync::OnceLock::new());
+                                            let member = |k: usize, cycle| {
+                                                let ring = ring.clone();
+                                                rt.create_query_with(
+                                                    move |rt| rt.get(ring.get().unwrap()[1 - k]),
+                                                    crate::cycle::QueryOpts {
+                                                        cycle,
+                                                        ..Default::default()
+                                                    },
+                                                )
+                                            };
+                                            let a = member(0, crate::cycle::CycleStrategy::fallback(|_| 3_u64));
+                                            let b = member(1, crate::cycle::CycleStrategy::None);
+                                            assert!(ring.set([a, b]).is_ok());
+                                            rt.get(a);
+                                        });
+                                    });
+                                }
+                                Some(2) if park.forced.load(SeqCst) && !park.given_back.load(SeqCst) => {
+                                    park.unrun.store(
+                                        world.rt(0).unrun_unclaims.load(SeqCst)
+                                            > park.unclaims.load(SeqCst),
+                                        SeqCst,
+                                    );
+                                    park.given_back.store(true, SeqCst);
+                                    until(|| park.claimed.load(SeqCst) || t.elapsed() > patience);
+                                }
+                                _ => {}
+                            }
+                        });
+                        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                    };
+                    // The third reader must end before run_two_until drops the runtimes.
+                    let got = run_two_until(&case, &phases, None, 0, &rig, &|p, _, _| {
+                        if let Some(third) = park.third.lock().unwrap().take() {
+                            third.join().unwrap();
+                        }
+                        p == overlap
+                    });
+                    let at = format!("round {round}");
+                    assert!(park.parked.load(SeqCst), "{at}: op 4 never reached 1");
+                    assert!(park.published.load(SeqCst), "{at}: op 3 never published 1");
+                    assert!(park.forced.load(SeqCst), "{at}: the third reader never claimed 1 in its walk");
+                    assert!(park.unrun.load(SeqCst), "{at}: the third reader's claim did not go back unrun");
+                    assert!(park.claimed.load(SeqCst), "{at}: op 4 never claimed 1");
+                    assert_eq!(got[4].0, Out::Cycle(vec![4, 5, 6]), "{at}");
+                }
+            });
+        },
+    )
+    .assert_clean();
+}
 /// 0x329f unbounded: op 1's `TryGet(4)` returned 1 where every order
 /// raises the cycle through 4, in about one run in ten under load, until
 /// what catches a cycle closed on this thread's stack was held.
