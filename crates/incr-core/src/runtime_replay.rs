@@ -11,6 +11,7 @@ use crate::changes::{self, Count};
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::{Frame, Placement};
+use crate::hold;
 use crate::locks::Lock;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::reserve;
@@ -453,6 +454,7 @@ impl<C: Cells> Runtime<C> {
         let unchanged = !attempt.first
             && attempt.verify_rev == attempt.stamp_rev
             && match catch_unwind(AssertUnwindSafe(|| {
+                let _user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
                 self.arenas
                     .erased(node.type_tag())
                     .equals_erased(node.arena_slot(), &*value)
@@ -2792,13 +2794,6 @@ impl<C: Cells> Runtime<C> {
             drop_payloads(made.into_iter().map(|m| m.1));
             return None;
         }
-        // A landing this thread holds stays Computing to the exit, which a
-        // rerun's raw release would publish early; a set's flip can leave
-        // the record of such a node until it forgets it.
-        if crate::hold::holds(state::cell_key::<C>(node.state_cell())) {
-            drop_payloads(made.into_iter().map(|m| m.1));
-            return None;
-        }
         // Another thread's rerun of the node holds it only for that run,
         // which never waits, so this waits it out. The claim is noted first,
         // so a rerun that finds the node Computing sees it.
@@ -2813,6 +2808,13 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Computing,
             );
             if moved.is_ok() {
+                // The owner reclaims its own held landing with the word
+                // still Computing; no other thread may take a held one.
+                debug_assert!(
+                    !node.held_mark()
+                        || crate::hold::holds(state::cell_key::<C>(node.state_cell())),
+                    "incr-core: a held landing's word left Computing before its publication"
+                );
                 replay::regen_running(self.runtime_id, id.0, true);
             }
             drop(t);
@@ -2871,8 +2873,16 @@ impl<C: Cells> Runtime<C> {
         }
         let mut flipped = true;
         let t = self.tickets.read();
-        let back =
-            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed);
+        let cell = state::cell_key::<C>(node.state_cell());
+        // The owner claimed its own held Failed landing back from the view,
+        // its word Computing throughout: the entry stays as it was, to
+        // publish with the attempt.
+        let back = if !C::SINGLE_THREADED && hold::holds(cell) {
+            hold::unpin(cell);
+            Ok(())
+        } else {
+            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed)
+        };
         if back.is_ok() {
             replay::regen_running(self.runtime_id, id.0, false);
         }
@@ -5462,7 +5472,9 @@ impl<C: Cells> Runtime<C> {
             }
         };
         if cycle_state::wounded() && !std::thread::panicking() {
+            let user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
             drop(payload);
+            drop(user);
             self.raise_wound();
         }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));

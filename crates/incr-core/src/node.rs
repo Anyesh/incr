@@ -437,6 +437,12 @@ impl<C: Cells> NodeData<C> {
         C::u64_fetch_max(&self.changed_at, rev);
     }
 
+    /// Whether the query keeps a memo, for whichever revision.
+    #[inline(always)]
+    pub(crate) fn keeps_memo(&self) -> bool {
+        C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0
+    }
+
     /// Whether the query, loaded Dirty, holds a memo for the revision
     /// `revision` loads, which only a memo's node loads.
     #[inline(always)]

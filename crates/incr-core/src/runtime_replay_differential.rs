@@ -5102,6 +5102,7 @@ fn walk_listing_passes_an_earlier_reader_its_user_code_joins() {
                 let out = live.apply(&Op::Get(3));
                 *b_out.lock().unwrap() = Some(out);
             });
+            let _free = FreeParked(&released);
             until(|| parked.load(SeqCst) || b_read.is_finished());
             assert!(parked.load(SeqCst), "B returned before it waited");
             let a = s.spawn(|| {
@@ -5286,6 +5287,7 @@ fn read_of_a_node_listed_through_a_peers_closure() {
                 ENTERED.with(|e| e.borrow_mut().take());
                 a
             });
+            let _free = FreeParked(&released);
             until(|| parked.load(SeqCst) || a.is_finished());
             assert!(parked.load(SeqCst), "op 3 entered node 1 once");
             assert!(
@@ -5555,6 +5557,24 @@ fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
     });
 }
 
+/// Seed 0x366149ed's op 7, `Get2(3, false)`, cross, at a budget of 1:
+/// node 19's held Failed landing read 4, which the budget's unrun
+/// releases left Dirty with no set since. Counted moved, it lowered 19
+/// and six Failed landings reading it to Dirty, and a read of one, 9,
+/// verified it back to its old value, and the replay that followed ran
+/// 19 down the branch that reads 1, which the unbounded run never takes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_held_failed_reader_of_a_dep_a_budget_left_dirty_matches_the_unbounded_run() {
+    let mut case = gen_case(0x3661_49ed, true, false);
+    case.ops.truncate(8);
+    assert!(matches!(case.ops[7], Op::Get2(3, false)));
+    quiet(|| {
+        differential::<Local>(&case, 0x3661_49ed);
+        differential::<Shared>(&case, 0x3661_49ed);
+    });
+}
+
 /// Seed 0x66a, unbounded: a released claim's later finished run published
 /// deps without dropping its released entry, so its kept count outlived
 /// the list it counted. [`Live::assert_invariants`] finds an entry
@@ -5613,6 +5633,17 @@ fn until(done: impl Fn() -> bool) {
     while !done() {
         assert!(start.elapsed().as_secs() < 20, "the schedule stalled");
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Sets its flag when dropped, so a forced schedule's failed assert frees
+/// the thread parked on the flag and the scope's join returns the failure
+/// instead of hanging.
+struct FreeParked<'a>(&'a AtomicBool);
+
+impl Drop for FreeParked<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, SeqCst);
     }
 }
 
