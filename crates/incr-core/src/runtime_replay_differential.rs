@@ -5062,6 +5062,7 @@ fn walk_listing_passes_an_earlier_reader_its_user_code_joins() {
                 let out = live.apply(&Op::Get(3));
                 *b_out.lock().unwrap() = Some(out);
             });
+            let _free = FreeParked(&released);
             until(|| parked.load(SeqCst) || b_read.is_finished());
             assert!(parked.load(SeqCst), "B returned before it waited");
             let a = s.spawn(|| {
@@ -5246,6 +5247,7 @@ fn read_of_a_node_listed_through_a_peers_closure() {
                 ENTERED.with(|e| e.borrow_mut().take());
                 a
             });
+            let _free = FreeParked(&released);
             until(|| parked.load(SeqCst) || a.is_finished());
             assert!(parked.load(SeqCst), "op 3 entered node 1 once");
             assert!(
@@ -5591,6 +5593,17 @@ fn until(done: impl Fn() -> bool) {
     while !done() {
         assert!(start.elapsed().as_secs() < 20, "the schedule stalled");
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Sets its flag when dropped, so a forced schedule's failed assert frees
+/// the thread parked on the flag and the scope's join returns the failure
+/// instead of hanging.
+struct FreeParked<'a>(&'a AtomicBool);
+
+impl Drop for FreeParked<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, SeqCst);
     }
 }
 
