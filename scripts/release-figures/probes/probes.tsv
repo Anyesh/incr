@@ -8,4 +8,4 @@ spec_foreign_scale	main	Under `Shared` with a frame budget, a query rerun specul
 caught_cycle_rerun	main	A query whose closure catches a cycle can rerun that cycle on every read
 grid_memory	none	`GridTable`: a node table for `(sheet, row, column)` keys	tree
 memory_ceiling	none	An input-query pair takes 250 bytes	tree
-failed_fan_in	main	A read through many queries that each read the same Failed query takes much longer than on the base
+failed_fan_in	main	A query that catches the panics of many readers of one Failed query reruns every reader after a `set`
