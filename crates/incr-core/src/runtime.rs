@@ -6379,6 +6379,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
         }
+        self.deps_installed(id.0);
         // The union keeps the old deps as its prefix.
         let kept = inner
             .released_deps

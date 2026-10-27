@@ -675,18 +675,21 @@ impl<C: Cells> Runtime<C> {
     /// Speculative landings are noted too: the take checks the node.
     #[inline(always)]
     pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
-        let past = |dep: NodeId| {
-            let cell = self.nodes.get(dep.0).state_cell();
-            let raw = state::load::<C>(cell);
-            raw == NodeState::ComputingDirty
-                || matches!(
-                    self.seen_quietly(cell, raw),
-                    NodeState::Dirty | NodeState::ComputingDirty
-                )
-        };
+        let past = |dep: NodeId| self.left_past(dep);
         if deps.iter().any(|&(d, _)| past(d)) {
             self.note_past(id, generation, deps, past);
         }
+    }
+
+    #[inline(always)]
+    fn left_past(&self, dep: NodeId) -> bool {
+        let cell = self.nodes.get(dep.0).state_cell();
+        let raw = state::load::<C>(cell);
+        raw == NodeState::ComputingDirty
+            || matches!(
+                self.seen_quietly(cell, raw),
+                NodeState::Dirty | NodeState::ComputingDirty
+            )
     }
 
     #[cold]
@@ -733,6 +736,26 @@ impl<C: Cells> Runtime<C> {
                     stack.push(below);
                 }
             });
+        }
+    }
+
+    /// `id` installed a new dep list: if it was scanned, its Dirty deps are
+    /// scanned again, as `above` may lack its new ones and the notes above
+    /// it stand (a closure that reads by run count reruns a memo with no
+    /// set and no take).
+    #[inline(always)]
+    pub(super) fn deps_installed(&self, id: u32) {
+        if self.failed_past.load(Relaxed) & past_bit(id) != 0 {
+            self.unscan(id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unscan(&self, id: u32) {
+        let mut t = self.tickets.write();
+        if t.scanned.remove(&id) {
+            self.scan_below(&mut t, NodeId(id), &|d| self.left_past(d));
         }
     }
 
