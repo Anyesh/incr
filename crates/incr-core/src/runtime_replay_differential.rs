@@ -4590,6 +4590,21 @@ fn two_thread_doomed_frame_held_value_seeds() {
     });
 }
 
+/// 0x1965, two threads with a second runtime: op 0's `Get(0)` panics with
+/// the cycle [14, 15] where every order gives a value, after the other
+/// thread's wound left node 15 Dirty with the deps of a run claimed from
+/// New, which a cycle closed under its virtual frame had not held.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_doomed_frame_retracted_member_seeds() {
+    let case = gen_case(0x1965, true, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x1965);
+        }
+    });
+}
+
 /// Two-thread seeds with a second runtime, each over several schedules.
 /// 0x43c2 and 0x4c08, with no cycles, compare with the unbounded run: a
 /// concurrent `Get2` panicked "dependency cycle" before a doomed frame's

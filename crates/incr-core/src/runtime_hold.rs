@@ -580,6 +580,35 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// [`Self::hold_closed_cycle`] of a cycle closed at position `p`. A
+    /// member at or above `p` that has only a virtual frame has no frame
+    /// for a pop to pass the hold to, so its member record takes it, and
+    /// its stand-in landing opens its entry before the write.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn hold_closed_cycle_at(&self, p: u32) {
+        self.hold_closed_cycle();
+        let rt = self.runtime_id;
+        let members: Vec<u32> = crate::replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| x.stacked())
+                .filter(|v| v.cidx >= p)
+                .map(|v| v.node)
+                .collect()
+        });
+        if members.is_empty() {
+            return;
+        }
+        cycle_state::with_held(|h| {
+            for slot in members {
+                if let Some(e) = h.get_mut(&(rt, slot)) {
+                    e.hold = true;
+                }
+            }
+        });
+    }
+
     /// The reading frame's landing depends on state this attempt has not
     /// published: it is held, and its runtime tainted.
     fn taint_reader(&self) {

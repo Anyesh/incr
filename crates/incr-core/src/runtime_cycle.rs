@@ -786,7 +786,7 @@ impl<C: Cells> Runtime<C> {
             .filter(|_| !self.foreign_frame_above(p));
         let Some((ctl, at)) = active else {
             if !C::SINGLE_THREADED {
-                self.hold_closed_cycle();
+                self.hold_closed_cycle_at(p);
             }
             return Some(Err(self.cycle_at(p)));
         };
@@ -833,7 +833,7 @@ impl<C: Cells> Runtime<C> {
         if on_stack.is_some() {
             ctl.lower(p);
             if !C::SINGLE_THREADED {
-                self.hold_closed_cycle();
+                self.hold_closed_cycle_at(p);
             }
             return Some(Err(self.cycle_at(p)));
         }
