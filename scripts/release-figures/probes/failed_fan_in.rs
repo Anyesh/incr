@@ -21,6 +21,8 @@ struct Read {
     ms: f64,
     chain_runs: u64,
     reader_runs: u64,
+    /// Whether the read of the top query panicked.
+    panicked: bool,
 }
 
 /// The three reads of a fan of `k`.
@@ -62,28 +64,24 @@ fn failed_fan_in<C: Cells>(k: usize) -> [Read; 3] {
             0
         })
     };
-    let read = |f: &dyn Fn()| {
+    let read = |f: &dyn Fn() -> bool| {
         chain_runs.store(0, Relaxed);
         reader_runs.store(0, Relaxed);
         let t = Instant::now();
-        f();
+        let panicked = f();
         Read {
             ms: ms(t),
+            panicked,
             chain_runs: chain_runs.load(Relaxed),
             reader_runs: reader_runs.load(Relaxed),
         }
     };
-    let clean = read(&|| {
-        rt.get(top);
-    });
+    let top_read = || catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err();
+    let clean = read(&top_read);
     rt.set(fail, 1);
-    let after_fail = read(&|| {
-        let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
-    });
+    let after_fail = read(&top_read);
     rt.set(input, 1);
-    let after_input = read(&|| {
-        let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
-    });
+    let after_input = read(&top_read);
     [clean, after_fail, after_input]
 }
 
@@ -102,11 +100,12 @@ fn failed_fan_in_probe() {
                 ] {
                     for (name, r) in ["clean", "after_fail", "after_input"].iter().zip(&reads) {
                         figs += &format!(
-                            " {mode}_{name}_ms={:.2} {mode}_{name}_us_per_reader={:.2} {mode}_{name}_chain_runs={} {mode}_{name}_reader_runs={}",
+                            " {mode}_{name}_ms={:.2} {mode}_{name}_us_per_reader={:.2} {mode}_{name}_chain_runs={} {mode}_{name}_reader_runs={} {mode}_{name}_top_panicked={}",
                             r.ms,
                             r.ms * 1e3 / k as f64,
                             r.chain_runs,
-                            r.reader_runs
+                            r.reader_runs,
+                            r.panicked
                         );
                     }
                 }
