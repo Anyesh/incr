@@ -2245,7 +2245,7 @@ fn shared_group_leave_in_an_attempt_retracts_with_its_record() {
         &mut bag,
     );
     rt.force_state_for_test(m, NodeState::Computing);
-    rt.release_group_claims(&[m.slot()], true);
+    rt.release_group_claims(&[m.slot()], true, &mut bag);
     rt.retract_held();
     bag.drain(&rt);
 

@@ -2805,7 +2805,7 @@ impl<C: Cells> Runtime<C> {
         payload: Payload,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
+        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false, bag);
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
@@ -2814,17 +2814,22 @@ impl<C: Cells> Runtime<C> {
     /// Dirty as if never claimed: no member ran, so another thread's read
     /// of one must make the decision a read before the claims would have
     /// made. They stay in their group unless `leave`, when they land out
-    /// of it, unverified (see `leave_group`).
+    /// of it, unverified (see `leave_group`), held if this thread holds
+    /// landings: a retraction puts the record back with the state.
     pub(super) fn release_group_claims<'a>(
         &self,
         claimed: impl IntoIterator<Item = &'a u32>,
         leave: bool,
+        bag: &mut Deferred<C>,
     ) {
         let rt = self.runtime_id;
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
             let (node, flags) = self.nodes.get_with_flags(c);
             if leave {
+                if !C::SINGLE_THREADED && hold::active() {
+                    self.open_hold(NodeId(c), node, false, None, bag);
+                }
                 self.land_single_as(
                     NodeId(c),
                     node,
@@ -2905,6 +2910,7 @@ impl<C: Cells> Runtime<C> {
                 self.release_group_claims(
                     &claimed,
                     !took && !virtual_member && seen != NodeState::Dirty && !is_computing(seen),
+                    bag,
                 );
                 return GroupEnd::Ordinary;
             }
@@ -2973,7 +2979,7 @@ impl<C: Cells> Runtime<C> {
             // A tainted node never runs: release the group, and leave `x`
             // Dirty for the closure that still reads it, whose read the
             // taint memo makes compute `x` alone.
-            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
+            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false, bag);
             self.memoize(x, owner);
             return GroupEnd::Done(Computed::Done);
         }
