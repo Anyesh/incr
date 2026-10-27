@@ -130,9 +130,10 @@ pub fn try_transition<C: Cells>(
     }
 }
 
-/// A claim of a node this thread's attempt holds, from the state the
-/// view shows it in: the owner takes its own landing back to rerun or
-/// reverify it, and the node's word stays `Computing` throughout.
+/// A transition of a node this thread's attempt holds, from the state the
+/// view shows it in, while the node's word stays `Computing`: the owner
+/// claims its own landing back to rerun or reverify it, or its set's walk
+/// moves the landing as it would a published one.
 #[cold]
 #[inline(never)]
 fn claim_own_held<C: Cells>(
@@ -142,11 +143,23 @@ fn claim_own_held<C: Cells>(
     raw: u8,
 ) -> Result<(), NodeState> {
     let seen = NodeState::from_u8(raw);
-    if new == NodeState::Computing
-        && matches!(seen, NodeState::Computing | NodeState::ComputingDirty)
-        && crate::hold::reclaim(cell_key::<C>(cell), expected)
-    {
-        return Ok(());
+    if matches!(seen, NodeState::Computing | NodeState::ComputingDirty) {
+        let key = cell_key::<C>(cell);
+        let own = match new {
+            NodeState::Computing => crate::hold::reclaim(key, expected, seen),
+            _ => crate::hold::flip(key, expected, new, seen),
+        };
+        if own {
+            // The claim's run reads after the set that flagged the word.
+            if new == NodeState::Computing && seen == NodeState::ComputingDirty {
+                let cleared = C::state_try_transition(cell, raw, NodeState::Computing.as_u8());
+                debug_assert!(
+                    cleared.is_ok(),
+                    "incr-core: only the owner moves a held word"
+                );
+            }
+            return Ok(());
+        }
     }
     Err(seen)
 }

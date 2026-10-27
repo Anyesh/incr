@@ -89,7 +89,33 @@ pub(crate) struct Held {
     /// for publication, which a delete of one meanwhile turns back
     /// ([`keep_read`]).
     pub(crate) read: Vec<(NodeId, u32)>,
+    /// For a Failed landing, the walked watermark its run read at: a
+    /// Failed landing raises no `verified_at` to compare its new deps to.
+    pub(crate) failed_at: Option<u64>,
     pub(crate) undo: Undo,
+}
+
+impl Held {
+    /// Failed if a landing in the attempt was Failed, else the target: the
+    /// record and tickets of that landing go with the entry even after a
+    /// set's flip or a rerun moved its target.
+    pub(crate) fn landed(&self) -> NodeState {
+        if self.failed_at.is_some() {
+            NodeState::Failed
+        } else {
+            self.target
+        }
+    }
+
+    /// The state the landing publishes as over the node's word `raw`: a
+    /// set that flagged the word since lands it `flagged`.
+    fn shown(&self, raw: NodeState) -> NodeState {
+        if raw == NodeState::ComputingDirty {
+            self.flagged
+        } else {
+            self.target
+        }
+    }
 }
 
 #[derive(Default)]
@@ -325,19 +351,19 @@ pub(crate) fn active() -> bool {
 #[cold]
 #[inline(never)]
 /// [`view`] for engine bookkeeping that is no read: it marks nothing.
-pub(crate) fn peek(cell: usize) -> Option<NodeState> {
+pub(crate) fn peek(cell: usize, raw: NodeState) -> Option<NodeState> {
     if !active() {
         return None;
     }
-    with(|h| h.get(cell).filter(|e| !e.reclaimed).map(|e| e.target))
+    with(|h| h.get(cell).filter(|e| !e.reclaimed).map(|e| e.shown(raw)))
 }
 
-pub(crate) fn view(cell: usize) -> Option<NodeState> {
+pub(crate) fn view(cell: usize, raw: NodeState) -> Option<NodeState> {
     if !active() {
         return None;
     }
     with(|h| {
-        let t = h.get(cell).filter(|e| !e.reclaimed).map(|e| e.target)?;
+        let t = h.get(cell).filter(|e| !e.reclaimed).map(|e| e.shown(raw))?;
         h.consulted = true;
         h.looks += 1;
         Some(t)
@@ -348,18 +374,63 @@ pub(crate) fn view(cell: usize) -> Option<NodeState> {
 /// target the view shows it.
 #[cold]
 #[inline(never)]
-pub(crate) fn reclaim(cell: usize, expected: NodeState) -> bool {
+pub(crate) fn reclaim(cell: usize, expected: NodeState, raw: NodeState) -> bool {
     if !active() {
         return false;
     }
     with(|h| {
-        let Some(e) = h.get(cell).filter(|e| !e.reclaimed && e.target == expected) else {
+        let Some(e) = h
+            .get(cell)
+            .filter(|e| !e.reclaimed && e.shown(raw) == expected)
+        else {
             return false;
         };
         e.reclaimed = true;
         h.looks += 1;
         true
     })
+}
+
+/// The reverse edges of `rt`'s held landings that wait for publication
+/// ([`keep_read`]), as `(dep, reader)` slots.
+#[cold]
+#[inline(never)]
+pub(crate) fn pending_edges(rt: RuntimeId) -> Vec<(u32, u32)> {
+    with(|h| {
+        h.entries
+            .iter()
+            .flatten()
+            .filter(|e| e.rt == rt)
+            .flat_map(|e| e.read.iter().map(|&(d, _)| (d.0, e.slot)))
+            .collect()
+    })
+}
+
+/// A set's walk moves the owner's held node from `expected`, the state
+/// the view shows, to `new`, as it would move the published landing:
+/// Clean, Failed or Dirty to Dirty, a visit of New, Cyclic to New.
+#[cold]
+#[inline(never)]
+pub(crate) fn flip(cell: usize, expected: NodeState, new: NodeState, raw: NodeState) -> bool {
+    use NodeState::{Clean, Cyclic, Dirty, Failed, New};
+    if !matches!(
+        (expected, new),
+        (Clean | Failed | Dirty, Dirty) | (New, New) | (Cyclic, New)
+    ) {
+        return false;
+    }
+    active()
+        && with(|h| {
+            let Some(e) = h
+                .get(cell)
+                .filter(|e| !e.reclaimed && e.shown(raw) == expected)
+            else {
+                return false;
+            };
+            e.target = new;
+            e.flagged = new;
+            true
+        })
 }
 
 /// A delete of the owner's held node: [`view`], and the entry is marked
@@ -479,6 +550,7 @@ pub(crate) fn open_even_taken(
             children: None,
             trace: Vec::new(),
             read: Vec::new(),
+            failed_at: None,
             undo: Undo {
                 first: cut.as_ref().map_or(first, |c| c.lands_new),
                 value: kept,
@@ -535,6 +607,15 @@ pub(crate) fn keep_read(cell: usize, installed: impl Iterator<Item = (NodeId, u3
                 let skip: Vec<NodeId> = skip.collect();
                 e.read.extend(installed.filter(|(d, _)| !skip.contains(d)));
             }
+        }
+    });
+}
+
+/// The walked watermark a held node's Failed landing read at.
+pub(crate) fn keep_failed_at(cell: usize, rev: u64) {
+    with(|h| {
+        if let Some(e) = h.get(cell) {
+            e.failed_at = Some(rev);
         }
     });
 }
@@ -857,7 +938,7 @@ pub(crate) fn take_visits() -> usize {
 }
 
 /// How many nodes this thread holds now.
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 pub(crate) fn held_count() -> usize {
     with(|h| h.by_cell.len())
 }

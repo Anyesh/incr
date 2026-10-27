@@ -11,6 +11,7 @@ use crate::changes::{self, Count};
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::{Frame, Placement};
+use crate::hold;
 use crate::locks::Lock;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::reserve;
@@ -453,6 +454,7 @@ impl<C: Cells> Runtime<C> {
         let unchanged = !attempt.first
             && attempt.verify_rev == attempt.stamp_rev
             && match catch_unwind(AssertUnwindSafe(|| {
+                let _user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
                 self.arenas
                     .erased(node.type_tag())
                     .equals_erased(node.arena_slot(), &*value)
@@ -495,6 +497,7 @@ impl<C: Cells> Runtime<C> {
                 foreign,
                 verify_rev: attempt.verify_rev,
                 index,
+                reshapes: ctl.reshapes.get(),
             },
             attempt.stamp_rev,
         );
@@ -518,6 +521,7 @@ impl<C: Cells> Runtime<C> {
     /// it as the unbounded run's verify.
     #[cold]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn stash_verify(
         &self,
         id: NodeId,
@@ -526,6 +530,7 @@ impl<C: Cells> Runtime<C> {
         since: u64,
         stamp_rev: u64,
         verify_rev: u64,
+        reshapes: u64,
     ) -> Computed {
         // A set whose walk was pending at the claim may dirty a dep the
         // scan saw Clean.
@@ -539,6 +544,7 @@ impl<C: Cells> Runtime<C> {
                     foreign: ForeignReads::default(),
                     verify_rev,
                     index: None,
+                    reshapes,
                 },
                 stamp_rev,
             );
@@ -559,10 +565,14 @@ impl<C: Cells> Runtime<C> {
         let revision = self.current_revision();
         let mut s = self.stashes.write();
         s.revision == revision
-            && (s.map.get_mut(&(slot, generation))).is_some_and(|e| match e.get_mut().outcome {
-                Outcome::Verified { since } => self.nodes.get(slot).verified_at() == since,
-                Outcome::Value { unchanged, .. } => unchanged,
-                Outcome::Panic(_) | Outcome::Tried => false,
+            && (s.map.get_mut(&(slot, generation))).is_some_and(|e| {
+                let e = e.get_mut();
+                !self.reshaped_since(e)
+                    && match e.outcome {
+                        Outcome::Verified { since } => self.nodes.get(slot).verified_at() == since,
+                        Outcome::Value { unchanged, .. } => unchanged,
+                        Outcome::Panic(_) | Outcome::Tried => false,
+                    }
             })
     }
 
@@ -573,8 +583,10 @@ impl<C: Cells> Runtime<C> {
         let revision = self.current_revision();
         let mut s = self.stashes.write();
         s.revision == revision
-            && (s.map.get_mut(&(slot, generation)))
-                .is_some_and(|e| matches!(e.get_mut().outcome, Outcome::Verified { .. }))
+            && (s.map.get_mut(&(slot, generation))).is_some_and(|e| {
+                let e = e.get_mut();
+                !self.reshaped_since(e) && matches!(e.outcome, Outcome::Verified { .. })
+            })
     }
 
     /// Node `node`'s deps, each at its current generation.
@@ -602,6 +614,8 @@ impl<C: Cells> Runtime<C> {
     /// lands them. Any dep that is neither Clean at or below the stash's
     /// verify revision nor adoptable fails the nodes above it, which keep
     /// their claims' source states and compute; the root keeps its claim.
+    /// So does any move of `Runtime::reshapes` since the stash's run began,
+    /// since a dep found Clean may have changed with no new revision.
     #[cold]
     #[inline(never)]
     pub(super) fn adopt_stash(
@@ -618,7 +632,7 @@ impl<C: Cells> Runtime<C> {
         }
         // A root's verify is its claim's own, after the walk settled its
         // deps; a taint memo's claim runs the closure, as unbounded.
-        let Some(stash) = self.take_stash(id.0, generation, false) else {
+        let Some(stash) = self.take_stash(id.0, generation, false, false) else {
             return Adopted::No;
         };
         let mut stack = vec![Adopting {
@@ -649,6 +663,9 @@ impl<C: Cells> Runtime<C> {
             }
             let a = stack.pop().expect("incr-core: adoption has a root");
             let root = stack.is_empty();
+            // A delete since the stash's run began may have changed a dep
+            // found Clean above.
+            failed |= self.reshaped_since(&a.stash);
             if !failed && root {
                 if let Outcome::Panic(payload) = a.stash.outcome {
                     return Adopted::Panicked(AdoptedPanic {
@@ -657,10 +674,17 @@ impl<C: Cells> Runtime<C> {
                     });
                 }
             }
-            failed |= !matches!(
-                a.stash.outcome,
-                Outcome::Value { .. } | Outcome::Verified { .. }
-            ) || !a.stash.foreign.adoptable();
+            let foreign_refused = !a.stash.foreign.adoptable();
+            if foreign_refused {
+                // The node relands in this revision, which changes what its
+                // readers' stashes read with no new revision.
+                C::u64_fetch_add(&self.reshapes, 1);
+            }
+            failed |= foreign_refused
+                || !matches!(
+                    a.stash.outcome,
+                    Outcome::Value { .. } | Outcome::Verified { .. }
+                );
             if failed {
                 bag.push_erased(Box::new(a.stash.outcome));
                 if root {
@@ -722,7 +746,7 @@ impl<C: Cells> Runtime<C> {
         if replay::speculative() {
             return;
         }
-        if let Some(stash) = self.take_stash(id.0, generation, false) {
+        if let Some(stash) = self.take_stash(id.0, generation, false, true) {
             self.discard_stashed_children(id, stash.index, bag);
             bag.push_erased(Box::new(stash.outcome));
         }
@@ -755,7 +779,7 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let stash = (node.generation() == generation)
-            .then(|| self.take_stash(id.0, generation, true))
+            .then(|| self.take_stash(id.0, generation, true, false))
             .flatten();
         let Some(stash) = stash else {
             self.land(id, node, source, source);
@@ -955,8 +979,16 @@ impl<C: Cells> Runtime<C> {
         if s.revision != revision {
             return None;
         }
-        let stash = s.map.get_mut(&(handle.slot(), handle.generation()))?;
-        let read = match &stash.get_mut().outcome {
+        let stash = s
+            .map
+            .get_mut(&(handle.slot(), handle.generation()))?
+            .get_mut();
+        let stale = self.reshaped_since(stash);
+        if stale && self.replayable(handle.slot()) {
+            return None;
+        }
+        let read = match &stash.outcome {
+            _ if stale => Err(()),
             Outcome::Value { value, .. } => Ok(Some(std::sync::Arc::clone(value))),
             Outcome::Verified { .. } => Ok(None),
             Outcome::Panic(_) | Outcome::Tried => Err(()),
@@ -1003,6 +1035,7 @@ impl<C: Cells> Runtime<C> {
                 foreign: ForeignReads::default(),
                 verify_rev: attempt.verify_rev,
                 index,
+                reshapes: ctl.reshapes.get(),
             },
             attempt.stamp_rev,
         );
@@ -1051,6 +1084,7 @@ impl<C: Cells> Runtime<C> {
                 foreign: ForeignReads::default(),
                 verify_rev: 0,
                 index: None,
+                reshapes: C::u64_load_acquire(&self.reshapes),
             },
             revision,
         )
@@ -1058,22 +1092,23 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Keeps `stash` for node `slot` at `generation`, for `revision`, the
-    /// one its run claimed in, and says whether the node had no entry. A
-    /// node already stashed keeps its first stash, which speculative reads
-    /// may have returned; a run's stash replaces its own tried mark. A
-    /// stash not kept, because a set ended its revision or the node keeps
-    /// its first, comes back.
+    /// one its run claimed in, and says whether the node had no entry in
+    /// force. A node already stashed keeps its first stash, which
+    /// speculative reads may have returned; a run's stash replaces its own
+    /// tried mark, and any entry from before a delete. A stash not kept,
+    /// because a set ended its revision, a delete came after its claim or
+    /// the node keeps its first, comes back.
     fn stash(
         &self,
         slot: u32,
         generation: u32,
         stash: Stash,
         revision: u64,
-    ) -> Result<bool, Stash> {
+    ) -> Result<bool, Box<Stash>> {
         let (displaced, ended) = {
             let mut s = self.stashes.write();
-            if self.current_revision() != revision {
-                return Err(stash);
+            if self.current_revision() != revision || self.reshaped_since(&stash) {
+                return Err(Box::new(stash));
             }
             self.park(ParkPoint::StashAfterCheck(NodeId(slot)));
             let ended = (s.revision != revision).then(|| std::mem::take(&mut s.map));
@@ -1081,10 +1116,12 @@ impl<C: Cells> Runtime<C> {
             let displaced = match s.map.entry((slot, generation)) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
                     let kept = o.get_mut().get_mut();
-                    if !matches!(kept.outcome, Outcome::Tried) {
-                        return Err(stash);
+                    let stale = self.reshaped_since(kept);
+                    if !stale && !matches!(kept.outcome, Outcome::Tried) {
+                        return Err(Box::new(stash));
                     }
-                    Some(std::mem::replace(kept, stash))
+                    let gone = stale && self.replayable(slot);
+                    Some((std::mem::replace(kept, stash), gone))
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
                     v.insert(Exclusive(stash));
@@ -1094,8 +1131,15 @@ impl<C: Cells> Runtime<C> {
             C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
             (displaced, ended)
         };
-        let vacant = displaced.is_none();
-        drop(displaced);
+        let vacant = displaced.as_ref().is_none_or(|&(_, gone)| gone);
+        if let Some((displaced, _)) = displaced {
+            // The caller's run holds the claim, so `drop_ended` could not
+            // take it to discard the displaced run's children.
+            let mut bag = Deferred::new();
+            self.discard_stashed_children(NodeId(slot), displaced.index, &mut bag);
+            drop(displaced);
+            bag.drain_isolated();
+        }
         if let Some(ended) = ended {
             self.drop_ended(ended);
         }
@@ -1117,7 +1161,7 @@ impl<C: Cells> Runtime<C> {
         };
         let mine = ended.remove(&(slot, generation));
         self.drop_ended(ended);
-        mine.map_or(Ok(vacant), |mine| Err(mine.0))
+        mine.map_or(Ok(vacant), |mine| Err(Box::new(mine.0)))
     }
 
     /// Whether node `slot` at `generation` has a stash this revision, a
@@ -1129,8 +1173,14 @@ impl<C: Cells> Runtime<C> {
         let revision = self.current_revision();
         let mut s = self.stashes.write();
         s.revision == revision
-            && (s.map.get_mut(&(slot, generation)))
-                .is_some_and(|e| tried || !matches!(e.get_mut().outcome, Outcome::Tried))
+            && (s.map.get_mut(&(slot, generation))).is_some_and(|e| {
+                let e = e.get_mut();
+                if self.reshaped_since(e) {
+                    tried && !self.replayable(slot)
+                } else {
+                    tried || !matches!(e.outcome, Outcome::Tried)
+                }
+            })
     }
 
     /// Adds to `counts` the checked reads of the stashes among `deps`: the
@@ -1182,10 +1232,11 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Takes the stash of node `slot` at `generation` for a real run that
-    /// adopts it, a verify's only if `verified`. A Native node's run keeps a
-    /// tried mark in its place for the revision, whether or not the
-    /// adoption lands it.
-    fn take_stash(&self, slot: u32, generation: u32, verified: bool) -> Option<Stash> {
+    /// adopts it, a verify's only if `verified`, and one from before a
+    /// delete only if `stale` (to drop it); a stale one is otherwise
+    /// dropped here. A Native node's run keeps a tried mark in its place
+    /// for the revision, whether or not the adoption lands it.
+    fn take_stash(&self, slot: u32, generation: u32, verified: bool, stale: bool) -> Option<Stash> {
         if C::u32_load_relaxed(&self.stash_count) == 0 {
             return None;
         }
@@ -1196,6 +1247,29 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let entry = s.map.get_mut(&(slot, generation))?.get_mut();
+        if !stale && self.reshaped_since(entry) {
+            let dead = if native {
+                let tried = Stash {
+                    outcome: Outcome::Tried,
+                    deps: Vec::new(),
+                    foreign: ForeignReads::default(),
+                    verify_rev: 0,
+                    index: None,
+                    reshapes: entry.reshapes,
+                };
+                std::mem::replace(entry, tried)
+            } else {
+                let dead = s.map.remove(&(slot, generation))?;
+                C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
+                dead.0
+            };
+            drop(s);
+            let mut bag = Deferred::new();
+            self.discard_stashed_children(NodeId(slot), dead.index, &mut bag);
+            drop(dead);
+            bag.drain_isolated();
+            return None;
+        }
         let verify = matches!(entry.outcome, Outcome::Verified { .. });
         if matches!(entry.outcome, Outcome::Tried) || verify && !verified {
             return None;
@@ -1207,12 +1281,20 @@ impl<C: Cells> Runtime<C> {
                 foreign: ForeignReads::default(),
                 verify_rev: 0,
                 index: None,
+                reshapes: entry.reshapes,
             };
             return Some(std::mem::replace(entry, tried));
         }
         let stash = s.map.remove(&(slot, generation))?;
         C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
         Some(stash.0)
+    }
+
+    /// Whether a node was deleted, or a speculative run read a dead handle,
+    /// since `stash`'s run began: any value it read may differ now.
+    #[inline(always)]
+    fn reshaped_since(&self, stash: &Stash) -> bool {
+        stash.reshapes != C::u64_load_acquire(&self.reshapes)
     }
 
     /// Drops every stash: a revision began, and a stash holds only for the
@@ -2712,13 +2794,6 @@ impl<C: Cells> Runtime<C> {
             drop_payloads(made.into_iter().map(|m| m.1));
             return None;
         }
-        // A landing this thread holds stays Computing to the exit, which a
-        // rerun's raw release would publish early; a set's flip can leave
-        // the record of such a node until it forgets it.
-        if crate::hold::holds(state::cell_key::<C>(node.state_cell())) {
-            drop_payloads(made.into_iter().map(|m| m.1));
-            return None;
-        }
         // Another thread's rerun of the node holds it only for that run,
         // which never waits, so this waits it out. The claim is noted first,
         // so a rerun that finds the node Computing sees it.
@@ -2733,6 +2808,13 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Computing,
             );
             if moved.is_ok() {
+                // The owner reclaims its own held landing with the word
+                // still Computing; no other thread may take a held one.
+                debug_assert!(
+                    !node.held_mark()
+                        || crate::hold::holds(state::cell_key::<C>(node.state_cell())),
+                    "incr-core: a held landing's word left Computing before its publication"
+                );
                 replay::regen_running(self.runtime_id, id.0, true);
             }
             drop(t);
@@ -2791,8 +2873,16 @@ impl<C: Cells> Runtime<C> {
         }
         let mut flipped = true;
         let t = self.tickets.read();
-        let back =
-            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed);
+        let cell = state::cell_key::<C>(node.state_cell());
+        // The owner claimed its own held Failed landing back from the view,
+        // its word Computing throughout: the entry stays as it was, to
+        // publish with the attempt.
+        let back = if !C::SINGLE_THREADED && hold::holds(cell) {
+            hold::unpin(cell);
+            Ok(())
+        } else {
+            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed)
+        };
         if back.is_ok() {
             replay::regen_running(self.runtime_id, id.0, false);
         }
@@ -4024,46 +4114,28 @@ impl<C: Cells> Runtime<C> {
                     .spec
                     .then(|| replay::Speculating::enter(self.runtime_id));
                 catch_unwind(AssertUnwindSafe(|| {
-                    if level == 0 {
+                    let id = NodeId(entry.node);
+                    let visit = match entry.retry {
                         // The target is the walk entry whose compute was
                         // discarded, and the walk has cleaned its deps, so
                         // it computes as that entry would, not as a new
                         // walk's root.
-                        let visit = if entry.retry == Retry::Direct {
-                            Visit::Direct
-                        } else {
-                            visit
-                        };
-                        self.compute_one::<VIRT>(
-                            NodeId(entry.node),
-                            visit,
-                            Some(entry.generation),
-                            entry.walked,
-                            None,
-                            Seen::Unwalked,
-                        )
-                    } else {
-                        let (id, generation) = (NodeId(entry.node), Some(entry.generation));
-                        match entry.retry {
-                            Retry::Walk => self.ensure_clean_virt(id, entry.generation),
-                            Retry::Compute => self.compute_one::<VIRT>(
-                                id,
-                                Visit::Full,
-                                generation,
-                                entry.walked,
-                                None,
-                                Seen::Unwalked,
-                            ),
-                            Retry::Direct => self.compute_one::<VIRT>(
-                                id,
-                                Visit::Direct,
-                                generation,
-                                entry.walked,
-                                None,
-                                Seen::Unwalked,
-                            ),
-                        }
-                    }
+                        Retry::Walk | Retry::Compute if level == 0 => visit,
+                        Retry::Walk => return self.ensure_clean_virt(id, entry.generation),
+                        Retry::Compute => Visit::Full,
+                        Retry::Direct => Visit::Direct,
+                    };
+                    // One call site, so the compute inlines once into this
+                    // frame, which every panic of a replayed run unwinds
+                    // through.
+                    self.compute_one::<VIRT>(
+                        id,
+                        visit,
+                        Some(entry.generation),
+                        entry.walked,
+                        None,
+                        Seen::Unwalked,
+                    )
                 }))
             };
             self.dep_stack.restore_placement(placement);
@@ -5400,7 +5472,9 @@ impl<C: Cells> Runtime<C> {
             }
         };
         if cycle_state::wounded() && !std::thread::panicking() {
+            let user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
             drop(payload);
+            drop(user);
             self.raise_wound();
         }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
@@ -6118,6 +6192,9 @@ pub(super) struct Stash {
     verify_rev: u64,
     /// A creator's child index as its run left it, unlanded.
     index: Option<StashedIndex>,
+    /// `Runtime::reshapes` as its run began. Once the count moves on, the
+    /// stash stands only as a Native node's tried mark.
+    reshapes: u64,
 }
 
 /// A stashed run's Clean reads of other runtimes, with those runtimes'

@@ -1096,6 +1096,63 @@ fn loom_held_episode_wound_retracts_values() {
     });
 }
 
+/// p panics once k is 1 and w reads p; a catches w's panic and then reads
+/// b, while b reads s and then catches w's panic. A reader of a holds the
+/// unwind's landings of p and w and waits on b's claim; a reader of b waits
+/// on that held w. Returns (a, b, p, w) with k set to 1.
+fn held_panic_wait(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let k = rt.create_input(0_u64);
+    let p = rt.create_query(move |rt: &Rt| {
+        let v = rt.get(k);
+        assert!(v != 1, "p boom");
+        v
+    });
+    let w = rt.create_query(move |rt: &Rt| rt.get(p) + 1);
+    let s = rt.create_query(move |rt: &Rt| rt.get(k) * 10);
+    let caught = move |rt: &Rt| {
+        EXPECTING_UNWIND.with(|e| e.set(true));
+        let v = catch_unwind(AssertUnwindSafe(|| rt.get(w))).unwrap_or(0);
+        EXPECTING_UNWIND.with(|e| e.set(false));
+        v
+    };
+    let b = rt.create_query(move |rt: &Rt| rt.get(s) + caught(rt));
+    let a = rt.create_query(move |rt: &Rt| caught(rt) + rt.get(b));
+    assert_eq!((rt.get(a), rt.get(b)), (2, 1));
+    rt.set(k, 1);
+    (a, b, p, w)
+}
+
+/// Whichever reader of [`held_panic_wait`] is wounded, a wound that
+/// overtakes the held landings of a caught panic takes them back before
+/// the other thread plans from them, and nothing waits on them past it:
+/// both reads and the landed states are a serial order's, and neither
+/// thread is left holding or registered.
+#[test]
+fn loom_wound_overtakes_held_panic_landings() {
+    run(|| {
+        let serial = {
+            let rt = Rt::new();
+            let (a, b, p, w) = held_panic_wait(&rt);
+            ((rt.get(a), rt.get(b)), (rt.state_of(p), rt.state_of(w)))
+        };
+        let rt = Arc::new(Rt::new());
+        let (a, b, p, w) = held_panic_wait(&rt);
+        let reads_a = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || (rt.get(a), crate::hold::held_count()))
+        };
+        let read_b = rt.get(b);
+        assert_eq!(crate::hold::held_count(), 0);
+        let (read_a, held_a) = reads_a.join().unwrap();
+        assert_eq!(held_a, 0);
+        assert_eq!(((read_a, read_b), (rt.state_of(p), rt.state_of(w))), serial);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
 /// A (Fallback) and B, where B also reads x, and o, which reads A and
 /// then B. A reader of o lands the episode {A, B} and is still in o when a
 /// setter changes x: the held members publish Dirty if the set came
@@ -2985,7 +3042,7 @@ fn hand_over_races_reclaim() {
         let rt = crate::handle::RuntimeId::allocate();
         hold_one(rt);
         let waiter = spawn_waiter(rt, 4);
-        let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean);
+        let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean, NodeState::Computing);
         let handed = waiter.join().unwrap();
         assert_ne!(reclaimed, handed, "reclaimed {reclaimed}, taken {handed}");
         assert_eq!(crate::hold::holds(HELD_CELL), !handed);

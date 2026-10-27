@@ -44,6 +44,8 @@ pub(crate) type Claim = (RuntimeId, u32);
 
 struct Waiter {
     ticket: u64,
+    /// The waiting thread's attempt word, as [`crate::attempt::word_id`].
+    owner: usize,
     waiting_on: Claim,
     holds: Vec<Claim>,
     state: Arc<AtomicU8>,
@@ -95,6 +97,17 @@ pub(crate) fn registered() -> usize {
     registry().waiters.len()
 }
 
+/// Threads registered now that wait on or hold a claim of `rt`: the count
+/// one test's runtime sees, whatever other tests' threads register.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn registered_on(rt: RuntimeId) -> usize {
+    registry()
+        .waiters
+        .iter()
+        .filter(|w| w.waiting_on.0 == rt || w.holds.iter().any(|h| h.0 == rt))
+        .count()
+}
+
 /// Whether a registered thread is waiting on `claim`, for tests.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn waited_on(claim: Claim) -> bool {
@@ -138,6 +151,7 @@ impl Registration {
         let ticket = ticket(&mut next);
         reg.waiters.push(Waiter {
             ticket,
+            owner: crate::attempt::word_id(),
             waiting_on,
             holds,
             state: state.clone(),
@@ -198,6 +212,60 @@ impl Drop for Registration {
         }
         self.state.store(DONE, Ordering::Release);
     }
+}
+
+/// Runs `wound`, a waiter's take-over of the attempt whose word is
+/// `owner`, under the registry lock, unless that owner waits here with an
+/// older ticket than the waiter's `ticket` (0 for one not taken yet, which
+/// is younger than every taken one) on a chain of claims that closes
+/// through registered holders: the registry resolves that wait by the
+/// wound order. A claim on the chain with no registered holder ends the
+/// refusal, as its holder may be in user code that waits on the waiter.
+/// False if refused.
+pub(crate) fn take_over_in_order(owner: usize, ticket: u64, wound: impl FnOnce() -> bool) -> bool {
+    let reg = registry();
+    let mine = if ticket == 0 { u64::MAX } else { ticket };
+    let waits_in_order = reg
+        .waiters
+        .iter()
+        .find(|w| w.owner == owner && w.ticket < mine && w.state.load(Ordering::Acquire) == WAITING)
+        .is_some_and(|o| closes(&reg.waiters, o));
+    if waits_in_order {
+        #[cfg(all(test, not(loom)))]
+        REFUSALS.with(|r| r.set(r.get() + 1));
+        return false;
+    }
+    wound()
+}
+
+/// Whether `from`'s waits-for chain comes back to a waiter on it: every
+/// claim on the way has a registered holder. At most one step per waiter.
+fn closes(waiters: &[Waiter], from: &Waiter) -> bool {
+    let mut seen = vec![from.owner];
+    let mut on = from.waiting_on;
+    for _ in 0..waiters.len() {
+        let Some(holder) = waiters.iter().find(|w| w.holds.contains(&on)) else {
+            return false;
+        };
+        if seen.contains(&holder.owner) {
+            return true;
+        }
+        seen.push(holder.owner);
+        on = holder.waiting_on;
+    }
+    true
+}
+
+#[cfg(all(test, not(loom)))]
+std::thread_local! {
+    static REFUSALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The take-overs the wound order refused on this thread since the last
+/// call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_refusals() -> u32 {
+    REFUSALS.with(|r| r.replace(0))
 }
 
 /// Before a wounded entry retries: waits until the oldest waiter on the

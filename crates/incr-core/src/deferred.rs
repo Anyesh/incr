@@ -180,7 +180,19 @@ impl<C: Cells> Deferred<C> {
     }
 
     #[inline(never)]
-    fn drain_items(mut self, rt: &Runtime<C>) {
+    fn drain_items(self, rt: &Runtime<C>) {
+        if C::SINGLE_THREADED {
+            self.drain_items_now(rt);
+        } else {
+            // The bag is `drain_items_now`'s, so what a panic leaves drops
+            // in that frame, under the guard.
+            let _drops = crate::attempt::Outside::enter(true);
+            self.drain_items_now(rt);
+        }
+    }
+
+    #[inline(always)]
+    fn drain_items_now(mut self, rt: &Runtime<C>) {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.drop_items())) {
             self.unwind(rt, payload);
         }
@@ -236,6 +248,7 @@ impl<C: Cells> Deferred<C> {
     }
 
     fn drop_isolated(&mut self) {
+        let _drops = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         if let Some(token) = self.dep_list.take() {
             isolate(|| retire_dep_list::<C>(token));
         }
@@ -297,7 +310,19 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
 
     /// Normal mode: see the module docs.
     #[inline(always)]
-    pub(crate) fn drain(mut self, rt: &Runtime<C>) {
+    pub(crate) fn drain(self, rt: &Runtime<C>) {
+        if C::SINGLE_THREADED {
+            self.drain_now(rt);
+        } else {
+            // The bag is `drain_now`'s, so what a panic leaves drops in that
+            // frame, under the guard.
+            let _drops = crate::attempt::Outside::enter(true);
+            self.drain_now(rt);
+        }
+    }
+
+    #[inline(always)]
+    fn drain_now(mut self, rt: &Runtime<C>) {
         if let Some(payload) = rt.drop_buried_tickets() {
             self.drain_after(rt, payload);
         }
@@ -449,6 +474,7 @@ impl<V: ?Sized> Drop for Unbuilt<V> {
         if let Some(value) = self.0.take() {
             #[cfg(all(test, not(loom)))]
             crate::replay::note_drop();
+            let _drops = crate::attempt::Outside::enter(true);
             isolate(|| drop(value));
         }
     }

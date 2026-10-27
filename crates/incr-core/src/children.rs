@@ -133,7 +133,16 @@ impl IndexState {
     /// The children a Clean landing may delete: every bound child this
     /// run did not touch, and every orphan.
     pub(crate) fn sweep_candidates(&self) -> Vec<ErasedIncr> {
-        let epoch = self.epoch;
+        self.untouched_since(self.epoch)
+    }
+
+    /// [`Self::sweep_candidates`] of a sweep not yet landed, after a run
+    /// that did or did not reach the index.
+    pub(crate) fn pending_sweep_candidates(&self, opened: bool) -> Vec<ErasedIncr> {
+        self.untouched_since(if opened { self.epoch } else { self.epoch + 1 })
+    }
+
+    fn untouched_since(&self, epoch: u64) -> Vec<ErasedIncr> {
         let mut out = self.orphans.clone();
         for (_, map) in &self.maps {
             map.select(&mut |e| e.touched != epoch, &mut out);

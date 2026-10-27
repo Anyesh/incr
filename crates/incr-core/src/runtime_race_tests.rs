@@ -3,17 +3,18 @@
 //! compute closure) and acts from another while it is parked. Every test
 //! ends by checking invariant (I) and the value a fresh read returns.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
 use super::{
-    DeleteError, DeleteOutcome, Entry, EpisodeLog, Expanded, GroupInfo, ParkPoint, Runtime, Walk,
-    EPISODE_LOG_LEN, NO_TAINT, VISIT,
+    DeleteError, DeleteOutcome, Entry, EpisodeLog, Expanded, GroupInfo, OnUnwind, ParkPoint,
+    Runtime, Walk, EPISODE_LOG_LEN, NO_TAINT, VISIT,
 };
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
@@ -27,6 +28,40 @@ type Rt = Runtime<Shared>;
 
 /// A park point that never gets reached would otherwise hang the test.
 pub(super) const PARK_TIMEOUT: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// The gates a test's thread made, let go when it ends, failed or not,
+    /// since a test drives its gates from that thread: a failed test then
+    /// fails alone instead of aborting the binary at the park timeout. A
+    /// scope joins its threads before the test thread ends, so a scope that
+    /// drives gates holds [`release_parked_on_unwind`], and a driver on
+    /// another thread holds [`Gate::released_on_unwind`].
+    static MADE_HERE: MadeHere = const { MadeHere(RefCell::new(Vec::new())) };
+}
+
+struct MadeHere(RefCell<Vec<Weak<GateInner>>>);
+
+impl MadeHere {
+    fn let_go(&self) {
+        for gate in self.0.borrow_mut().drain(..) {
+            if let Some(gate) = gate.upgrade() {
+                Gate(gate).let_go();
+            }
+        }
+    }
+}
+
+impl Drop for MadeHere {
+    fn drop(&mut self) {
+        self.let_go();
+    }
+}
+
+/// Lets go of every gate this thread made if it is dropped by a panic, so
+/// a scope that joins a parked thread does not wait out the park timeout.
+pub(crate) fn release_parked_on_unwind() -> OnUnwind<impl FnMut()> {
+    OnUnwind(|| MADE_HERE.with(MadeHere::let_go))
+}
 
 /// One-shot rendezvous. The thread under test calls [`Gate::park`]; the
 /// driver calls [`Gate::wait_parked`], acts, then [`Gate::release`]. A
@@ -48,14 +83,18 @@ impl Gate {
     pub(crate) fn new() -> Self {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        Self(Arc::new(GateInner {
+        let gate = Self(Arc::new(GateInner {
             armed: AtomicBool::new(false),
             reached_tx: Mutex::new(reached_tx),
             reached_rx: Mutex::new(reached_rx),
             release_tx: Mutex::new(release_tx),
             release_rx: Mutex::new(release_rx),
             test: thread::current().name().map(str::to_owned),
-        }))
+        }));
+        if gate.0.test.is_some() {
+            MADE_HERE.with(|m| m.0.borrow_mut().push(Arc::downgrade(&gate.0)));
+        }
+        gate
     }
 
     pub(crate) fn arm(&self) {
@@ -104,9 +143,35 @@ impl Gate {
         self.0.release_tx.lock().unwrap().send(()).unwrap();
     }
 
+    /// Lets the gate go if this thread panics: for a driver that is not
+    /// the thread that made the gate.
+    pub(crate) fn released_on_unwind(&self) -> OnUnwind<impl FnMut() + '_> {
+        OnUnwind(|| self.let_go())
+    }
+
+    fn let_go(&self) {
+        self.0.armed.store(false, Ordering::SeqCst);
+        self.release();
+    }
+
     /// Whether an armed gate has been reached.
     pub(crate) fn reached(&self) -> bool {
         !self.0.armed.load(Ordering::SeqCst)
+    }
+}
+
+/// Releases its gates if the test unwinds, so a failed assert fails the
+/// test instead of leaving a thread parked until its timeout aborts the
+/// binary. A release sent before a thread parks lets that park through.
+pub(crate) struct ReleaseOnUnwind(pub(crate) Vec<Gate>);
+
+impl Drop for ReleaseOnUnwind {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            for gate in &self.0 {
+                gate.release();
+            }
+        }
     }
 }
 
@@ -430,8 +495,18 @@ fn b3_dep_recomputed_for_an_unwalked_set_supersedes_new_dependent() {
 }
 
 /// `f` panics while `x` is even; `d` catches that panic as 7 and reads
-/// `y`, parking on `gate` once its reads are done.
+/// `y`, parking on `gate` in its own code once its reads are done, while
+/// its attempt holds `f`'s Failed landing.
 fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    caught_failed_dep_counted(rt, gate, &Arc::new(AtomicUsize::new(0)))
+}
+
+/// [`caught_failed_dep`], counting `d`'s runs in `d_runs`.
+fn caught_failed_dep_counted(
+    rt: &Rt,
+    gate: &Gate,
+    d_runs: &Arc<AtomicUsize>,
+) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
     let x = rt.create_input(0_u64);
     let y = rt.create_input(0_u64);
     let f = rt.create_query(move |rt: &Rt| {
@@ -441,9 +516,11 @@ fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, 
     });
     let d = {
         let gate = gate.clone();
+        let d_runs = Arc::clone(d_runs);
         rt.create_query(move |rt: &Rt| {
+            d_runs.fetch_add(1, Ordering::SeqCst);
             let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10) + rt.get(y);
-            gate.park();
+            gate.park_in_user_code();
             v
         })
     };
@@ -452,7 +529,8 @@ fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, 
 
 /// A set moves `d`'s Failed dep `f` between `d`'s first read and its
 /// publish, before `d`'s edge exists, so the walk can't reach `d`: it
-/// lands Dirty with no memo.
+/// lands Dirty with no memo. `d`'s attempt holds `f`'s Failed landing
+/// until it ends, so the set meets it held.
 #[test]
 fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
     let rt = Arc::new(Rt::new());
@@ -464,7 +542,7 @@ fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
         thread::spawn(move || rt.get(d))
     };
     gate.wait_parked();
-    assert_eq!(rt.state_of(f), NodeState::Failed);
+    assert_eq!(rt.state_of(f), NodeState::Computing);
     rt.set(x, 1);
     gate.release();
     assert_eq!(reader.join().unwrap(), 7);
@@ -476,13 +554,16 @@ fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
     assert_eq!(rt.get(d), 10);
 }
 
-/// As above, and `f` lands Failed again for the set before `d` publishes,
-/// so the Failed state `d` finds is not the one it read.
+/// As above, and `f` lands Failed again for the set before `d` publishes:
+/// the reader that relands it takes `f`'s held landing over from `d`'s
+/// parked attempt, wounding it, so `d` never publishes over a Failed state
+/// it did not read: its retry reads the relanded one and keeps that memo.
 #[test]
-fn caught_failed_dep_relanded_failed_before_the_first_publish_keeps_no_memo() {
+fn caught_failed_dep_relanded_failed_before_the_first_publish_retries_over_it() {
     let rt = Arc::new(Rt::new());
     let gate = Gate::new();
-    let (x, _, f, d) = caught_failed_dep(&rt, &gate);
+    let d_runs = Arc::new(AtomicUsize::new(0));
+    let (x, _, f, d) = caught_failed_dep_counted(&rt, &gate, &d_runs);
     gate.arm();
     let reader = {
         let rt = Arc::clone(&rt);
@@ -498,10 +579,13 @@ fn caught_failed_dep_relanded_failed_before_the_first_publish_keeps_no_memo() {
     assert_eq!(rt.state_of(f), NodeState::Failed);
     gate.release();
     assert_eq!(reader.join().unwrap(), 7);
+    assert_eq!(d_runs.load(Ordering::SeqCst), 2);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
-    assert!(!rt.has_memo_of(d));
+    assert!(rt.has_memo_of(d));
     rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 7);
+    assert_eq!(d_runs.load(Ordering::SeqCst), 2);
 }
 
 /// `d` lands Dirty with a memo over Failed `f`; a recompute for `y` reads
@@ -2926,4 +3010,51 @@ fn walk_rereads_under_constant_releases() {
             );
         }
     }
+}
+
+/// Runs `drive` on a named thread like a test's, which parks a thread on
+/// a gate it made and then panics; returns whether the parked thread was
+/// released well inside the park timeout instead of aborting the binary.
+fn parked_thread_released_after_a_failed_driver(drive: fn(Gate, mpsc::Sender<()>)) -> bool {
+    let (resumed_tx, resumed_rx) = mpsc::channel();
+    let driver = thread::Builder::new()
+        .name("failing driver".into())
+        .spawn(move || {
+            let gate = Gate::new();
+            gate.arm();
+            drive(gate, resumed_tx);
+        })
+        .unwrap();
+    assert!(driver.join().is_err(), "the driver panics");
+    resumed_rx.recv_timeout(PARK_TIMEOUT / 2).is_ok()
+}
+
+#[test]
+fn a_failed_tests_spawned_parked_thread_is_released() {
+    let released = parked_thread_released_after_a_failed_driver(|gate, resumed| {
+        let parked = gate.clone();
+        thread::spawn(move || {
+            parked.park();
+            resumed.send(()).unwrap();
+        });
+        gate.wait_parked();
+        panic!("the test fails while a thread is parked");
+    });
+    assert!(released);
+}
+
+#[test]
+fn a_failed_tests_scoped_parked_thread_is_released() {
+    let released = parked_thread_released_after_a_failed_driver(|gate, resumed| {
+        thread::scope(|s| {
+            let _released = release_parked_on_unwind();
+            s.spawn(|| {
+                gate.park();
+                resumed.send(()).unwrap();
+            });
+            gate.wait_parked();
+            panic!("the test fails while a scoped thread is parked");
+        });
+    });
+    assert!(released);
 }

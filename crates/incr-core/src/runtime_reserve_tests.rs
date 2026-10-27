@@ -432,6 +432,89 @@ fn a_walk_listing_ends_at_its_nodes_settled_landing() {
     drop(read);
 }
 
+/// Another thread reads a walk listing awake exactly while it holds every
+/// op: through a peer's user code, not past other user code, a cycle
+/// callback, the node's settled landing or the read's end.
+#[test]
+fn a_walk_listing_reads_awake_from_another_thread_while_it_holds_every_op() {
+    use crate::reserve::{end_walk_landed, note_walk, user_code, walk_listed_awake, Peers, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    let elsewhere = |generation| {
+        std::thread::scope(|s| {
+            s.spawn(move || walk_listed_awake(n, generation))
+                .join()
+                .unwrap()
+        })
+    };
+    let read = Root::arm(true, root);
+    assert!(!elsewhere(1));
+    note_walk(n, 1, &Peers::new([5, 7]));
+    assert!(elsewhere(1), "listed");
+    assert!(!elsewhere(2), "another generation");
+    user_code((rt.runtime_id, 5));
+    assert!(elsewhere(1), "a peer's user code");
+    user_code(outside(&rt));
+    assert!(!elsewhere(1), "other user code");
+    note_walk(n, 1, &Peers::new([7]));
+    rt.callback(|| ());
+    assert!(!elsewhere(1), "a cycle callback");
+    note_walk(n, 1, &Peers::new([]));
+    end_walk_landed(n, 1);
+    assert!(!elsewhere(1), "the settled landing");
+    note_walk(n, 1, &Peers::new([]));
+    assert!(elsewhere(1), "listed again");
+    drop(read);
+    assert!(!elsewhere(1), "the read's end");
+}
+
+/// A waiter on an awake walk listing leaves its owner be, however long the
+/// owner stays in a peer's user code: the unbounded run holds the node in
+/// the owner's frame there, and a wait cycle through it is the registry's,
+/// which sees the listing among the owner's claims.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_waiter_on_an_awake_walk_listing_takes_no_owner_over() {
+    use crate::attempt::{begin, enter_hold, leave_hold, Outside, Patience};
+    use crate::reserve::{note_walk, take_over, user_code, Peers, Root};
+    let rt = Rt::new();
+    let (root, n) = ((rt.runtime_id, 3), (rt.runtime_id, 7));
+    begin();
+    let owner = enter_hold();
+    let read = Root::arm(true, root);
+    note_walk(n, 1, &Peers::new([5, 7]));
+    user_code((rt.runtime_id, 5));
+    let user = Outside::enter(true);
+    assert!(
+        crate::reserve::held().contains(&n),
+        "the registry sees the listing"
+    );
+    let took = thread::spawn(move || {
+        let mut patience = Patience::default();
+        let until = Instant::now() + Duration::from_millis(100);
+        // Enough checks for a waiter's patience on a loaded runner.
+        for calls in 0.. {
+            if calls >= 256 && Instant::now() >= until {
+                break;
+            }
+            if take_over(n, 1, &mut patience) {
+                return true;
+            }
+            thread::yield_now();
+        }
+        false
+    })
+    .join()
+    .unwrap();
+    assert!(!took, "a waiter took over an owner in a peer's user code");
+    assert!(!owner.wounded());
+    drop(user);
+    user_code(outside(&rt));
+    assert!(!reserved_elsewhere(n));
+    drop(read);
+    assert!(!leave_hold(), "a waiter wounded the attempt while it held");
+}
+
 /// A context that also reserves the node and ends before the walk's
 /// thread runs user code leaves the walk listing awake.
 #[test]
@@ -1749,8 +1832,11 @@ fn a_foreign_rerun_after_the_owners_landing_leaves_no_stale_delivery() {
 /// **A Failed landing's delivery stays the read it stands for**, at
 /// budget 1: R reads F, F reads X and X reads input I, panicking while I
 /// is 1. R dooms on X, X's entry lands it Failed and its panic is
-/// delivered to F's retry; R parks before F's entry. A set of I to 2 lets
-/// X compute, and another thread reads X. F's retry takes the panic, as
+/// delivered to F's retry; R parks before F's entry, holding X's landing.
+/// A set of I to 2 lets X compute, and another thread's read of X waits
+/// for that hold: R is parked in engine code, not user code, and the
+/// unbounded run's F runs no user code between X's landing and its
+/// unwind. F's retry takes the panic, as
 /// the unbounded run's F read it when X landed, but once both reads are
 /// done F must not stay Failed over X's new value.
 #[test]
@@ -1777,9 +1863,17 @@ fn a_foreign_rerun_after_a_failed_landing_leaves_no_stale_delivery() {
     };
     entry.wait_parked();
     rt.set(i, 2);
-    let x_read = read_unreserved(&rt, x);
+    let other = {
+        let rt = rt.clone();
+        spawn("other", move || rt.get(x))
+    };
+    // A reader that holds nothing never registers its wait.
+    assert!(
+        other.0.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the read of X did not wait for R's held landing"
+    );
     entry.release();
-    let f_read = r.join();
+    let (f_read, x_read) = (r.join(), other.join());
     assert_eq!(f_read, Err("x boom".to_string()));
     assert_eq!(x_read, Ok(3));
     assert_eq!(

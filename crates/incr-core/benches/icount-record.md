@@ -2477,6 +2477,48 @@ is within 1% (Local compute rows +0.2% to +0.7%, Shared compute rows
   unwind through a walk frame runs a longer CFA program. The two
   budget-1 `nested_caught` rows fall (0.98, 0.97).
 
+## A user panic's landings held to the attempt's end
+
+`w/T10-held-unwind-landings` holds every landing a user panic makes in a
+`Shared` attempt until the outermost entry exits, and the owner's own
+set flips its held landings through the view (`341b3ddc1`). Base
+`44e67aeee`, tip `61a24aa8b`, same box, `icount.sh` defaults; PT line
+diffs at 10 iterations (`chain_shared/propagate/10`,
+`foreign_dirty_read_unbudgeted_u64`) and 1 (`delete_owned_tree_shared`,
+which loses AUX data at 3).
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 99 | 99 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_shared` | 218.1 | 218.1 | 0 |
+| `chain_local/propagate/100` | 105523.0 | 105523.0 | 0 |
+| `chain_shared/propagate/4` | 10731.2 | 10767.2 | +36.0 |
+| `chain_shared/propagate/10` | 23312.4 | 23390.5 | +78.0 |
+| `chain_shared/propagate/100` | 249190.1 | 249898.7 | +708.6 |
+| `simple_count/shared/1000` | 4660.2 | 4675.3 | +15.1 |
+| `collection_insert_then_read/shared_incremental/1000` | 8415.4 | 8444.1 | +28.7 |
+| `diamond_shared` | 8908.9 | 8943.9 | +35.0 |
+| `foreign_dirty_read_unbudgeted_u64` | 62078.1 | 62212.4 | +134.3 |
+| `delete_owned_tree_shared` | 998246.7 | 1001161.2 | +2914.5 |
+
+- Every `Shared` rise is the set walk: per node walked, the
+  `is_computing` test inside `seen_quietly` on the loaded word (+5,
+  `runtime.rs:1070` inlined) and `push_pending`'s empty test (+2,
+  `runtime.rs:6605`); per walk, `hold::active()` and the empty
+  `pending` list (+8, `runtime.rs:3512`). `chain_shared` fits 7 per
+  node plus 8 at 4, 10 and 100 nodes; `delete_owned_tree_shared` is
+  200 walks at about 9 each in the PT diff.
+- The largest ratio is 1.0051 (`early_cutoff_shared`). Scale icount
+  (GitHub, `61a24aa8-1d4a1c`) tops out at 1.020 on caught-panic chains;
+  scale timing at 9 rounds totals 1.001.
+- Local pays nothing: every `Local` row is within 0.2 % of base, and
+  the walk's checks sit behind `C::SINGLE_THREADED`.
+- The tip measured predates `05816c989`, which changes only
+  `moved_since_read`; that runs at the publication of a held Failed
+  landing, or of a held Clean one being lowered there, which no
+  workload here makes, so the rows stand.
+
 ## A read revisits a node another read published or released since its plan
 
 `w/T10-wide-two-b0939-w7` (tip `56b5744f`, increment 15 `0dde1d8c` merged
