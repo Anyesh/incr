@@ -5280,6 +5280,89 @@ fn two_thread_budget_1_read_builds_on_no_unfinished_attempts_delivered_cycle() {
     });
 }
 
+/// 0x40a38's ops 0 (`Get(0)`, thread 0) and 1 (`TryGet(6)`, thread 1)
+/// overlap. Op 1 closes the cycle through 6 and is parked at its second
+/// claim of 4 until op 0 reads 6's held landing and wounds it. Unbounded,
+/// 4's frame took the closed cycle's hold, so the wound retracts 4 with
+/// 5, 6, 8 and 11, and the retry gives every order's
+/// `Cycle([1, 4, 6, 8, 11, 12, 13])`. Under a byte budget 4 lands from a
+/// member run whose frame took that hold; landed unheld, it outlived the
+/// wound, and the retry ran 5 under it into `Cycle([1, 4, 5, ..])`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_wound_retracts_a_member_run_landing_under_a_closed_cycle() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_wound_retracts_a_member_run_landing_under_a_closed_cycle",
+        || {
+            struct Park {
+                claims: AtomicU32,
+                parked: AtomicBool,
+                a_started: AtomicBool,
+            }
+            let case = gen_case(0x40a38, false, true);
+            let phases = phases(&case, 0x40a38);
+            let overlap = phases.iter().position(|p| p.ops() == [0, 1]).unwrap();
+            assert_eq!(phases[overlap].of(1), Some(1));
+            let patience = std::time::Duration::from_secs(2);
+            quiet(|| {
+                for bytes in [0, 16 * 1024] {
+                    for round in 0..3 {
+                        let park = Arc::new(Park {
+                            claims: AtomicU32::new(0),
+                            parked: AtomicBool::new(false),
+                            a_started: AtomicBool::new(false),
+                        });
+                        let rig = |live: &Live<Shared>| {
+                            let (park, world) = (park.clone(), live.world.clone());
+                            let n4 = NodeId(world.handle(0, 4).erased().slot());
+                            let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                                if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                                    return;
+                                }
+                                match TWO_THREAD.with(std::cell::Cell::get) {
+                                    Some(1)
+                                        if p == ParkPoint::BeforeClaim(n4)
+                                            && park.claims.fetch_add(1, SeqCst) == 1 =>
+                                    {
+                                        park.parked.store(true, SeqCst);
+                                        let t = std::time::Instant::now();
+                                        until(|| {
+                                            crate::waits::registered() > 0
+                                                || t.elapsed() > patience
+                                        });
+                                    }
+                                    Some(0) if !park.a_started.swap(true, SeqCst) => {
+                                        let t = std::time::Instant::now();
+                                        until(|| park.parked.load(SeqCst) || t.elapsed() > patience);
+                                    }
+                                    _ => {}
+                                }
+                            });
+                            assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                        };
+                        let serial = Serial::new(&case, &phases);
+                        let verdict = Mutex::new(None);
+                        let got = run_two_until(&case, &phases, None, bytes, &rig, &|p, prefix, live| {
+                            let v = serial.at_overlap("0x40a38", prefix, live);
+                            let stop = p == overlap || v.is_some();
+                            *verdict.lock().unwrap() = v;
+                            stop
+                        });
+                        assert!(park.parked.load(SeqCst), "{bytes} bytes, round {round}: op 1 never parked");
+                        serial.check("0x40a38", &got, verdict.into_inner().unwrap());
+                        assert_eq!(
+                            got[1].0,
+                            Out::Cycle(vec![1, 4, 6, 8, 11, 12, 13]),
+                            "{bytes} bytes, round {round}"
+                        );
+                    }
+                }
+            });
+        },
+    )
+    .assert_clean();
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
