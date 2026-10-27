@@ -10788,3 +10788,15 @@ fn seed_8ecc1_abandoned_member_keeps_its_reads() {
         differential::<Shared>(&case, 0x8ecc1);
     });
 }
+
+/// Seed 0x2efc: a doom that keeps the claims a kept owner's run deferred
+/// must leave every virtual frame rooting only claims it holds.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_2efc_kept_children_root_no_unheld_frame() {
+    let case = gen_case(0x2efc, false, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x2efc);
+        differential::<Shared>(&case, 0x2efc);
+    });
+}
