@@ -1324,6 +1324,25 @@ fn shared_held_failed_landing_over_a_dep_a_set_moved_lands_dirty() {
     assert_eq!(rt.get(r), 10);
 }
 
+/// An unheld dep left Dirty with no set since the read did not move: in
+/// 0x366149ed a budget's unrun releases left one so, and lowering its
+/// Failed reader published six more Failed landings Dirty, one of which
+/// a read then verified back to its old value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_a_dep_left_dirty_with_no_set_since_the_read_did_not_move() {
+    let rt = Runtime::<Shared>::new();
+    let x = rt.create_input(0_i64);
+    let q = rt.create_query(move |rt: &Runtime<Shared>| rt.get(x));
+    assert_eq!(rt.get(q), 0);
+    rt.set(x, 1);
+    assert_eq!(rt.state_of(q), NodeState::Dirty);
+    let rev = rt.current_revision();
+    assert!(!rt.moved_since_read(NodeId(q.slot()), &Default::default(), rev));
+    rt.set(x, 2);
+    assert!(rt.moved_since_read(NodeId(q.slot()), &Default::default(), rev));
+}
+
 /// The landing lowered to Dirty drops its run's failed-run record and the
 /// ticket of the panic d contained, as a held Failed landing a set flagged
 /// does: the node is Failed no longer. With `stop`, a panic at the held
