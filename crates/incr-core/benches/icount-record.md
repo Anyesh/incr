@@ -2587,3 +2587,69 @@ cost on compute rows; the earlier held-landing sections measured walks.
   (wall 1.059), `shared_same_text_fan_through_a_frame_over_chain_stays_linear`
   1.064 (wall 1.069), `shared_failed_entry_fan_in` 1.059 (wall 1.028)
   and the contained chain at budget 2 1.048 (wall 1.041).
+
+## A read revisits a node another read published or released since its plan
+
+`w/T10-wide-two-b0939-w7` (tip `56b5744f`, increment 15 `0dde1d8c` merged
+into `df341666`) publishes a held release without the unrun mark, and
+after the root's claim restarts the walk when another thread's
+publication logged the root in the episode log since the plan. Bench
+rows with `icount.sh` on this box; scale tests as `gh-scale-icount.sh`
+against increment 15.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 99 / 193 | 99 / 193 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `simple_count/shared/1000` | 4,695.22 | 4,715.42 | +20.20 |
+| `chain_shared/propagate/4` | 10,793.21 | 10,837.21 | +44 |
+| `shared_failed_entry_fan_in` (scale) | 1,784,641,129 | 1,793,604,164 | +0.50% |
+| `shared_nested_caught_chain_through_a_query_stays_linear` (scale) | 4,887,484,994 | 4,959,152,493 | +1.47% |
+
+Gate: every hard gate counts the same as the base, every Local row is
+within 0.14% (`table_hit_sip_local` +0.14%), and Shared compute rows
+rise at most 0.61% (`early_cutoff_shared`). Scale icount totals 1.0010
+over 75 tests (Local rows within 0.03%), scale timing 1.012.
+
+- Shared, +44 per iteration on `chain_shared/propagate/4` (Intel PT per
+  line, 20 iterations): the root now carries its plan into its claim
+  (`ensure_clean`'s `then_some(planned)` drops the `!is_root` test, -32
+  at the old line, +4 at the new one, +26 in `bool::then_some`, +9 in
+  `Option`), the claim compares it (`others_landed`, +10) and runs the
+  root check (`!node.unrun()`, +2); `Vec` length reads +20 and
+  `takes_held` +4, atomics +1, while `complete_walk`'s inlining moves
+  cancel (+13, -13). The episode log is read under its lock
+  (`root_reached`) only when another thread landed since the plan, which
+  a single-threaded bench never does; Local skips the check
+  (`C::SINGLE_THREADED`).
+- The check reads only entries a publication logged (`Logged::ended`):
+  a landing or release published at a read's end, never an interim
+  landing of an attempt still running, so a restart reacts only to
+  finished history. A node released unrun is skipped, its read still
+  running elsewhere; `shared_reader_that_waited_out_a_discarded_claim_keeps_its_plan`
+  (0x59bd) pins that a discarded claim's waiter keeps its plan.
+- The root check's restart has no cap (the release replan keeps its
+  `ROOT_RESTARTS`). Each restart replans, moving `since` past every
+  number logged so far, so a second restart needs a new ended entry for
+  the root numbered after the new plan, that is another read finished on
+  the root. Eviction cannot loop: an evicted entry counts only if it was
+  ended (`evicted_ended`, not `evicted`) and its number follows the new
+  plan, so a restart taken on eviction alone needs 1,024 per-slot
+  entries logged after an ended one that is itself after the plan. Own
+  ended entries count there too, but only once `others_since` saw
+  another thread's landing, and each such restart still needs new log
+  traffic past the plan.
+  `a_root_check_reads_only_another_threads_ended_entries` covers ended
+  against interim, own against foreign, landed against released numbers,
+  wrap and eviction.
+- Panicking Shared scale rows (`nested_caught` up to 1.0147,
+  `many_caught_unwinds` 1.0093, `failed_entry_chain` 1.0080): callgrind
+  on `shared_failed_entry_fan_in` at `70ca13f9` counted the engine's own
+  functions within 0.1M of the base and `_Unwind_RaiseException` and
+  `_Unwind_Resume` exactly as often, so the change adds no
+  `resume_unwind` or second unwind of a panic; the rise is the
+  unwinder's per-frame work (libgcc CFA interpretation +35.2M,
+  `rust_eh_personality` +12.1M, `_dl_find_object` -11.8M).
+- Loom: `env -u CARGO_ENCODED_RUSTFLAGS RUSTFLAGS="--cfg loom -D warnings"
+  cargo test -p incr-core --release --lib --no-run` rc 0 on `56b5744f`.
