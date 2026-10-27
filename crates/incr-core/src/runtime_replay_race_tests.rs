@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use super::race_tests::{await_reservation_wait, id, Gate, PARK_TIMEOUT};
+use super::race_tests::{await_reservation_wait, id, Gate, ReleaseOnUnwind, PARK_TIMEOUT};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
@@ -2131,6 +2131,7 @@ fn shared_vframe_reader_takes_an_owed_payload_after_the_landing_store() {
         }
     }));
     assert!(installed.is_ok(), "park hook installed twice");
+    let _release = ReleaseOnUnwind(vec![s.gate.clone(), read.clone(), stored.clone()]);
     let first = {
         let (rt, top) = (rt.clone(), s.top);
         spawn(move || outcome(|| rt.get(top)))

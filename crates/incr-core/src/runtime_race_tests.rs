@@ -110,6 +110,21 @@ impl Gate {
     }
 }
 
+/// Releases its gates if the test unwinds, so a failed assert fails the
+/// test instead of leaving a thread parked until its timeout aborts the
+/// binary. A release sent before a thread parks lets that park through.
+pub(crate) struct ReleaseOnUnwind(pub(crate) Vec<Gate>);
+
+impl Drop for ReleaseOnUnwind {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            for gate in &self.0 {
+                gate.release();
+            }
+        }
+    }
+}
+
 /// Install the runtime's park hook with armed gates at `points`.
 pub(super) fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>) {
     for (_, gate) in &points {
