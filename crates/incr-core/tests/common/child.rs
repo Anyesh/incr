@@ -16,8 +16,8 @@ const CHILD: &str = "INCR_TEST_CHILD";
 pub const HANG_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// [`HANG_TIMEOUT`], or 60 s in a sanitized build (`INCR_TEST_REDUCED`, which
-/// the TSan job sets): a child that takes 7 s under TSan on one runner
-/// passed 10 s on a runner 1.7 times slower.
+/// the TSan job sets), where a child runs several times slower and a slow
+/// runner stretches that again.
 pub fn hang_timeout() -> Duration {
     if env::var_os("INCR_TEST_REDUCED").is_some() {
         Duration::from_secs(60)
