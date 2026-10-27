@@ -5060,16 +5060,12 @@ impl<C: Cells> Runtime<C> {
             }
             // No entry check covers the root, so its claim checks for
             // another thread's landing of it since the plan, whose deps a
-            // read after that landing expands first; a node released unrun
-            // is another read's still. The landing precedes every reader's
-            // claim, so the claim goes back unmarked and another reader's
-            // root check still sees it.
+            // read after that landing expands first, whatever unrun mark a
+            // later give-back left on it: the check reads only ended entries.
+            // The landing precedes every reader's claim, so the claim goes
+            // back unmarked and another reader's root check still sees it.
             if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED && !walked) {
-                if seen != Seen::Unwalked
-                    && !node.unrun()
-                    && self.others_since(p)
-                    && self.root_reached(p, id)
-                {
+                if seen != Seen::Unwalked && self.others_since(p) && self.root_reached(p, id) {
                     self.give_back(node, claimed_dirty, false);
                     return Computed::Revisit;
                 }
