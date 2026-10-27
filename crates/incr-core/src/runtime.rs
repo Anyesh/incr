@@ -5573,6 +5573,9 @@ impl<C: Cells> Runtime<C> {
         own_run: bool,
         bag: &mut Deferred<C>,
     ) {
+        if !C::SINGLE_THREADED && hold::active() {
+            self.open_hold_for_held_deps(id, node, attempt.first, deps);
+        }
         let landing = match self.publish_deps(
             id,
             deps,
@@ -5681,6 +5684,9 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
+        if !C::SINGLE_THREADED && hold::active() {
+            self.open_hold_for_held_deps(id, node, attempt.first, deps);
+        }
         // Any outcome lands New, which recomputes.
         self.publish_deps(
             id,

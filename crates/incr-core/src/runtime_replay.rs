@@ -880,6 +880,9 @@ impl<C: Cells> Runtime<C> {
         if changed || first {
             node.max_changed_at(stamp_rev);
         }
+        if !C::SINGLE_THREADED && crate::hold::active() {
+            self.open_hold_for_held_deps(a.id, node, first, &a.stash.deps);
+        }
         let published = self.publish_deps(a.id, &a.stash.deps, None, verify_rev, bag);
         if published == Publish::Stale {
             if first && wrote.get() == 0 {
