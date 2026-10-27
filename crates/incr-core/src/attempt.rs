@@ -440,8 +440,10 @@ impl Attempt {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    #[cfg(test)]
+                    #[cfg(all(test, loom))]
                     TAKE_OVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(all(test, not(loom)))]
+                    TAKE_OVERS.add(claim.0);
                     return true;
                 }
                 Err(now) => w = now,
@@ -527,9 +529,14 @@ pub(crate) fn epoch() -> u32 {
     MINE.with(|w| w.state.load(Ordering::Relaxed) & !FLAGS)
 }
 
-/// Attempts a waiter wounded, for tests and the scans' counts; a plain
-/// atomic under loom too, which a model reads after its threads join.
-#[cfg(test)]
+/// Attempts a waiter wounded, for tests, by the runtime of the claim it
+/// waited on.
+#[cfg(all(test, not(loom)))]
+pub(crate) static TAKE_OVERS: crate::waits::PerRuntime = crate::waits::PerRuntime::new();
+
+/// Attempts a waiter wounded, for loom models; a plain atomic, which a
+/// model reads after its threads join.
+#[cfg(all(test, loom))]
 pub(crate) static TAKE_OVERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(all(test, not(loom)))]
