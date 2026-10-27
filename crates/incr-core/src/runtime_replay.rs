@@ -423,8 +423,8 @@ impl<C: Cells> Runtime<C> {
     ) -> bool {
         ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_UNCHECKED) != 0
             || deps.iter().any(|&(d, generation)| {
-                !state::load::<C>(self.nodes.get(d.0).state_cell()).is_settled()
-                    && !(ctl.read_stashes()
+                !(state::load::<C>(self.nodes.get(d.0).state_cell()).is_settled()
+                    || ctl.read_stashes()
                         && replay::spec_read_of(self.runtime_id, cidx, ctl, d.0, generation))
             })
             || self.frame_owes_outcome(id)
