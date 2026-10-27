@@ -1208,8 +1208,11 @@ impl<C: Cells> Runtime<C> {
         held.wrote = ctl.wrote.get() != 0;
         let look = Look::here();
         // A compute frame's notes may be an earlier frame's at this
-        // position, so a speculative one keeps no basis.
-        cycle_state::with_held(|h| h.drop_spec_reads(rt, cidx));
+        // position, so a speculative one keeps no basis. Notes are made only
+        // inside a replay context.
+        if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+            cycle_state::with_held(|h| h.drop_spec_reads(rt, cidx));
+        }
         let (replaced, spec_buf) = held.record(
             look,
             deps,

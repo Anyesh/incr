@@ -142,9 +142,6 @@ pub(crate) struct Held {
     /// again once the buffer is written or taken, so a noted stamp tells
     /// whether the buffer read is still the one held.
     stamp: u64,
-    /// What the last speculative run read, if it read only real state: a
-    /// look outside speculation adopts the run while all of it is unchanged.
-    basis: Option<Box<Basis>>,
 }
 
 impl Held {
@@ -187,7 +184,6 @@ impl Held {
             in_cu: false,
             pre_spec: None,
             stamp: 0,
-            basis: None,
         }
     }
 
@@ -208,18 +204,19 @@ impl Held {
         basis: Option<Basis>,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
+            let first = self.pre_spec.is_none();
+            let kept = self.keep_record();
             // Every speculative run since the first is merged into the
             // record, so an adoption rests on all of their reads.
-            self.basis = match (self.pre_spec.is_some(), self.basis.take(), basis) {
-                (false, _, basis) => basis.map(Box::new),
-                (true, Some(mut kept), Some(basis)) => {
+            kept.basis = match (first, kept.basis.take(), basis) {
+                (true, _, basis) => basis,
+                (false, Some(mut kept), Some(basis)) => {
                     kept.held.extend(basis.held);
                     kept.clean.extend(basis.clean);
                     Some(kept)
                 }
                 _ => None,
             };
-            self.keep_record();
             None
         } else {
             self.settle()
@@ -300,22 +297,33 @@ impl Held {
     /// a landing that speculation may make.
     pub(crate) fn adopt(&mut self) {
         self.pre_spec = None;
-        self.basis = None;
+    }
+
+    fn basis(&self) -> Option<&Basis> {
+        self.pre_spec.as_ref()?.basis.as_ref()
+    }
+
+    /// For a speculative run proven not real: no later look adopts it.
+    fn drop_basis(&mut self) {
+        if let Some(r) = &mut self.pre_spec {
+            r.basis = None;
+        }
     }
 
     /// Before a run's buffer and record are written under speculation:
     /// keeps the record they replace, unless an earlier speculative run's
     /// write already did.
-    fn keep_record(&mut self) {
-        if self.pre_spec.is_none() {
-            self.pre_spec = Some(Box::new(RunRecord {
+    fn keep_record(&mut self) -> &mut RunRecord {
+        self.pre_spec.get_or_insert_with(|| {
+            Box::new(RunRecord {
                 deps: self.deps.clone(),
                 last: self.last.clone(),
                 installed: self.installed.clone(),
                 opened: self.opened,
                 poison: self.poison,
-            }));
-        }
+                basis: None,
+            })
+        })
     }
 
     fn settle_for(&mut self, look: Look) -> Option<Unbuilt> {
@@ -330,7 +338,6 @@ impl Held {
     /// value it buffered, as the unbounded run may never make that run.
     fn settle(&mut self) -> Option<Unbuilt> {
         let r = self.pre_spec.take()?;
-        self.basis = None;
         self.stamp = 0;
         self.deps = r.deps;
         self.last = r.last;
@@ -491,6 +498,9 @@ struct RunRecord {
     installed: Vec<NodeId>,
     opened: bool,
     poison: u16,
+    /// What the speculative runs since read, if they read only real state:
+    /// a look outside speculation adopts them while all of it is unchanged.
+    basis: Option<Basis>,
 }
 
 /// An episode between member runs. A doom that discards a member run
@@ -737,26 +747,40 @@ impl HeldMap {
     /// is unchanged ([`Self::adoptable`]); otherwise it settles the claim.
     /// `clean` gives a node's generation and `changed_at` while it is
     /// Clean.
+    #[inline(always)]
     pub(crate) fn look(
         &mut self,
         key: &(RuntimeId, u32),
         look: Look,
         clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
     ) -> Option<(Seen<&mut Held>, Option<Unbuilt>)> {
-        if self.spec_written && !look.speculative && self.claims.get(key)?.spec_written() {
-            let mut verdicts = HashMap::default();
-            let adopted = self.adoptable(key.0, key.1, clean, &mut verdicts);
-            for (m, real) in verdicts {
-                if let Some(e) = self.claims.get_mut(&(key.0, m)) {
-                    if adopted && real {
-                        e.adopt();
-                    } else if !real {
-                        e.basis = None;
-                    }
+        if self.spec_written && !look.speculative {
+            self.adopt_if_real(key, clean);
+        }
+        self.claims.get_mut(key).map(|e| e.look(look))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn adopt_if_real(
+        &mut self,
+        key: &(RuntimeId, u32),
+        clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
+    ) {
+        if !self.claims.get(key).is_some_and(Held::spec_written) {
+            return;
+        }
+        let mut verdicts = HashMap::default();
+        let adopted = self.adoptable(key.0, key.1, clean, &mut verdicts);
+        for (m, real) in verdicts {
+            if let Some(e) = self.claims.get_mut(&(key.0, m)) {
+                if adopted && real {
+                    e.adopt();
+                } else if !real {
+                    e.drop_basis();
                 }
             }
         }
-        self.claims.get_mut(key).map(|e| e.look(look))
     }
 
     /// Whether claim `slot`'s buffer is real: a run's outside speculation,
@@ -797,7 +821,7 @@ impl HeldMap {
         if !e.spec_written() {
             return true;
         }
-        let Some(basis) = &e.basis else {
+        let Some(basis) = e.basis() else {
             return false;
         };
         basis
@@ -824,6 +848,7 @@ impl HeldMap {
 
     /// [`Held::record`] on claim `key`, if held.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub(crate) fn record(
         &mut self,
         key: &(RuntimeId, u32),
