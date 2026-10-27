@@ -2097,8 +2097,8 @@ fn shared_vframe_reader_under_a_native_read_races_for_the_payload() {
 /// claim. The other thread's wait registers first, so the driver is the
 /// one wounded out of the cycle, which retracts its held Y; the
 /// other thread lands Y and X Failed, and the retry reads X Failed. All
-/// three end Failed, as in the unbounded run, with the closure's payload
-/// on one of the two reads.
+/// three end Failed, as in the unbounded run; the other thread's read
+/// gets the closure's payload and the retry the Failed read.
 #[test]
 fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
     let s = delivery_shape(Panics::Out, Some(Panics::Out));
@@ -2139,6 +2139,9 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
         })
     };
     read.wait_parked();
+    // Before the parked driver's own timeout, whose abort would hide the
+    // asserts below.
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
     assert_eq!(
         (rt.state_of(s.y), rt.state_of(s.x), rt.state_of(s.top)),
         (NodeState::Computing, NodeState::New, NodeState::Computing),
@@ -2156,8 +2159,6 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
         "the other thread did not claim X before Y"
     );
     at_y.release();
-    // Before the parked driver's own timeout, whose abort would hide this assert.
-    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
     while !crate::waits::waited_on((rt.runtime_id, s.y.slot())) {
         assert!(
             std::time::Instant::now() < deadline,
