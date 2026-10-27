@@ -59,6 +59,7 @@ both!(
     a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle,
     a_seeded_hit_leaves_its_key_and_closure_in_the_bag,
     a_seed_ends_a_speculative_stash_of_its_node,
+    a_seed_ends_the_stashes_that_read_its_node,
 );
 
 fn dep<T>(h: Incr<T>) -> SeedDep {
@@ -643,6 +644,41 @@ fn a_seed_ends_a_speculative_stash_of_its_node<C: Cells>() {
     );
     assert_eq!(rt.get(q), 40);
     assert_eq!(runs.load(SeqCst), 1);
+}
+
+/// A speculative run stashes `q` and, over `q`'s stash, its reader `r`; a
+/// seed then lands `q` at W0, a read verifies it, and `r`'s real claim
+/// reads the seeded value, as the unbounded run, which never ran `q`, does.
+fn a_seed_ends_the_stashes_that_read_its_node<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let x = rt.create_input(3_u64);
+    let (q, _) = counted(&rt, x);
+    let r = rt.create_query_with(
+        move |rt: &Runtime<C>| rt.get(q) + 1,
+        super::replay_tests::replayable(),
+    );
+    let b = rt.create_query(|_: &Runtime<C>| 5_u64);
+    let top = rt.create_query_with(
+        move |rt| {
+            let v = rt.get(b);
+            if v == 0 {
+                rt.get(r)
+            } else {
+                v
+            }
+        },
+        super::replay_tests::replayable(),
+    );
+    assert_eq!(rt.get(top), 5);
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, q, 40, &[dep(x)], Reuse::IfUnchanged),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.get(q), 40);
+    assert_eq!(rt.get(r), 41);
 }
 
 /// Outside a compute and in the retry nothing is doomed; in the doomed
