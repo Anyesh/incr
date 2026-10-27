@@ -2066,7 +2066,8 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn kept_children(&self, cidx: u32, keep: &[u32], root: u32) -> KeptChildren {
         let rt = self.runtime_id;
         cycle_state::with_held(|h| {
-            if h.is_empty() {
+            // Only a run above `cidx` that deferred claims can keep children.
+            if !h.any_owned_from(rt, cidx.saturating_add(1)) {
                 return KeptChildren::default();
             }
             let released = releasable(h, rt, cidx, None, keep);
