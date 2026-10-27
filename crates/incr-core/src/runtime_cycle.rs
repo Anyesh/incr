@@ -2815,7 +2815,11 @@ impl<C: Cells> Runtime<C> {
     /// of one must make the decision a read before the claims would have
     /// made. They stay in their group unless `leave`, when they land out
     /// of it, unverified (see `leave_group`).
-    fn release_group_claims<'a>(&self, claimed: impl IntoIterator<Item = &'a u32>, leave: bool) {
+    pub(super) fn release_group_claims<'a>(
+        &self,
+        claimed: impl IntoIterator<Item = &'a u32>,
+        leave: bool,
+    ) {
         let rt = self.runtime_id;
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
