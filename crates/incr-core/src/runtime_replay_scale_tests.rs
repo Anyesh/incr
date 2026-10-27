@@ -18,16 +18,26 @@ use crate::handle::Incr;
 use crate::state::NodeState;
 
 /// `n` times `INCR_TEST_SCALE` (1 when unset), so a test can be timed at a
-/// multiple of its size against its stated growth class.
-fn scaled<T: std::ops::Mul<Output = T> + From<u8>>(n: T) -> T {
-    static SCALE: OnceLock<u8> = OnceLock::new();
+/// multiple of its size against its stated growth class. When the variable
+/// is set, each call prints `SCALED k=<k> n=<n>` to stderr, so a timing run
+/// can tell a test whose size ignores it.
+fn scaled<T: std::ops::Mul<Output = T> + From<u8> + std::fmt::Display + Copy>(n: T) -> T {
+    static SCALE: OnceLock<Option<u8>> = OnceLock::new();
     let k = *SCALE.get_or_init(|| {
-        std::env::var("INCR_TEST_SCALE").map_or(1, |v| match v.parse() {
-            Ok(k) if k > 0 => k,
-            _ => panic!("INCR_TEST_SCALE={v} is not an integer from 1 to 255"),
-        })
+        std::env::var("INCR_TEST_SCALE")
+            .ok()
+            .map(|v| match v.parse() {
+                Ok(k) if k > 0 => k,
+                _ => panic!("INCR_TEST_SCALE={v} is not an integer from 1 to 255"),
+            })
     });
-    n * T::from(k)
+    match k {
+        Some(k) => {
+            eprintln!("SCALED k={k} n={n}");
+            n * T::from(k)
+        }
+        None => n,
+    }
 }
 
 fn counters(n: usize) -> Arc<Vec<AtomicU32>> {
