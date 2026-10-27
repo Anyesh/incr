@@ -682,6 +682,50 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// A held Failed landing's new deps seen Failed: their reverse edges
+    /// wait for its publication, so a set's flip of one reaches the landing
+    /// only through a note. Taken before the publish reads whether they
+    /// are settled: a flip before the note leaves the dep Dirty for that
+    /// read, and one after finds the note.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_held_failed_deps(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        deps: &[(NodeId, u32)],
+    ) {
+        let failed: Vec<&(NodeId, u32)> = deps
+            .iter()
+            .filter(|&&(d, _)| {
+                let dep = self.nodes.get(d.0);
+                self.seen_quietly(dep.state_cell(), dep.state()) == NodeState::Failed
+            })
+            .collect();
+        if failed.is_empty() {
+            return;
+        }
+        let mut published: Vec<NodeId> = Vec::new();
+        node.for_each_dep(|d| published.push(d));
+        fn unpublished<'a, S: DepLookup + ?Sized>(
+            failed: Vec<&'a (NodeId, u32)>,
+            published: &S,
+        ) -> Vec<&'a (NodeId, u32)> {
+            failed
+                .into_iter()
+                .filter(|(d, _)| !published.has(*d))
+                .collect()
+        }
+        let new = if dep_set::needs_hashing(published.len(), failed.len()) {
+            unpublished(failed, &DepHashSet::new(&published))
+        } else {
+            unpublished(failed, published.as_slice())
+        };
+        if !new.is_empty() {
+            self.note_past(id, node.generation(), new.into_iter());
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn note_past<'a>(
