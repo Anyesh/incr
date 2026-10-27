@@ -430,6 +430,38 @@ impl Landings {
     fn retire(&mut self, cidx: u32, ev: &Retire, resumed: Option<PayloadKey>) {
         let source = self.source;
         let ours = |p: PayloadKey| source == Some(p) || resumed == Some(p);
+        // Panics of one text at one address share a log, so a copy's log
+        // holds every earlier one's notes: reading it per event is
+        // quadratic.
+        if let Nodes::Shared { depth, cut, .. } = &mut self.nodes {
+            let top = match *ev {
+                Retire::Above(at) => Some(i64::from(at)),
+                Retire::Contained { cidx: at, payload } => {
+                    Some(i64::from(at) - i64::from(ours(payload)))
+                }
+                Retire::Landing { .. } => None,
+            };
+            if let Some(top) = top {
+                let Ok(keep) = u32::try_from(top - i64::from(cidx) - 1) else {
+                    self.nodes = Nodes::Owned(Vec::new());
+                    return;
+                };
+                if keep < *depth {
+                    *depth = keep;
+                    match cut {
+                        Some(c) => c.depth = c.depth.min(keep),
+                        None => {
+                            *cut = Some(Cut {
+                                depth: keep,
+                                seen: 0,
+                                landed: Rc::default(),
+                            })
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let gone: Box<dyn Fn((u32, u32), u32) -> bool> = match *ev {
             Retire::Above(at) => Box::new(move |_, pos| pos > at),
             Retire::Contained { cidx: at, payload } => {
