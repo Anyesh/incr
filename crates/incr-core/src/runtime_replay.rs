@@ -379,7 +379,8 @@ impl<C: Cells> Runtime<C> {
 
     /// A speculative entry's run stashes only Clean values: a node it would
     /// land Dirty, poisoned, over a dep that is neither Clean nor stashed, or
-    /// over a read its adoption can't check (`KEPT_UNCHECKED`), has a
+    /// over a read its adoption can't check (`KEPT_UNCHECKED`, or a read
+    /// that named no checked source), has a
     /// history the unbounded run may never give it, and a later walk
     /// of its deps would differ from a first run of its closure. A kept
     /// Clean read of another runtime is checked: the stash keeps that runtime's
@@ -422,6 +423,7 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
     ) -> bool {
         ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_UNCHECKED) != 0
+            || ctl.spec_unchecked()
             || deps.iter().any(|&(d, generation)| {
                 !(state::load::<C>(self.nodes.get(d.0).state_cell()).is_settled()
                     || ctl.read_stashes()
@@ -1625,7 +1627,7 @@ impl<C: Cells> Runtime<C> {
             }
         };
         if !kept {
-            ctl.raise(cycle::KEPT_UNCHECKED);
+            ctl.mark_spec_unchecked();
         }
     }
 
@@ -3210,7 +3212,7 @@ impl<C: Cells> Runtime<C> {
             // An unbudgeted reader keeps no count of this runtime's changes
             // for its stash's adoption to check.
             if reader != self.runtime_id && flags.has(cycle::SPECULATIVE) {
-                flags.raise(cycle::KEPT_UNCHECKED);
+                flags.mark_spec_unchecked();
             }
             return self.read_unframed(handle, observed, kind, word);
         }
@@ -6351,7 +6353,7 @@ impl Drop for SpecReadScope {
             replay::close_spec_read(outer);
             // SAFETY: the reading frame is on the stack while its read
             // unwinds, so its control block is live.
-            unsafe { &*self.ctl }.raise(cycle::KEPT_UNCHECKED);
+            unsafe { &*self.ctl }.mark_spec_unchecked();
         }
     }
 }
