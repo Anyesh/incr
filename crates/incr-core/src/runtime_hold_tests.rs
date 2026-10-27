@@ -9,8 +9,10 @@ use super::race_tests::{park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
+use crate::deferred::Deferred;
 use crate::handle::Incr;
 use crate::node::NodeId;
+use crate::segmented_nodes::IN_GROUP;
 use crate::state::NodeState;
 
 fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
@@ -2208,4 +2210,121 @@ fn a_stopped_held_failed_target_keeps_the_next_runs_record() {
 #[cfg_attr(miri, ignore)]
 fn a_flagged_held_failed_target_keeps_the_next_runs_record() {
     held_failed_target_keeps_the_next_runs_record(false);
+}
+
+/// A group verify's claims that leave their group inside an attempt land
+/// held: the attempt's retraction puts each back Dirty, in its group, with
+/// its verification.
+#[test]
+fn shared_group_leave_in_an_attempt_retracts_with_its_record() {
+    let rt = Runtime::<Shared>::new();
+    let k = rt.create_input(1_i64);
+    let m = rt.create_query(move |rt| rt.get(k) + 1);
+    let held = rt.create_query(move |rt| rt.get(k) + 2);
+    assert_eq!(rt.get(m), 2);
+    assert_eq!(rt.get(held), 3);
+    let (node, flags) = rt.nodes.get_with_flags(m.slot());
+    let group = Arc::new(super::GroupInfo {
+        members: vec![(m.slot(), node.generation())],
+        cycle: Cycle::new(vec![m.erase()]),
+    });
+    rt.inner
+        .write()
+        .set_member_rec(rt.runtime_id, m.slot(), Some(group.clone()));
+    Shared::u8_store_relaxed(flags, Shared::u8_load_relaxed(flags) | IN_GROUP);
+    let verified = node.verified_at();
+    assert_ne!(verified, 0);
+
+    let mut bag = Deferred::new();
+    rt.force_state_for_test(held, NodeState::Computing);
+    rt.open_hold(
+        NodeId(held.slot()),
+        rt.nodes.get(held.slot()),
+        false,
+        None,
+        &mut bag,
+    );
+    rt.force_state_for_test(m, NodeState::Computing);
+    rt.release_group_claims(&[m.slot()], true, &mut bag);
+    rt.retract_held();
+    bag.drain(&rt);
+
+    assert_eq!(rt.state_of(m), NodeState::Dirty);
+    let rec = rt.inner.read().member_recs.get(&m.slot()).cloned();
+    assert!(
+        rec.is_some_and(|r| Arc::ptr_eq(&r, &group)),
+        "the retraction left the member out of its group"
+    );
+    assert_ne!(
+        Shared::u8_load_relaxed(flags) & IN_GROUP,
+        0,
+        "IN_GROUP stayed clear"
+    );
+    assert_eq!(node.verified_at(), verified);
+}
+
+/// A leave inside an attempt, where a waiter took one of the claims,
+/// could not be retracted, so every claim stays in its group.
+#[test]
+fn shared_group_leave_with_a_taken_claim_keeps_the_group() {
+    let rt = Runtime::<Shared>::new();
+    let k = rt.create_input(1_i64);
+    let u = rt.create_query(move |rt| rt.get(k) + 1);
+    let m = rt.create_query(move |rt| rt.get(k) + 2);
+    let held = rt.create_query(move |rt| rt.get(k) + 3);
+    for q in [u, m, held] {
+        rt.get(q);
+    }
+    let mut members = vec![
+        (u.slot(), rt.nodes.get(u.slot()).generation()),
+        (m.slot(), rt.nodes.get(m.slot()).generation()),
+    ];
+    members.sort_unstable();
+    let group = Arc::new(super::GroupInfo {
+        members,
+        cycle: Cycle::new(vec![u.erase(), m.erase()]),
+    });
+    for q in [u, m] {
+        rt.inner
+            .write()
+            .set_member_rec(rt.runtime_id, q.slot(), Some(group.clone()));
+        let flags = rt.nodes.get_with_flags(q.slot()).1;
+        Shared::u8_store_relaxed(flags, Shared::u8_load_relaxed(flags) | IN_GROUP);
+    }
+
+    let mut bag = Deferred::new();
+    rt.force_state_for_test(held, NodeState::Computing);
+    rt.open_hold(
+        NodeId(held.slot()),
+        rt.nodes.get(held.slot()),
+        false,
+        None,
+        &mut bag,
+    );
+    rt.force_state_for_test(u, NodeState::Computing);
+    rt.force_state_for_test(m, NodeState::Computing);
+    crate::reserve::mark_claims_taken([(rt.runtime_id, m.slot())]);
+    rt.release_group_claims(&[u.slot(), m.slot()], true, &mut bag);
+    let kept: Vec<(bool, bool)> = [u, m]
+        .iter()
+        .map(|q| {
+            let rec = rt.inner.read().member_recs.get(&q.slot()).cloned();
+            let flags = rt.nodes.get_with_flags(q.slot()).1;
+            (
+                rec.is_some_and(|r| Arc::ptr_eq(&r, &group)),
+                Shared::u8_load_relaxed(flags) & IN_GROUP != 0,
+            )
+        })
+        .collect();
+    rt.retract_held();
+    crate::reserve::clear_taken();
+    bag.drain(&rt);
+
+    assert_eq!(rt.state_of(u), NodeState::Dirty);
+    assert_eq!(rt.state_of(m), NodeState::Dirty);
+    assert_eq!(
+        kept,
+        vec![(true, true), (true, true)],
+        "a claim left its group (record, IN_GROUP) for the untaken and the taken claim"
+    );
 }
