@@ -2802,7 +2802,7 @@ impl<C: Cells> Runtime<C> {
             || self.reads_in_lazy_frame(),
         );
         if read.is_err() && cycle_state::depth() > 0 {
-            cycle_state::note_cycle_caught();
+            self.note_cycle_caught(None);
         }
         read
     }
@@ -5131,7 +5131,7 @@ impl<C: Cells> Runtime<C> {
                 {
                     result = Err(Box::new(cycle::WoundUnwind));
                 }
-                let (deps, reading, read_at) = self.dep_stack.pop_frame_reading();
+                let (deps, reading) = self.dep_stack.pop_frame_reading();
                 let word = value_code::thread_word();
                 if word
                     & (value_code::MEMO_BIT
@@ -5150,7 +5150,9 @@ impl<C: Cells> Runtime<C> {
                     };
                     if let Err(payload) = &result {
                         if word & value_code::UNWIND_MASK != 0 {
-                            cycle_impl::clear_caught_cycle(&**payload, &deps, reading, read_at);
+                            if cycle_impl::read_past_cycle(&**payload, &deps, reading, &ctl) {
+                                self.note_cycle_caught(Some(&ctl));
+                            }
                         }
                     }
                     if let Some(dropped) =
@@ -5833,7 +5835,7 @@ impl<C: Cells> Runtime<C> {
         if word & value_code::KEPT_BIT != 0 {
             replay::drop_kept_from(self.runtime_id, attempt.cidx);
         }
-        if self.after_pop(word, result.is_ok()) {
+        if self.after_pop(word, result.is_ok(), ctl) {
             *result = Err(match UnwindKind::of_word(word) {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
                 _ => Box::new(cycle::WoundUnwind),
@@ -5871,13 +5873,13 @@ impl<C: Cells> Runtime<C> {
     /// wound, which the pop lands as an unwind.
     #[cold]
     #[inline(never)]
-    fn after_pop(&self, word: u64, returned: bool) -> bool {
+    fn after_pop(&self, word: u64, returned: bool, ctl: &ComputeCtl) -> bool {
         if word & value_code::MEMO_BIT != 0 {
             taint_memo::clear_from(self.dep_stack.next_cidx() + 1);
         }
         returned
             && !std::thread::panicking()
-            && self.swallowed(cycle_state::UnwindKind::of_word(word))
+            && self.swallowed(cycle_state::UnwindKind::of_word(word), ctl)
     }
 
     /// A single-node landing: a node landing outside an episode leaves

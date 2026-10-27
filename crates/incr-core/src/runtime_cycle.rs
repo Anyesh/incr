@@ -483,7 +483,7 @@ impl<C: Cells> Runtime<C> {
                 };
                 if kind == ReadKind::TryGet {
                     if !outermost {
-                        cycle_state::note_cycle_caught();
+                        self.note_cycle_caught(None);
                     }
                     if wounded {
                         cycle_state::set_unwind_kind(Some(UnwindKind::Wound));
@@ -644,16 +644,29 @@ impl<C: Cells> Runtime<C> {
     /// its closure as unwound, since the claims the wound must release are
     /// still held and the closure's value rests on the swallowed panic.
     #[cold]
-    pub(super) fn swallowed(&self, kind: Option<UnwindKind>) -> bool {
+    pub(super) fn swallowed(&self, kind: Option<UnwindKind>, ctl: &ComputeCtl) -> bool {
         match kind {
             Some(UnwindKind::Cycle) => {
                 cycle_state::set_unwind_kind(None);
-                cycle_state::note_cycle_caught();
+                self.note_cycle_caught(Some(ctl));
                 false
             }
             Some(UnwindKind::Wound) | Some(UnwindKind::Discard) => true,
             None => false,
         }
+    }
+
+    /// Notes that the attempt took a cycle and reads on past it, unless the
+    /// read is in a doomed or speculative run, which the unbounded run may
+    /// never make: its retry notes it again if it does.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_cycle_caught(&self, popped: Option<&ComputeCtl>) {
+        let discarded = |ctl: &ComputeCtl| ctl.has(cycle::DOOMED) || ctl.has(cycle::SPECULATIVE);
+        if popped.is_some_and(discarded) || self.dep_stack.any_frame(discarded) {
+            return;
+        }
+        cycle_state::note_cycle_caught();
     }
 
     /// Raises a wound: this thread unwinds to its outermost engine entry,
@@ -1127,7 +1140,7 @@ impl<C: Cells> Runtime<C> {
         {
             result = Err(Box::new(WoundUnwind));
         }
-        let (deps, reading, read_at) = self.dep_stack.pop_frame_reading();
+        let (deps, reading) = self.dep_stack.pop_frame_reading();
         let word = value_code::thread_word();
         // A member run starts after its episode root's pop, so nothing
         // below it drops what it kept.
@@ -1136,11 +1149,13 @@ impl<C: Cells> Runtime<C> {
         }
         if let Err(payload) = &result {
             if word & value_code::UNWIND_MASK != 0 {
-                clear_caught_cycle(&**payload, &deps, reading, read_at);
+                if read_past_cycle(&**payload, &deps, reading, &ctl) {
+                    self.note_cycle_caught(Some(&ctl));
+                }
             }
         }
         if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
-            && self.after_pop(word, result.is_ok())
+            && self.after_pop(word, result.is_ok(), &ctl)
         {
             result = Err(match UnwindKind::of_word(word) {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
@@ -3229,18 +3244,17 @@ fn released_at(rt: RuntimeId, e: &Held, cidx: u32) -> bool {
 /// pop clears it here.
 #[cold]
 #[inline(never)]
-pub(super) fn clear_caught_cycle(
+/// Clears a caught cycle's stale kind (see `read_cold`) when the closure
+/// read past it; true if the frame read on past the cycle, even if it then
+/// raised the cycle again.
+pub(super) fn read_past_cycle(
     payload: &(dyn Any + Send),
     deps: &[(NodeId, u32)],
     reading: u64,
-    read_at: u32,
-) {
+    ctl: &ComputeCtl,
+) -> bool {
     if cycle_state::unwind_kind() != Some(UnwindKind::Cycle) {
-        return;
-    }
-    // Read on past the cycle, even if the closure then raised it again.
-    if deps.len() > read_at as usize {
-        cycle_state::note_cycle_caught();
+        return false;
     }
     if !payload.is::<CycleUnwind>()
         && deps
@@ -3249,6 +3263,7 @@ pub(super) fn clear_caught_cycle(
     {
         cycle_state::set_unwind_kind(None);
     }
+    deps.len() > ctl.read_at.get() as usize
 }
 
 /// A node's run landings while reads watch its cycle verdict.

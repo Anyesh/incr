@@ -50,9 +50,6 @@ pub struct Frame {
     /// owns the control block and pops the frame before it returns.
     pub(crate) ctl: *const ComputeCtl,
     pub(crate) cidx: u32,
-    /// `deps`' length at the frame's last read that could unwind into it:
-    /// a dep past it was read after.
-    pub(crate) read_at: u32,
     /// The node the frame's closure is blocked reading, as
     /// `slot | generation << 32`, stored by every nested non-Clean read
     /// before it nests: a doom that marks this frame names it.
@@ -93,6 +90,12 @@ impl Frame {
     #[inline(always)]
     pub(crate) fn rt(&self) -> RuntimeId {
         self.tagged_rt.rt()
+    }
+
+    fn note_read_at(&self) {
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        unsafe { (*self.ctl).read_at.set(self.deps.len() as u32) };
     }
 
     /// Whether the frame is `rt`'s, never the sentinel. A frame that does
@@ -370,7 +373,6 @@ impl Frames {
             deps: Vec::with_capacity(4),
             ctl,
             cidx,
-            read_at: 0,
             reading: 0,
         }
     }
@@ -440,11 +442,23 @@ pub trait DepStack: sealed::Sealed + 'static {
         self.with(|s| s.push(Frames::frame(node, rt, ctl, cidx)))
     }
 
+    /// Whether any frame on the stack, of any runtime, has a control block
+    /// for which `f` holds.
+    fn any_frame(&self, f: impl Fn(&ComputeCtl) -> bool) -> bool {
+        self.with(|s| {
+            s.frames.iter().any(|frame| {
+                // SAFETY: the frame is on the stack, so its control block is
+                // live (see `Frame::ctl`).
+                f(unsafe { &*frame.ctl })
+            })
+        })
+    }
+
     /// The top frame raises from its own code here, after any read so far.
     fn note_raise(&self) {
         self.with(|s| {
-            if let Some(top) = s.frames.last_mut() {
-                top.read_at = top.deps.len() as u32;
+            if let Some(top) = s.frames.last() {
+                top.note_read_at();
             }
         });
     }
@@ -457,15 +471,15 @@ pub trait DepStack: sealed::Sealed + 'static {
     }
 
     /// [`Self::pop_frame`], with the frame's last non-Clean read (see
-    /// `Frame::reading`) and `Frame::read_at`.
+    /// `Frame::reading`).
     #[inline(always)]
-    fn pop_frame_reading(&self) -> (Vec<(NodeId, u32)>, u64, u32) {
+    fn pop_frame_reading(&self) -> (Vec<(NodeId, u32)>, u64) {
         let frame = self.with(|s| {
             let f = s
                 .frames
                 .pop()
                 .expect("incr-core: pop_frame on an empty stack");
-            (f.deps, f.reading, f.read_at)
+            (f.deps, f.reading)
         });
         crate::lock_order::leave_frame();
         frame
@@ -713,14 +727,14 @@ pub trait DepStack: sealed::Sealed + 'static {
             let top = match s.frames.last_mut() {
                 Some(top) if top.is_of(rt) => top,
                 Some(top) => {
-                    top.read_at = top.deps.len() as u32;
+                    top.note_read_at();
                     s.foreign_non_clean_read();
                     return None;
                 }
                 None => return None,
             };
             top.deps.push((dep, generation));
-            top.read_at = top.deps.len() as u32;
+            top.note_read_at();
             top.reading = u64::from(dep.0) | (u64::from(generation) << 32);
             Some(ActiveRead {
                 node: top.node,
