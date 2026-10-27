@@ -181,6 +181,7 @@ impl<C: Cells> Deferred<C> {
 
     #[inline(never)]
     fn drain_items(mut self, rt: &Runtime<C>) {
+        let _drops = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.drop_items())) {
             self.unwind(rt, payload);
         }
@@ -236,6 +237,7 @@ impl<C: Cells> Deferred<C> {
     }
 
     fn drop_isolated(&mut self) {
+        let _drops = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         if let Some(token) = self.dep_list.take() {
             isolate(|| retire_dep_list::<C>(token));
         }
@@ -301,6 +303,7 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
         if let Some(payload) = rt.drop_buried_tickets() {
             self.drain_after(rt, payload);
         }
+        let drops = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
             self.node.drop_parts();
             if self.dep_list.is_some() || self.members.is_some() {
@@ -309,6 +312,7 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
         })) {
             self.unwind(rt, payload);
         }
+        drop(drops);
         let DeleteBag {
             node:
                 NodeDrops {

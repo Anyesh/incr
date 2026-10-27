@@ -374,6 +374,7 @@ impl<T: Value> Drop for RetiredValue<T> {
         // made this token, and is never loaded from the slot again;
         // hazard pointers defer the actual free until no reader still
         // references it.
+        let _drops = crate::attempt::Outside::enter(true);
         unsafe { self.0.retire() };
     }
 }
@@ -387,6 +388,7 @@ impl<T: Value> Drop for IsolatingRetire<T> {
         // SAFETY: as for `RetiredValue`, whose pointer this is; the
         // pointer came from `Box::into_raw`, as `Isolated::from_raw`
         // requires.
+        let _drops = crate::attempt::Outside::enter(true);
         unsafe {
             Domain::global().retire_ptr::<T, Isolated<T>>(self.0.into_inner().as_ptr());
         }

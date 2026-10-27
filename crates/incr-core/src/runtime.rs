@@ -1848,11 +1848,10 @@ impl<C: Cells> Runtime<C> {
             let arena_inner = arena;
             let compute: ComputeFn<C> = Box::new(
                 move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
-                    let new_value = {
-                        let _user =
-                            (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
-                        f(rt)
-                    };
+                    // The closure, and the value's Eq at the cutoff and Drop
+                    // of the value it replaces, are user code.
+                    let _user = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
+                    let new_value = f(rt);
                     let node = rt.nodes.get(slot);
                     let outcome = match ctl.flags.get()
                         & (cycle::RECOMPUTE
