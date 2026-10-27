@@ -739,17 +739,20 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Drops the stash of node `id` at `generation`, which its claim will
-    /// not adopt, with the children a creator's stashed run made.
+    /// not adopt, with the children a creator's stashed run made; true if
+    /// there was one.
     #[cold]
     #[inline(never)]
-    pub(super) fn drop_stash(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) {
+    pub(super) fn drop_stash(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) -> bool {
         if replay::speculative() {
-            return;
+            return false;
         }
-        if let Some(stash) = self.take_stash(id.0, generation, false, true) {
-            self.discard_stashed_children(id, stash.index, bag);
-            bag.push_erased(Box::new(stash.outcome));
-        }
+        let Some(stash) = self.take_stash(id.0, generation, false, true) else {
+            return false;
+        };
+        self.discard_stashed_children(id, stash.index, bag);
+        bag.push_erased(Box::new(stash.outcome));
+        true
     }
 
     /// Claims stashed node `id` at `generation` for adoption, from New or
