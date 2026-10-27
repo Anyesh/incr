@@ -432,6 +432,11 @@ pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
 /// A speculative frame whose outcome no stash keeps: a doomed run is
 /// discarded, and an open cycle's provisional read may settle otherwise.
 pub(crate) const UNSTASHED: u16 = DOOMED | LOW;
+/// A frame that read some node other than as its real state: a
+/// placeholder, a kept or held landing, another runtime's node unchecked,
+/// or a dep that did not land Clean.
+pub(crate) const UNREAL_READS: u16 =
+    DOOMED | POISONED | PH_SEEN | KEPT_READ | FOREIGN_HOLD | KEPT_UNCHECKED | HOLD;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
@@ -456,8 +461,10 @@ const _: () = assert!(crate::bits::disjoint(&[
 const PATH_KEPT: u8 = 1;
 /// [`ComputeCtl::marks`]: see [`ComputeCtl::reads_counted`].
 const READS_COUNTED: u8 = 2;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::looked_up_unrecorded`].
+const LOOKED_UP_UNRECORDED: u8 = 4;
 /// [`ComputeCtl::marks`]: see [`ComputeCtl::read_stashes`].
-const STASH_READ: u8 = 4;
+const STASH_READ: u8 = 8;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -471,8 +478,12 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
-    /// `PATH_KEPT`, `READS_COUNTED` and `STASH_READ`, which only get set.
+    /// `PATH_KEPT`, `READS_COUNTED`, `LOOKED_UP_UNRECORDED` and `STASH_READ`,
+    /// which only get set.
     marks: Cell<u8>,
+    /// The frame's dep count at its last read that could unwind into it:
+    /// a dep past it was read after.
+    pub(crate) read_at: Cell<u32>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
@@ -512,6 +523,7 @@ impl ComputeCtl {
             buf: Cell::new(None),
             wrote: Cell::new(0),
             marks: Cell::new(0),
+            read_at: Cell::new(0),
             children: Cell::new(std::ptr::null()),
             keep,
             path: Cell::new(MaybeUninit::uninit()),
@@ -554,6 +566,16 @@ impl ComputeCtl {
 
     pub(crate) fn mark_stash_read(&self) {
         self.marks.set(self.marks.get() | STASH_READ);
+    }
+
+    /// Whether a `BUFFERED` frame made a lookup that records no dep, which
+    /// a speculative member run's basis cannot check.
+    pub(crate) fn looked_up_unrecorded(&self) -> bool {
+        self.marks.get() & LOOKED_UP_UNRECORDED != 0
+    }
+
+    pub(crate) fn look_up_unrecorded(&self) {
+        self.marks.set(self.marks.get() | LOOKED_UP_UNRECORDED);
     }
 
     /// The frame's path, if [`Self::keep_path`] kept it.

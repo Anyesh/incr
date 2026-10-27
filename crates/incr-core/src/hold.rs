@@ -118,6 +118,16 @@ impl Held {
     }
 }
 
+/// A node whose cycle verdict the attempt may have taken.
+#[derive(Clone, Copy)]
+pub(crate) struct Verdict {
+    pub(crate) generation: u32,
+    /// The node's run landings counted when the verdict was noted.
+    pub(crate) runs: u64,
+    /// This thread's own run landings of it since.
+    pub(crate) own: u64,
+}
+
 #[derive(Default)]
 struct HoldSet {
     by_cell: HashMap<usize, usize, FxBuildHasher>,
@@ -143,6 +153,10 @@ struct HoldSet {
     /// Runtimes a cycle closed in on this thread's stack: what caught it is
     /// held, so the hold stays until their first entry's exit.
     closed: Vec<RuntimeId>,
+    /// The nodes a cycle unwind released while a cycle closed on this
+    /// thread's stack held the attempt: a catcher may have taken their
+    /// verdict.
+    verdicts: HashMap<(RuntimeId, u32), Verdict, FxBuildHasher>,
     /// Records a cut replaced on claims it keeps ([`keep_cut_rec`]).
     cut_recs: Vec<CutRec>,
     /// Runtimes with a replaced record not yet taken by [`take_recs`],
@@ -663,6 +677,16 @@ pub(crate) fn defer_trace(cell: usize, action: TraceAction) -> Option<TraceActio
 
 /// Records a landing of a node with an entry; false if it has none.
 pub(crate) fn land(cell: usize, target: NodeState, flagged: NodeState, unrun: bool) -> bool {
+    land_with(cell, target, flagged, Some(unrun))
+}
+
+/// [`land`] of a give-back, which marks the entry unrun only if `mark`
+/// and otherwise leaves its mark as the claim found it.
+pub(crate) fn land_marking(cell: usize, target: NodeState, flagged: NodeState, mark: bool) -> bool {
+    land_with(cell, target, flagged, mark.then_some(true))
+}
+
+fn land_with(cell: usize, target: NodeState, flagged: NodeState, unrun: Option<bool>) -> bool {
     with(|h| {
         h.seq += 1;
         let seq = h.seq;
@@ -672,7 +696,9 @@ pub(crate) fn land(cell: usize, target: NodeState, flagged: NodeState, unrun: bo
         e.seq = seq;
         e.target = target;
         e.flagged = flagged;
-        e.unrun = unrun;
+        if let Some(unrun) = unrun {
+            e.unrun = unrun;
+        }
         e.reclaimed = false;
         attempt::hold_progress();
         true
@@ -686,6 +712,52 @@ pub(crate) fn consulted() -> bool {
 
 pub(crate) fn clear_consulted() {
     with(|h| h.consulted = false);
+}
+
+pub(crate) fn has_verdict(rt: RuntimeId, slot: u32, generation: u32) -> bool {
+    with(|h| {
+        h.verdicts
+            .get(&(rt, slot))
+            .is_some_and(|v| v.generation == generation)
+    })
+}
+
+/// Notes the verdict with the node's run landings so far; the generation
+/// of a record it replaces, whose watch the caller ends.
+pub(crate) fn note_verdict(rt: RuntimeId, slot: u32, generation: u32, runs: u64) -> Option<u32> {
+    with(|h| {
+        h.verdicts
+            .insert(
+                (rt, slot),
+                Verdict {
+                    generation,
+                    runs,
+                    own: 0,
+                },
+            )
+            .map(|v| v.generation)
+    })
+}
+
+/// This thread's run landed `rt`'s node at `slot`, as counted.
+pub(crate) fn own_run(rt: RuntimeId, slot: u32, generation: u32) {
+    with(|h| {
+        if let Some(v) = h.verdicts.get_mut(&(rt, slot)) {
+            if v.generation == generation {
+                v.own += 1;
+            }
+        }
+    });
+}
+
+pub(crate) fn verdicts(rt: RuntimeId) -> Vec<(u32, Verdict)> {
+    with(|h| {
+        h.verdicts
+            .iter()
+            .filter(|(k, _)| k.0 == rt)
+            .map(|(k, v)| (k.1, *v))
+            .collect()
+    })
 }
 
 pub(crate) fn note_episode(rt: RuntimeId) {
@@ -812,6 +884,8 @@ pub(crate) struct Taken {
     /// A waiter wounded the attempt, and may have taken entries the
     /// landings read: they retract rather than publish.
     pub(crate) wounded: bool,
+    /// The verdicts noted, as (slot, generation), whose watches end.
+    pub(crate) verdicts: Vec<(u32, u32)>,
 }
 
 /// Takes `rt`'s entries, with the episodes it landed, for publication or
@@ -839,6 +913,13 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
         h.tainted.retain(|r| *r != rt);
         h.closed.retain(|r| *r != rt);
         h.recs.retain(|r| *r != rt);
+        let mut verdicts = Vec::new();
+        h.verdicts.retain(|k, v| {
+            if k.0 == rt {
+                verdicts.push((k.1, v.generation));
+            }
+            k.0 != rt
+        });
         let cut_recs = take_cut_recs(h, rt);
         // A taint keeps the bit, so that the `HOLD` it raised passes up.
         if h.by_cell.is_empty()
@@ -849,6 +930,10 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
             h.entries.clear();
             debug_assert!(h.by_rt.is_empty());
             h.consulted = false;
+            debug_assert!(
+                h.verdicts.is_empty(),
+                "incr-core: a verdict outlived its runtime's take, and its watch with it"
+            );
             value_code::set_held_bit(false);
         }
         taken.sort_by_key(|e| e.seq);
@@ -862,6 +947,7 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
             episodes,
             cut_recs,
             wounded,
+            verdicts,
         }
     })
 }

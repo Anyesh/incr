@@ -18,7 +18,7 @@ use crate::handle::RuntimeId;
 
 #[cfg(not(loom))]
 use std::sync::{
-    atomic::{AtomicU64, AtomicU8, Ordering},
+    atomic::{AtomicU8, Ordering},
     Arc, Mutex,
 };
 
@@ -83,13 +83,55 @@ loom::thread_local! {
     static WINNER: std::cell::RefCell<Option<(Arc<AtomicU8>, Claim)>> = std::cell::RefCell::new(None);
 }
 
-/// Wounds dealt, for tests.
-#[cfg(not(loom))]
-pub(crate) static WOUNDS: AtomicU64 = AtomicU64::new(0);
-
-/// Head-start checks a runtime made of a claim of its own, for tests.
+/// Wounds dealt to a waiter on or holding a claim of each runtime, for
+/// tests.
 #[cfg(all(test, not(loom)))]
-pub(crate) static OWN_CLAIM_CHECKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WOUNDS: PerRuntime = PerRuntime::new();
+
+/// Head-start checks each runtime made of a claim of its own, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) static OWN_CLAIM_CHECKS: PerRuntime = PerRuntime::new();
+
+/// A count kept per runtime, so a test reads its own runtimes' events and
+/// not those of tests running beside it in the process.
+#[cfg(all(test, not(loom)))]
+pub(crate) struct PerRuntime(Mutex<Vec<(RuntimeId, u64)>>);
+
+#[cfg(all(test, not(loom)))]
+impl PerRuntime {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    fn counts(&self) -> impl std::ops::DerefMut<Target = Vec<(RuntimeId, u64)>> + '_ {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn add(&self, rt: RuntimeId) {
+        let mut counts = self.counts();
+        match counts.iter_mut().find(|(r, _)| *r == rt) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((rt, 1)),
+        }
+    }
+
+    pub(crate) fn on(&self, rt: RuntimeId) -> u64 {
+        self.counts()
+            .iter()
+            .find(|(r, _)| *r == rt)
+            .map_or(0, |&(_, n)| n)
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+fn count_wound(w: &Waiter) {
+    let mut rts: Vec<RuntimeId> = w.holds.iter().chain([&w.waiting_on]).map(|c| c.0).collect();
+    rts.sort();
+    rts.dedup();
+    for rt in rts {
+        WOUNDS.add(rt);
+    }
+}
 
 /// Threads registered now, for tests.
 #[cfg(test)]
@@ -175,8 +217,8 @@ impl Registration {
                     if i != oldest {
                         reg.waiters[i].winner = Some(winner.clone());
                         reg.waiters[i].state.store(WOUNDED, Ordering::Release);
-                        #[cfg(not(loom))]
-                        WOUNDS.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(all(test, not(loom)))]
+                        count_wound(&reg.waiters[i]);
                     }
                 }
                 break;
@@ -325,6 +367,28 @@ mod tests {
                     },
                 );
                 assert_eq!(backoffs, 0);
+            },
+        )
+        .assert_clean();
+    }
+
+    /// A wound counts once for each runtime whose claims its waiter waits
+    /// on or holds, and for no other runtime.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_wound_counts_for_its_waiters_runtimes_only() {
+        crate::child_test::run_in_child(
+            "waits::tests::a_wound_counts_for_its_waiters_runtimes_only",
+            || {
+                let [a, b, c] = [9, 11, 13].map(|n| RuntimeId::for_test(u64::MAX - n));
+                let older = Registration::new(|_| 1, (b, 2), vec![(a, 1), (c, 5)]);
+                let younger = Registration::new(|_| 2, (a, 1), vec![(a, 3), (b, 2)]);
+                assert!(younger.wounded() && !older.wounded());
+                assert_eq!(
+                    [a, b, c].map(|rt| WOUNDS.on(rt)),
+                    [1, 1, 0],
+                    "wounds on a, b, c"
+                );
             },
         )
         .assert_clean();

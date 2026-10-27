@@ -3856,6 +3856,110 @@ fn speculative_member_run_leaves_no_buffer() {
     });
 }
 
+/// Seeds where a cycle member's run inside a doomed frame was made under
+/// speculation and the frame's real look reran it: at budget 1 the
+/// member's Native query ran twice where the unbounded run runs it once.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_member_run_of_unchanged_reads_is_not_rerun() {
+    let seeds = [0x3ce9, 0xf10, 0x20764, 0x2389c, 0x23d9f, 0x1a063, 0x16a03];
+    quiet(|| {
+        for seed in seeds {
+            differential::<Local>(&gen_case(seed, false, false), seed);
+        }
+        differential::<Shared>(&gen_case(0x20764, false, false), 0x20764);
+    });
+}
+
+/// 0x30e8 under `Shared` at budgets 1 and 2: op 12's second speculative
+/// member run is member 6's, which reads 7 Clean. Another thread sets input
+/// 25 and lands 7 again before that run is recorded. No real look may adopt
+/// the run, which read 7's old value, and `Get(0)` after both returns what
+/// the unbounded run gives with the set before or after op 12.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_speculative_member_run_over_a_dep_landed_again_before_its_record_is_not_adopted() {
+    let case = gen_case(0x30e8, false, false);
+    let op = 12;
+    let reference = |set_first: bool, v: u64| {
+        let mut c = case.clone();
+        c.ops = case.ops[..op].to_vec();
+        if set_first {
+            c.ops
+                .extend([Op::Set(25, v), case.ops[op].clone(), Op::Get(0)]);
+        } else {
+            c.ops
+                .extend([case.ops[op].clone(), Op::Set(25, v), Op::Get(0)]);
+        }
+        let mut trace = Vec::new();
+        quiet(|| trace = run::<Shared>(&c, None, 0));
+        trace.pop().expect("the read ran").0
+    };
+    for frames in [1, 2] {
+        for v in [2, 4, 6] {
+            let rts = runtimes::<Shared>(Some(frames), 0);
+            let live = Live::new(&rts, &case);
+            let world = live.world.clone();
+            let member = NodeId(world.handle(0, 6).erased().slot());
+            let armed = Arc::new(AtomicBool::new(false));
+            let a = armed.clone();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let r = runs.clone();
+            let raced = Arc::new(Mutex::new(None));
+            let s = raced.clone();
+            let installed = rts[0].park_hook.set(Box::new(move |p| {
+                let ParkPoint::MemberBeforeRecord(id) = p else {
+                    return;
+                };
+                if !a.load(SeqCst) || !crate::replay::speculative() || r.fetch_add(1, SeqCst) != 1 {
+                    return;
+                }
+                let w = world.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let setter = std::thread::spawn(move || {
+                    set_out(w.rt(0), w.handle(0, 25), v);
+                    let _ = tx.send(read_out(w.rt(0), w.handle(0, 7), false));
+                });
+                let landed = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+                *s.lock().unwrap() = Some((id, landed, setter));
+            }));
+            assert!(installed.is_ok());
+            reset_thread();
+            crate::cycle_state::ADOPTED.with(|a| a.borrow_mut().clear());
+            let mut after = None;
+            quiet(|| {
+                for o in &case.ops[..op] {
+                    let _ = catch_unwind(AssertUnwindSafe(|| live.apply(o)));
+                }
+                crate::cycle_state::ADOPTED.with(|a| a.borrow_mut().clear());
+                armed.store(true, SeqCst);
+                let _ = catch_unwind(AssertUnwindSafe(|| live.apply(&case.ops[op])));
+                armed.store(false, SeqCst);
+                after = Some(live.apply(&Op::Get(0)));
+            });
+            let (id, landed, setter) = raced
+                .lock()
+                .unwrap()
+                .take()
+                .expect("op 12 made a second speculative member run");
+            setter.join().expect("the setter ran");
+            let after = after.expect("the read ran");
+            let at = format!("budget {frames}, v {v}");
+            assert_eq!(id, member, "{at}: the second speculative member run is 6's");
+            assert!(landed, "{at}: 7 landed again before the record");
+            assert!(
+                !crate::cycle_state::ADOPTED.with(|a| a.borrow().contains(&member.0)),
+                "{at}: a real look adopted member 6's run over 7's old value"
+            );
+            let (set_first, op_first) = (reference(true, v), reference(false, v));
+            assert!(
+                after == set_first || after == op_first,
+                "{at}: Get(0) after the set gives {after:?}, the unbounded run {set_first:?} (set first) or {op_first:?} (op 12 first)"
+            );
+        }
+    }
+}
+
 /// 0x1dd5_ac14_6f19_4569 with every query bare and [`Bare`] given a
 /// placeholder, whose `Drop` panics on a value only a speculative run
 /// builds. At budget 1 a speculative run buffers 9999 on a member, and
@@ -5918,6 +6022,110 @@ fn two_thread_wound_retracts_a_member_run_landing_under_a_closed_cycle() {
     .assert_clean();
 }
 
+/// 0xb0939's ops 3 (`Get(0)`, thread 0) and 4 (`TryGet(1)`, thread 1)
+/// overlap on the cycle {1, 2, 3}. Op 3 unwinds the cycle, releases 1 and
+/// 2 unrun, held, and publishes them New at its read's end with the deps
+/// its runs recorded. Op 4 either waits on op 3's claim of 1 through op 3
+/// (`wait`) or plans 1 New with no deps and claims it only after op 3
+/// published it (`after`). Every order has op 4's walk expand 1's deps
+/// then, entering the cycle where the op-3-first order does, which gives
+/// `Cycle([4, 5, 6])`; running 1 at once entered the cycle at 1 over 2's
+/// recorded deps, and 1 caught `Cycle([4, 6])`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_waiter_revisits_a_release_published_at_its_reads_end() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_waiter_revisits_a_release_published_at_its_reads_end",
+        || {
+            struct Park {
+                claimed: AtomicBool,
+                waits: AtomicBool,
+                published: AtomicBool,
+                parked: AtomicBool,
+            }
+            let case = gen_case(0xb0939, false, true);
+            let phases = phases(&case, 0xb0939);
+            let overlap = phases.iter().position(|p| p.ops() == [3, 4]).unwrap();
+            assert_eq!(phases[overlap].of(1), Some(4));
+            let patience = std::time::Duration::from_secs(2);
+            quiet(|| {
+                for frames in [None, Some(1)] {
+                    for wait in [true, false] {
+                        for round in 0..2 {
+                            let park = Arc::new(Park {
+                                claimed: AtomicBool::new(false),
+                                waits: AtomicBool::new(false),
+                                published: AtomicBool::new(false),
+                                parked: AtomicBool::new(false),
+                            });
+                            let rig = |live: &Live<Shared>| {
+                                let (park, world) = (park.clone(), live.world.clone());
+                                let n1 = NodeId(world.handle(0, 1).erased().slot());
+                                let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                                    if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                                        return;
+                                    }
+                                    let t = std::time::Instant::now();
+                                    match TWO_THREAD.with(std::cell::Cell::get) {
+                                        Some(0)
+                                            if p == ParkPoint::BeforeReservationCheck(n1)
+                                                && !park.claimed.swap(true, SeqCst)
+                                                && wait =>
+                                        {
+                                            until(|| park.waits.load(SeqCst) || t.elapsed() > patience);
+                                        }
+                                        Some(0) if p == ParkPoint::HeldPublished(n1) => {
+                                            park.published.store(true, SeqCst);
+                                        }
+                                        Some(1)
+                                            if p == ParkPoint::BeforeComputeOne(n1)
+                                                && !park.parked.swap(true, SeqCst) =>
+                                        {
+                                            until(|| {
+                                                (if wait { &park.claimed } else { &park.published })
+                                                    .load(SeqCst)
+                                                    || t.elapsed() > patience
+                                            });
+                                        }
+                                        // Op 3 stays parked on its claim of 1 until
+                                        // op 4 waits on it, in the walk or the claim.
+                                        Some(1)
+                                            if p == ParkPoint::WalkWaits(n1)
+                                                || p == ParkPoint::ComputeWaits(n1) =>
+                                        {
+                                            park.waits.store(true, SeqCst);
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                                assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                            };
+                            let serial = Serial::new(&case, &phases);
+                            let verdict = Mutex::new(None);
+                            let got = run_two_until(&case, &phases, frames, 0, &rig, &|p, prefix, live| {
+                                let v = serial.at_overlap("0xb0939", prefix, live);
+                                let stop = p == overlap || v.is_some();
+                                *verdict.lock().unwrap() = v;
+                                stop
+                            });
+                            let at = format!("{frames:?} frames, wait {wait}, round {round}");
+                            assert!(park.parked.load(SeqCst), "{at}: op 4 never reached 1");
+                            if wait {
+                                assert!(park.waits.load(SeqCst), "{at}: op 4 never waited on 1");
+                            } else {
+                                assert!(park.published.load(SeqCst), "{at}: op 3 never published 1");
+                            }
+                            serial.check("0xb0939", &got, verdict.into_inner().unwrap());
+                            assert_eq!(got[4].0, Out::Cycle(vec![4, 5, 6]), "{at}");
+                        }
+                    }
+                }
+            });
+        },
+    )
+    .assert_clean();
+}
+
 /// 0x329f unbounded: op 1's `TryGet(4)` returned 1 where every order
 /// raises the cycle through 4, in about one run in ten under load, until
 /// what catches a cycle closed on this thread's stack was held.
@@ -6236,11 +6444,10 @@ fn two_thread_walk_plan_holds_over_unrelated_releases() {
 /// Op 7 enters it at 8, which has none, so 7's `try_get(4)` gets the
 /// cycle (R3). Here op 7 then holds until op 6, entering at 12, has
 /// landed 8 Clean, and 7 reads 8 = 2 twice: 7777 + 2 + 2, no order's
-/// value. The oracle orders that get per read: each read is an order's
-/// outcome for it, and the value is 7's closure over them.
+/// value, so op 7 reruns once and gives the 6-first order's 8.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
+fn two_thread_get_that_caught_a_cycle_the_partner_then_landed_reruns() {
     let case = gen_case(0x1006, false, true);
     let phases = phases(&case, 0x1006);
     let overlap = phases.iter().position(|p| p.ops() == [6, 7]).unwrap();
@@ -6276,10 +6483,11 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
     };
     quiet(|| {
         let serial = Serial::new(&case, &phases);
-        let (verdict, seven) = (Mutex::new(None), Mutex::new(None));
+        let (verdict, seven, reruns) = (Mutex::new(None), Mutex::new(None), Mutex::new(None));
         let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
             if p == overlap {
                 on.store(false, SeqCst);
+                *reruns.lock().unwrap() = Some(live.world.rt(0).verdict_reruns.load(SeqCst));
                 let evals = live.evals.lock().unwrap();
                 let last = evals[&7]
                     .iter()
@@ -6295,14 +6503,19 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
             *verdict.lock().unwrap() = v;
             stop
         });
-        assert_eq!(got[7].0, Out::Value(7781));
-        serial.check("0x1006", &got, verdict.into_inner().unwrap());
-        let per_read = serial.per_read.lock().unwrap().clone();
         assert_eq!(
-            per_read.keys().collect::<Vec<_>>(),
-            [&7],
-            "op 6 stays exact"
+            got[7].0,
+            Out::Value(8),
+            "op 7 gives the 6-first order's value"
         );
+        assert_eq!(reruns.into_inner().unwrap(), Some(1), "the race was driven");
+        serial.check("0x1006", &got, verdict.into_inner().unwrap());
+        let in_order = run::<Shared>(&case, None, 0);
+        assert_eq!(
+            got[7].1 .0[7], in_order[7].1 .0[7],
+            "the rerun leaves the 6-first order's state"
+        );
+        let per_read = serial.per_read.lock().unwrap().clone();
 
         let (prefix, mut sevens) = seven.into_inner().unwrap().unwrap();
         let read = (sevens.reads.iter_mut())
@@ -6330,22 +6543,15 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
             failed[k].1 .0[5] = NodeState::Failed;
         }
         rejects(failed, "a Failed node no order leaves");
-        // 7 read 4 through the cycle's unwind, so it lands Dirty, where 6
-        // first leaves it Clean: the states differ past the phase and, in
-        // a case with cycles, later results are history as after any such
-        // phase.
-        let in_order = run::<Shared>(&case, None, 0);
-        assert_eq!(got[7].1 .0[7], NodeState::Dirty);
-        assert_eq!(in_order[7].1 .0[7], NodeState::Clean);
     });
 }
 
 /// 0x1006's phase [6, 7] run serially: op 7 holds at its first park until
 /// op 6 has landed 8..12 Clean, so no race is possible and op 7's outcome
 /// must be the 6-first order's Value(8). With a stale-catch fault spliced
-/// in (op 7 carries the racing run's reads, its `try_get(4)` = Cycle, and
-/// returns 7781), the oracle must reject the trace: the cycle was caught
-/// after the partner landed it, not before.
+/// in (op 7 carries the reads of the racing attempt its rerun discarded,
+/// its `try_get(4)` = Cycle, and returns 7781), the oracle must reject the
+/// trace: the cycle was caught after the partner landed it, not before.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
@@ -6403,7 +6609,11 @@ fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
         let race_got = run_two_until(&case, &phases, None, 0, &race_rig, &|p, prefix, live| {
             if p == overlap {
                 on.store(false, SeqCst);
-                *race_evals.lock().unwrap() = Some(live.evals.lock().unwrap()[&7].clone());
+                let rt = live.world.rt(0);
+                assert_eq!(rt.verdict_reruns.load(SeqCst), 1, "the race was driven");
+                let evals = live.evals.lock().unwrap()[&7].clone();
+                let discarded = evals.into_iter().filter(|e| !e.caught.is_empty());
+                *race_evals.lock().unwrap() = Some(discarded.collect::<Vec<_>>());
             }
             let v = racing.at_overlap("0x1006 race", prefix, live);
             if p + 1 == overlap {
@@ -6411,7 +6621,11 @@ fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
             }
             v.is_some()
         });
-        assert_eq!(race_got[7].0, Out::Value(7781), "the race was driven");
+        assert_eq!(
+            race_got[7].0,
+            Out::Value(8),
+            "op 7 reran in the 6-first order"
+        );
         let race_evals = race_evals.into_inner().unwrap().unwrap();
 
         let serial = Serial::new(&case, &phases);

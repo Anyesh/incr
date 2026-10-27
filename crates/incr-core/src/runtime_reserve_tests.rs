@@ -147,7 +147,7 @@ fn shared_reservation_ends_when_its_owner_is_wounded() {
         spawn("r", move || rt.get(t))
     };
     entry.wait_parked();
-    let wounds = crate::waits::WOUNDS.load(SeqCst);
+    let wounds = crate::waits::WOUNDS.on(s.rt.runtime_id);
     let waits = s.rt.reservation_waits.load(SeqCst);
     s.w_gate.release();
     await_reservation_wait(&s.rt, waits);
@@ -159,7 +159,7 @@ fn shared_reservation_ends_when_its_owner_is_wounded() {
     let want = (outcome(|| u.rt.get(u.w)), outcome(|| u.rt.get(u.t)));
     assert_eq!((w, t), want);
     assert!(
-        crate::waits::WOUNDS.load(SeqCst) > wounds,
+        crate::waits::WOUNDS.on(s.rt.runtime_id) > wounds,
         "no wound passed through the reservation"
     );
     s.rt.assert_invariant_i();

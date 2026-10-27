@@ -430,12 +430,10 @@ impl<C: Cells> Runtime<C> {
             || self.frame_owes_outcome(id)
     }
 
-    /// Whether a speculative stand-in's run read something its landing
-    /// alone can't check: a read `KEPT_UNCHECKED` or a stash, whose reads
-    /// go with the frame.
-    pub(super) fn stand_in_unchecked(&self, cidx: u32, ctl: &ComputeCtl) -> bool {
-        let took = !self.take_spec_reads(cidx, ctl).is_empty();
-        took || ctl.read_stashes() || ctl.has(cycle::KEPT_UNCHECKED)
+    /// Ends a member run's reads of other stashes: a member run keeps no
+    /// stash, and its claim's landing checks its reads by their basis.
+    pub(super) fn end_spec_reads(&self, cidx: u32, ctl: &ComputeCtl) {
+        drop(self.take_spec_reads(cidx, ctl));
     }
 
     /// The popping frame's reads of other stashes, for its own stash.
@@ -1670,6 +1668,7 @@ impl<C: Cells> Runtime<C> {
             match cycle_state::unwind_kind() {
                 Some(UnwindKind::Cycle) => {
                     cycle_state::set_unwind_kind(None);
+                    self.note_cycle_caught(None);
                     word = value_code::thread_word();
                 }
                 Some(UnwindKind::Discard) if !std::thread::panicking() => {
@@ -4615,41 +4614,27 @@ impl<C: Cells> Runtime<C> {
                     e.last().iter().any(|&(d, _)| d.0 == v.node)
                 })
                 .expect("incr-core: a stand-in is held");
-        if let (Some(revs), false) = (stand_in, rooted) {
-            if !(v.spec && self.alone_lands_dirty(v.node, v.spec)) {
-                if v.spec {
-                    // `land_alone` takes a speculative run's buffer only when
-                    // adopted: over Clean deps alone it is the value the
-                    // unbounded run's own run of the node gives.
-                    cycle_state::with_held(|h| {
-                        h.get_mut(&(rt, v.node))
-                            .expect("incr-core: a stand-in is held")
-                            .adopt();
-                    });
+        if let (Some(revs), false, false) = (stand_in, rooted, v.spec) {
+            let mut bag = Deferred::new();
+            return match self.land_alone(v.node, revs, &mut bag) {
+                Ok(landed) => {
+                    bag.drain(self);
+                    match landed {
+                        Some(NodeState::Clean) => VPop::Finished(v.node, Ended::Landed),
+                        Some(_) => VPop::Finished(v.node, Ended::Unsettled),
+                        None => VPop::Next,
+                    }
                 }
-                let mut bag = Deferred::new();
-                return match self.land_alone(v.node, revs, &mut bag) {
-                    Ok(landed) => {
-                        bag.drain(self);
-                        match landed {
-                            Some(NodeState::Clean) => VPop::Finished(v.node, Ended::Landed),
-                            Some(_) => VPop::Finished(v.node, Ended::Unsettled),
-                            None => VPop::Next,
-                        }
-                    }
-                    Err(payload) => {
-                        // The landing finishes the stand-in's run, whose
-                        // speculative guard has dropped.
-                        cycle_state::set_unwind_kind(replay::run_unwind_kind(
-                            cycle_state::unwind_kind(),
-                            v.spec || replay::speculative(),
-                        ));
-                        bag.drain(self);
-                        self.vframe_unwound(id, v, v.node, true, payload, failures)
-                    }
-                };
-            }
-        } else if !rooted {
+                Err(payload) => {
+                    cycle_state::set_unwind_kind(replay::run_unwind_kind(
+                        cycle_state::unwind_kind(),
+                        replay::speculative(),
+                    ));
+                    bag.drain(self);
+                    self.vframe_unwound(id, v, v.node, true, payload, failures)
+                }
+            };
+        } else if stand_in.is_none() && !rooted {
             return VPop::Left;
         }
         if v.spec {
@@ -4678,20 +4663,6 @@ impl<C: Cells> Runtime<C> {
             Ok(end) => self.episode_task_end(NodeId(v.node), v.cidx, end, bag),
             Err(payload) => self.vframe_unwound(id, v, v.node, false, payload, failures),
         }
-    }
-
-    /// Whether held node `slot`, landing alone in a speculative run, would
-    /// land other than Clean, which such a run never does. `spec` is the
-    /// popping frame's own flag.
-    fn alone_lands_dirty(&self, slot: u32, spec: bool) -> bool {
-        self.look_held(slot, Look::here_or(spec), |e| {
-            e.poison() != 0
-                || e.spec_unchecked()
-                || e.last()
-                    .iter()
-                    .any(|&(d, _)| !state::load::<C>(self.nodes.get(d.0).state_cell()).is_settled())
-        })
-        .expect("incr-core: a landing claim is held")
     }
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's

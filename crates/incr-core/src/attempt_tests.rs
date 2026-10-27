@@ -78,7 +78,7 @@ fn a_waiter_takes_over_only_a_flight_that_stays_open() {
 }
 
 fn claim(slot: u32) -> crate::waits::Claim {
-    (crate::handle::RuntimeId::for_test(1), slot)
+    (crate::handle::RuntimeId::for_test(u64::MAX - 10), slot)
 }
 
 #[test]

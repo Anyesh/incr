@@ -549,7 +549,7 @@ mod wounds {
             assert_eq!(episode.join().unwrap(), 5);
             assert_eq!(reader.join().unwrap(), 0);
         });
-        assert_wounded();
+        assert_wounded(ep.rt.runtime_id);
         ep.assert_landed(Shape::plain(), 5, false);
     }
 

@@ -184,6 +184,117 @@ fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
     rt.assert_invariant_i();
 }
 
+/// q reads the held cycle and then d, and panics on d's first value, so its
+/// Failed landing is held with its edge to d unpublished. A set of d
+/// before the exit walks no edge to q: the set must still reach q, or q
+/// stays Failed over a value it never read.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_failed_landing_sees_a_set_on_its_new_dep_before_the_exit() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let (a, _) = two_cycle(&*rt);
+    let d = rt.create_input(7_i64);
+    let q = rt.create_query(move |rt| {
+        let cycle = rt.get(a);
+        let v = rt.get(d);
+        assert!(v != 7, "boom");
+        cycle * 1000 + v
+    });
+    let set = Arc::new(AtomicBool::new(false));
+    let hook: super::ParkHook = {
+        let (weak, set) = (Arc::downgrade(&rt), set.clone());
+        let owner = std::thread::current().id();
+        Box::new(move |point| {
+            if point != super::ParkPoint::BeforeHeldPublish
+                || std::thread::current().id() != owner
+                || set.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            std::thread::spawn(move || rt.set(d, 8)).join().unwrap();
+            set.store(true, Ordering::SeqCst);
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let first = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+    assert!(first.is_err(), "q panics on d's first value");
+    assert!(
+        set.load(Ordering::SeqCst),
+        "the read published held landings"
+    );
+    let cycle = rt.get(a);
+    let again = catch_unwind(AssertUnwindSafe(|| rt.get(q))).map_err(panic_message);
+    assert_eq!(
+        again,
+        Ok(cycle * 1000 + 8),
+        "q stayed Failed over the set of d"
+    );
+    rt.assert_invariant_i();
+}
+
+/// d's Failed landing is published by an earlier read. q then reads d and
+/// the held cycle, so its own Failed landing is held with its edge to d
+/// unpublished. Before the exit a set flips d and another read reruns it
+/// to a new Failed landing with no write: the flip must reach q as its
+/// edge would have, so that q runs again rather than stay Failed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_failed_landing_sees_its_failed_dep_rerun_before_the_exit() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let (a, _) = two_cycle(&*rt);
+    let i = rt.create_input(1_i64);
+    let d = rt.create_query(move |rt| -> i64 { panic!("boom {}", rt.get(i)) });
+    let q = rt.create_query(move |rt| -> i64 {
+        let saw = catch_unwind(AssertUnwindSafe(|| rt.get(d))).map_err(panic_message);
+        let cycle = rt.get(a);
+        panic!("q saw {saw:?} over {cycle}")
+    });
+    let armed = Arc::new(AtomicBool::new(false));
+    let rerun = Arc::new(AtomicBool::new(false));
+    let hook: super::ParkHook = {
+        let (weak, armed, rerun) = (Arc::downgrade(&rt), armed.clone(), rerun.clone());
+        let owner = std::thread::current().id();
+        Box::new(move |point| {
+            if point != super::ParkPoint::BeforeHeldPublish
+                || std::thread::current().id() != owner
+                || !armed.load(Ordering::SeqCst)
+                || rerun.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            std::thread::spawn(move || {
+                rt.set(i, 2);
+                let again = catch_unwind(AssertUnwindSafe(|| rt.get(d))).map_err(panic_message);
+                assert_eq!(again, Err(String::from("boom 2")));
+            })
+            .join()
+            .unwrap();
+            rerun.store(true, Ordering::SeqCst);
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let early = catch_unwind(AssertUnwindSafe(|| rt.get(d))).map_err(panic_message);
+    assert_eq!(early, Err(String::from("boom 1")));
+    armed.store(true, Ordering::SeqCst);
+    let first = catch_unwind(AssertUnwindSafe(|| rt.get(q))).map_err(panic_message);
+    assert!(
+        first.as_ref().is_err_and(|m| m.starts_with("q saw")),
+        "q ran and panicked: {first:?}"
+    );
+    assert!(
+        rerun.load(Ordering::SeqCst),
+        "the read published held landings"
+    );
+    let again = catch_unwind(AssertUnwindSafe(|| rt.get(q))).map_err(panic_message);
+    assert!(
+        again.as_ref().is_err_and(|m| m.starts_with("q saw")),
+        "q stayed Failed over the rerun of d: {again:?}"
+    );
+    rt.assert_invariant_i();
+}
+
 /// Reads `p`, whose landing is held, with its publication panicking at the
 /// first other landing it publishes, where a child sweep's caught panic
 /// resumes, and `also` sees every other park point. Returns that landing's
