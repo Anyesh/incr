@@ -5121,13 +5121,14 @@ fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
 }
 
 /// Seed 0x366149ed's op 7, `Get2(3, false)`, cross, at a budget of 1:
-/// node 19's held Failed landing read 4, whose held landing the attempt
-/// then left Dirty with no memo, so 4 moved and 19 lands Dirty, as the
-/// unbounded run reruns it and reads 1. A held Dirty dep that keeps a
-/// memo for the revision is what 19 read, as in seed 0x36618028 above.
+/// node 19's held Failed landing read 4, which the budget's unrun
+/// releases left Dirty with no set since. Counted moved, it lowered 19
+/// and six Failed landings reading it to Dirty, and a read of one, 9,
+/// verified it back to its old value, and the replay that followed ran
+/// 19 down the branch that reads 1, which the unbounded run never takes.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn a_held_failed_reader_of_a_dep_left_dirty_without_a_memo_moves() {
+fn a_held_failed_reader_of_a_dep_a_budget_left_dirty_stays_failed() {
     let mut case = gen_case(0x3661_49ed, true, false);
     case.ops.truncate(8);
     assert!(matches!(case.ops[7], Op::Get2(3, false)));
