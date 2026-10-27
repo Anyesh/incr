@@ -125,3 +125,38 @@ fn a_discard_the_engine_raises_again_is_back_in_flight() {
     set_wounded(false);
     crate::reserve::clear_taken();
 }
+
+/// A take-over is for an owner the registry cannot see: one that waits
+/// there, older than the waiter, gives way only by the wound order.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_waiter_takes_over_no_older_owner_waiting_in_the_registry() {
+    let rt = crate::handle::RuntimeId::for_test(u64::MAX - 11);
+    begin();
+    let a = enter_hold();
+    let take = || {
+        let a = a.clone();
+        std::thread::spawn(move || {
+            let mut patience = Patience::default();
+            let until = std::time::Instant::now() + 4 * STUCK_FOR;
+            while std::time::Instant::now() < until {
+                if a.wound_if_stuck((rt, 1), &mut patience) {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        })
+        .join()
+        .unwrap()
+    };
+    let waiting = crate::waits::Registration::new(|_| 1, (rt, 2), vec![(rt, 1)]);
+    assert!(
+        !take(),
+        "a younger waiter wounded an older owner that waits in the registry"
+    );
+    assert!(!a.wounded());
+    drop(waiting);
+    assert!(take(), "an owner outside the registry is taken over");
+    assert!(leave_hold());
+}
