@@ -210,6 +210,21 @@ pub(crate) struct Patience {
     since: Option<std::time::Instant>,
 }
 
+/// A waiter's patience that has already seen this thread's open flight
+/// through all but one of [`STUCK_AFTER`] checks, for a model's waiter to
+/// reach the wound within a small preemption bound.
+#[cfg(all(test, loom))]
+pub(crate) fn patience_one_check_short() -> Patience {
+    MINE.with(|w| Patience {
+        seen: Some((
+            Arc::as_ptr(w) as usize,
+            w.state.load(Ordering::Relaxed) & !FLAGS,
+            w.flights.load(Ordering::Relaxed),
+        )),
+        checks: STUCK_AFTER - 1,
+    })
+}
+
 impl Attempt {
     fn current(&self, word: u32) -> bool {
         word & !FLAGS == self.epoch

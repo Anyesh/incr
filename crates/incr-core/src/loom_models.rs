@@ -2872,19 +2872,30 @@ impl HandOvers {
     }
 }
 
-/// A waiter's claim wait on the held landing of `HELD_CELL`: the check
-/// that sees the owner's flight, `STUCK_AFTER` more, and one spare for a
-/// flight the owner's progress restarts. No yield between checks: loom
-/// resumes a yielded waiter only by preempting a runnable owner, so with
-/// one the waiter could never outlast an owner that is not blocked.
-fn wait_to_hand_over(rt: crate::handle::RuntimeId) -> bool {
-    let mut patience = crate::attempt::Patience::default();
-    for _ in 0..4 {
+/// A waiter's claim wait on the held landing of `HELD_CELL`, `calls`
+/// checks yielding between them as the engine's claim wait does. Its
+/// patience starts one check short of `STUCK_AFTER` on the owner's flight
+/// at the spawn: loom resumes a yielded waiter only by preempting a
+/// runnable owner, so a waiter starting from nothing could not outlast
+/// one within the bound.
+fn wait_to_hand_over(
+    rt: crate::handle::RuntimeId,
+    mut patience: crate::attempt::Patience,
+    calls: usize,
+) -> bool {
+    for _ in 0..calls {
         if crate::hold::hand_over(HELD_CELL, (rt, HELD_SLOT), &mut patience).is_some() {
             return true;
         }
+        thread::yield_now();
     }
     false
+}
+
+/// A waiter on `rt`'s held landing, spawned by its owner.
+fn spawn_waiter(rt: crate::handle::RuntimeId, calls: usize) -> thread::JoinHandle<bool> {
+    let patience = crate::attempt::patience_one_check_short();
+    thread::spawn(move || wait_to_hand_over(rt, patience, calls))
 }
 
 const HELD_CELL: usize = 0x1000;
@@ -2911,7 +2922,7 @@ fn hand_over_races_publication() {
     run(|| {
         let rt = crate::handle::RuntimeId::allocate();
         hold_one(rt);
-        let waiter = thread::spawn(move || wait_to_hand_over(rt));
+        let waiter = spawn_waiter(rt, 4);
         let taken = crate::hold::take(rt);
         let handed = waiter.join().unwrap();
         assert_eq!(taken.wounded, handed);
@@ -2932,7 +2943,7 @@ fn hand_over_races_reclaim() {
     run(|| {
         let rt = crate::handle::RuntimeId::allocate();
         hold_one(rt);
-        let waiter = thread::spawn(move || wait_to_hand_over(rt));
+        let waiter = spawn_waiter(rt, 4);
         let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean);
         let handed = waiter.join().unwrap();
         assert_ne!(reclaimed, handed, "reclaimed {reclaimed}, taken {handed}");
@@ -2949,12 +2960,14 @@ static PROGRESS_RACE: HandOvers = HandOvers::new();
 /// A waiter's patience against a holder that keeps landing: each landing
 /// is engine progress and restarts it, so only a holder that stops is
 /// wounded, and the owner learns of it at the take that ends its hold.
+/// Two checks: the first wounds if it precedes the landing; otherwise the
+/// landing's flight resets the patience and the second stays short.
 #[test]
 fn hand_over_waits_out_a_holder_that_progresses() {
     run(|| {
         let rt = crate::handle::RuntimeId::allocate();
         hold_one(rt);
-        let waiter = thread::spawn(move || wait_to_hand_over(rt));
+        let waiter = spawn_waiter(rt, 2);
         crate::hold::land(HELD_CELL, NodeState::Clean, NodeState::Clean, false);
         let wounded = crate::attempt::hold_wounded();
         let handed = waiter.join().unwrap();
