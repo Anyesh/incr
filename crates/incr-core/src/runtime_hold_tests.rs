@@ -3410,3 +3410,122 @@ fn waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake() {
     drop(read);
     assert!(crate::hold::take(rt.runtime_id).wounded);
 }
+
+/// What `retracted_held_read_shape` saw.
+#[derive(Debug)]
+struct RetractedHeldRead {
+    q: i64,
+    r: i64,
+    d_runs: usize,
+    /// q's reads of d during the read of r: d's raw state and the value.
+    q_reads_before: Vec<(NodeState, i64)>,
+    /// q's closure runs in the final read of q; 0 means a stash was adopted.
+    q_runs_in_final: usize,
+    stashes_before_final: u32,
+}
+
+/// r reads d, which reads the held cycle a, so d's landing (a plus its run
+/// count) is held; r then reads the replayable chain p, which dooms at
+/// `frames`, and on its placeholder reads q, so the driver runs q
+/// speculatively over d's held landing. r's first run with p's real value
+/// wounds the attempt once: d's landing is retracted and the retry lands d
+/// again. q is then read in the same revision, after publication.
+fn retracted_held_read_shape(frames: u32) -> RetractedHeldRead {
+    let mut rt = Runtime::<Shared>::new();
+    rt.all_replayable = false;
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(frames);
+    let (a, _) = two_cycle(&rt);
+    let d_runs = Arc::new(AtomicUsize::new(0));
+    let d = {
+        let d_runs = d_runs.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            rt.get(a) + d_runs.fetch_add(1, Ordering::SeqCst) as i64 + 1
+        })
+    };
+    let q_reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let q = {
+        let q_reads = q_reads.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<Shared>| {
+                let v = rt.get(d);
+                q_reads.lock().unwrap().push((rt.state_of(d), v));
+                v * 10
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_input(0_i64);
+    let mut p = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(x) + 1, replayable());
+    for _ in 0..3 {
+        let below = p;
+        p = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(below) + 1, replayable());
+    }
+    let wounded = Arc::new(AtomicBool::new(false));
+    let r = {
+        let wounded = wounded.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<Shared>| {
+                let v = rt.get(d);
+                let c = rt.get(p);
+                if c == 0 {
+                    let _ = rt.get(q);
+                } else if !wounded.swap(true, Ordering::SeqCst) {
+                    rt.raise_wound();
+                }
+                v + c
+            },
+            replayable(),
+        )
+    };
+    let r_value = rt.get(r);
+    assert!(
+        wounded.load(Ordering::SeqCst),
+        "frames={frames}: r's run wounded its attempt"
+    );
+    assert_eq!(crate::hold::held_count(), 0);
+    let q_reads_before = std::mem::take(&mut *q_reads.lock().unwrap());
+    let stashes_before_final = Shared::u32_load_relaxed(&rt.stash_count);
+    let q_value = rt.get(q);
+    let q_runs_in_final = q_reads.lock().unwrap().len();
+    assert_eq!(rt.get(d), 102, "frames={frames}: d's published landing");
+    RetractedHeldRead {
+        q: q_value,
+        r: r_value,
+        d_runs: d_runs.load(Ordering::SeqCst),
+        q_reads_before,
+        q_runs_in_final,
+        stashes_before_final,
+    }
+}
+
+/// Worker-13's case C: q's speculative run reads d's held landing as Clean
+/// through the view and is stashed; a wound retracts d and the retry lands
+/// it again with another value; a later read of q in the same revision
+/// must give what the unbounded run gives, not adopt the stash over the
+/// retracted landing.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stash_over_a_retracted_held_landing_is_not_adopted() {
+    let want = retracted_held_read_shape(u32::MAX);
+    assert_eq!(
+        (want.q, want.r, want.d_runs),
+        (1020, 106, 2),
+        "unbounded: d lands 101 held, is retracted and lands 102; q reads 102"
+    );
+    assert!(want.q_reads_before.is_empty(), "{want:?}");
+    let got = retracted_held_read_shape(2);
+    assert_eq!(got.d_runs, 2, "{got:?}");
+    assert_eq!(
+        got.q_reads_before.first(),
+        Some(&(NodeState::Computing, 101)),
+        "q's speculative run read d's held landing first: {got:?}"
+    );
+    assert_eq!(
+        (got.q, got.r),
+        (want.q, want.r),
+        "q read its stash over d's retracted landing (q ran {} times in the final read, {} stashes before it)",
+        got.q_runs_in_final,
+        got.stashes_before_final
+    );
+}
