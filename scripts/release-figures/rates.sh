@@ -2,6 +2,7 @@
 set -uo pipefail
 (($# == 2)) || { echo "usage: rates.sh <release-sha> <row>" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
 root=$PWD
 row=$2
 declare -A sha=([rel]=$1 [b5]=c61be873c4d6681cd0b59333441267749f4776cc [main]=b9f0d0bf3b11adec48b81eee123f9921a8ef694c)
@@ -22,8 +23,7 @@ names=() bins=()
 for t in ${trees//,/ }; do
   s=${sha[$t]:-$t}
   wt=$root/../rate-$row-$t
-  if ! { git fetch -q --depth=1 origin "$s" || git fetch -q --depth=1 https://github.com/Anyesh/incr.git "$s"; } ||
-    ! git worktree add -q --detach "$wt" FETCH_HEAD; then
+  if ! checkout_sha "$s" "$wt"; then
     echo "RATE-FETCH-FAILED $row $t $s"
     failed=1
     continue

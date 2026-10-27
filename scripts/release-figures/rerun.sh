@@ -2,6 +2,7 @@
 set -uo pipefail
 (($# == 1)) || { echo "usage: rerun.sh <release-sha>" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
 rounds=${FIGURE_ROUNDS:-3}
 declare -A sha=([rel]=$1 [b5]=c61be873c4d6681cd0b59333441267749f4776cc [main]=b9f0d0bf3b11adec48b81eee123f9921a8ef694c)
 declare -A against built kind
@@ -41,8 +42,7 @@ for n in rel b5 main; do
     trees_of "$p" | grep -qx "$n" && mine+=("$p")
   done
   ((${#mine[@]})) || continue
-  git fetch -q --depth=1 origin "${sha[$n]}"
-  git worktree add -q --detach "../fig-$n" "${sha[$n]}" || exit 1
+  checkout_sha "${sha[$n]}" "../fig-$n" || { echo "FIG-FETCH-FAILED $n ${sha[$n]}"; echo "FIG-DONE failed=1"; exit 1; }
   in_tree "$n" git log --oneline -1
   for p in "${mine[@]}"; do
     if [[ ${kind[$p]} == kit ]]; then

@@ -2,6 +2,7 @@
 set -uo pipefail
 (($# >= 2)) || { echo "usage: pure.sh <release-sha> <case>..." >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
 root=$PWD
 rel=$1
 shift
@@ -10,8 +11,7 @@ secs=${PURE_SECS:-1200}
 end=$((SECONDS + ${PURE_TOTAL_SECS:-6000}))
 runner=${RUNNER_NAME:-unknown}
 wt=$root/../pure-$rel
-if ! { git fetch -q --depth=1 origin "$rel" || git fetch -q --depth=1 https://github.com/Anyesh/incr.git "$rel"; } ||
-  ! git worktree add -q --detach "$wt" FETCH_HEAD; then
+if ! checkout_sha "$rel" "$wt"; then
   echo "PURE-FETCH-FAILED $rel"
   echo "PURE-DONE failed=1"
   exit 1
