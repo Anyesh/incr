@@ -2018,3 +2018,111 @@ local_and_shared!(
     local_member_try_get_in_caught_cycle_stays_new,
     shared_member_try_get_in_caught_cycle_stays_new
 );
+
+thread_local! {
+    static FAN_LAST: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(None) };
+    static FAN_FIRST: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A fan of one-text panics, each raising again the box the reader caught
+/// last, read by a frame over a chain deeper than the budget, so each
+/// retry delivers copies of one note log under different keys. The reader
+/// then raises again its last box, or its first one after the later
+/// retries, and an outer query catches it, before and after a `set` under
+/// the chain: every read and state is the unbounded run's.
+fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
+    let run = |frames: Option<u32>, n: usize, through: bool, first: bool| {
+        FAN_LAST.with(|b| b.borrow_mut().take());
+        FAN_FIRST.with(|b| b.borrow_mut().take());
+        let rt = runtime::<C>(frames);
+        let p = rt.create_input(0_u64);
+        let mut nodes = Vec::new();
+        let failing: Vec<Incr<u64>> = (0..n)
+            .map(|_| {
+                let f = rt.create_query_with(
+                    |_| -> u64 {
+                        let b = FAN_LAST.with(|b| b.borrow_mut().take());
+                        std::panic::resume_unwind(b.unwrap_or_else(|| Box::new("fan")))
+                    },
+                    replayable(),
+                );
+                nodes.push(f);
+                if through {
+                    let g = rt.create_query_with(move |rt| rt.get(f) + 1, replayable());
+                    nodes.push(g);
+                    g
+                } else {
+                    f
+                }
+            })
+            .collect();
+        let mut top = rt.create_query_with(move |rt| rt.get(p), replayable());
+        nodes.push(top);
+        for _ in 0..12 {
+            let below = top;
+            top = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+            nodes.push(top);
+        }
+        let reader = rt.create_query_with(
+            move |rt| {
+                for (i, &f) in failing.iter().enumerate() {
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                        if payload.is::<&'static str>() {
+                            let slot = if first && i == 0 {
+                                &FAN_FIRST
+                            } else {
+                                &FAN_LAST
+                            };
+                            slot.with(|b| *b.borrow_mut() = Some(payload));
+                        }
+                    }
+                }
+                let v = rt.get(top);
+                let slot = if first { &FAN_FIRST } else { &FAN_LAST };
+                if let Some(b) = slot.with(|b| b.borrow_mut().take()) {
+                    std::panic::resume_unwind(b);
+                }
+                v
+            },
+            replayable(),
+        );
+        nodes.push(reader);
+        let outer = rt.create_query_with(
+            move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(reader))).unwrap_or(1000),
+            replayable(),
+        );
+        nodes.push(outer);
+        let mut outs = vec![get(&rt, outer)];
+        rt.set(p, 1);
+        outs.push(get(&rt, outer));
+        outs.push(get(&rt, nodes[0]));
+        outs.push(get(&rt, reader));
+        let states: Vec<NodeState> = nodes.iter().map(|&h| rt.state_of(h)).collect();
+        (outs, states)
+    };
+    let mut differ = Vec::new();
+    for n in [2, 3, 5] {
+        for through in [false, true] {
+            for first in [false, true] {
+                let unbounded = run(None, n, through, first);
+                for frames in [1, 2, 3, 8] {
+                    let bounded = run(Some(frames), n, through, first);
+                    if bounded != unbounded {
+                        differ.push(format!(
+                            "n {n} through {through} first {first} frames {frames}: \
+                             want {unbounded:?} got {bounded:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+local_and_shared!(
+    reraised_fan_box_lands_as_unbounded,
+    local_reraised_fan_box_lands_as_unbounded,
+    shared_reraised_fan_box_lands_as_unbounded
+);
