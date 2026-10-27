@@ -348,6 +348,20 @@ pub(crate) fn park_timed_out(test: Option<&str>) -> ! {
     std::process::abort()
 }
 
+/// Runs its closure if dropped by a panic: a test that parks a thread
+/// releases it this way when it fails, before a scope joins the thread.
+#[cfg(test)]
+pub(crate) struct OnUnwind<F: FnMut()>(pub(crate) F);
+
+#[cfg(test)]
+impl<F: FnMut()> Drop for OnUnwind<F> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            (self.0)();
+        }
+    }
+}
+
 /// The panic of a read that found its node `Dead` under the handle's
 /// generation: a delete has claimed it and not yet unhooked it.
 #[cold]

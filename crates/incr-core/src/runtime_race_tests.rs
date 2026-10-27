@@ -3,17 +3,18 @@
 //! compute closure) and acts from another while it is parked. Every test
 //! ends by checking invariant (I) and the value a fresh read returns.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
 use super::{
-    DeleteError, DeleteOutcome, Entry, EpisodeLog, Expanded, GroupInfo, ParkPoint, Runtime, Walk,
-    EPISODE_LOG_LEN, NO_TAINT, VISIT,
+    DeleteError, DeleteOutcome, Entry, EpisodeLog, Expanded, GroupInfo, OnUnwind, ParkPoint,
+    Runtime, Walk, EPISODE_LOG_LEN, NO_TAINT, VISIT,
 };
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
@@ -27,6 +28,39 @@ type Rt = Runtime<Shared>;
 
 /// A park point that never gets reached would otherwise hang the test.
 pub(super) const PARK_TIMEOUT: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// The gates a test's thread made. Only that thread releases a thread
+    /// parked on one, so when it ends, failed or not, they are let go: a
+    /// failed test then fails alone instead of aborting the binary at the
+    /// park timeout. A scope joins its threads before the test thread ends,
+    /// so a scope that drives gates holds [`release_parked_on_unwind`].
+    static MADE_HERE: MadeHere = const { MadeHere(RefCell::new(Vec::new())) };
+}
+
+struct MadeHere(RefCell<Vec<Weak<GateInner>>>);
+
+impl MadeHere {
+    fn let_go(&self) {
+        for gate in self.0.borrow_mut().drain(..) {
+            if let Some(gate) = gate.upgrade() {
+                Gate(gate).let_go();
+            }
+        }
+    }
+}
+
+impl Drop for MadeHere {
+    fn drop(&mut self) {
+        self.let_go();
+    }
+}
+
+/// Lets go of every gate this thread made if it is dropped by a panic, so
+/// a scope that joins a parked thread does not wait out the park timeout.
+pub(crate) fn release_parked_on_unwind() -> OnUnwind<impl FnMut()> {
+    OnUnwind(|| MADE_HERE.with(MadeHere::let_go))
+}
 
 /// One-shot rendezvous. The thread under test calls [`Gate::park`]; the
 /// driver calls [`Gate::wait_parked`], acts, then [`Gate::release`]. A
@@ -48,14 +82,18 @@ impl Gate {
     pub(crate) fn new() -> Self {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        Self(Arc::new(GateInner {
+        let gate = Self(Arc::new(GateInner {
             armed: AtomicBool::new(false),
             reached_tx: Mutex::new(reached_tx),
             reached_rx: Mutex::new(reached_rx),
             release_tx: Mutex::new(release_tx),
             release_rx: Mutex::new(release_rx),
             test: thread::current().name().map(str::to_owned),
-        }))
+        }));
+        if gate.0.test.is_some() {
+            MADE_HERE.with(|m| m.0.borrow_mut().push(Arc::downgrade(&gate.0)));
+        }
+        gate
     }
 
     pub(crate) fn arm(&self) {
@@ -102,6 +140,13 @@ impl Gate {
 
     pub(crate) fn release(&self) {
         self.0.release_tx.lock().unwrap().send(()).unwrap();
+    }
+
+    /// Disarms the gate and releases a thread parked on it, as its driver
+    /// is gone.
+    fn let_go(&self) {
+        self.0.armed.store(false, Ordering::SeqCst);
+        self.release();
     }
 
     /// Whether an armed gate has been reached.
@@ -2875,4 +2920,51 @@ fn walk_rereads_under_constant_releases() {
             );
         }
     }
+}
+
+/// Runs `drive` on a named thread like a test's, which parks a thread on
+/// a gate it made and then panics; returns whether the parked thread was
+/// released well inside the park timeout instead of aborting the binary.
+fn parked_thread_released_after_a_failed_driver(drive: fn(Gate, mpsc::Sender<()>)) -> bool {
+    let (resumed_tx, resumed_rx) = mpsc::channel();
+    let driver = thread::Builder::new()
+        .name("failing driver".into())
+        .spawn(move || {
+            let gate = Gate::new();
+            gate.arm();
+            drive(gate, resumed_tx);
+        })
+        .unwrap();
+    assert!(driver.join().is_err(), "the driver panics");
+    resumed_rx.recv_timeout(PARK_TIMEOUT / 2).is_ok()
+}
+
+#[test]
+fn a_failed_tests_spawned_parked_thread_is_released() {
+    let released = parked_thread_released_after_a_failed_driver(|gate, resumed| {
+        let parked = gate.clone();
+        thread::spawn(move || {
+            parked.park();
+            resumed.send(()).unwrap();
+        });
+        gate.wait_parked();
+        panic!("the test fails while a thread is parked");
+    });
+    assert!(released);
+}
+
+#[test]
+fn a_failed_tests_scoped_parked_thread_is_released() {
+    let released = parked_thread_released_after_a_failed_driver(|gate, resumed| {
+        thread::scope(|s| {
+            let _released = release_parked_on_unwind();
+            s.spawn(|| {
+                gate.park();
+                resumed.send(()).unwrap();
+            });
+            gate.wait_parked();
+            panic!("the test fails while a scoped thread is parked");
+        });
+    });
+    assert!(released);
 }

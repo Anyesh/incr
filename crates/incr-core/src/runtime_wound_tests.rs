@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::observe_impl::observed_is_clear;
-use super::race_tests::{id, park_at, Gate};
+use super::race_tests::{id, park_at, release_parked_on_unwind, Gate};
 use super::{GroupInfo, NodeId, ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
@@ -614,6 +614,7 @@ fn shared_concurrent_reads_of_a_warm_cycle_match_the_single_thread_result() {
                     catch_unwind(AssertUnwindSafe(|| rt.get(node))).map_err(panic_message)
                 };
                 let (b, m) = thread::scope(|s| {
+                    let _released = release_parked_on_unwind();
                     let b = s.spawn(|| read(below));
                     let m = s.spawn(|| read(m));
                     (b.join().unwrap(), m.join().unwrap())
@@ -747,6 +748,7 @@ impl Duel {
         let first = if a_older { &g.b_gate } else { &g.a_gate };
         first.arm();
         let (a, b) = thread::scope(|s| {
+            let _released = release_parked_on_unwind();
             let g = &g;
             let parked = |n: Incr<i64>| {
                 let read = s.spawn(move || g.read(n));
@@ -958,6 +960,7 @@ impl Released {
         let g = Released::new(release);
         g.gate.arm();
         let (a, b) = thread::scope(|s| {
+            let _released = release_parked_on_unwind();
             let g = &g;
             let b = s.spawn(move || g.read(g.m));
             g.gate.wait_parked();
@@ -1210,6 +1213,7 @@ impl Dissolve {
         let wounds = waits::WOUNDS.load(Ordering::Relaxed);
         g.early.arm();
         let (a, b) = thread::scope(|s| {
+            let _released = release_parked_on_unwind();
             let g = &g;
             let a = s.spawn(move || g.read(g.r));
             g.early.wait_parked();
@@ -1402,6 +1406,7 @@ fn shared_released_member_waits_for_the_cut_owners_read() {
             );
             released.arm();
             let (states, b_waited, b_done_early, a, b) = thread::scope(|s| {
+                let _released = release_parked_on_unwind();
                 let g = &g;
                 let a = s.spawn(move || g.read(g.r));
                 released.wait_parked();
@@ -1548,6 +1553,7 @@ fn cut_exit_retracts(wound: CutWound) {
     };
     g.early.arm();
     let (a, b) = thread::scope(|s| {
+        let _released = release_parked_on_unwind();
         let g = &g;
         let a = s.spawn(|| {
             a_thread.set(thread::current().id()).unwrap();
