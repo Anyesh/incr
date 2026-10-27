@@ -2107,15 +2107,18 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
     let (read, at_y) = (Gate::new(), Gate::new());
     let driver = Arc::new(OnceLock::new());
     let flag = || Arc::new(AtomicBool::new(false));
-    let (entered, waited, wounded) = (flag(), flag(), flag());
+    let (entered, waited, wounded, early) = (flag(), flag(), flag(), flag());
     let installed = rt.park_hook.set(Box::new({
         let (read, at_y, driver) = (read.clone(), at_y.clone(), driver.clone());
         let (entered, waited, wounded) = (entered.clone(), waited.clone(), wounded.clone());
+        let early = early.clone();
         let (top, x, y) = (id(s.top), id(s.x), id(s.y));
         move |p| {
             if driver.get() != Some(&thread::current().id()) {
                 if p == ParkPoint::BeforeComputeOne(y) {
                     at_y.park();
+                } else if p == ParkPoint::FailedBeforeStore(x) && !wounded.load(SeqCst) {
+                    early.store(true, SeqCst);
                 }
             } else if p == ParkPoint::BeforeEntry(top) {
                 entered.store(true, SeqCst);
@@ -2152,6 +2155,13 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
         let (rt, x) = (rt.clone(), s.x);
         spawn(move || outcome(|| rt.get(x)))
     };
+    while !at_y.reached() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the other thread never reached Y"
+        );
+        thread::yield_now();
+    }
     at_y.wait_parked();
     assert_eq!(
         rt.state_of(s.x),
@@ -2195,6 +2205,10 @@ fn shared_vframe_reader_wounded_by_a_reader_of_its_held_failed_dep() {
     assert!(
         wounded.load(SeqCst),
         "the driver was not wounded out of the cycle"
+    );
+    assert!(
+        !early.load(SeqCst),
+        "the other thread's X landed Failed before the driver's wound, the window the hold removes"
     );
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
