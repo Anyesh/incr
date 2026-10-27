@@ -838,6 +838,9 @@ impl<C: Cells> Runtime<C> {
         // R0: an unseeded member that still reads another such member.
         if let Some((anchor, true, _, Some(cycle), _)) = &held {
             ctl.lower(*anchor);
+            if replay::speculative() {
+                cycle_state::with_held(|h| h.note_spec_cycle_read(rt, at, slot, cycle.clone()));
+            }
             return Some(Err(cycle.clone()));
         }
         // R2: a strategy member reads as its current value.

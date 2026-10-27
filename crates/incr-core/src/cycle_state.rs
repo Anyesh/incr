@@ -410,13 +410,22 @@ pub(crate) struct Discarded {
 }
 
 /// What a speculative run read, for [`HeldMap::look`] to check: the held
-/// members whose buffers it read, each with the buffer's stamp, and the
-/// other nodes, each Clean when the run recorded, with its generation and
-/// `changed_at`.
+/// members it read, each with what it read, and the other nodes, each
+/// Clean when the run recorded, with its generation and `changed_at`.
 #[derive(Debug, Default)]
 pub(crate) struct Basis {
-    pub(crate) held: Vec<(u32, u64)>,
+    pub(crate) held: Vec<(u32, MemberRead)>,
     pub(crate) clean: Vec<(NodeId, u32, u64)>,
+}
+
+/// A speculative run's read of a held member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MemberRead {
+    /// The member's buffer, by its stamp.
+    Buffer(u64),
+    /// The member's episode's cycle, as an unseeded member that reads
+    /// another such member gets it.
+    Cycle(Cycle),
 }
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
@@ -515,9 +524,9 @@ pub(crate) struct HeldMap {
     /// The groups a virtual frame owns.
     by_virtual_owner: BTreeSet<(RuntimeId, u32, u64)>,
     next_group: u64,
-    /// `(rt, reader position, member, stamp)` of each buffer a speculative
-    /// run read, until that run records.
-    spec_reads: Vec<(RuntimeId, u32, u32, u64)>,
+    /// `(rt, reader position, member, read)` of each read of a held member
+    /// a speculative run made, until that run records.
+    spec_reads: Vec<(RuntimeId, u32, u32, MemberRead)>,
 }
 
 struct Group {
@@ -691,9 +700,11 @@ impl HeldMap {
 
     /// Whether claim `slot`'s buffer is real: a run's outside speculation,
     /// or a speculative run's whose reads were all of real state and are
-    /// unchanged, each Clean node at its generation and `changed_at` and
-    /// each member's buffer the one read and itself real. `runs` collects
-    /// the claims checked, a claim already there counting as real.
+    /// unchanged, each Clean node at its generation and `changed_at`, each
+    /// member's buffer the one read and itself real, and each member read
+    /// as its episode's cycle still in that episode as such a member.
+    /// `runs` collects the claims checked, a claim already there counting
+    /// as real.
     fn adoptable(
         &self,
         rt: RuntimeId,
@@ -718,9 +729,17 @@ impl HeldMap {
             .clean
             .iter()
             .all(|&(d, generation, at)| clean(d) == Some((generation, at)))
-            && basis.held.iter().all(|&(m, stamp)| {
-                self.claims.get(&(rt, m)).is_some_and(|r| r.stamp == stamp)
-                    && self.adoptable(rt, m, clean, runs)
+            && basis.held.iter().all(|(m, read)| match read {
+                MemberRead::Buffer(stamp) => {
+                    self.claims
+                        .get(&(rt, *m))
+                        .is_some_and(|r| r.stamp == *stamp)
+                        && self.adoptable(rt, *m, clean, runs)
+                }
+                MemberRead::Cycle(cycle) => self
+                    .claims
+                    .get(&(rt, *m))
+                    .is_some_and(|r| r.in_cu && r.episode.as_ref() == Some(cycle)),
             })
     }
 
@@ -728,14 +747,22 @@ impl HeldMap {
     /// buffer.
     pub(crate) fn note_spec_read(&mut self, rt: RuntimeId, at: u32, slot: u32) {
         if let Some(e) = self.claims.get(&(rt, slot)) {
-            self.spec_reads.push((rt, at, slot, e.stamp));
+            let read = MemberRead::Buffer(e.stamp);
+            self.spec_reads.push((rt, at, slot, read));
         }
     }
 
+    /// Notes a speculative run's read, at position `at`, of member `slot`
+    /// as `cycle`, its episode's.
+    pub(crate) fn note_spec_cycle_read(&mut self, rt: RuntimeId, at: u32, slot: u32, cycle: Cycle) {
+        self.spec_reads
+            .push((rt, at, slot, MemberRead::Cycle(cycle)));
+    }
+
     /// The basis of a speculative run at position `at` that read `deps`,
-    /// if each was real state: a member's buffer noted as read, or a node
-    /// `clean` finds Clean at the generation read. Drops every read noted
-    /// at `at` or above.
+    /// if each was real state: a member read as noted, or a node `clean`
+    /// finds Clean at the generation read. Drops every read noted at `at`
+    /// or above.
     pub(crate) fn take_basis(
         &mut self,
         rt: RuntimeId,
@@ -744,13 +771,15 @@ impl HeldMap {
         clean: &dyn Fn(NodeId) -> Option<(u32, u64)>,
     ) -> Option<Basis> {
         let mut held = Vec::new();
-        self.spec_reads.retain(|&(r, c, m, stamp)| {
-            let mine = r == rt && c >= at;
-            if mine && c == at {
-                held.push((m, stamp));
+        let mut reads = std::mem::take(&mut self.spec_reads);
+        reads.retain(|(r, c, m, read)| {
+            let mine = *r == rt && *c >= at;
+            if mine && *c == at {
+                held.push((*m, read.clone()));
             }
             !mine
         });
+        self.spec_reads = reads;
         let mut basis = Basis {
             held,
             clean: Vec::new(),
