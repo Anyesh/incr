@@ -743,7 +743,7 @@ impl<C: Cells> Runtime<C> {
             }
             let a = stack.pop().expect("incr-core: adoption has a root");
             let root = stack.is_empty();
-            // A delete since the stash's run began may have changed a dep
+            // A reshape since the stash's run began may have changed a dep
             // found Clean above.
             failed |= self.reshaped_since(&a.stash);
             if !failed && root {
@@ -1423,8 +1423,8 @@ impl<C: Cells> Runtime<C> {
         Some(stash.0)
     }
 
-    /// Whether a node was deleted, or a speculative run read a dead handle,
-    /// since `stash`'s run began: any value it read may differ now.
+    /// Whether `Runtime::reshapes` moved since `stash`'s run began: any
+    /// value it read may differ now.
     #[inline(always)]
     fn reshaped_since(&self, stash: &Stash) -> bool {
         stash.reshapes != C::u64_load_acquire(&self.reshapes)
