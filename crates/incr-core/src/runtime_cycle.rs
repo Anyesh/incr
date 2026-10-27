@@ -2307,10 +2307,14 @@ impl<C: Cells> Runtime<C> {
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
         let first = e.first;
-        // A cut's claim lands held, as does one whose run took `HOLD`: its
-        // entry opens before the write, so the undo keeps what the write
-        // displaces.
-        if !C::SINGLE_THREADED && (e.hold || hold::cut_kept(rt, slot)) {
+        // A cut's claim lands held, as does one whose run took `HOLD` or
+        // whose publish adds a held dep: its entry opens before the write,
+        // so the undo keeps what the write displaces.
+        if !C::SINGLE_THREADED
+            && (e.hold
+                || hold::cut_kept(rt, slot)
+                || hold::active() && self.publishes_held_dep(node, e.last()))
+        {
             self.open_hold(id, node, first, None, bag);
         }
         let written = catch_unwind(AssertUnwindSafe(|| {

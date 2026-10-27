@@ -5241,6 +5241,9 @@ impl<C: Cells> Runtime<C> {
                 debug_assert_ne!(outcome, Outcome::Buffered);
                 let value_changed = outcome == Outcome::Changed;
 
+                if !C::SINGLE_THREADED && hold::active() {
+                    self.open_hold_for_held_deps(id, node, first, &deps);
+                }
                 let published = self.publish_deps(id, &deps, None, verify_rev, bag);
 
                 // The closure has already written its value into the slot, and
