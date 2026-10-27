@@ -206,22 +206,43 @@ impl Drop for Registration {
 /// Runs `wound`, a waiter's take-over of the attempt whose word is
 /// `owner`, under the registry lock, unless that owner waits here with an
 /// older ticket than the waiter's `ticket` (0 for one not taken yet, which
-/// is younger than every taken one): the wound order settles that owner's
-/// waits, and a take-over is only for an owner held where the registry
-/// cannot see it. False if refused.
+/// is younger than every taken one) on a chain of claims that closes
+/// through registered holders: the registry resolves that wait by the
+/// wound order. A claim on the chain with no registered holder ends the
+/// refusal, as its holder may be in user code that waits on the waiter.
+/// False if refused.
 pub(crate) fn take_over_in_order(owner: usize, ticket: u64, wound: impl FnOnce() -> bool) -> bool {
     let reg = registry();
     let mine = if ticket == 0 { u64::MAX } else { ticket };
-    let older_waits = reg
+    let waits_in_order = reg
         .waiters
         .iter()
-        .any(|w| w.owner == owner && w.ticket < mine && w.state.load(Ordering::Acquire) == WAITING);
-    if older_waits {
+        .find(|w| w.owner == owner && w.ticket < mine && w.state.load(Ordering::Acquire) == WAITING)
+        .is_some_and(|o| closes(&reg.waiters, o));
+    if waits_in_order {
         #[cfg(all(test, not(loom)))]
         REFUSALS.with(|r| r.set(r.get() + 1));
         return false;
     }
     wound()
+}
+
+/// Whether `from`'s waits-for chain comes back to a waiter on it: every
+/// claim on the way has a registered holder. At most one step per waiter.
+fn closes(waiters: &[Waiter], from: &Waiter) -> bool {
+    let mut seen = vec![from.owner];
+    let mut on = from.waiting_on;
+    for _ in 0..waiters.len() {
+        let Some(holder) = waiters.iter().find(|w| w.holds.contains(&on)) else {
+            return false;
+        };
+        if seen.contains(&holder.owner) {
+            return true;
+        }
+        seen.push(holder.owner);
+        on = holder.waiting_on;
+    }
+    true
 }
 
 #[cfg(all(test, not(loom)))]
