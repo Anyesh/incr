@@ -456,6 +456,8 @@ const _: () = assert!(crate::bits::disjoint(&[
 const PATH_KEPT: u8 = 1;
 /// [`ComputeCtl::marks`]: see [`ComputeCtl::reads_counted`].
 const READS_COUNTED: u8 = 2;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::read_stashes`].
+const STASH_READ: u8 = 4;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -469,7 +471,7 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
-    /// `PATH_KEPT` and `READS_COUNTED`, which only get set.
+    /// `PATH_KEPT`, `READS_COUNTED` and `STASH_READ`, which only get set.
     marks: Cell<u8>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
@@ -537,6 +539,17 @@ impl ComputeCtl {
 
     pub(crate) fn count_reads(&self) {
         self.marks.set(self.marks.get() | READS_COUNTED);
+    }
+
+    /// Whether this speculative frame read a stash, kept in
+    /// `replay::keep_spec_read` under this control block. A fresh one at a
+    /// popped frame's address says no.
+    pub(crate) fn read_stashes(&self) -> bool {
+        self.marks.get() & STASH_READ != 0
+    }
+
+    pub(crate) fn mark_stash_read(&self) {
+        self.marks.set(self.marks.get() | STASH_READ);
     }
 
     /// The frame's path, if [`Self::keep_path`] kept it.

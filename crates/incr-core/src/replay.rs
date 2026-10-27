@@ -2139,6 +2139,8 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
     static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
+    static SPEC_READS: RefCell<Vec<SpecRead>> = const { RefCell::new(Vec::new()) };
+    static SPEC_PENDING: Cell<Option<SpecPending>> = const { Cell::new(None) };
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
@@ -2167,6 +2169,8 @@ thread_local! {
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
     static CHECKED_READS: RefCell<Vec<CheckedRead>> = RefCell::new(Vec::new());
+    static SPEC_READS: RefCell<Vec<SpecRead>> = RefCell::new(Vec::new());
+    static SPEC_PENDING: Cell<Option<SpecPending>> = Cell::new(None);
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
@@ -2369,6 +2373,148 @@ pub(crate) fn check_read(
             });
         }
     });
+}
+
+/// Where a speculative frame's read of a node took its value. Only a
+/// listed source leaves the frame's stash adoptable; every other read,
+/// including one through a path no site lists, leaves it `Unchecked`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpecSource {
+    Unchecked,
+    /// The node's published state was Clean or Cyclic when its value was
+    /// read, so it stays so for the revision.
+    Settled,
+    /// The node's stash with this serial, which the frame's adoption needs
+    /// the node to land from.
+    Stash(u64),
+}
+
+/// The open speculative read of node `slot` at `generation` of `rt`.
+#[derive(Clone, Copy)]
+pub(crate) struct SpecPending {
+    rt: RuntimeId,
+    slot: u32,
+    generation: u32,
+    source: SpecSource,
+}
+
+/// A speculative frame's read of a node's stash.
+struct SpecRead {
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    slot: u32,
+    generation: u32,
+    serial: u64,
+}
+
+/// Opens a speculative frame's read of node `slot` at `generation` of
+/// `rt`, `Unchecked` until a listed source names its own; returns the
+/// read it nests in, for [`close_spec_read`].
+pub(crate) fn open_spec_read(rt: RuntimeId, slot: u32, generation: u32) -> Option<SpecPending> {
+    SPEC_PENDING.with(|p| {
+        p.replace(Some(SpecPending {
+            rt,
+            slot,
+            generation,
+            source: SpecSource::Unchecked,
+        }))
+    })
+}
+
+/// A listed source of the open read, if it is of node `slot` at
+/// `generation` of `rt`.
+pub(crate) fn spec_source(rt: RuntimeId, slot: u32, generation: u32, source: SpecSource) {
+    SPEC_PENDING.with(|p| {
+        if let Some(mut q) = p.get() {
+            if q.rt == rt && q.slot == slot && q.generation == generation {
+                q.source = source;
+                p.set(Some(q));
+            }
+        }
+    });
+}
+
+/// Closes the open read, back to `outer`, and returns its source.
+pub(crate) fn close_spec_read(outer: Option<SpecPending>) -> SpecSource {
+    SPEC_PENDING
+        .with(|p| p.replace(outer))
+        .map_or(SpecSource::Unchecked, |q| q.source)
+}
+
+/// Keeps the frame of `ctl` at `cidx` of `rt`'s read of node `slot` at
+/// `generation` from its stash `serial`. The reads of frames above it go,
+/// and so do an earlier frame's at its position on the frame's first one
+/// (`fresh`). False if the frame read another stash of the node, whose
+/// adoption both reads cannot share.
+pub(crate) fn keep_spec_read(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    (slot, generation): (u32, u32),
+    serial: u64,
+    fresh: bool,
+) -> bool {
+    SPEC_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        d.retain(|e| e.rt != rt || e.cidx < cidx || !fresh && e.cidx == cidx && e.ctl == ctl);
+        let ours = |e: &&SpecRead| {
+            e.rt == rt
+                && e.cidx == cidx
+                && e.ctl == ctl
+                && e.slot == slot
+                && e.generation == generation
+        };
+        if let Some(e) = d.iter().find(ours) {
+            return e.serial == serial;
+        }
+        d.push(SpecRead {
+            rt,
+            cidx,
+            ctl,
+            slot,
+            generation,
+            serial,
+        });
+        true
+    })
+}
+
+/// Whether the frame of `ctl` at `cidx` of `rt` read node `slot` at
+/// `generation` from a stash.
+pub(crate) fn spec_read_of(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    slot: u32,
+    generation: u32,
+) -> bool {
+    SPEC_READS.with(|d| {
+        d.borrow().iter().any(|e| {
+            e.rt == rt
+                && e.cidx == cidx
+                && e.ctl == ctl
+                && e.slot == slot
+                && e.generation == generation
+        })
+    })
+}
+
+/// The stash reads of the frame of `ctl` at `cidx` of `rt`, which is
+/// popping, as `(slot, generation, serial)`, taken with those of frames
+/// above it.
+pub(crate) fn take_spec_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<(u32, u32, u64)> {
+    SPEC_READS.with(|d| {
+        d.borrow_mut()
+            .extract_if(.., |e| e.rt == rt && e.cidx >= cidx)
+            .filter(|e| e.cidx == cidx && e.ctl == ctl)
+            .map(|e| (e.slot, e.generation, e.serial))
+            .collect()
+    })
 }
 
 /// A context named so that no context of another thread, now or later, has
@@ -2921,6 +3067,7 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
             COPIED_GEN.with(|g| g.set(0));
             if !speculative() {
                 CHECKED_READS.with(|c| c.borrow_mut().clear());
+                SPEC_READS.with(|c| c.borrow_mut().clear());
             }
             if word & value_code::NOTES_BIT == 0 {
                 end_kept_marks();

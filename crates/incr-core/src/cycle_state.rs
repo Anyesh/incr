@@ -134,6 +134,9 @@ pub(crate) struct Held {
     /// While the buffer and run record come from a run made under
     /// speculation: the record from before that run's write.
     pre_spec: Option<Box<RunRecord>>,
+    /// The last speculative run read something its landing can't check:
+    /// its frame was `KEPT_UNCHECKED` or read a stash.
+    spec_unchecked: bool,
 }
 
 impl Held {
@@ -173,6 +176,7 @@ impl Held {
             ep: 0,
             in_cu: false,
             pre_spec: None,
+            spec_unchecked: false,
         }
     }
 
@@ -189,6 +193,7 @@ impl Held {
         buf: Option<Erased>,
         opened: bool,
         poison: u16,
+        unchecked: bool,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
             self.keep_record();
@@ -207,6 +212,7 @@ impl Held {
         self.last = deps;
         self.opened = opened;
         self.poison |= poison;
+        self.spec_unchecked = look.speculative && unchecked;
         (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
 
@@ -276,6 +282,7 @@ impl Held {
     /// value it buffered, as the unbounded run may never make that run.
     fn settle(&mut self) -> Option<Unbuilt> {
         let r = self.pre_spec.take()?;
+        self.spec_unchecked = false;
         self.deps = r.deps;
         self.last = r.last;
         self.installed = r.installed;
@@ -359,6 +366,11 @@ impl<H: Borrow<Held>> Seen<H> {
     /// The runs' `POISONED` and `HANDLED` flags: either lands Dirty.
     pub(crate) fn poison(&self) -> u16 {
         self.0.borrow().poison
+    }
+
+    /// See [`Held::spec_unchecked`].
+    pub(crate) fn spec_unchecked(&self) -> bool {
+        self.0.borrow().spec_unchecked
     }
 }
 

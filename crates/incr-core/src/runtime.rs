@@ -2928,7 +2928,12 @@ impl<C: Cells> Runtime<C> {
                 && !(MODE & VIRT != 0 && self.resume_pending(NodeId(slot)))
             {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
+                let cyclic =
+                    MODE & VIRT != 0 && state::load::<C>(node.state_cell()) == NodeState::Cyclic;
                 if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
+                    if cyclic {
+                        self.spec_source(handle, replay::SpecSource::Settled);
+                    }
                     self.unregenerable(frame);
                     return read;
                 }
@@ -2983,6 +2988,14 @@ impl<C: Cells> Runtime<C> {
                     == NodeState::Dirty
             };
             let dirty_before = !C::SINGLE_THREADED && frame.is_some() && dirty();
+            // A speculative read's source: the published state before the
+            // slot read, and an unchanged stash the read may stand on, which
+            // must be the same stash once the value is pinned.
+            let spec = MODE & VIRT != 0 && frame.is_some();
+            let settled_before = spec && state::load::<C>(node.state_cell()).is_settled();
+            let unchanged_before = (spec && !settled_before)
+                .then(|| self.unchanged_serial(slot, handle.generation()))
+                .flatten();
             let mut dirty_pinned = false;
             let mut reserving = false;
             // Under Shared the value is pinned before the clone, which is
@@ -3003,6 +3016,9 @@ impl<C: Cells> Runtime<C> {
             };
             match read {
                 Some(value) => {
+                    if settled_before {
+                        self.spec_source(handle, replay::SpecSource::Settled);
+                    }
                     let noted = if C::SINGLE_THREADED {
                         frame.is_some() && dirty()
                     } else {
@@ -3010,8 +3026,12 @@ impl<C: Cells> Runtime<C> {
                     };
                     if noted {
                         if let Some(f) = frame {
-                            if !self.unchanged_stash(handle.slot(), handle.generation()) {
-                                self.note_dirty_read(f, handle, &value);
+                            match self.unchanged_serial(handle.slot(), handle.generation()) {
+                                Some(serial) if spec && unchanged_before == Some(serial) => {
+                                    self.spec_source(handle, replay::SpecSource::Stash(serial))
+                                }
+                                Some(_) => {}
+                                None => self.note_dirty_read(f, handle, &value),
                             }
                         }
                         if reserving {
@@ -3026,6 +3046,9 @@ impl<C: Cells> Runtime<C> {
                         return Err(cycle);
                     }
                     Err(NodeState::Clean) => {
+                        if MODE & VIRT != 0 && state::load::<C>(node.state_cell()).is_settled() {
+                            self.spec_source(handle, replay::SpecSource::Settled);
+                        }
                         return Ok(self.read_slot(handle, node, type_tag, arena_slot));
                     }
                     Err(now) => {
@@ -5828,7 +5851,8 @@ impl<C: Cells> Runtime<C> {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
                 _ => Box::new(cycle::WoundUnwind),
             });
-        } else if result.is_ok() && self.speculative_lands_dirty(id, word, ctl, deps) {
+        } else if result.is_ok() && self.speculative_lands_dirty(id, word, attempt.cidx, ctl, deps)
+        {
             if self.drop_cooperatively(None) {
                 return Some(self.discard_dropped(id, attempt, ctl, bag));
             }
