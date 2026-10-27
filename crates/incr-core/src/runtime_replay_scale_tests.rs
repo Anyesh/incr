@@ -22,9 +22,9 @@ use crate::state::NodeState;
 fn scaled<T: std::ops::Mul<Output = T> + From<u8>>(n: T) -> T {
     static SCALE: OnceLock<u8> = OnceLock::new();
     let k = *SCALE.get_or_init(|| {
-        std::env::var("INCR_TEST_SCALE").map_or(1, |v| {
-            v.parse()
-                .unwrap_or_else(|_| panic!("INCR_TEST_SCALE={v} is not a small integer"))
+        std::env::var("INCR_TEST_SCALE").map_or(1, |v| match v.parse() {
+            Ok(k) if k > 0 => k,
+            _ => panic!("INCR_TEST_SCALE={v} is not an integer from 1 to 255"),
         })
     });
     n * T::from(k)
