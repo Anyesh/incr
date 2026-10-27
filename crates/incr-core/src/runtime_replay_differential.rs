@@ -5363,6 +5363,110 @@ fn two_thread_wound_retracts_a_member_run_landing_under_a_closed_cycle() {
     .assert_clean();
 }
 
+/// 0xb0939's ops 3 (`Get(0)`, thread 0) and 4 (`TryGet(1)`, thread 1)
+/// overlap on the cycle {1, 2, 3}. Op 3 unwinds the cycle, releases 1 and
+/// 2 unrun, held, and publishes them New at its read's end with the deps
+/// its runs recorded. Op 4 either waits on op 3's claim of 1 through op 3
+/// (`wait`) or plans 1 New with no deps and claims it only after op 3
+/// published it (`after`). Every order has op 4's walk expand 1's deps
+/// then, entering the cycle where the op-3-first order does, which gives
+/// `Cycle([4, 5, 6])`; running 1 at once entered the cycle at 1 over 2's
+/// recorded deps, and 1 caught `Cycle([4, 6])`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_waiter_revisits_a_release_published_at_its_reads_end() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_waiter_revisits_a_release_published_at_its_reads_end",
+        || {
+            struct Park {
+                claimed: AtomicBool,
+                waits: AtomicBool,
+                published: AtomicBool,
+                parked: AtomicBool,
+            }
+            let case = gen_case(0xb0939, false, true);
+            let phases = phases(&case, 0xb0939);
+            let overlap = phases.iter().position(|p| p.ops() == [3, 4]).unwrap();
+            assert_eq!(phases[overlap].of(1), Some(4));
+            let patience = std::time::Duration::from_secs(2);
+            quiet(|| {
+                for frames in [None, Some(1)] {
+                    for wait in [true, false] {
+                        for round in 0..2 {
+                            let park = Arc::new(Park {
+                                claimed: AtomicBool::new(false),
+                                waits: AtomicBool::new(false),
+                                published: AtomicBool::new(false),
+                                parked: AtomicBool::new(false),
+                            });
+                            let rig = |live: &Live<Shared>| {
+                                let (park, world) = (park.clone(), live.world.clone());
+                                let n1 = NodeId(world.handle(0, 1).erased().slot());
+                                let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                                    if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                                        return;
+                                    }
+                                    let t = std::time::Instant::now();
+                                    match TWO_THREAD.with(std::cell::Cell::get) {
+                                        Some(0)
+                                            if p == ParkPoint::BeforeReservationCheck(n1)
+                                                && !park.claimed.swap(true, SeqCst)
+                                                && wait =>
+                                        {
+                                            until(|| park.waits.load(SeqCst) || t.elapsed() > patience);
+                                        }
+                                        Some(0) if p == ParkPoint::HeldPublished(n1) => {
+                                            park.published.store(true, SeqCst);
+                                        }
+                                        Some(1)
+                                            if p == ParkPoint::BeforeComputeOne(n1)
+                                                && !park.parked.swap(true, SeqCst) =>
+                                        {
+                                            until(|| {
+                                                (if wait { &park.claimed } else { &park.published })
+                                                    .load(SeqCst)
+                                                    || t.elapsed() > patience
+                                            });
+                                            // Op 3 stays parked on its claim of 1 until
+                                            // this is set.
+                                            if wait {
+                                                park.waits.store(park.claimed.load(SeqCst), SeqCst);
+                                            }
+                                        }
+                                        Some(1) if p == ParkPoint::ComputeWaits(n1) => {
+                                            park.waits.store(true, SeqCst);
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                                assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                            };
+                            let serial = Serial::new(&case, &phases);
+                            let verdict = Mutex::new(None);
+                            let got = run_two_until(&case, &phases, frames, 0, &rig, &|p, prefix, live| {
+                                let v = serial.at_overlap("0xb0939", prefix, live);
+                                let stop = p == overlap || v.is_some();
+                                *verdict.lock().unwrap() = v;
+                                stop
+                            });
+                            let at = format!("{frames:?} frames, wait {wait}, round {round}");
+                            assert!(park.parked.load(SeqCst), "{at}: op 4 never reached 1");
+                            if wait {
+                                assert!(park.waits.load(SeqCst), "{at}: op 4 never waited on 1");
+                            } else {
+                                assert!(park.published.load(SeqCst), "{at}: op 3 never published 1");
+                            }
+                            serial.check("0xb0939", &got, verdict.into_inner().unwrap());
+                            assert_eq!(got[4].0, Out::Cycle(vec![4, 5, 6]), "{at}");
+                        }
+                    }
+                }
+            });
+        },
+    )
+    .assert_clean();
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
