@@ -23,11 +23,11 @@ use crate::waits;
 /// instead of being killed.
 const POLL_DEADLINE: Duration = Duration::from_secs(4);
 
-/// Asserts the cycle was resolved by wounds. Usually one: a retry that
-/// takes its released claims back before the older thread does, which
-/// `await_winner`'s head start makes rare but cannot rule out under load,
-/// is wounded again over the same cycle, which costs a retry and never
-/// changes a value.
+/// Asserts a cycle through `rt`'s claims was resolved by wounds. Usually
+/// one: a retry that takes its released claims back before the older
+/// thread does, which `await_winner`'s head start makes rare but cannot
+/// rule out under load, is wounded again over the same cycle, which costs
+/// a retry and never changes a value.
 pub(crate) fn assert_wounded(rt: RuntimeId) {
     assert!(waits::WOUNDS.on(rt) >= 1);
 }

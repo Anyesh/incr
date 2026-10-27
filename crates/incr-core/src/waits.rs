@@ -381,7 +381,7 @@ mod tests {
             "waits::tests::a_wound_counts_for_its_waiters_runtimes_only",
             || {
                 let [a, b, c] = [9, 11, 13].map(|n| RuntimeId::for_test(u64::MAX - n));
-                let older = Registration::new(|_| 1, (b, 2), vec![(a, 1)]);
+                let older = Registration::new(|_| 1, (b, 2), vec![(a, 1), (c, 5)]);
                 let younger = Registration::new(|_| 2, (a, 1), vec![(a, 3), (b, 2)]);
                 assert!(younger.wounded() && !older.wounded());
                 assert_eq!(
