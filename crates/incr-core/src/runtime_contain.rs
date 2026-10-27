@@ -728,6 +728,8 @@ impl<C: Cells> Runtime<C> {
     /// would reach it: only a walk that flips a dep takes it, and a walk
     /// stopping below a dep reaches it through the dep's own notes, so no
     /// scan below, which would flip it where the published landing stays.
+    #[cold]
+    #[inline(never)]
     fn note_held<'a>(
         &self,
         id: NodeId,
