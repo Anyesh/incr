@@ -310,7 +310,8 @@ fn shared_older_threads_uncaught_cycle_stands_over_a_later_landing() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_over_a_later_landing",
         || older_threads_uncaught_cycle_stands(None),
-    );
+    )
+    .assert_clean();
 }
 
 #[test]
@@ -319,7 +320,8 @@ fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_1() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_1",
         || older_threads_uncaught_cycle_stands(Some(1)),
-    );
+    )
+    .assert_clean();
 }
 
 #[test]
@@ -328,7 +330,8 @@ fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_2() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_2",
         || older_threads_uncaught_cycle_stands(Some(2)),
-    );
+    )
+    .assert_clean();
 }
 
 #[test]
@@ -337,7 +340,8 @@ fn shared_older_threads_uncaught_cycle_stands_at_frame_budget_3() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_older_threads_uncaught_cycle_stands_at_frame_budget_3",
         || older_threads_uncaught_cycle_stands(Some(3)),
-    );
+    )
+    .assert_clean();
 }
 
 #[test]
