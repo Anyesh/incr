@@ -3311,3 +3311,71 @@ fn shared_holder_whose_replaced_value_drop_joins_a_reader_finishes() {
     )
     .assert_clean();
 }
+
+/// A waiter on a held landing leaves its owner be while the landing's walk
+/// listing is awake, however long the owner stays in a peer's user code,
+/// and the landing can be taken over once other user code ends the
+/// listing. The second wait calls `hold::hand_over`, since the runtime's
+/// take-over would retract the entry onto an input that no claim ran.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake() {
+    crate::child_test::run_in_child(
+        "runtime::hold_tests::a_waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake",
+        waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake,
+    )
+    .assert_clean();
+}
+
+fn waiter_takes_no_held_landing_over_while_its_walk_listing_is_awake() {
+    use crate::attempt::{Outside, Patience};
+    use crate::reserve::{note_walk, user_code, Peers, Root};
+    use std::time::{Duration, Instant};
+    let rt = Runtime::<Shared>::new();
+    let slot = rt.create_input(1i64).slot();
+    let node = rt.nodes.get(slot);
+    let cell = crate::state::cell_key::<Shared>(node.state_cell());
+    let (generation, claim) = (node.generation(), (rt.runtime_id, slot));
+    crate::attempt::begin();
+    let own = crate::hold::open(cell, rt.runtime_id, slot, generation, true, None, None);
+    assert!(own.is_none());
+    crate::hold::land(cell, NodeState::Clean, NodeState::Clean, false);
+    let read = Root::arm(true, (rt.runtime_id, slot + 1));
+    note_walk(claim, generation, &Peers::new([slot, slot + 2]));
+    user_code((rt.runtime_id, slot + 2));
+    let user = Outside::enter(true);
+    let wait = |take: &(dyn Fn(&mut Patience) -> bool + Sync)| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut patience = Patience::default();
+                let until = Instant::now() + Duration::from_millis(100);
+                while Instant::now() < until {
+                    if take(&mut patience) {
+                        return true;
+                    }
+                    std::thread::yield_now();
+                }
+                false
+            })
+            .join()
+            .unwrap()
+        })
+    };
+    assert!(
+        !wait(&|p| rt.hand_over(NodeId(slot), p)),
+        "a waiter took a held landing over in a peer's user code"
+    );
+    assert!(!crate::attempt::wounded());
+    user_code((rt.runtime_id, slot + 3));
+    assert!(
+        crate::reserve::may_take_over(claim, generation, &mut Patience::default()),
+        "other user code left the refusal standing"
+    );
+    assert!(
+        wait(&|p| crate::hold::hand_over(cell, claim, p).is_some()),
+        "the held landing was never takeable"
+    );
+    drop(user);
+    drop(read);
+    assert!(crate::hold::take(rt.runtime_id).wounded);
+}
