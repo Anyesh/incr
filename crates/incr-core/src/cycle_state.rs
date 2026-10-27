@@ -846,22 +846,12 @@ impl HeldMap {
             })
     }
 
-    /// [`Held::record`] on claim `key`, if held.
-    #[allow(clippy::too_many_arguments)]
+    /// Claim `key`, if held, for a [`Held::record`] under `look`, which
+    /// must go through here so that the map knows of speculative records.
     #[inline(always)]
-    pub(crate) fn record(
-        &mut self,
-        key: &(RuntimeId, u32),
-        look: Look,
-        deps: Vec<(NodeId, u32)>,
-        buf: Option<Erased>,
-        opened: bool,
-        poison: u16,
-        basis: Option<Basis>,
-    ) -> Option<(Option<Erased>, Option<Unbuilt>)> {
-        let e = self.claims.get_mut(key)?;
+    pub(crate) fn recording(&mut self, key: &(RuntimeId, u32), look: Look) -> Option<&mut Held> {
         self.spec_written |= look.speculative;
-        Some(e.record(look, deps, buf, opened, poison, basis))
+        self.claims.get_mut(key)
     }
 
     /// Drops the reads noted at position `at` or above, of a run that

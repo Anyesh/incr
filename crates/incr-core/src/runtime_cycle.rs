@@ -1113,20 +1113,17 @@ impl<C: Cells> Runtime<C> {
                 h.drop_spec_reads(rt, cidx);
                 None
             };
-            let out = h
-                .record(
-                    &(rt, slot),
-                    look,
-                    deps,
-                    ctl.buf.take(),
-                    !ctl.children.get().is_null(),
-                    ctl.poison(),
-                    basis,
-                )
-                .expect("incr-core: a member run's node is held");
             let e = h
-                .get_mut(&(rt, slot))
+                .recording(&(rt, slot), look)
                 .expect("incr-core: a member run's node is held");
+            let out = e.record(
+                look,
+                deps,
+                ctl.buf.take(),
+                !ctl.children.get().is_null(),
+                ctl.poison(),
+                basis,
+            );
             e.hold |= ctl.has(cycle::HOLD);
             // An engine unwind is no fault of the member's.
             if result.is_err() && cycle_state::unwind_kind().is_none() {
