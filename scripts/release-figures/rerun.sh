@@ -4,14 +4,18 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 rounds=${FIGURE_ROUNDS:-3}
 declare -A sha=([rel]=$1 [b5]=c61be873c4d6681cd0b59333441267749f4776cc [main]=b9f0d0bf3b11adec48b81eee123f9921a8ef694c)
-declare -A against built
+declare -A against built kind
 probes=()
-while IFS=$'\t' read -r probe vs _; do
+while IFS=$'\t' read -r probe vs _ src; do
   [[ -n $probe ]] || continue
+  [[ -z ${FIGURE_PROBES:-} || " $FIGURE_PROBES " == *" $probe "* ]] || continue
   [[ -n ${sha[$vs]:-} || $vs == none ]] || { echo "probes.tsv: $probe has unknown against tree $vs" >&2; exit 2; }
-  [[ -f $here/probes/$probe.rs ]] || { echo "probes.tsv: no probes/$probe.rs" >&2; exit 2; }
+  src=${src:-kit}
+  [[ $src == kit || $src == tree ]] || { echo "probes.tsv: $probe has unknown source $src" >&2; exit 2; }
+  [[ $src == tree || -f $here/probes/$probe.rs ]] || { echo "probes.tsv: no probes/$probe.rs" >&2; exit 2; }
   probes+=("$probe")
   against[$probe]=$vs
+  kind[$probe]=$src
 done < <(tail -n +2 "$here/probes/probes.tsv")
 logs=$(mktemp -d)
 
@@ -40,7 +44,12 @@ for n in rel b5 main; do
   git worktree add -q --detach "../fig-$n" "${sha[$n]}" || exit 1
   in_tree "$n" git log --oneline -1
   for p in "${mine[@]}"; do
-    cp "$here/probes/$p.rs" "../fig-$n/crates/incr-core/tests/"
+    if [[ ${kind[$p]} == kit ]]; then
+      cp "$here/probes/$p.rs" "../fig-$n/crates/incr-core/tests/"
+    elif [[ ! -f ../fig-$n/crates/incr-core/tests/$p.rs ]]; then
+      echo "FIG-MISSING $n $p"
+      continue
+    fi
     if in_tree "$n" cargo test --release -p incr-core --test "$p" --no-run >"$logs/$n-$p.log" 2>&1; then
       built[$n:$p]=1
     else
@@ -55,7 +64,11 @@ for p in "${probes[@]}"; do
     for n in $(trees_of "$p" | tac); do
       [[ -n ${built[$n:$p]:-} ]] || continue
       in_tree "$n" env FIGURE_TREE="r$r-$n" NC_TREE="r$r-$n" cargo test -q --release -p incr-core --test "$p" -- --nocapture 2>&1 |
-        grep -a '^NC \|^FIG \|panicked\|FAILED'
+        if [[ ${kind[$p]} == tree ]]; then
+          grep -a ' B per \|panicked\|FAILED' | sed "s/^/FIG r$r-$n $p /"
+        else
+          grep -a '^NC \|^FIG \|panicked\|FAILED'
+        fi
     done
   done
 done
