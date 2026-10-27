@@ -1332,6 +1332,7 @@ fn shared_failed_entry_fan_in() {
 /// the chain, not their product.
 fn failed_readers_over_a_dirty_chain<C: Cells>(over_top: bool) {
     for &n in FAILED_WALK_SIZES {
+        let n = scaled(n);
         let rt = Runtime::<C>::new();
         let fail = rt.create_input(0_u64);
         let gate = rt.create_input(0_u64);
