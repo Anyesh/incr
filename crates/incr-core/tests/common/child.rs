@@ -15,14 +15,16 @@ const CHILD: &str = "INCR_TEST_CHILD";
 
 pub const HANG_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// [`HANG_TIMEOUT`], or 60 s in a sanitized build (`INCR_TEST_REDUCED`, which
-/// the TSan job sets), where a child runs several times slower and a slow
-/// runner stretches that again.
-pub fn hang_timeout() -> Duration {
+/// How many times longer a child gets in a sanitized build
+/// (`INCR_TEST_REDUCED`, which the TSan job sets), where it runs several
+/// times slower and a slow runner stretches that again.
+const SANITIZED_SLOWDOWN: u32 = 6;
+
+fn scaled(timeout: Duration) -> Duration {
     if env::var_os("INCR_TEST_REDUCED").is_some() {
-        Duration::from_secs(60)
+        timeout * SANITIZED_SLOWDOWN
     } else {
-        HANG_TIMEOUT
+        timeout
     }
 }
 
@@ -56,14 +58,14 @@ impl Outcome {
     }
 }
 
-/// Runs `body` in a re-executed copy of this test binary with [`hang_timeout`].
+/// Runs `body` in a re-executed copy of this test binary with [`HANG_TIMEOUT`].
 ///
 /// `test` is the full test path as libtest names it (matched with `--exact`).
 /// In the child the body runs and the process exits; in the parent the child's
 /// fate is returned. Callers must add `#[cfg_attr(miri, ignore)]` because Miri
 /// cannot spawn processes.
 pub fn run_in_child(test: &str, body: impl FnOnce()) -> Outcome {
-    run_in_child_within(test, hang_timeout(), body)
+    run_in_child_within(test, HANG_TIMEOUT, body)
 }
 
 /// Runs `body` with no other test thread in the process: in a child, or
@@ -78,6 +80,8 @@ pub fn run_alone(test: &str, body: impl FnOnce()) {
     }
 }
 
+/// [`run_in_child`] with `timeout` for the plain build, scaled up in a
+/// sanitized build like [`HANG_TIMEOUT`].
 pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -> Outcome {
     if env::var_os(CHILD).is_some() {
         body();
@@ -108,7 +112,7 @@ pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -
     let stdout = drain(Box::new(child.stdout.take().unwrap()));
     let stderr = drain(Box::new(child.stderr.take().unwrap()));
 
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + scaled(timeout);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break Some(status);

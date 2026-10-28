@@ -51,3 +51,18 @@ fn a_reduced_build_child_outlives_the_plain_timeout() {
     )
     .assert_clean();
 }
+
+/// The longer sanitized-build timeout also covers a caller's own timeout.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_reduced_build_child_outlives_an_explicit_timeout() {
+    if std::env::var_os("INCR_TEST_REDUCED").is_none() {
+        return;
+    }
+    run_in_child_within(
+        "child_selftest::a_reduced_build_child_outlives_an_explicit_timeout",
+        Duration::from_secs(1),
+        || std::thread::sleep(Duration::from_secs(2)),
+    )
+    .assert_clean();
+}
