@@ -8919,9 +8919,13 @@ fn two_thread_walk_entry_below_an_ancestor_another_read_claimed_seed() {
 /// 0x173f8's ops 3 and 4 with op 3 claiming 2 while op 4's entry for 14
 /// waits on op 3's claim of 14: op 4 holds before that entry until op 3
 /// has claimed 14, so its root wait sees 2 unclaimed, and op 3 holds after
-/// its claim of 14 until op 4 waits on it. Op 4 then claims 14 under a root
-/// op 3 holds, closes the 5-6 cycle on its own stack, and the cycle reaches
-/// its catcher in 3 as 7777 where every order reads 2 Failed and fails.
+/// its claim of 14 until op 4 waits on it. Op 4 holds before its claim of
+/// 14 until op 3 holds at its first point with 2 claimed and 14 neither
+/// claimed nor reserved (its held landings of 2's run), and op 3 holds
+/// there until op 4 has claimed 14; without that second hold op 4's claim
+/// lands after 2 under suite load. Op 4 then claims 14 under a root op 3
+/// holds, closes the 5-6 cycle on its own stack, and the cycle reaches its
+/// catcher in 3 as 7777 where every order reads 2 Failed and fails.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
@@ -8940,17 +8944,23 @@ fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
     quiet(|| {
         for (frames, bytes) in [(None, 0), (None, 16384), (Some(2), 0)] {
             for _ in 0..4 {
-                let (gated, at14, waits, seen) = (
+                let (gated, at14, waits, ready, parked, claimed, seen) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                 );
                 let rig = |live: &Live<Shared>| {
-                    let (gated, at14, waits, seen, world) = (
+                    let (gated, at14, waits, ready, parked, claimed, seen, world) = (
+                        parked.clone(),
+                        ready.clone(),
                         gated.clone(),
                         at14.clone(),
                         waits.clone(),
+                        claimed.clone(),
                         seen.clone(),
                         live.world.clone(),
                     );
@@ -8968,6 +8978,13 @@ fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
                         let computing = |n: NodeId| {
                             matches!(state(n), NodeState::Computing | NodeState::ComputingDirty)
                         };
+                        let reserved = |n: NodeId| {
+                            let claim = (rt.runtime_id, n.0);
+                            let generation = rt.nodes.get(n.0).generation();
+                            std::thread::spawn(move || crate::reserve::elsewhere(claim, generation))
+                                .join()
+                                .unwrap()
+                        };
                         let begun = std::time::Instant::now();
                         let hold = |done: &dyn Fn() -> bool| {
                             while !done() && begun.elapsed() < std::time::Duration::from_secs(10) {
@@ -8984,6 +9001,14 @@ fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
                             {
                                 hold(&|| waits.load(SeqCst));
                             }
+                            if waits.load(SeqCst)
+                                && computing(n2)
+                                && !computing(n14)
+                                && !reserved(n14)
+                                && !parked.swap(true, SeqCst)
+                            {
+                                hold(&|| claimed.load(SeqCst));
+                            }
                             return;
                         }
                         if p == ParkPoint::BeforeComputeOne(n14)
@@ -8994,8 +9019,14 @@ fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
                             hold(&|| computing(n14));
                         } else if p == ParkPoint::ComputeWaits(n14) && at14.load(SeqCst) {
                             waits.store(true, SeqCst);
+                        } else if p == ParkPoint::BeforeClaim(n14)
+                            && waits.load(SeqCst)
+                            && !ready.swap(true, SeqCst)
+                        {
+                            hold(&|| parked.load(SeqCst));
                         } else if p == ParkPoint::AfterWalkClaim(n14) && waits.load(SeqCst) {
                             seen.store(computing(n2), SeqCst);
+                            claimed.store(true, SeqCst);
                         }
                     });
                     assert!(live.world.rt(0).park_hook.set(hook).is_ok());
@@ -9010,6 +9041,8 @@ fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
                 });
                 at14.store(true, SeqCst);
                 waits.store(true, SeqCst);
+                parked.store(true, SeqCst);
+                claimed.store(true, SeqCst);
                 shaped += usize::from(seen.load(SeqCst));
                 serial.check("0x173f8", &got, verdict.into_inner().unwrap());
             }
