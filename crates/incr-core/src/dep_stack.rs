@@ -183,6 +183,14 @@ pub(crate) fn frames_scanned() -> u64 {
     FRAMES_SCANNED.with(std::cell::Cell::get)
 }
 
+/// Counts once per scan rather than per frame compared, so the test
+/// binary the cost gates time runs the scan as user builds do.
+#[inline(always)]
+fn note_scanned(_frames: usize) {
+    #[cfg(all(test, not(loom)))]
+    FRAMES_SCANNED.with(|n| n.set(n.get() + _frames as u64));
+}
+
 /// A placement [`DepStack::place_next_at`] replaced, to restore.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
@@ -968,27 +976,29 @@ pub trait DepStack: sealed::Sealed + 'static {
     /// `node` of runtime `rt`, if one is.
     fn frame_cidx(&self, rt: RuntimeId, node: NodeId) -> Option<u32> {
         self.with(|s| {
-            let is = |f: &Frame| {
-                #[cfg(all(test, not(loom)))]
-                FRAMES_SCANNED.with(|n| n.set(n.get() + 1));
-                f.node == node && f.rt() == rt
-            };
-            let near = s.frames.len().saturating_sub(NEAR_FRAMES);
-            if let Some(f) = s.frames[near..].iter().rev().find(|f| is(f)) {
-                return Some(f.cidx);
+            let is = |f: &Frame| f.node == node && f.rt() == rt;
+            let len = s.frames.len();
+            let near = len.saturating_sub(NEAR_FRAMES);
+            if let Some(j) = s.frames[near..].iter().rposition(is) {
+                note_scanned(len - near - j);
+                return Some(s.frames[near + j].cidx);
             }
+            note_scanned(len - near);
             if near == 0 {
                 return None;
             }
             if let Some(&i) = s.deep.get(&(rt, node)) {
-                if i < near && s.frames.get(i).is_some_and(is) {
-                    debug_assert!(!s.frames[i + 1..near]
-                        .iter()
-                        .any(|f| f.node == node && f.rt() == rt));
-                    return Some(s.frames[i].cidx);
+                if i < near {
+                    note_scanned(1);
+                    if is(&s.frames[i]) {
+                        debug_assert!(!s.frames[i + 1..near].iter().any(is));
+                        return Some(s.frames[i].cidx);
+                    }
                 }
             }
-            let i = s.frames[..near].iter().rposition(is)?;
+            let found = s.frames[..near].iter().rposition(is);
+            note_scanned(near - found.unwrap_or(0));
+            let i = found?;
             if s.deep.len() >= DEEP_FRAMES_MAX {
                 s.deep.clear();
             }
