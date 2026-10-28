@@ -2101,7 +2101,7 @@ fn chained_group_with<C: Cells>(
         let below = *xs.last().unwrap();
         let (bottom, here, armed, y) = (xs[0], at == Some(k - 1 - i), armed.clone(), own());
         xs.push(rt.create_query(move |rt| {
-            if here && armed.swap(0, SeqCst) == 1 {
+            if here && armed.compare_exchange(1, 0, SeqCst, SeqCst).is_ok() {
                 let node = rt.nodes.get(bottom.slot());
                 if crate::state::try_claim_compute::<C>(node.state_cell()).is_ok() {
                     rt.land_unrun(crate::NodeId(bottom.slot()), node, NodeState::New);
