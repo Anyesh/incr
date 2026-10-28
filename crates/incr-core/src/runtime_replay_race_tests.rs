@@ -3825,7 +3825,12 @@ fn a_stashed_value_is_cloned_outside_the_stash_lock() {
         let rt = Arc::clone(&rt);
         thread::spawn(move || rt.get(r2))
     };
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT;
     while !SLOW_IN_CLONE.load(SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "r2's speculative read never cloned x's stash"
+        );
         thread::sleep(Duration::from_millis(1));
     }
     let (tx, rx) = mpsc::channel();
