@@ -2689,13 +2689,13 @@ fn shared_vframe_set_before_the_retrys_claim_under_a_waiting_reader() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// W reads X, which reads Y. The other thread's X lets Y's failed read
-/// out, and a set and a read reland X Clean before the retry of X's frame.
-/// Only the order with this thread first is serial, so the retry takes the
-/// payload over the Clean X, and W lets it out.
+/// W reads X, which reads Y. The retry of X's frame parks holding X's
+/// reservation, so the other thread's read of X waits it out, and a set
+/// that mends Y lands meanwhile. The retry takes Y's payload and W lets it
+/// out; the other read then gets the mended X: W's read, the set, the
+/// other read, in that serial order.
 #[test]
-#[ignore = "W's retry reads X Clean on the fast path and never takes the delivery"]
-fn shared_vframe_relanded_clean_below_its_reader() {
+fn shared_vframe_retry_holds_a_read_of_its_node_past_a_set() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -2722,13 +2722,17 @@ fn shared_vframe_relanded_clean_below_its_reader() {
         spawn(move || outcome(|| rt.get(w)))
     };
     gate.wait_parked();
-    let other = outcome(|| rt.get(x));
-    assert!(failed(&other), "{other:?}");
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
     rt.set(i, 1);
-    assert_eq!(outcome(|| rt.get(x)), Ok(8));
     gate.release();
-    let first = first.join();
-    assert_eq!(first, Err("y boom".to_string()));
+    assert_eq!(first.join(), Err("y boom".to_string()));
+    assert_eq!(other.join(), Ok(8));
+    assert_eq!(outcome(|| rt.get(w)), Ok(9));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
@@ -3045,48 +3049,55 @@ fn walked_frame() -> WalkedFrame {
     WalkedFrame { rt, i, x, r, gate }
 }
 
-/// The other thread's X lets Y's failed read out before the walk's retry
-/// of X, which finds X Failed. Only the order with this thread's whole
-/// read first is serial: its walk contains "y boom" on X, R's rerun takes
-/// it, and the other thread reads X Failed.
+/// The walk's retry of X parks holding X's reservation, so the other
+/// thread's read of X waits it out. The walk contains "y boom" on X, R's
+/// rerun takes it, and the other thread then reads X Failed, as in the
+/// serial order with this thread's whole read first.
 #[test]
-#[ignore = "a walked retry skips the owed check; T8-vframe-owed-walked-retry"]
-fn shared_walked_vframe_failed_by_a_landing_that_let_the_failure_out() {
+fn shared_walked_vframe_retry_holds_a_read_of_its_node() {
     let WalkedFrame { rt, x, r, gate, .. } = walked_frame();
     let first = {
         let rt = rt.clone();
         spawn(move || outcome(|| rt.get(r)))
     };
     gate.wait_parked();
-    let other = outcome(|| rt.get(x));
-    assert!(failed(&other), "{other:?}");
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
     gate.release();
-    let first = first.join();
-    assert_eq!(first, Err("y boom".to_string()));
+    assert_eq!(first.join(), Err("y boom".to_string()));
+    let other = other.join();
+    assert!(failed(&other), "{other:?}");
     assert!(failed(&outcome(|| rt.get(x))));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
     assert_eq!(rt.contained_payloads(), 0);
 }
 
-/// As `failed_by_a_landing_that_let_the_failure_out`, but a set that
-/// mends Y flips X Dirty before the retry, which claims X. The serial
-/// outcome is the same, and the set leaves X Dirty for the next read.
+/// As `shared_walked_vframe_retry_holds_a_read_of_its_node`, with a set
+/// that mends Y while the other read waits: R's read still gets "y boom",
+/// and the other read and the next read of R see the set.
 #[test]
-#[ignore = "a walked retry skips the owed check; T8-vframe-owed-walked-retry"]
-fn shared_walked_vframe_dirtied_after_it_let_the_failure_out() {
+fn shared_walked_vframe_retry_holds_a_read_of_its_node_past_a_set() {
     let WalkedFrame { rt, i, x, r, gate } = walked_frame();
     let first = {
         let rt = rt.clone();
         spawn(move || outcome(|| rt.get(r)))
     };
     gate.wait_parked();
-    let other = outcome(|| rt.get(x));
-    assert!(failed(&other), "{other:?}");
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
     rt.set(i, 1);
     gate.release();
-    let first = first.join();
-    assert_eq!(first, Err("y boom".to_string()));
+    assert_eq!(first.join(), Err("y boom".to_string()));
+    assert_eq!(other.join(), Ok(8));
     assert_eq!(outcome(|| rt.get(r)), Ok(9));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
