@@ -8443,20 +8443,19 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
+    #[cfg_attr(miri, ignore)]
     fn replay_differential_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
+    #[cfg_attr(miri, ignore)]
     fn replay_differential_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
     fn replay_differential_shared_two_threads(seed in any::<u64>()) {
         quiet(|| differential_two(&gen_case(seed, false, true), seed));
     }
