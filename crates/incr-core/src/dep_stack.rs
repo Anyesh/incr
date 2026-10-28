@@ -159,9 +159,9 @@ pub struct Frames {
     read_counts: Vec<(u32, ReadCounts)>,
     /// The index of a frame found below the top `NEAR_FRAMES`, by runtime
     /// and node: each group expansion nested in a deep chain of member runs
-    /// asks for the same frame at the stack's bottom. An entry stands while
-    /// its frame still computes its node, since one stack computes a node at
-    /// most once.
+    /// asks for the same frame at the stack's bottom. A push of a frame for
+    /// the node drops its entry, so an entry whose frame still computes the
+    /// node is the innermost one that does.
     deep: HashMap<(RuntimeId, NodeId), usize, FxBuildHasher>,
 }
 
@@ -386,7 +386,16 @@ impl Frames {
         if self.frames.capacity() == 0 {
             first_push();
         }
+        if !self.deep.is_empty() {
+            self.forget_deep(frame.rt(), frame.node);
+        }
         self.frames.push(frame);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn forget_deep(&mut self, rt: RuntimeId, node: NodeId) {
+        self.deep.remove(&(rt, node));
     }
 
     #[inline(always)]
@@ -1295,6 +1304,29 @@ mod tests {
         assert!(s.is_computing(rt(1), NodeId(7)));
         s.pop_frame();
         assert!(!s.is_computing(rt(1), NodeId(7)));
+    }
+
+    /// A frame for a node pushed above a deep frame for it that a lookup
+    /// remembered is the one found.
+    #[test]
+    fn a_node_pushed_again_above_a_remembered_deep_frame_is_found() {
+        let s = SharedDepStack::new();
+        let ctls: Vec<ComputeCtl> = (0..40).map(|_| ComputeCtl::new(0)).collect();
+        for (i, ctl) in ctls.iter().enumerate() {
+            let node = if i == 0 || i == 20 {
+                5
+            } else {
+                1000 + i as u32
+            };
+            s.push_frame_at(rt(1), NodeId(node), ctl, 100 + i as u32);
+            if i == 19 {
+                assert_eq!(s.frame_cidx(rt(1), NodeId(5)), Some(100));
+            }
+        }
+        assert_eq!(s.frame_cidx(rt(1), NodeId(5)), Some(120));
+        for _ in 0..40 {
+            s.pop_frame();
+        }
     }
 
     #[test]
