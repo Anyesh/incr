@@ -8910,20 +8910,23 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                 if here == 2 {
                     break;
                 }
-                let (held, released, passes) = (
+                let (held, released, passes, timed_out) = (
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicBool::new(false)),
                 );
                 let rig = |live: &Live<Shared>| {
-                    let (held, released, passes, world, ended) = (
+                    let (held, released, passes, timed_out, world, ended) = (
                         held.clone(),
                         released.clone(),
                         passes.clone(),
+                        timed_out.clone(),
                         live.world.clone(),
                         live.ended.clone(),
                     );
                     let n2 = NodeId(world.handle(0, 2).erased().slot());
+                    let rts = [world.rt(0).runtime_id, world.rt(1).runtime_id];
                     let hook: crate::runtime::ParkHook = Box::new(move |p| {
                         if TWO_PHASE.with(std::cell::Cell::get) != overlap
                             || TWO_THREAD.with(std::cell::Cell::get) != Some(reader)
@@ -8937,10 +8940,17 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                             }
                             return;
                         }
+                        // Op 15 can instead wait on a claim this thread
+                        // holds, which no hold outlasts: the run misses the
+                        // order and goes on.
                         let begun = std::time::Instant::now();
                         while !ended.lock().unwrap().contains(&15)
-                            && begun.elapsed() < std::time::Duration::from_secs(10)
+                            && rts.iter().all(|&rt| crate::waits::registered_on(rt) == 0)
                         {
+                            if begun.elapsed() > std::time::Duration::from_secs(10) {
+                                timed_out.store(true, SeqCst);
+                                break;
+                            }
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         released.store(ended.lock().unwrap().contains(&15), SeqCst);
@@ -8951,6 +8961,10 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                 let got = run_two_until(&case, &phases, frames, bytes, &rig, &|p, prefix, live| {
                     p == overlap || serial.at_overlap("0x4b004", prefix, live).is_some()
                 });
+                assert!(
+                    !timed_out.load(SeqCst),
+                    "op 15 neither ended nor waited on op 14's claims within 10 s of the hold"
+                );
                 if released.load(SeqCst) && got[15].0 == Out::Panic("cycle".into()) {
                     shaped += 1;
                     here += 1;
