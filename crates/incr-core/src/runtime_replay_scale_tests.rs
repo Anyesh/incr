@@ -2070,14 +2070,15 @@ fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
     chained_group_landing_new(rt, k, None).0
 }
 
-/// [`chained_group`] where `xs[at]`'s run, once armed, first lands the
-/// bottom member New unrun, as a doom's discard of it would.
+/// [`chained_group`] where `xs[at]`'s run, once armed (1), first lands the
+/// bottom member New unrun from the claim a blocked verify kept on it, as
+/// a doom's discard of that claim would, and then reads 2.
 fn chained_group_landing_new<C: Cells>(
     rt: &Runtime<C>,
     k: usize,
     at: Option<usize>,
-) -> (ChainedGroup, Arc<std::sync::atomic::AtomicBool>) {
-    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+) -> (ChainedGroup, Arc<AtomicU32>) {
+    let armed = Arc::new(AtomicU32::new(0));
     let on = rt.create_input(0_i64);
     let root: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
     let m = {
@@ -2095,10 +2096,11 @@ fn chained_group_landing_new<C: Cells>(
         let below = *xs.last().unwrap();
         let (bottom, here, armed) = (xs[0], at == Some(k - 1 - i), armed.clone());
         xs.push(rt.create_query(move |rt| {
-            if here && armed.swap(false, SeqCst) {
+            if here && armed.swap(0, SeqCst) == 1 {
                 let node = rt.nodes.get(bottom.slot());
-                if crate::state::try_claim_compute::<C>(node.state_cell()).is_ok() {
+                if crate::state::load::<C>(node.state_cell()) == NodeState::Computing {
                     rt.land_unrun(crate::NodeId(bottom.slot()), node, NodeState::New);
+                    armed.store(2, SeqCst);
                 }
             }
             rt.get(below) + 1
@@ -2160,19 +2162,19 @@ type GroupOutcome = (
 
 /// The read of `m` with the blocked-record skip and the listed-externals
 /// reuse as given, `xs[unrun_at]` landing the bottom member New if set,
-/// and how many skips and reuses it took.
+/// how many skips and reuses it took, and whether the bottom landed.
 fn chained_group_outcome<C: Cells>(
     k: usize,
     (skip, reuse): (bool, bool),
     unrun_at: Option<usize>,
-) -> (GroupOutcome, u64, u64) {
+) -> (GroupOutcome, u64, u64, bool) {
     crate::cycle_state::set_group_blocker_skip(skip);
     crate::cycle_state::set_group_externals_reuse(reuse);
     let skips = crate::cycle_state::group_blocker_skips();
     let reuses = crate::cycle_state::group_externals_reuses();
     let rt = Runtime::<C>::new();
     let (shape, armed) = chained_group_landing_new(&rt, k, unrun_at);
-    armed.store(true, SeqCst);
+    armed.store(1, SeqCst);
     let read = |h: Incr<i64>| {
         catch_unwind(AssertUnwindSafe(|| rt.get(h))).map_err(super::race_tests::panic_message)
     };
@@ -2210,6 +2212,7 @@ fn chained_group_outcome<C: Cells>(
         (got, states, values, deps, groups),
         crate::cycle_state::group_blocker_skips() - skips,
         crate::cycle_state::group_externals_reuses() - reuses,
+        armed.load(SeqCst) == 2,
     )
 }
 
@@ -2219,8 +2222,8 @@ fn chained_group_outcome<C: Cells>(
 /// group at each member.
 fn chained_group_skip_moves_no_node<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
-    let (with, skipped, _) = chained_group_outcome::<C>(k, (true, true), None);
-    let (without, _, _) = chained_group_outcome::<C>(k, (false, true), None);
+    let (with, skipped, ..) = chained_group_outcome::<C>(k, (true, true), None);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), None);
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
 }
@@ -2241,8 +2244,9 @@ fn shared_chained_group_skip_moves_no_node() {
 fn chained_group_unrun_landing_ends_skip<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
     let at = Some(k / 2);
-    let (with, skipped, _) = chained_group_outcome::<C>(k, (true, true), at);
-    let (without, _, _) = chained_group_outcome::<C>(k, (false, true), at);
+    let (with, skipped, _, landed) = chained_group_outcome::<C>(k, (true, true), at);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), at);
+    assert!(landed, "the bottom member was not claimed to land");
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
 }
@@ -2263,8 +2267,8 @@ fn shared_chained_group_unrun_landing_ends_skip() {
 fn chained_group_reuse_moves_no_node<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
     for at in [None, Some(k / 2)] {
-        let (with, _, reused) = chained_group_outcome::<C>(k, (true, true), at);
-        let (without, _, _) = chained_group_outcome::<C>(k, (true, false), at);
+        let (with, _, reused, _) = chained_group_outcome::<C>(k, (true, true), at);
+        let (without, ..) = chained_group_outcome::<C>(k, (true, false), at);
         assert!(reused > 0, "no group expansion reused a listing");
         assert_eq!(with, without, "bottom landed New at {at:?}");
     }
