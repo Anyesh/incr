@@ -1666,10 +1666,11 @@ impl<C: Cells> Runtime<C> {
         };
         let (word, node) = (walk.word, self.nodes.get(handle.slot()));
         match walk.mode {
-            0 => self.read_walk::<T, 0>(handle, node, observed, kind, word, frame),
-            ARMED => self.read_walk::<T, ARMED>(handle, node, observed, kind, word, frame),
-            VIRT => self.read_walk::<T, VIRT>(handle, node, observed, kind, word, frame),
-            _ => self.read_walk::<T, { ARMED | VIRT }>(handle, node, observed, kind, word, frame),
+            0 => self.read_walk::<T, 0, true>(handle, node, observed, kind, word, frame),
+            ARMED => self.read_walk::<T, ARMED, true>(handle, node, observed, kind, word, frame),
+            VIRT => self.read_walk::<T, VIRT, true>(handle, node, observed, kind, word, frame),
+            _ => self
+                .read_walk::<T, { ARMED | VIRT }, true>(handle, node, observed, kind, word, frame),
         }
     }
 
@@ -3554,7 +3555,7 @@ impl<C: Cells> Runtime<C> {
         {
             return self.read_cold(handle, observed, kind, None, word, false);
         }
-        self.read_walk::<T, 0>(handle, node, observed, kind, word, None)
+        self.read_walk::<T, 0, false>(handle, node, observed, kind, word, None)
     }
 
     pub(super) fn budgeted(&self) -> bool {

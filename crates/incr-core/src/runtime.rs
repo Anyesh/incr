@@ -3081,22 +3081,7 @@ impl<C: Cells> Runtime<C> {
         {
             return self.read_cold(handle, observed, kind, frame, word, first);
         }
-        self.read_hot_walk(handle, node, observed, kind, word, frame)
-    }
-
-    /// [`Self::read_walk`] in no mode, out of line so that a read sent to
-    /// [`Self::read_cold`] does not carry its frame down a deep chain.
-    #[inline(never)]
-    fn read_hot_walk<T: Value>(
-        &self,
-        handle: Incr<T>,
-        node: &NodeData<C>,
-        observed: NodeState,
-        kind: ReadKind,
-        word: u64,
-        frame: Option<ActiveRead>,
-    ) -> Result<T, Cycle> {
-        self.read_walk::<T, 0>(handle, node, observed, kind, word, frame)
+        self.read_walk::<T, 0, false>(handle, node, observed, kind, word, frame)
     }
 
     /// [`Self::read_slow`] for this runtime's first entry inside another
@@ -3129,9 +3114,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The rest of a slow read: a cycle read, or a walk in `MODE` and
-    /// then the slot.
+    /// then the slot. A `COLD` read came through [`Self::read_cold`] and
+    /// reads the slot out of line ([`Self::read_after_walk`]).
     #[inline(always)]
-    fn read_walk<T: Value, const MODE: u8>(
+    fn read_walk<T: Value, const MODE: u8, const COLD: bool>(
         &self,
         handle: Incr<T>,
         node: &NodeData<C>,
@@ -3208,7 +3194,12 @@ impl<C: Cells> Runtime<C> {
                     unreachable!("incr-core: a walk's root is never skipped or revisited")
                 }
             }
-            match self.read_after_walk(handle, node, frame, spec, &mut root) {
+            let after = if COLD {
+                self.read_after_walk(handle, node, frame, spec, &mut root)
+            } else {
+                self.after_walk(handle, node, frame, spec, &mut root)
+            };
+            match after {
                 ControlFlow::Break(read) => return read,
                 ControlFlow::Continue(now) => {
                     observed = now;
@@ -3218,11 +3209,26 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// [`Self::read_walk`] after its walk: the slot read, or the state to
-    /// walk again from. Out of line so that its locals are off the stack
-    /// while the walk recurses through a deep chain.
+    /// [`Self::after_walk`] out of line, for a read through
+    /// [`Self::read_cold`]: such reads recurse through chains deeper than
+    /// the frame budget, and this keeps the slot read's locals off the
+    /// stack while the walk computes.
     #[inline(never)]
     fn read_after_walk<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        frame: Option<ActiveRead>,
+        spec: bool,
+        root: &mut Option<reserve::Root>,
+    ) -> ControlFlow<Result<T, Cycle>, NodeState> {
+        self.after_walk(handle, node, frame, spec, root)
+    }
+
+    /// [`Self::read_walk`] after its walk: the slot read, or the state to
+    /// walk again from.
+    #[inline(always)]
+    fn after_walk<T: Value>(
         &self,
         handle: Incr<T>,
         node: &NodeData<C>,
