@@ -2665,3 +2665,51 @@ fn local_shorter_outer_walk_keeps_the_nested_walks_buffer() {
 fn shared_shorter_outer_walk_keeps_the_nested_walks_buffer() {
     a_shorter_outer_walk_keeps_the_nested_walks_buffer::<Shared>();
 }
+
+/// Reads the top of a 50-deep Dirty chain once with no retraction and once
+/// with one counted while the walk sits before each node's dep read, so the
+/// walk drops and revisits every expansion once. The revisits must not count
+/// as first visits: the count places the switch to exact mode, and a walk
+/// that crosses it at a different node plans another order (0x17ce25,
+/// 0x16574d).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_walk_revisit_after_a_retraction_is_no_first_visit() {
+    const DEPTH: usize = 50;
+    let read = |retract: bool| {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let (x, top) = dirty_chain(&*rt, DEPTH);
+        if retract {
+            let weak = Arc::downgrade(&rt);
+            let seen = Mutex::new(std::collections::HashSet::new());
+            let hook: super::ParkHook = Box::new(move |point| {
+                if let ParkPoint::WalkBeforeDeps(n) = point {
+                    if seen.lock().unwrap().insert(n) {
+                        if let Some(rt) = weak.upgrade() {
+                            Shared::u64_fetch_add(&rt.retractions.0, 1);
+                        }
+                    }
+                }
+            });
+            assert!(rt.park_hook.set(hook).is_ok());
+        }
+        rt.set(x, 1);
+        let (visits, rereads) = (rt.first_visits(), rt.rereads.load(Ordering::Relaxed));
+        assert_eq!(rt.get(top), DEPTH as i64);
+        (
+            rt.first_visits() - visits,
+            rt.rereads.load(Ordering::Relaxed) - rereads,
+        )
+    };
+    let (plain, plain_rereads) = read(false);
+    let (retracted, rereads) = read(true);
+    assert_eq!(plain_rereads, 0);
+    assert!(
+        rereads >= DEPTH as u64 - 1,
+        "only {rereads} expansions were dropped and revisited"
+    );
+    assert_eq!(
+        retracted, plain,
+        "{rereads} revisits moved the walk's first visits"
+    );
+}
