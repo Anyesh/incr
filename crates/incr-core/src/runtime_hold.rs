@@ -758,7 +758,7 @@ impl<C: Cells> Runtime<C> {
     /// give-back is unverified, published or not, so one Clean over the
     /// value restored recomputes once after the panic.
     fn unverify_readers(&self, given: &[u32]) {
-        C::u64_fetch_add(&self.unsettled, 1);
+        let _moving = self.settle_move();
         let mut readers: Vec<NodeId> = Vec::new();
         {
             let inner = self.inner.read();

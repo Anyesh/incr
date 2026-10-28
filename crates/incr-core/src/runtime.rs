@@ -111,6 +111,15 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
+/// Ends a move counted by [`Runtime::settle_move`].
+pub(crate) struct SettleMove<'a, C: Cells>(&'a C::U64);
+
+impl<C: Cells> Drop for SettleMove<'_, C> {
+    fn drop(&mut self) {
+        C::u64_fetch_add(self.0, 1);
+    }
+}
+
 /// A landed cycle group: its members with the generations they landed
 /// under, sorted by slot, and the cycle readers see.
 pub(crate) struct GroupInfo {
@@ -1595,10 +1604,10 @@ pub struct Runtime<C: Cells> {
     /// which keep its record: a group verify's blocker stands only while
     /// none has happened since.
     pub(crate) group_unrun_landings: C::U64,
-    /// Moves of a settled node to unsettled with no new revision that
-    /// `reshapes` does not count: a held landing's give-back unverifying
-    /// its readers, and a replay rerun of a Failed node. Counted before
-    /// the move.
+    /// Twice the moves of a settled node to unsettled with no new revision
+    /// that `reshapes` does not count (a held landing's give-back
+    /// unverifying its readers, a replay rerun of a Failed node), odd while
+    /// one is under way.
     pub(crate) unsettled: C::U64,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
@@ -4841,14 +4850,16 @@ impl<C: Cells> Runtime<C> {
         // Each read in a member's run of a member below it expands the
         // group again, so the group's deps are listed once per entry.
         let settle = self.settle_key();
-        let listed =
-            cycle_state::group_externals(self.runtime_id, &group, (rec_changes, unrun, settle));
+        let listed = settle.and_then(|settle| {
+            cycle_state::group_externals(self.runtime_id, &group, (rec_changes, unrun, settle))
+        });
         #[cfg(all(test, not(loom)))]
         if listed.is_some() {
             cycle_state::note_group_externals_reuse();
         }
         let mut changed = listed.is_none();
-        let mut ext = listed.unwrap_or_else(|| self.list_group_externals(&group, settle));
+        let mut ext =
+            listed.unwrap_or_else(|| self.list_group_externals(&group, settle.unwrap_or_default()));
         // A dep found settled stays settled until the settle key moves, so
         // later expansions in the entry skip it.
         let mut kept: Option<Vec<cycle_state::GroupExternal>> = None;
@@ -4866,11 +4877,11 @@ impl<C: Cells> Runtime<C> {
             };
             match (&mut kept, keep) {
                 (Some(kept), true) => kept.push(step),
-                (None, false) => kept = Some(ext.deps[..i].to_vec()),
+                (None, false) if settle.is_some() => kept = Some(ext.deps[..i].to_vec()),
                 _ => {}
             }
         }
-        if let Some(kept) = kept {
+        if let (Some(kept), Some(settle)) = (kept, settle) {
             ext.deps = kept.into();
             ext.settle = settle;
             changed = true;
@@ -4977,12 +4988,24 @@ impl<C: Cells> Runtime<C> {
 
     /// The revision, and the reshapes and other moves of a settled node to
     /// unsettled within it: a state loaded settled stays so while neither
-    /// moves.
-    fn settle_key(&self) -> (u64, u64) {
-        (
-            self.current_revision(),
-            C::u64_load_acquire(&self.reshapes).wrapping_add(C::u64_load_acquire(&self.unsettled)),
-        )
+    /// moves. None while such a move is under way, a set's dirty walk
+    /// included, since its count moves before it ends.
+    fn settle_key(&self) -> Option<(u64, u64)> {
+        let revision = self.current_revision();
+        let moves = C::u64_load_acquire(&self.unsettled);
+        (moves % 2 == 0 && C::walked(&self.walk, &self.revision) >= revision).then(|| {
+            (
+                revision,
+                C::u64_load_acquire(&self.reshapes).wrapping_add(moves),
+            )
+        })
+    }
+
+    /// Counts a move of settled nodes to unsettled as under way until the
+    /// returned guard drops.
+    pub(crate) fn settle_move(&self) -> SettleMove<'_, C> {
+        C::u64_fetch_add(&self.unsettled, 1);
+        SettleMove(&self.unsettled)
     }
 
     /// Whether another thread changed `id`'s group record since the walk
