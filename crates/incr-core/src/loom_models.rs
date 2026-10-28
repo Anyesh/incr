@@ -2033,18 +2033,33 @@ fn doom_reservations_cross(len: usize, frames: u32) {
         fc.set(f).unwrap();
         (rt, f, x)
     }
+    // One thread, so one execution: the orders are computed once here and
+    // not again in each of the concurrent model's executions.
+    let orders = std::sync::Arc::new(std::sync::OnceLock::new());
+    run({
+        let orders = std::sync::Arc::clone(&orders);
+        move || {
+            let serial = |f_first: bool| {
+                let (rt, f, x) = shape(len, frames);
+                if f_first {
+                    let vf = panic_message(|| rt.get(f));
+                    (vf, panic_message(|| rt.get(x)))
+                } else {
+                    let vx = panic_message(|| rt.get(x));
+                    (panic_message(|| rt.get(f)), vx)
+                }
+            };
+            let got = [serial(true), serial(false)];
+            assert_eq!(crate::waits::registered(), 0);
+            assert!(
+                !crate::reserve::any(),
+                "a reservation outlived a serial read"
+            );
+            assert_eq!(orders.get_or_init(|| got.clone()), &got);
+        }
+    });
+    let orders = orders.get().cloned().unwrap();
     run(move || {
-        let serial = |f_first: bool| {
-            let (rt, f, x) = shape(len, frames);
-            if f_first {
-                let vf = panic_message(|| rt.get(f));
-                (vf, panic_message(|| rt.get(x)))
-            } else {
-                let vx = panic_message(|| rt.get(x));
-                (panic_message(|| rt.get(f)), vx)
-            }
-        };
-        let orders = [serial(true), serial(false)];
         let (rt, f, x) = shape(len, frames);
         let other = {
             let rt = Arc::clone(&rt);
