@@ -946,8 +946,10 @@ pub(crate) struct Walk {
     /// node a compute left not Clean, kept from the switch on so a popped
     /// `(x, false)` of one of them is skipped instead of expanded again.
     /// `None` below the switch, which keeps the walk free of set
-    /// operations for small graphs.
-    visited: Option<HashSet<NodeId>>,
+    /// operations for small graphs. Boxed because a walk sits in the frame
+    /// of every level of a deep chain's read.
+    #[allow(clippy::box_collection)]
+    visited: Option<Box<HashSet<NodeId>>>,
     /// Created at the walk's first New expansion or group expansion, in
     /// one box so that a walk with neither tests one pointer at its drop.
     expanded: Option<Box<Expanded>>,
@@ -1169,13 +1171,13 @@ impl Walk {
             }
             None => {
                 self.drop_repeats(self.work.len() - 1);
-                self.visited = Some(
+                self.visited = Some(Box::new(
                     self.work
                         .iter()
                         .filter(|e| e.is_pending())
                         .map(|e| e.id)
                         .collect(),
-                );
+                ));
             }
         }
     }
@@ -1246,7 +1248,7 @@ impl Walk {
             .map(|e| e.id)
             .collect();
         visited.insert(id);
-        self.visited = Some(visited);
+        self.visited = Some(Box::new(visited));
     }
 
     /// Drops the plan above `work[keep - 1]`, and with it the visits and
@@ -4302,15 +4304,16 @@ impl<C: Cells> Runtime<C> {
         } else {
             self.planned()
         };
-        let mut walk = resume.unwrap_or_else(|| {
-            let mut walk = Walk::new(id, gen, observed);
-            if !C::SINGLE_THREADED {
-                walk.failed_from = cycle_state::failed_here_count();
-                walk.retracted = self.retraction_count();
-                walk.first_planned = planned;
-            }
-            walk
-        });
+        // Built in place and overwritten by a resumed walk: choosing between
+        // the two in one expression copies the whole walk on every read.
+        let mut walk = Walk::new(id, gen, observed);
+        if let Some(resumed) = resume {
+            walk = *resumed;
+        } else if !C::SINGLE_THREADED {
+            walk.failed_from = cycle_state::failed_here_count();
+            walk.retracted = self.retraction_count();
+            walk.first_planned = planned;
+        }
         let mut ran_unsettled = false;
         let mut root = Computed::Done;
         let root_node = self.nodes.get(id.0);
