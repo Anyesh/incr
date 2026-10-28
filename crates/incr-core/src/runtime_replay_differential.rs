@@ -4946,20 +4946,78 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
 /// every order of the overlapping reads panics "boom 0:6". The speculative
 /// entry a lazy doomed frame pushed for a read the unbounded run never makes
 /// waited on the other thread, closed a waits-for cycle, and the wound
-/// retried the attempt that had seen the panic; its run drops instead.
+/// retried the attempt that had seen the panic; its run drops instead. Since
+/// 33c30fd66, the held-unwind merge onto increment 16, the drop no longer
+/// decides that value: without it the read still gives every order's value.
+/// The pin keeps the schedule in which both threads meet at 4:
+/// op 1's thread, speculating while it holds the claim on 4, holds before its
+/// speculative reads until op 0's thread, holding 3, waits on 4, so its read
+/// of 3 reaches the speculative claim wait in `wait_registered`; without that
+/// hold op 0's thread lands 3 first under suite load.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_lazy_doomed_frame_placeholder_seeds() {
     TWO_WAIT_DROPS.with(|d| d.set(0));
     let case = gen_case(0x7b5e6, false, true);
+    let phases = phases(&case, 0x7b5e6);
+    let serial = Serial::new(&case, &phases);
+    let overlap = phases
+        .iter()
+        .position(|p| p.ops().contains(&0) && p.ops().contains(&1))
+        .unwrap();
+    let reader = if phases[overlap].of(0) == Some(1) {
+        0
+    } else {
+        1
+    };
     quiet(|| {
         for _ in 0..8 {
-            differential_two(&case, 0x7b5e6);
+            for frames in [None, Some(1), Some(2), Some(3)] {
+                for bytes in [0, 16 * 1024] {
+                    let (waits, held) = (
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    let rig = |live: &Live<Shared>| {
+                        let (waits, held, world) =
+                            (waits.clone(), held.clone(), live.world.clone());
+                        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                            let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                                return;
+                            };
+                            if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                                return;
+                            }
+                            let rt = world.rt(0);
+                            let n4 = NodeId(world.handle(0, 4).erased().slot());
+                            if p == ParkPoint::WalkWaits(n4) {
+                                waits.store(true, SeqCst);
+                            } else if t == reader
+                                && crate::replay::speculating_in(rt.runtime_id)
+                                && rt.own_claim_owner(n4).is_some()
+                                && !held.swap(true, SeqCst)
+                            {
+                                let begun = std::time::Instant::now();
+                                while !waits.load(SeqCst)
+                                    && begun.elapsed() < std::time::Duration::from_secs(10)
+                                {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                        });
+                        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                    };
+                    let label = format!(
+                        "seed 0x7b5e6, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
+                    );
+                    serial.differential(&label, frames, bytes, &rig);
+                }
+            }
         }
     });
     assert!(
         TWO_WAIT_DROPS.with(|d| d.get()) > 0,
-        "no speculative run dropped at a wait"
+        "no speculative read reached the claim wait in wait_registered"
     );
 }
 
