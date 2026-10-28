@@ -2138,7 +2138,9 @@ fn chained_group_reads_claim_once<C: Cells>() {
     let before = rt.group_claims.load(SeqCst);
     let listed = rt.group_listings.load(SeqCst);
     let loaded = rt.group_external_loads.load(SeqCst);
+    let scanned = crate::dep_stack::frames_scanned();
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let scans = crate::dep_stack::frames_scanned() - scanned;
     let claims = rt.group_claims.load(SeqCst) - before;
     let listings = rt.group_listings.load(SeqCst) - listed;
     let loads = rt.group_external_loads.load(SeqCst) - loaded;
@@ -2154,6 +2156,10 @@ fn chained_group_reads_claim_once<C: Cells>() {
     assert!(
         loads <= 4 * k as u64,
         "{loads} loads of a {k}-member group's deps in one read"
+    );
+    assert!(
+        scans <= 64 * k as u64,
+        "{scans} frames compared finding frames in a {k}-deep chain in one read"
     );
 }
 
