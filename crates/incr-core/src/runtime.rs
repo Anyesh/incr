@@ -1555,11 +1555,17 @@ pub struct Runtime<C: Cells> {
     /// set or delete reads it under the hold it claims under, so each one
     /// claimed after the change counts itself.
     pub(crate) read_speculatively: C::U8,
-    /// Delete claims, speculative reads of a deleted node, and relands and
-    /// seeds of a stashed node, so far. Each changes what a read returns
-    /// with no new revision, so a stash stands only at the count its run
-    /// began under.
+    /// Delete claims, node creations outside a compute after a speculative
+    /// read of a deleted node, and relands and seeds of a stashed node, so
+    /// far. Each changes what a read returns with no new revision, so a
+    /// stash stands only at the count its run began under.
     pub(crate) reshapes: C::U64,
+    /// Speculative reads of a deleted node so far. The read itself moves no
+    /// reshape count: its run reads the dead handle again until a recreate,
+    /// and a count it moved would end its own stash and rerun it without end.
+    pub(crate) dead_reads: C::U64,
+    /// The `dead_reads` a creation has counted as a reshape.
+    pub(crate) dead_reads_counted: C::U64,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -1698,6 +1704,8 @@ impl<C: Cells> Runtime<C> {
             changes: crate::changes::Changes::new(),
             read_speculatively: C::new_u8(0),
             reshapes: C::new_u64(0),
+            dead_reads: C::new_u64(0),
+            dead_reads_counted: C::new_u64(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -1882,6 +1890,7 @@ impl<C: Cells> Runtime<C> {
             };
             (slot, self.nodes.get(slot).generation())
         };
+        self.count_created();
         Incr::new(slot, generation, self.runtime_id)
     }
 
@@ -2041,6 +2050,7 @@ impl<C: Cells> Runtime<C> {
             }
             (slot, self.nodes.get(slot).generation())
         };
+        self.count_created();
         Incr::new(slot, generation, self.runtime_id)
     }
 
@@ -2249,6 +2259,31 @@ impl<C: Cells> Runtime<C> {
     /// in its place may change, with no new revision.
     fn count_dead_read(&self) {
         if replay::speculative() {
+            C::u64_fetch_add(&self.dead_reads, 1);
+        }
+    }
+
+    /// A node created outside a compute, by a create or a table miss, may be
+    /// the recreate of one a speculative run read dead, which a closure
+    /// reads in its place. A compute cannot recreate one: it reaches a node
+    /// only through a handle it captured, a dep's value or a table, which
+    /// never returns a dead node; and a run's own miss counting would end
+    /// its own stash. A dead read this load sees began its run before the
+    /// reshape it counts; one it misses stays pending for the next creation.
+    #[inline(always)]
+    fn count_created(&self) {
+        let dead = C::u64_load_acquire(&self.dead_reads);
+        if dead != C::u64_load_relaxed(&self.dead_reads_counted) {
+            self.count_dead_reads(dead);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_dead_reads(&self, dead: u64) {
+        if !self.dep_stack.current_frame_active(self.runtime_id)
+            && C::u64_fetch_max(&self.dead_reads_counted, dead) < dead
+        {
             C::u64_fetch_add(&self.reshapes, 1);
         }
     }

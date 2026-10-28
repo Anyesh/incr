@@ -3675,3 +3675,43 @@ fn local_stash_reads_end_with_their_context() {
 fn shared_stash_reads_end_with_their_context() {
     stash_reads_end_with_their_context::<Shared>();
 }
+
+/// A speculative run's dead read counts as one reshape at the next creation
+/// made with no frame of the runtime active, a table miss included, and at
+/// none made inside a compute, where a run's own miss would end its stash.
+fn dead_reads_count_at_a_creation_outside_a_compute<C: Cells>(rt: &Runtime<C>)
+where
+    crate::table::NodeTable<u64, u64, C>: Send + Sync,
+{
+    let table = Arc::new(rt.create_table::<u64, u64>());
+    let inside = {
+        let table = table.clone();
+        rt.create_query(move |rt: &Runtime<C>| rt.get(table.get_or_insert_input(rt, 1, || 2)))
+    };
+    C::u64_fetch_add(&rt.dead_reads, 1);
+    let before = C::u64_load_relaxed(&rt.reshapes);
+    assert_eq!(rt.get(inside), 2);
+    assert_eq!(
+        C::u64_load_relaxed(&rt.reshapes),
+        before,
+        "a miss inside a compute"
+    );
+    let _ = table.get_or_insert_input(rt, 2, || 3);
+    assert_eq!(
+        C::u64_load_relaxed(&rt.reshapes),
+        before + 1,
+        "a miss outside"
+    );
+    let _ = rt.create_input(4_u64);
+    assert_eq!(
+        C::u64_load_relaxed(&rt.reshapes),
+        before + 1,
+        "counted once"
+    );
+}
+
+local_and_shared!(
+    dead_reads_count_at_a_creation_outside_a_compute,
+    local_dead_reads_count_at_a_creation_outside_a_compute,
+    shared_dead_reads_count_at_a_creation_outside_a_compute
+);

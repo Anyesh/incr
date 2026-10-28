@@ -3579,6 +3579,29 @@ fn seed_48e9_stash_over_a_dead_handle_then_a_recreate() {
     });
 }
 
+/// 0x11203: a speculative run reads a deleted node's handle with no
+/// recreate to follow. Its stash must stand, or each replay of the bounded
+/// chain reruns it over the same dead handle without end.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_11203_a_dead_read_keeps_its_own_stash() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let case = gen_case(0x11203, false, false);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            quiet(|| {
+                differential::<Local>(&case, 0x11203);
+                differential::<Shared>(&case, 0x11203);
+            });
+        }));
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(r) => r.unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        Err(_) => panic!("seed 0x11203: a bounded run never returned"),
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn seed_e126d92b8f_repeated_runs_keep_their_deliveries() {
