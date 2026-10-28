@@ -969,14 +969,19 @@ fn native_graph_never_speculates<C: Cells>(rt: &Runtime<C>) {
     assert!(rt.dooms.lock().unwrap().is_empty());
 }
 
+// Its 51 native levels outgrow libtest's 2 MiB thread under TSan.
 #[test]
 fn local_native_graph_never_speculates() {
-    native_graph_never_speculates(&native_runtime::<Local>());
+    on_stack(16 << 20, || {
+        native_graph_never_speculates(&native_runtime::<Local>())
+    });
 }
 
 #[test]
 fn shared_native_graph_never_speculates() {
-    native_graph_never_speculates(&native_runtime::<Shared>());
+    on_stack(16 << 20, || {
+        native_graph_never_speculates(&native_runtime::<Shared>())
+    });
 }
 
 /// `c` and `e` are a cycle with no strategy, reached only by the
