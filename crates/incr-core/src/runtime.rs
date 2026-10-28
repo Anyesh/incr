@@ -4183,15 +4183,18 @@ impl<C: Cells> Runtime<C> {
         } else {
             self.planned()
         };
-        let mut walk = resume.unwrap_or_else(|| {
-            let mut walk = Walk::new(id, gen, observed);
-            if !C::SINGLE_THREADED {
-                walk.failed_from = cycle_state::failed_here_count();
-                walk.retracted = self.retraction_count();
-                walk.first_planned = planned;
+        let mut walk = match resume {
+            Some(walk) => *walk,
+            None => {
+                let mut walk = Walk::new(id, gen, observed);
+                if !C::SINGLE_THREADED {
+                    walk.failed_from = cycle_state::failed_here_count();
+                    walk.retracted = self.retraction_count();
+                    walk.first_planned = planned;
+                }
+                walk
             }
-            walk
-        });
+        };
         let mut ran_unsettled = false;
         let mut root = Computed::Done;
         let root_node = self.nodes.get(id.0);

@@ -5535,8 +5535,7 @@ impl<C: Cells> Runtime<C> {
                         let d = x.pending.get(i);
                         resumed = Some(d.runs.clone());
                         if let Delivered::Walk(walk, _) = &d.what {
-                            let walk = (**walk).clone();
-                            x.resume = Some((reading, f.cidx, walk));
+                            x.resume = Some((reading, f.cidx, walk.clone()));
                         }
                     }
                 }
@@ -6065,7 +6064,7 @@ impl<C: Cells> Runtime<C> {
     /// read whose walk a doom stopped goes on from where it stopped.
     #[cold]
     #[inline(never)]
-    pub(super) fn take_resume(&self, root: NodeId) -> Option<Walk> {
+    pub(super) fn take_resume(&self, root: NodeId) -> Option<Box<Walk>> {
         let rt = self.runtime_id;
         let (_, at) = self.dep_stack.active_frame(rt)?;
         let reading = u64::from(root.0) | (u64::from(self.nodes.get(root.0).generation()) << 32);

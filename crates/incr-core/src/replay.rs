@@ -1916,7 +1916,7 @@ pub(crate) struct Context {
     /// The walk a `Walk` delivery just taken resumes, with the read it is
     /// for and the reading frame's position, until that read's walk takes
     /// it or the read ends.
-    pub(crate) resume: Option<(u64, u32, crate::runtime::Walk)>,
+    pub(crate) resume: Option<(u64, u32, Box<crate::runtime::Walk>)>,
     /// The node, generation and reading frame's position of the read a
     /// `Direct` delivery just taken sends to its compute, until that
     /// read's walk does or the read ends.
