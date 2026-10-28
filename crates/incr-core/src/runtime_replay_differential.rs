@@ -5584,7 +5584,7 @@ impl<'a> Woken<'a> {
     /// The control for [`Self::try_at`]: the waiter held at its first park
     /// point of the phase, before its walk does anything, until the holder
     /// has claimed the node and the claim has ended. Checked, and whether
-    /// the holder claimed while the waiter was held; a try where it did
+    /// the waiter was held through the whole claim; a try where it was
     /// must see no walk of the waiter's wait on the node.
     fn try_unstarted(&self) -> bool {
         let Woken {
@@ -5600,12 +5600,14 @@ impl<'a> Woken<'a> {
         let parked = Arc::new(AtomicBool::new(false));
         let claiming = Arc::new(AtomicBool::new(false));
         let claimed = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
         let walk_waits = Arc::new(AtomicUsize::new(0));
         let rig = |live: &Live<Shared>| {
-            let (parked, claiming, claimed, walk_waits) = (
+            let (parked, claiming, claimed, held, walk_waits) = (
                 parked.clone(),
                 claiming.clone(),
                 claimed.clone(),
+                held.clone(),
                 walk_waits.clone(),
             );
             let world = live.world.clone();
@@ -5628,7 +5630,7 @@ impl<'a> Woken<'a> {
                     walk_waits.fetch_add(1, SeqCst);
                 }
                 if !parked.swap(true, SeqCst) && wait_for(|| claimed.load(SeqCst), 2000) {
-                    wait_for(
+                    let ended = wait_for(
                         || {
                             !matches!(
                                 world.rt(0).nodes.get(held_node.0).state(),
@@ -5637,6 +5639,7 @@ impl<'a> Woken<'a> {
                         },
                         2000,
                     );
+                    held.store(ended, SeqCst);
                 }
             });
             assert!(live.world.rt(0).park_hook.set(hook).is_ok());
@@ -5657,13 +5660,13 @@ impl<'a> Woken<'a> {
                 verdict.into_inner().unwrap(),
             );
         });
-        let claimed = claimed.load(SeqCst);
+        let held = held.load(SeqCst);
         assert!(
-            !claimed || walk_waits.load(SeqCst) == 0,
+            !held || walk_waits.load(SeqCst) == 0,
             "{seed:#x}: op {waiter} waited on {node} {} times after the claim it was held through",
             walk_waits.load(SeqCst)
         );
-        claimed
+        held
     }
 
     /// One try with the waiter held at its `k`-th visit of the node until
