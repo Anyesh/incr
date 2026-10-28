@@ -3784,8 +3784,10 @@ impl Clone for Slow {
 /// so a user `Clone` that waits on another thread cannot hold up that
 /// thread's stash bookkeeping, and a real claim that adopts the value
 /// meanwhile lands a clone of it rather than running the closure again.
+/// Each reader reads x through its own `m`: a Shared doomed frame raises
+/// at its next read, so only a run nested below that read gets past b's
+/// placeholder to compute and stash x.
 #[test]
-#[ignore = "x's stash and its speculative read are computed past b's placeholder; a Shared doomed frame raises before computing"]
 fn a_stashed_value_is_cloned_outside_the_stash_lock() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
@@ -3802,11 +3804,12 @@ fn a_stashed_value_is_cloned_outside_the_stash_lock() {
     );
     let reader = || {
         let b = rt.create_query(|_: &Rt| 5_u64);
+        let m = rt.create_query_with(move |rt: &Rt| rt.get(x).0, replayable());
         rt.create_query_with(
             move |rt: &Rt| {
                 let v = rt.get(b);
                 if v == 0 {
-                    rt.get(x).0
+                    rt.get(m)
                 } else {
                     v
                 }
