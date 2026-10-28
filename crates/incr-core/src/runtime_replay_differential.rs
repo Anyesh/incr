@@ -5623,6 +5623,59 @@ impl Woken<'_> {
     }
 }
 
+/// 0x4b004's phase order on one thread, with and without the `Get(9)`
+/// that the failing two-thread runs make before op 14's walk plans. That
+/// read gives 4 and leaves 9 Clean, so every later operation must come
+/// out as it does without it, at every budget under Local and Shared, and
+/// ops 14 and 15 read node 1's panic, `Panic(failed)`, as main does either
+/// way. 18 reads the cycle there without the `Get(9)`.
+#[test]
+#[ignore = "T10-scan-crosstwo-0x4b004"]
+fn serial_read_of_a_clean_node_leaves_the_later_reads_alone_seed() {
+    let case = gen_case(0x4b004, true, true);
+    let phases = phases(&case, 0x4b004);
+    let base = Order::new(&case, &phases, 0);
+    let at14 = base.of.iter().position(|&o| o == 14).unwrap();
+    let mut with9 = base.case.clone();
+    with9.ops.insert(at14, Op::Get(9));
+    let after =
+        |t: &Trace, from: usize| t[from..].iter().map(|(o, _)| o.clone()).collect::<Vec<_>>();
+    let failed = Out::Panic("failed".to_owned());
+    quiet(|| {
+        for (frames, bytes) in std::iter::once((None, 0)).chain(BUDGETS) {
+            for (rt, without, with) in [
+                (
+                    "Local",
+                    run::<Local>(&base.case, frames, bytes),
+                    run::<Local>(&with9, frames, bytes),
+                ),
+                (
+                    "Shared",
+                    run::<Shared>(&base.case, frames, bytes),
+                    run::<Shared>(&with9, frames, bytes),
+                ),
+            ] {
+                assert_eq!(
+                    after(&without, at14)[..2],
+                    [failed.clone(), failed.clone()],
+                    "{rt} at {frames:?} frames, {bytes} bytes: ops 14 and 15 without Get(9)"
+                );
+                assert_eq!(
+                    with[at14].0,
+                    Out::Value(4),
+                    "{rt} at {frames:?} frames, {bytes} bytes: Get(9)"
+                );
+                assert_eq!(
+                    after(&with, at14 + 1),
+                    after(&without, at14),
+                    "{rt} at {frames:?} frames, {bytes} bytes: ops {:?} with Get(9) before 14",
+                    &base.of[at14..]
+                );
+            }
+        }
+    });
+}
+
 /// Two-thread seeds with panics or cycles whose overlapping reads, at most
 /// budgets, come out as the unbounded run of the other order: which read
 /// lands a node both read first decides which gets a closure's payload,
