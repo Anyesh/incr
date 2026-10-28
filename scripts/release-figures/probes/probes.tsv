@@ -1,0 +1,11 @@
+probe	against	headline	source
+probe_nested_caught	b5	A chain where each level catches a panicking dependency costs about 3.4x beta.5
+fan_probe	b5	The first read of a replayed query whose parent reads many new child queries
+probe_fan	main	At a frame budget of 1, a query that catches many panics
+kr_b1_probe	main	A second read of a panicking query under a deep chain reruns every level
+w10_stack_probe	none	Deep chains replay instead of overflowing the stack
+spec_foreign_scale	main	Under `Shared` with a frame budget, a query rerun speculatively after a budget doom
+caught_cycle_rerun	main	A query whose closure catches a cycle can rerun that cycle on every read
+grid_memory	none	`GridTable`: a node table for `(sheet, row, column)` keys	tree
+memory_ceiling	none	An input-query pair takes 250 bytes	tree
+failed_fan_in	main	A query that catches the panics of many readers of one Failed query reruns every reader after a `set`

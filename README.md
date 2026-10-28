@@ -10,7 +10,7 @@
 
 Most software recomputes everything from scratch whenever anything changes. Your CI rebuilds the whole project when you edit one file, your dashboard re-queries the whole database when one row updates. There are domain-specific fixes for this (React diffs the DOM, Salsa caches compiler queries, Materialize does incremental SQL) but if you just want to make your own code incremental, theres nothing to reach for.
 
-incr is a crack at solving that. It's a Rust library (with Python bindings, `pip install incr-compute` or `incr-concurrent`) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. The engine lives in `incr-core` and is parameterized over a concurrency strategy; two surface crates expose it: `incr-compute` (`Local` strategy, single-threaded, zero atomic-fence cost) and `incr-concurrent` (`Shared` strategy, `Send + Sync`: reader threads pull values while a writer mutates, with hazard-pointer-protected reads that can never tear). Same public API, one-line dependency swap.
+incr is a crack at solving that. It's a Rust library (with Python bindings, `pip install --pre incr-compute` or `incr-concurrent`) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. The engine lives in `incr-core` and is parameterized over a concurrency strategy; two surface crates expose it: `incr-compute` (`Local` strategy, single-threaded, zero atomic-fence cost) and `incr-concurrent` (`Shared` strategy, `Send + Sync`: reader threads pull values while a writer mutates, with hazard-pointer-protected reads that can never tear). Same public API, one-line dependency swap.
 
 ![Live spreadsheet demo showing formula cells updating incrementally as values change, powered by incr-concurrent with real-time WebSocket sync](examples/spreadsheet/demo.gif)
 
@@ -64,7 +64,7 @@ A compute that needs a node per key, such as a spreadsheet cell per address, kee
 
 A compute can also own the nodes it makes. `rt.child_input(key, init)` and `rt.child_query(key, f)` return the running compute's child for `key`, creating it on the first run that asks and reusing it on every later one. A run that stops asking for a child deletes it when it lands, unless something outside still reads it, a run that fails or is discarded deletes the children it created, and deleting the creator deletes everything it owns.
 
-Long chains don't overflow the stack. A query created with `QueryOpts { replay: Replay::Allowed, .. }` whose type has a placeholder (`rt.set_placeholder`) reads past a frame budget (`rt.set_max_frames`, 256 by default and 32 in debug builds) by discarding its frame and the replayable frames below it and computing what it wanted at a shallow depth, then running them again; the results are those of the unbounded run, so in a release build a first compute of a 100k-deep chain fits on a 1 MiB thread. Such a closure may run more than once for one read, so it must be pure. A `Replay::Native` query that a replaying closure reads may be computed ahead of need, at most once per revision. That run lands nothing: a later read of the query in the same revision takes the value or panic it ended with, and the children it created, if nothing it read has changed. Otherwise the later read runs the closure again, and so it does when the run kept nothing: it read a dep that did not land Clean or a panic that another such run kept, it read through a run that kept nothing, or it met a cycle. A Native query on a cycle, which runs once per round of its cycle's resolution, may also run more times under a frame budget than without one; its values and outcomes are the unbounded run's.
+Long chains don't overflow the stack. A query created with `QueryOpts { replay: Replay::Allowed, .. }` whose type has a placeholder (`rt.set_placeholder`) reads past a frame budget (`rt.set_max_frames`, 256 by default and 32 in debug builds) by discarding its frame and the replayable frames below it and computing what it wanted at a shallow depth, then running them again; the results are those of the unbounded run, apart from the known limitations in CHANGELOG.md, so in a release build a first compute of a 100k-deep chain fits on a 1 MiB thread. Any query's closure may run more than once for one read (retries, wounds, cycle iterations and replay), so every closure must be pure. A `Replay::Native` query that a replaying closure reads may be computed ahead of need, at most once per revision. That run lands nothing: a later read of the query in the same revision takes the value or panic it ended with, and the children it created, if nothing it read has changed. Otherwise the later read runs the closure again, and so it does when the run kept nothing: it read a dep that did not land Clean or a panic that another such run kept, it read through a run that kept nothing, or it met a cycle. A Native query on a cycle, which runs once per round of its cycle's resolution, may also run more times under a frame budget than without one; its values and outcomes are the unbounded run's.
 
 ## Three crates, one engine
 
@@ -117,9 +117,9 @@ The engine itself lives in [`incr-core`](crates/incr-core/) under a `Cells` stra
 
 ```toml
 [dependencies]
-incr-compute = "0.2"      # single-threaded
+incr-compute = "0.2.0-beta.6"      # single-threaded
 # or
-incr-concurrent = "0.2"   # multi-threaded (Send + Sync)
+incr-concurrent = "0.2.0-beta.6"   # multi-threaded (Send + Sync)
 ```
 
 **Running the tests:**

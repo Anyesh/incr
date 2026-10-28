@@ -98,4 +98,4 @@ Use `incr-concurrent` when you need to share a computation graph across threads.
 
 ## Python
 
-`pip install incr-concurrent` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr_concurrent import Runtime`); its classes are shareable across Python threads and the GIL is released around computing calls.
+`pip install --pre incr-concurrent` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr_concurrent import Runtime`); its classes are shareable across Python threads and the GIL is released around computing calls.
