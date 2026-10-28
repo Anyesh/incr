@@ -8,6 +8,7 @@ use std::borrow::{Borrow, BorrowMut};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1251,6 +1252,34 @@ pub(crate) struct GroupBlocker {
     pub(crate) unrun: u64,
 }
 
+/// Per (runtime, group record address): the record and what its
+/// expansions read, listed once in this outermost entry.
+type GroupExternalsMap =
+    HashMap<(RuntimeId, usize), (Arc<GroupInfo>, GroupExternals), FxBuildHasher>;
+
+/// A group's deps outside it, in the order an expansion reads them, as the
+/// runtime's record change and in-group unrun landing counts left them.
+#[derive(Clone)]
+pub(crate) struct GroupExternals {
+    pub(crate) rec_changes: u64,
+    pub(crate) unrun: u64,
+    pub(crate) deps: Rc<[GroupExternal]>,
+    /// The runtime's held-mark change count and the first held member it
+    /// left, once a `Shared` expansion has scanned the marks.
+    pub(crate) held: Option<(u64, Option<(u32, u32)>)>,
+}
+
+/// One step of a group expansion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GroupExternal {
+    /// A dep outside the group of a member the record still holds, whose
+    /// deps change only with a record change.
+    Dep(u32),
+    /// A member the record no longer holds, whose deps can change with no
+    /// record change, so each expansion reads them.
+    Left(u32),
+}
+
 /// What the outermost entry resets: the roots whose episodes dissolved,
 /// and the cycle the last uncaught cycle panic reported.
 struct Outer {
@@ -1261,6 +1290,9 @@ struct Outer {
     /// Each group record whose verify failed on a member this thread's
     /// frame computes, held so that no later record can reuse its address.
     group_blockers: GroupBlockers,
+    /// Each group record this entry expanded, held so that no later record
+    /// can reuse its address.
+    group_externals: GroupExternalsMap,
     /// The group record this thread left at each slot it changed, held so
     /// that no later record can reuse its address.
     recs_left: Vec<(RuntimeId, u32, Option<Arc<GroupInfo>>)>,
@@ -1301,6 +1333,7 @@ thread_local! {
             dissolved: Vec::new(),
             dissolved_groups: Vec::new(),
             group_blockers: HashMap::with_hasher(FxBuildHasher),
+            group_externals: HashMap::with_hasher(FxBuildHasher),
             recs_left: Vec::new(),
             last_cycle: None,
             budgets_met: Vec::new(),
@@ -1335,6 +1368,7 @@ loom::thread_local! {
         dissolved: Vec::new(),
         dissolved_groups: Vec::new(),
         group_blockers: HashMap::with_hasher(FxBuildHasher),
+        group_externals: HashMap::with_hasher(FxBuildHasher),
         recs_left: Vec::new(),
         last_cycle: None,
         budgets_met: Vec::new(),
@@ -1737,6 +1771,68 @@ pub(crate) fn group_blocker(rt: RuntimeId, group: &Arc<GroupInfo>) -> Option<Gro
         let key = (rt, Arc::as_ptr(group) as usize);
         o.group_blockers.get(&key).map(|&(_, blocker)| blocker)
     })
+}
+
+/// What an expansion of `group` read in this outermost entry, if neither
+/// count has changed since.
+pub(crate) fn group_externals(
+    rt: RuntimeId,
+    group: &Arc<GroupInfo>,
+    (rec_changes, unrun): (u64, u64),
+) -> Option<GroupExternals> {
+    if !group_externals_reuse() {
+        return None;
+    }
+    OUTER.with(|o| {
+        let o = o.borrow();
+        if o.group_externals.is_empty() {
+            return None;
+        }
+        let key = (rt, Arc::as_ptr(group) as usize);
+        let (_, ext) = o.group_externals.get(&key)?;
+        (ext.rec_changes == rec_changes && ext.unrun == unrun).then(|| ext.clone())
+    })
+}
+
+/// Notes what an expansion of `group` read.
+pub(crate) fn note_group_externals(rt: RuntimeId, group: Arc<GroupInfo>, ext: GroupExternals) {
+    let key = (rt, Arc::as_ptr(&group) as usize);
+    OUTER.with(|o| o.borrow_mut().group_externals.insert(key, (group, ext)));
+    ENTRY.with(|e| e.outer_set.set(true));
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static GROUP_EXTERNALS_REUSE: Cell<bool> = const { Cell::new(true) };
+    static GROUP_EXTERNALS_REUSES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(all(test, not(loom)))]
+fn group_externals_reuse() -> bool {
+    GROUP_EXTERNALS_REUSE.with(Cell::get)
+}
+
+#[cfg(not(all(test, not(loom))))]
+fn group_externals_reuse() -> bool {
+    true
+}
+
+/// Turns this thread's reuse of a group's listed externals on or off, for
+/// tests that compare a read with and without it.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn set_group_externals_reuse(on: bool) {
+    GROUP_EXTERNALS_REUSE.with(|s| s.set(on));
+}
+
+#[cfg(all(test, not(loom)))]
+pub(crate) fn note_group_externals_reuse() {
+    GROUP_EXTERNALS_REUSES.with(|n| n.set(n.get() + 1));
+}
+
+/// The group expansions this thread read from a listing.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn group_externals_reuses() -> u64 {
+    GROUP_EXTERNALS_REUSES.with(Cell::get)
 }
 
 #[cfg(all(test, not(loom)))]
@@ -2174,6 +2270,7 @@ pub(crate) fn reset_outermost() {
             o.dissolved.clear();
             o.dissolved_groups.clear();
             o.group_blockers.clear();
+            o.group_externals.clear();
             o.recs_left.clear();
             o.last_cycle = None;
             o.budgets_met.clear();

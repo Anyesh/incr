@@ -2123,12 +2123,18 @@ fn chained_group_reads_claim_once<C: Cells>() {
     let rt = Runtime::<C>::new();
     let shape = chained_group(&rt, k);
     let before = rt.group_claims.load(SeqCst);
+    let listed = rt.group_listings.load(SeqCst);
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
     let claims = rt.group_claims.load(SeqCst) - before;
+    let listings = rt.group_listings.load(SeqCst) - listed;
     assert!(got.is_ok(), "the read of m panicked");
     assert!(
         (k as u64 - 1..=2 * k as u64).contains(&claims),
         "{claims} member claims for a {k}-member group in one read"
+    );
+    assert!(
+        listings <= 4,
+        "{listings} listings of a {k}-member group's deps in one read"
     );
 }
 
@@ -2152,15 +2158,18 @@ type GroupOutcome = (
     Vec<Vec<(u32, u32)>>,
 );
 
-/// The read of `m` with the blocked-record skip on or off, `xs[unrun_at]`
-/// landing the bottom member New if set, and how many skips it took.
+/// The read of `m` with the blocked-record skip and the listed-externals
+/// reuse as given, `xs[unrun_at]` landing the bottom member New if set,
+/// and how many skips and reuses it took.
 fn chained_group_outcome<C: Cells>(
     k: usize,
-    skip: bool,
+    (skip, reuse): (bool, bool),
     unrun_at: Option<usize>,
-) -> (GroupOutcome, u64) {
+) -> (GroupOutcome, u64, u64) {
     crate::cycle_state::set_group_blocker_skip(skip);
+    crate::cycle_state::set_group_externals_reuse(reuse);
     let skips = crate::cycle_state::group_blocker_skips();
+    let reuses = crate::cycle_state::group_externals_reuses();
     let rt = Runtime::<C>::new();
     let (shape, armed) = chained_group_landing_new(&rt, k, unrun_at);
     armed.store(true, SeqCst);
@@ -2195,10 +2204,12 @@ fn chained_group_outcome<C: Cells>(
             .collect()
     };
     crate::cycle_state::set_group_blocker_skip(true);
+    crate::cycle_state::set_group_externals_reuse(true);
     rt.assert_invariant_i();
     (
         (got, states, values, deps, groups),
         crate::cycle_state::group_blocker_skips() - skips,
+        crate::cycle_state::group_externals_reuses() - reuses,
     )
 }
 
@@ -2208,8 +2219,8 @@ fn chained_group_outcome<C: Cells>(
 /// group at each member.
 fn chained_group_skip_moves_no_node<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
-    let (with, skipped) = chained_group_outcome::<C>(k, true, None);
-    let (without, _) = chained_group_outcome::<C>(k, false, None);
+    let (with, skipped, _) = chained_group_outcome::<C>(k, (true, true), None);
+    let (without, _, _) = chained_group_outcome::<C>(k, (false, true), None);
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
 }
@@ -2230,8 +2241,8 @@ fn shared_chained_group_skip_moves_no_node() {
 fn chained_group_unrun_landing_ends_skip<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
     let at = Some(k / 2);
-    let (with, skipped) = chained_group_outcome::<C>(k, true, at);
-    let (without, _) = chained_group_outcome::<C>(k, false, at);
+    let (with, skipped, _) = chained_group_outcome::<C>(k, (true, true), at);
+    let (without, _, _) = chained_group_outcome::<C>(k, (false, true), at);
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
 }
@@ -2244,4 +2255,27 @@ fn local_chained_group_unrun_landing_ends_skip() {
 #[test]
 fn shared_chained_group_unrun_landing_ends_skip() {
     on_stack(16 << 20, chained_group_unrun_landing_ends_skip::<Shared>);
+}
+
+/// Reusing a group's externals listed earlier in the entry moves no node:
+/// the read, every node's state and value, and every slot's deps and
+/// group record match the read that lists them at each expansion.
+fn chained_group_reuse_moves_no_node<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    for at in [None, Some(k / 2)] {
+        let (with, _, reused) = chained_group_outcome::<C>(k, (true, true), at);
+        let (without, _, _) = chained_group_outcome::<C>(k, (true, false), at);
+        assert!(reused > 0, "no group expansion reused a listing");
+        assert_eq!(with, without, "bottom landed New at {at:?}");
+    }
+}
+
+#[test]
+fn local_chained_group_reuse_moves_no_node() {
+    on_stack(16 << 20, chained_group_reuse_moves_no_node::<Local>);
+}
+
+#[test]
+fn shared_chained_group_reuse_moves_no_node() {
+    on_stack(16 << 20, chained_group_reuse_moves_no_node::<Shared>);
 }

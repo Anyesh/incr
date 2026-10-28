@@ -286,7 +286,7 @@ impl<C: Cells> Runtime<C> {
             );
             debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
             if crate::hold::holds(cell) {
-                node.set_held_mark(true);
+                self.set_held_mark(node, true);
             }
         }
     }

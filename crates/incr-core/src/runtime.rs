@@ -118,6 +118,22 @@ pub(crate) struct GroupInfo {
     pub(crate) cycle: Cycle,
 }
 
+impl GroupInfo {
+    /// Whether `slot` is a member's. Members are sorted by slot.
+    pub(crate) fn has_slot(&self, slot: u32) -> bool {
+        self.members
+            .binary_search_by_key(&slot, |&(s, _)| s)
+            .is_ok()
+    }
+
+    /// Whether `slot` at `generation` is a member.
+    pub(crate) fn has_member(&self, slot: u32, generation: u32) -> bool {
+        self.members
+            .binary_search_by_key(&slot, |&(s, _)| s)
+            .is_ok_and(|i| self.members[i].1 == generation)
+    }
+}
+
 impl<C: Cells> Inner<C> {
     /// Sets `slot`'s group record, or removes it for `None`. Under
     /// `Shared` the thread notes the record it left there, so that a claim
@@ -1515,6 +1531,9 @@ pub struct Runtime<C: Cells> {
     /// Members group verifications tried to claim.
     #[cfg(test)]
     pub(crate) group_claims: std::sync::atomic::AtomicU64,
+    /// Group expansions that listed the group's deps.
+    #[cfg(test)]
+    pub(crate) group_listings: std::sync::atomic::AtomicU64,
     /// Every claim a wound or a T8 discard landed as unrun: the node,
     /// whether its episode had dissolved on that thread, whether its group
     /// record then named a member that had left it, and whether it landed
@@ -1565,6 +1584,10 @@ pub struct Runtime<C: Cells> {
     /// with no new revision, so a stash stands only at the count its run
     /// began under.
     pub(crate) reshapes: C::U64,
+    /// Held marks set or cleared so far, each counted after its change: a
+    /// group expansion's scan of its members' marks stands while it is
+    /// unchanged.
+    pub(crate) held_marks: C::U64,
     /// Unrun landings of a group member in a state other than `Dirty`,
     /// which keep its record: a group verify's blocker stands only while
     /// none has happened since.
@@ -1688,6 +1711,8 @@ impl<C: Cells> Runtime<C> {
             #[cfg(test)]
             group_claims: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
+            group_listings: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             unwound_landings: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             dooms: std::sync::Mutex::new(Vec::new()),
@@ -1709,6 +1734,7 @@ impl<C: Cells> Runtime<C> {
             changes: crate::changes::Changes::new(),
             read_speculatively: C::new_u8(0),
             reshapes: C::new_u64(0),
+            held_marks: C::new_u64(0),
             group_unrun_landings: C::new_u64(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
@@ -4769,15 +4795,19 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn expand_group(&self, cur: NodeId, walk: &mut Walk) -> bool {
-        let group = self.inner.read().member_recs.get(&cur.0).cloned();
+        let unrun = C::u64_load_acquire(&self.group_unrun_landings);
+        let (group, rec_changes) = {
+            let inner = self.inner.read();
+            (
+                inner.member_recs.get(&cur.0).cloned(),
+                inner.member_rec_changes,
+            )
+        };
         let Some(group) = group else {
             return false;
         };
         let generation = self.nodes.get(cur.0).generation();
-        if !group
-            .members
-            .iter()
-            .any(|&(m, g)| m == cur.0 && g == generation)
+        if !group.has_member(cur.0, generation)
             || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
         {
             return false;
@@ -4797,31 +4827,41 @@ impl<C: Cells> Runtime<C> {
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pending = walk.visit_pending_marked(cur, generation, NO_TAINT_GROUP);
-        for &(m, _) in &group.members {
-            self.nodes.get(m).for_each_dep(|dep| {
-                if group
-                    .members
-                    .binary_search_by_key(&dep.0, |&(s, _)| s)
-                    .is_ok()
-                {
-                    return;
-                }
-                let dep_node = self.nodes.get(dep.0);
-                let dep_state = state::load::<C>(dep_node.state_cell());
-                if !dep_state.is_settled() {
-                    let dep_state = self.seen(dep_node.state_cell(), dep_state);
-                    if !dep_state.is_settled() {
-                        walk.expand(dep, dep_node.generation(), dep_state);
+        // Each read in a member's run of a member below it expands the
+        // group again, so the group's deps are listed once per entry.
+        let listed = cycle_state::group_externals(self.runtime_id, &group, (rec_changes, unrun));
+        #[cfg(all(test, not(loom)))]
+        if listed.is_some() {
+            cycle_state::note_group_externals_reuse();
+        }
+        let mut changed = listed.is_none();
+        let mut ext = listed.unwrap_or_else(|| self.list_group_externals(&group));
+        for &step in ext.deps.iter() {
+            match step {
+                cycle_state::GroupExternal::Dep(dep) => self.expand_external(walk, NodeId(dep)),
+                cycle_state::GroupExternal::Left(m) => self.nodes.get(m).for_each_dep(|dep| {
+                    if !group.has_slot(dep.0) {
+                        self.expand_external(walk, dep);
                     }
-                }
-            });
+                }),
+            }
         }
         if !C::SINGLE_THREADED {
-            let held = group
-                .members
-                .iter()
-                .find(|&&(m, _)| self.nodes.get(m).held_mark())
-                .map(|&(m, g)| (NodeId(m), g));
+            let marks = C::u64_load_acquire(&self.held_marks);
+            let held = match ext.held {
+                Some((at, held)) if at == marks => held,
+                _ => {
+                    let held = group
+                        .members
+                        .iter()
+                        .find(|&&(m, _)| self.nodes.get(m).held_mark())
+                        .copied();
+                    ext.held = Some((marks, held));
+                    changed = true;
+                    held
+                }
+            };
+            let held = held.map(|(m, g)| (NodeId(m), g));
             if held.is_some() || self.retracted_since(walk) {
                 self.drop_held_expansion(
                     walk,
@@ -4831,7 +4871,68 @@ impl<C: Cells> Runtime<C> {
                 );
             }
         }
+        if changed {
+            cycle_state::note_group_externals(self.runtime_id, group, ext);
+        }
         true
+    }
+
+    /// `group`'s deps outside it, in the order an expansion reads them, and
+    /// the record change count they stand at.
+    #[cold]
+    #[inline(never)]
+    fn list_group_externals(&self, group: &Arc<GroupInfo>) -> cycle_state::GroupExternals {
+        #[cfg(test)]
+        self.group_listings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let unrun = C::u64_load_acquire(&self.group_unrun_landings);
+        let (held_here, rec_changes): (Vec<bool>, u64) = {
+            let inner = self.inner.read();
+            (
+                group
+                    .members
+                    .iter()
+                    .map(|(m, _)| {
+                        inner
+                            .member_recs
+                            .get(m)
+                            .is_some_and(|r| Arc::ptr_eq(r, group))
+                    })
+                    .collect(),
+                inner.member_rec_changes,
+            )
+        };
+        let mut deps = Vec::new();
+        for (&(m, _), here) in group.members.iter().zip(held_here) {
+            if !here {
+                deps.push(cycle_state::GroupExternal::Left(m));
+                continue;
+            }
+            self.nodes.get(m).for_each_dep(|dep| {
+                if !group.has_slot(dep.0) {
+                    deps.push(cycle_state::GroupExternal::Dep(dep.0));
+                }
+            });
+        }
+        cycle_state::GroupExternals {
+            rec_changes,
+            unrun,
+            deps: deps.into(),
+            held: None,
+        }
+    }
+
+    /// Pushes `dep`, a dep outside an expanded group, unless it is settled.
+    #[inline]
+    fn expand_external(&self, walk: &mut Walk, dep: NodeId) {
+        let dep_node = self.nodes.get(dep.0);
+        let dep_state = state::load::<C>(dep_node.state_cell());
+        if !dep_state.is_settled() {
+            let dep_state = self.seen(dep_node.state_cell(), dep_state);
+            if !dep_state.is_settled() {
+                walk.expand(dep, dep_node.generation(), dep_state);
+            }
+        }
     }
 
     /// Whether another thread changed `id`'s group record since the walk
@@ -6431,6 +6532,13 @@ impl<C: Cells> Runtime<C> {
         {
             C::u64_fetch_add(&self.group_unrun_landings, 1);
         }
+    }
+
+    /// Sets or clears `node`'s held mark, then counts the change.
+    #[inline]
+    pub(crate) fn set_held_mark(&self, node: &NodeData<C>, held: bool) {
+        node.set_held_mark(held);
+        C::u64_fetch_add(&self.held_marks, 1);
     }
 
     #[inline(always)]

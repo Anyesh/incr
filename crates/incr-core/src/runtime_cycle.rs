@@ -3173,7 +3173,7 @@ impl<C: Cells> Runtime<C> {
         let Some(group) = group else {
             return GroupEnd::Ordinary;
         };
-        if !group.members.iter().any(|&(m, gen)| m == x.0 && gen == g) {
+        if !group.has_member(x.0, g) {
             return GroupEnd::Ordinary;
         }
         // A discard keeps the root in the group it dissolved, for other
