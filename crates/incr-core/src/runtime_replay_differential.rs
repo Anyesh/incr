@@ -4836,11 +4836,11 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
 /// every order of the overlapping reads panics "boom 0:6". The speculative
 /// entry a lazy doomed frame pushed for a read the unbounded run never makes
 /// waited on the other thread, closed a waits-for cycle, and the wound
-/// retried the attempt that had seen the panic; its run drops instead. The
-/// thread that speculates has claimed 4 and holds before its speculative
-/// reads until the other thread, holding 3, waits on 4, so its read of 3
-/// waits on a thread that waits on it; without that hold the other thread
-/// lands 3 first under suite load.
+/// retried the attempt that had seen the panic; its run drops instead. A
+/// thread that speculates while it holds the claim on 4 holds before its
+/// speculative reads until the other thread, holding 3, waits on 4, so its
+/// read of 3 waits on a thread that waits on it; without that hold the other
+/// thread lands 3 first under suite load.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_lazy_doomed_frame_placeholder_seeds() {
@@ -4868,10 +4868,7 @@ fn two_thread_lazy_doomed_frame_placeholder_seeds() {
                             if p == ParkPoint::WalkWaits(n4) {
                                 waits.store(true, SeqCst);
                             } else if crate::replay::speculating_in(rt.runtime_id)
-                                && matches!(
-                                    rt.nodes.get(n4.0).state(),
-                                    NodeState::Computing | NodeState::ComputingDirty
-                                )
+                                && rt.own_claim_owner(n4).is_some()
                                 && !held.swap(true, SeqCst)
                             {
                                 let begun = std::time::Instant::now();
