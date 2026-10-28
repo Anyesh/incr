@@ -5465,7 +5465,7 @@ fn two_thread_walk_entry_after_a_claim_wait_matches_unbounded_seed() {
 #[ignore = "T10-wide-crosstwo-0xaab9d"]
 fn two_thread_walk_woken_by_a_released_claim_matches_an_order_seed() {
     assert!(matches!(gen_case(0xaab9d, true, true).ops[6], Op::Get(12)));
-    walk_woken_by_a_released_claim(0xaab9d, 6, 7, 12, false);
+    walk_woken_by_a_released_claim(&gen_case(0xaab9d, true, true), 0xaab9d, 6, 7, 12, false);
 }
 
 /// A guard, not a red of the walk-plan rule: 0x886d3's phase [21, 22] at
@@ -5478,7 +5478,37 @@ fn two_thread_walk_woken_by_a_released_claim_matches_an_order_seed() {
 #[cfg_attr(miri, ignore)]
 fn two_thread_walk_woken_by_a_wound_keeps_the_run_it_owes_seed() {
     assert!(matches!(gen_case(0x886d3, true, true).ops[22], Op::Get(7)));
-    walk_woken_by_a_released_claim(0x886d3, 22, 21, 9, true);
+    walk_woken_by_a_released_claim(&gen_case(0x886d3, true, true), 0x886d3, 22, 21, 9, true);
+}
+
+/// 0xe1454's phase [7, 8] at no budget: op 7 (`TryGet(18)`) and op 8
+/// (`Get(1)`) both reach the cycle through 13, and op 7's walk waits on 13
+/// under op 8's claim. Op 8 then runs the region alone and must read an
+/// order's value; 18 fails it with `Panic(cycle)` where every order gives
+/// `Value(2)`.
+#[test]
+#[ignore = "T10-wide800-N1b-unbounded-spurious-cycle"]
+fn two_thread_claimer_of_a_member_another_walk_waits_on_matches_an_order_seed() {
+    let case = gen_case(0xe1454, false, true);
+    assert!(matches!(case.ops[7], Op::TryGet(18)));
+    assert!(matches!(case.ops[8], Op::Get(1)));
+    walk_woken_by_a_released_claim(&case, 0xe1454, 7, 8, 13, false);
+}
+
+/// The control for the test above: op 7 held before its walk starts until
+/// op 8 has claimed 13, so no walk waits while op 8 runs the region. Both
+/// reads give an order's values, `Value(12)` and `Value(2)`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_claimer_of_a_member_no_walk_waits_on_matches_an_order_seed() {
+    let case = gen_case(0xe1454, false, true);
+    let phases = phases(&case, 0xe1454);
+    let woken = Woken::of(&case, &phases, 0xe1454, 7, 8, 13, false);
+    let released = (0..5).filter(|_| woken.try_unstarted()).count();
+    assert!(
+        released > 0,
+        "0xe1454: op 8 never claimed 13 while op 7 was held"
+    );
 }
 
 /// `seed`'s read phase of ops `waiter` and `holder` at no budget, with the
@@ -5487,30 +5517,15 @@ fn two_thread_walk_woken_by_a_wound_keeps_the_run_it_owes_seed() {
 /// trace must be an order's, and if `owes_run`, the waiter must claim
 /// `node` again after the wait.
 fn walk_woken_by_a_released_claim(
+    case: &Case,
     seed: u64,
     waiter: usize,
     holder: usize,
     node: usize,
     owes_run: bool,
 ) {
-    let case = gen_case(seed, true, true);
-    let phases = phases(&case, seed);
-    let overlap = (phases.iter())
-        .position(|p| p.ops().len() == 2 && p.ops().contains(&waiter) && p.ops().contains(&holder))
-        .unwrap();
-    let thread = (0..2)
-        .find(|&t| phases[overlap].of(t) == Some(waiter))
-        .unwrap();
-    let woken = Woken {
-        case: &case,
-        phases: &phases,
-        overlap,
-        thread,
-        waiter,
-        node,
-        owes_run,
-        seed,
-    };
+    let phases = phases(case, seed);
+    let woken = Woken::of(case, &phases, seed, waiter, holder, node, owes_run);
     for k in 1..=8 {
         for _ in 0..5 {
             if woken.try_at(k) {
@@ -5535,7 +5550,95 @@ struct Woken<'a> {
     seed: u64,
 }
 
-impl Woken<'_> {
+impl<'a> Woken<'a> {
+    fn of(
+        case: &'a Case,
+        phases: &'a [Phase],
+        seed: u64,
+        waiter: usize,
+        holder: usize,
+        node: usize,
+        owes_run: bool,
+    ) -> Self {
+        let overlap = (phases.iter())
+            .position(|p| {
+                p.ops().len() == 2 && p.ops().contains(&waiter) && p.ops().contains(&holder)
+            })
+            .unwrap();
+        let thread = (0..2)
+            .find(|&t| phases[overlap].of(t) == Some(waiter))
+            .unwrap();
+        Woken {
+            case,
+            phases,
+            overlap,
+            thread,
+            waiter,
+            node,
+            owes_run,
+            seed,
+        }
+    }
+
+    /// The control for [`Self::try_at`]: the waiter held at its first park
+    /// point of the phase, before its walk does anything, until the holder
+    /// has claimed the node. Checked, and whether the claim released it.
+    fn try_unstarted(&self) -> bool {
+        let Woken {
+            case,
+            phases,
+            overlap,
+            thread,
+            node,
+            seed,
+            ..
+        } = *self;
+        let gate = Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicBool::new(false));
+        let rig = |live: &Live<Shared>| {
+            let (gate, claimed) = (gate.clone(), claimed.clone());
+            let world = live.world.clone();
+            let held_node = world.handle(0, node).erased().slot();
+            let hook: crate::runtime::ParkHook = Box::new(move |_| {
+                if TWO_PHASE.with(std::cell::Cell::get) == overlap
+                    && TWO_THREAD.with(std::cell::Cell::get) == Some(thread)
+                    && !gate.swap(true, SeqCst)
+                {
+                    claimed.store(
+                        wait_for(
+                            || {
+                                matches!(
+                                    world.rt(0).nodes.get(held_node).state(),
+                                    NodeState::Computing | NodeState::ComputingDirty
+                                )
+                            },
+                            2000,
+                        ),
+                        SeqCst,
+                    );
+                }
+            });
+            assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+        };
+        quiet(|| {
+            let serial = Serial::new(case, phases);
+            let verdict = Mutex::new(None);
+            let label = format!("{seed:#x}");
+            let got = run_two_until(case, phases, None, 0, &rig, &|_, prefix, live| {
+                let v = serial.at_overlap(&label, prefix, live);
+                let stop = v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            serial.check(
+                &format!("{seed:#x}, waiter held unstarted until {node} was claimed"),
+                &got,
+                verdict.into_inner().unwrap(),
+            );
+        });
+        claimed.load(SeqCst)
+    }
+
     /// One try with the waiter held at its `k`-th visit of the node until
     /// the holder claims it, and the holder held after its claim until the
     /// waiter's walk waits on it; whether the walk waited, and a try where
