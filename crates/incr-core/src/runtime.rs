@@ -854,6 +854,10 @@ enum Computed {
     /// and unclaimed, and the walk visits it again, as a read that came
     /// after that landing expands its deps before claiming it.
     Revisit,
+    /// Another thread claimed the walk's root, or landed it Failed, after
+    /// the walk planned this entry: the node was left unrun and unclaimed,
+    /// and the walk waits out the root.
+    RootTaken,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
     /// walk skips it and taints the path under this memo owner.
@@ -963,6 +967,11 @@ pub(crate) struct Walk {
     /// attempt's retry counts as the unbounded run's walk does.
     root_failed_here: bool,
     failed_from: usize,
+    /// Whether the walk has waited out another thread's claim of its root.
+    /// It waits once: two walks that each claim the other's root as an
+    /// entry would otherwise give back and wait on each other without end
+    /// (0x124b29). Carries over a resume and a restart.
+    root_waited: bool,
     /// What the walk planned under, kept when a doom stashes it.
     planned: Planned,
     /// The runtime's retraction count as the walk last checked it, loaded
@@ -1072,6 +1081,7 @@ impl Walk {
             repushed: None,
             root_failed_here: false,
             failed_from: 0,
+            root_waited: false,
             planned: Planned::default(),
             retracted: 0,
             #[cfg(test)]
@@ -3271,7 +3281,7 @@ impl<C: Cells> Runtime<C> {
                     observed = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
                     continue;
                 }
-                Computed::Skipped(_) | Computed::Revisit => {
+                Computed::Skipped(_) | Computed::Revisit | Computed::RootTaken => {
                     unreachable!("incr-core: a walk's root is never skipped or revisited")
                 }
             }
@@ -4347,7 +4357,10 @@ impl<C: Cells> Runtime<C> {
                         }
                         continue;
                     }
-                    if is_computing(root_state) && self.claimed_elsewhere(id, root_node) {
+                    if is_computing(root_state)
+                        && !walk.root_waited
+                        && self.claimed_elsewhere(id, root_node)
+                    {
                         self.wait_for_claimed_root(&mut walk, id, gen);
                         planned = self.planned();
                         continue;
@@ -4382,7 +4395,11 @@ impl<C: Cells> Runtime<C> {
                     !is_root,
                     (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur))).then_some(
                         Planned {
-                            root: (!is_root && cur != id && !walk.root_failed_here).then_some(id),
+                            root: (!is_root
+                                && cur != id
+                                && !walk.root_failed_here
+                                && !walk.root_waited)
+                                .then_some(id),
                             ..planned
                         },
                     ),
@@ -4392,7 +4409,7 @@ impl<C: Cells> Runtime<C> {
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
-                    if !is_root && self.root_claimed_elsewhere(id) {
+                    if !is_root && !walk.root_waited && self.root_claimed_elsewhere(id) {
                         self.wait_for_claimed_root(&mut walk, id, gen);
                         planned = self.planned();
                         continue;
@@ -4402,6 +4419,21 @@ impl<C: Cells> Runtime<C> {
                         planned = self.planned();
                     }
                     walk.revisit(cur, generation);
+                    continue;
+                }
+                // A root Failed since the plan passes the entry at its next
+                // pop. A claimed one is waited out even if its claim has
+                // ended by now: two walks giving back each other's roots
+                // between the checks would otherwise repeat without end.
+                if !C::SINGLE_THREADED && computed == Computed::RootTaken {
+                    #[cfg(test)]
+                    revisited.push(cur);
+                    if state::load::<C>(root_node.state_cell()) == NodeState::Failed {
+                        walk.revisit(cur, generation);
+                    } else {
+                        self.wait_for_claimed_root(&mut walk, id, gen);
+                        planned = self.planned();
+                    }
                     continue;
                 }
                 if !C::SINGLE_THREADED && computed == Computed::Replan {
@@ -4700,6 +4732,7 @@ impl<C: Cells> Runtime<C> {
     fn wait_for_claimed_root(&self, walk: &mut Walk, root: NodeId, gen: u32) {
         walk.work.clear();
         walk.restart();
+        walk.root_waited = true;
         walk.retracted = self.retraction_count();
         walk.revisit(root, gen);
     }
@@ -5504,7 +5537,7 @@ impl<C: Cells> Runtime<C> {
                 // then waits for the root instead.
                 if p.root.is_some_and(|root| self.root_taken_elsewhere(root)) {
                     self.unclaim_unrun(node, claimed_dirty);
-                    return Computed::Revisit;
+                    return Computed::RootTaken;
                 }
             }
             // No entry check covers the root, so its claim checks for

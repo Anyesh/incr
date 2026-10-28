@@ -5095,6 +5095,24 @@ fn cross_two_thread_seeds() {
     });
 }
 
+/// 0x124b29 crossed, two threads: each read's walk claimed the other's
+/// root as an entry, gave it back on finding its own root taken, and
+/// waited its root out; with no bound on those give-backs the two walks
+/// restarted each other without end, in about 28 of 30 runs alone.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_walks_giving_back_each_others_roots_end_seed() {
+    crate::child_test::run_in_child_within(
+        "runtime::replay_differential::two_walks_giving_back_each_others_roots_end_seed",
+        std::time::Duration::from_secs(60),
+        || {
+            let case = gen_case(0x124b29, true, true);
+            quiet(|| differential_two(&case, 0x124b29));
+        },
+    )
+    .assert_clean();
+}
+
 /// 0xd6d9 crossed: the Fixpoint head 0 of the cycle 0-1-2-3 panics, its
 /// release lands members 1, 2 and 3 New, and node 6 catches the panic
 /// through its read of 1. A replayed walk ran the cycle from 0, so the
