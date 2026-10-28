@@ -5558,8 +5558,8 @@ fn two_thread_claimer_of_a_member_no_walk_waits_on_matches_an_order_seed() {
 /// `seed`'s read phase of ops `waiter` and `holder` at no budget, with the
 /// waiter's walk made to wait on spec `node` under the holder's claim at
 /// its `k`-th visit, for `k` from 1 until a try's walk waits: that try's
-/// trace must be an order's, and if `owes_run`, the waiter must claim
-/// `node` again after the wait.
+/// trace must be an order's, and if `owes_run`, the holder must have given
+/// `node` back unrun and the waiter must claim it again after the wait.
 fn walk_woken_by_a_released_claim(
     case: &Case,
     seed: u64,
@@ -5589,6 +5589,7 @@ struct Woken<'a> {
     overlap: usize,
     thread: usize,
     waiter: usize,
+    holder: usize,
     node: usize,
     owes_run: bool,
     seed: u64,
@@ -5618,6 +5619,7 @@ impl<'a> Woken<'a> {
             overlap,
             thread,
             waiter,
+            holder,
             node,
             owes_run,
             seed,
@@ -5723,15 +5725,22 @@ impl<'a> Woken<'a> {
             overlap,
             thread,
             waiter,
+            holder,
             node,
             owes_run,
             seed,
         } = *self;
         let reached = Arc::new(AtomicBool::new(false));
         let waited = Arc::new(AtomicBool::new(false));
+        let given_back = Arc::new(AtomicBool::new(false));
         let reclaimed = Arc::new(AtomicBool::new(false));
         let rig = |live: &Live<Shared>| {
-            let (reached, waited, reclaimed) = (reached.clone(), waited.clone(), reclaimed.clone());
+            let (reached, waited, given_back, reclaimed) = (
+                reached.clone(),
+                waited.clone(),
+                given_back.clone(),
+                reclaimed.clone(),
+            );
             let world = live.world.clone();
             let held_node = NodeId(world.handle(0, node).erased().slot());
             let visits = AtomicUsize::new(0);
@@ -5745,17 +5754,29 @@ impl<'a> Woken<'a> {
                         NodeState::Computing | NodeState::ComputingDirty
                     )
                 };
+                let unrun = || {
+                    matches!(
+                        world.rt(0).nodes.get(held_node.0).state(),
+                        NodeState::New | NodeState::Dirty
+                    )
+                };
                 let on_waiter = TWO_THREAD.with(std::cell::Cell::get) == Some(thread);
                 if on_waiter && p == ParkPoint::BeforeVisit(held_node) {
                     if visits.fetch_add(1, SeqCst) + 1 == k {
                         reached.store(true, SeqCst);
                         wait_for(held, 2000);
+                    } else if waited.load(SeqCst) && unrun() {
+                        given_back.store(true, SeqCst);
                     }
                 } else if on_waiter && p == ParkPoint::WalkWaits(held_node) {
                     if reached.load(SeqCst) {
                         waited.store(true, SeqCst);
                     }
                 } else if on_waiter && p == ParkPoint::BeforeClaim(held_node) {
+                    if waited.load(SeqCst) && unrun() {
+                        given_back.store(true, SeqCst);
+                    }
+                } else if on_waiter && p == ParkPoint::BeforeReservationCheck(held_node) {
                     if waited.load(SeqCst) {
                         reclaimed.store(true, SeqCst);
                     }
@@ -5785,10 +5806,16 @@ impl<'a> Woken<'a> {
                 return;
             }
             met = true;
-            assert!(
-                reclaimed.load(SeqCst) || !owes_run,
-                "{seed:#x}: op {waiter} dropped the run of {node} it owed after the wait"
-            );
+            if owes_run {
+                assert!(
+                    given_back.load(SeqCst),
+                    "{seed:#x}: op {holder} never gave {node} back to op {waiter}'s walk"
+                );
+                assert!(
+                    reclaimed.load(SeqCst),
+                    "{seed:#x}: op {waiter} dropped the run of {node} it owed after the wait"
+                );
+            }
             serial.check(
                 &format!("{seed:#x}, waiter waiting at its visit {k} of {node}"),
                 &got,
