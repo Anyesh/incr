@@ -3175,6 +3175,17 @@ impl<C: Cells> Runtime<C> {
         if cycle_state::is_dissolved_group(rt, x.0, &group) {
             return GroupEnd::Ordinary;
         }
+        // A member this thread's frame computes fails step 1 of every
+        // verify of the record while the frame runs, and that failure keeps
+        // the claims in their group, so each member read inside a member's
+        // run would claim the members below it again.
+        if let Some((member, depth)) = cycle_state::group_blocker(rt, &group) {
+            if self.dep_stack.frame_at_is(depth, rt, NodeId(member)) {
+                #[cfg(test)]
+                cycle_state::note_group_blocker_skip();
+                return GroupEnd::Ordinary;
+            }
+        }
         // The members' runs sit where `x`'s frame would.
         let cidx = self.dep_stack.next_cidx();
         // 1. Claim the other members, Dirty to Computing, in slot order.
@@ -3205,6 +3216,11 @@ impl<C: Cells> Runtime<C> {
                 // two threads' passes wait on each other.
                 let seen =
                     self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
+                if !took && !virtual_member && is_computing(seen) {
+                    if let Some(depth) = self.dep_stack.frame_depth(rt, NodeId(m)) {
+                        cycle_state::note_group_blocker(rt, group.clone(), m, depth);
+                    }
+                }
                 self.release_group_claims(
                     &claimed,
                     !took && !virtual_member && seen != NodeState::Dirty && !is_computing(seen),

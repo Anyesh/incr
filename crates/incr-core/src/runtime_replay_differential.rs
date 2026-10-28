@@ -12401,3 +12401,54 @@ fn seed_2efc_kept_children_root_no_unheld_frame() {
         differential::<Shared>(&case, 0x2efc);
     });
 }
+
+/// `case`'s trace with this thread's blocked-record skip `on`, or its
+/// panic's message.
+fn run_with_group_blocker_skip<C: Cells>(
+    case: &Case,
+    frames: Option<u32>,
+    bytes: usize,
+    on: bool,
+) -> Result<Trace, String> {
+    crate::cycle_state::set_group_blocker_skip(on);
+    let got = catch_unwind(AssertUnwindSafe(|| run::<C>(case, frames, bytes)))
+        .map_err(super::race_tests::panic_message);
+    crate::cycle_state::set_group_blocker_skip(true);
+    got
+}
+
+/// Ending a verify early on a record blocked by a member this thread
+/// computes moves no outcome: every operation's output and every node's
+/// state, deps and group record match the run that claims the group each
+/// time, unbounded and at every budget, crossed or not. Returns how many
+/// verifies took the skip.
+fn group_blocker_skip_moves_no_trace(seeds: std::ops::Range<u64>) -> u64 {
+    let skips = crate::cycle_state::group_blocker_skips();
+    quiet(|| {
+        for seed in seeds {
+            for cross in [false, true] {
+                let case = gen_case(seed, cross, false);
+                for (frames, bytes) in std::iter::once((None, 0)).chain(BUDGETS) {
+                    let label = format!("seed {seed:#x} cross {cross} {frames:?}/{bytes}");
+                    assert_eq!(
+                        run_with_group_blocker_skip::<Local>(&case, frames, bytes, true),
+                        run_with_group_blocker_skip::<Local>(&case, frames, bytes, false),
+                        "Local {label}"
+                    );
+                    assert_eq!(
+                        run_with_group_blocker_skip::<Shared>(&case, frames, bytes, true),
+                        run_with_group_blocker_skip::<Shared>(&case, frames, bytes, false),
+                        "Shared {label}"
+                    );
+                }
+            }
+        }
+    });
+    crate::cycle_state::group_blocker_skips() - skips
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_blocked_group_skip_moves_no_trace() {
+    group_blocker_skip_moves_no_trace(0..300);
+}

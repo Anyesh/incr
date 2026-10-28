@@ -1235,6 +1235,11 @@ struct EntryState {
     thread_key: Cell<u32>,
 }
 
+/// Per (runtime, group record address): the record, the member a verify
+/// of it failed on, and the depth of this thread's frame computing that
+/// member.
+type GroupBlockers = HashMap<(RuntimeId, usize), (Arc<GroupInfo>, u32, usize), FxBuildHasher>;
+
 /// What the outermost entry resets: the roots whose episodes dissolved,
 /// and the cycle the last uncaught cycle panic reported.
 struct Outer {
@@ -1242,6 +1247,9 @@ struct Outer {
     /// The landed group of each root whose episode dissolved in this
     /// entry, held so that no later record can reuse its address.
     dissolved_groups: Vec<(RuntimeId, u32, Arc<GroupInfo>)>,
+    /// Each group record whose verify failed on a member this thread's
+    /// frame computes, held so that no later record can reuse its address.
+    group_blockers: GroupBlockers,
     /// The group record this thread left at each slot it changed, held so
     /// that no later record can reuse its address.
     recs_left: Vec<(RuntimeId, u32, Option<Arc<GroupInfo>>)>,
@@ -1281,6 +1289,7 @@ thread_local! {
         RefCell::new(Outer {
             dissolved: Vec::new(),
             dissolved_groups: Vec::new(),
+            group_blockers: HashMap::with_hasher(FxBuildHasher),
             recs_left: Vec::new(),
             last_cycle: None,
             budgets_met: Vec::new(),
@@ -1314,6 +1323,7 @@ loom::thread_local! {
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         dissolved_groups: Vec::new(),
+        group_blockers: HashMap::with_hasher(FxBuildHasher),
         recs_left: Vec::new(),
         last_cycle: None,
         budgets_met: Vec::new(),
@@ -1694,6 +1704,67 @@ pub(crate) fn is_dissolved_group(rt: RuntimeId, root: u32, group: &Arc<GroupInfo
             .iter()
             .any(|(r, n, g)| *r == rt && *n == root && Arc::ptr_eq(g, group))
     })
+}
+
+/// Notes that a verify of `group` failed on `member`, which this
+/// thread's frame at `depth` computes.
+pub(crate) fn note_group_blocker(rt: RuntimeId, group: Arc<GroupInfo>, member: u32, depth: usize) {
+    let key = (rt, Arc::as_ptr(&group) as usize);
+    OUTER.with(|o| {
+        o.borrow_mut()
+            .group_blockers
+            .insert(key, (group, member, depth))
+    });
+    ENTRY.with(|e| e.outer_set.set(true));
+}
+
+/// The member and frame depth a verify of `group` last failed on in this
+/// outermost entry.
+pub(crate) fn group_blocker(rt: RuntimeId, group: &Arc<GroupInfo>) -> Option<(u32, usize)> {
+    if !group_blocker_skip() {
+        return None;
+    }
+    let key = (rt, Arc::as_ptr(group) as usize);
+    OUTER.with(|o| {
+        o.borrow()
+            .group_blockers
+            .get(&key)
+            .map(|&(_, member, depth)| (member, depth))
+    })
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static GROUP_BLOCKER_SKIP: Cell<bool> = const { Cell::new(true) };
+    static GROUP_BLOCKER_SKIPS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(all(test, not(loom)))]
+fn group_blocker_skip() -> bool {
+    GROUP_BLOCKER_SKIP.with(Cell::get)
+}
+
+#[cfg(not(all(test, not(loom))))]
+fn group_blocker_skip() -> bool {
+    true
+}
+
+/// Turns this thread's blocked-record skip on or off, for tests that
+/// compare a read with and without it.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn set_group_blocker_skip(on: bool) {
+    GROUP_BLOCKER_SKIP.with(|s| s.set(on));
+}
+
+#[cfg(all(test, not(loom)))]
+pub(crate) fn note_group_blocker_skip() {
+    GROUP_BLOCKER_SKIPS.with(|n| n.set(n.get() + 1));
+}
+
+/// The group verifies this thread returned early on a blocked record.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn group_blocker_skips() -> u64 {
+    GROUP_BLOCKER_SKIPS.with(Cell::get)
 }
 
 /// How many held claims this thread has marked failed: a member run that
@@ -2096,6 +2167,7 @@ pub(crate) fn reset_outermost() {
             let mut o = o.borrow_mut();
             o.dissolved.clear();
             o.dissolved_groups.clear();
+            o.group_blockers.clear();
             o.recs_left.clear();
             o.last_cycle = None;
             o.budgets_met.clear();

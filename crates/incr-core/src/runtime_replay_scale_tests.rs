@@ -2122,3 +2122,55 @@ fn local_chained_group_reads_claim_once() {
 fn shared_chained_group_reads_claim_once() {
     on_stack(64 << 20, chained_group_reads_claim_once::<Shared>);
 }
+
+/// The read's answer, then every node's state, then every node's value.
+type GroupOutcome = (
+    Result<i64, String>,
+    Vec<NodeState>,
+    Vec<Result<i64, String>>,
+);
+
+fn chained_group_outcome<C: Cells>(k: usize, skip: bool) -> (GroupOutcome, u64) {
+    crate::cycle_state::set_group_blocker_skip(skip);
+    let skips = crate::cycle_state::group_blocker_skips();
+    let rt = Runtime::<C>::new();
+    let shape = chained_group(&rt, k);
+    let read = |h: Incr<i64>| {
+        catch_unwind(AssertUnwindSafe(|| rt.get(h))).map_err(super::race_tests::panic_message)
+    };
+    let got = read(shape.m);
+    let nodes: Vec<Incr<i64>> = [shape.on, shape.m, shape.r]
+        .into_iter()
+        .chain(shape.xs.iter().copied())
+        .collect();
+    let states = nodes.iter().map(|&h| rt.state_of(h)).collect();
+    let values = nodes.iter().map(|&h| read(h)).collect();
+    crate::cycle_state::set_group_blocker_skip(true);
+    rt.assert_invariant_i();
+    (
+        (got, states, values),
+        crate::cycle_state::group_blocker_skips() - skips,
+    )
+}
+
+/// Ending a verify early on a record blocked by a member this thread
+/// computes moves no node: the read and every node's state and value
+/// match the read that claims the group at each member.
+fn chained_group_skip_moves_no_node<C: Cells>() {
+    let (with, skipped) = chained_group_outcome::<C>(64, true);
+    let (without, _) = chained_group_outcome::<C>(64, false);
+    assert!(skipped > 0, "no group verify took the skip");
+    assert_eq!(with, without);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_chained_group_skip_moves_no_node() {
+    on_stack(16 << 20, chained_group_skip_moves_no_node::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_chained_group_skip_moves_no_node() {
+    on_stack(16 << 20, chained_group_skip_moves_no_node::<Shared>);
+}

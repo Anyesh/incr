@@ -921,6 +921,15 @@ pub trait DepStack: sealed::Sealed + 'static {
         })
     }
 
+    /// Whether the frame at `depth` computes `node` of runtime `rt`.
+    fn frame_at_is(&self, depth: usize, rt: RuntimeId, node: NodeId) -> bool {
+        self.with(|s| {
+            s.frames
+                .get(depth)
+                .is_some_and(|f| f.node == node && f.rt() == rt)
+        })
+    }
+
     /// The position of the innermost frame on this stack computing
     /// `node` of runtime `rt`, if one is.
     fn frame_cidx(&self, rt: RuntimeId, node: NodeId) -> Option<u32> {
