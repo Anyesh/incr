@@ -2293,29 +2293,47 @@ fn a_walk_that_waited_out_a_released_group_claim_keeps_its_plan() {
 fn expanded_group_replaced_before_the_claim(regroup: bool) {
     let rt = Arc::new(Rt::new());
     let k = rt.create_input(0_i64);
-    let w = rt.create_query(move |rt| rt.get(k) + 1);
-    let x = rt.create_query(move |rt| rt.get(k) * 10);
+    // p's state is taken where the probe's closure runs on A, not where
+    // its compute was planned: a replan backs out of a planned compute
+    // without running it.
+    let p_cell: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::default();
+    let p_at_probe: Arc<Mutex<Vec<NodeState>>> = Arc::default();
+    let note = {
+        let (p_cell, p_at_probe) = (p_cell.clone(), p_at_probe.clone());
+        move |rt: &Rt| {
+            if thread::current().name() == Some("A") {
+                let p = *p_cell.get().expect("p is made before A reads");
+                p_at_probe.lock().unwrap().push(rt.state_of(p));
+            }
+        }
+    };
+    let note_w = note.clone();
+    let w = rt.create_query(move |rt| {
+        if regroup {
+            note_w(rt);
+        }
+        rt.get(k) + 1
+    });
+    let x = rt.create_query(move |rt| {
+        if !regroup {
+            note(rt);
+        }
+        rt.get(k) * 10
+    });
     let z = rt.create_query(move |rt| rt.get(w) * 2);
     let p = rt.create_query(move |rt| rt.get(x) + rt.get(k));
+    assert!(p_cell.set(p).is_ok());
     assert_eq!((rt.get(p), rt.get(z)), (0, 2));
     rt.force_group_for_test(&[p.erase(), x.erase()]);
     rt.set(k, 1);
-    let probe = if regroup { id(w) } else { id(x) };
     let planned = Gate::new();
     planned.arm();
-    let p_at_probe: Arc<Mutex<Vec<NodeState>>> = Arc::default();
     let installed = rt.park_hook.set(Box::new({
-        let (rt, planned, p_at_probe) = (Arc::downgrade(&rt), planned.clone(), p_at_probe.clone());
+        let planned = planned.clone();
         move |point| {
-            if thread::current().name() != Some("A") {
-                return;
-            }
-            if point == ParkPoint::BeforeComputeOne(id(p)) {
+            if thread::current().name() == Some("A") && point == ParkPoint::BeforeComputeOne(id(p))
+            {
                 planned.park();
-            } else if point == ParkPoint::BeforeComputeOne(probe) {
-                if let Some(rt) = rt.upgrade() {
-                    p_at_probe.lock().unwrap().push(rt.state_of(p));
-                }
             }
         }
     }));
