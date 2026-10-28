@@ -4614,6 +4614,7 @@ impl<C: Cells> Runtime<C> {
             self.max_walk_rereads.fetch_max(walk.rereads, Relaxed);
         }
         walk.work.truncate(pending);
+        walk.first_visits = walk.first_visits.saturating_sub(1);
         walk.forget(|&n| n == id);
         let open = || {
             node.held_mark()
