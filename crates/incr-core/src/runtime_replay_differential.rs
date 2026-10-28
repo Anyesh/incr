@@ -5455,6 +5455,19 @@ fn two_thread_walk_entry_after_a_claim_wait_matches_unbounded_seed() {
     });
 }
 
+/// 0xaab9d's phase [6, 7] at no budget: op 6 (`Get(12)`) walks the cycle
+/// {12, 13, 14} and meets 12 again as a walk entry just after op 7 claimed
+/// it, and waits. Op 7's attempt gives 12 back Dirty unrun; woken, op 6's
+/// walk must not go on with the plan and visit count it made before the
+/// wait. Every order fails op 6 with the cycle, where the resumed plan
+/// entered it at 22 and returned Value(3).
+#[test]
+#[ignore = "T10-wide-crosstwo-0xaab9d"]
+fn two_thread_walk_woken_by_a_released_claim_matches_an_order_seed() {
+    assert!(matches!(gen_case(0xaab9d, true, true).ops[6], Op::Get(12)));
+    walk_woken_by_a_released_claim(0xaab9d, 6, 7, 12, false);
+}
+
 /// A guard, not a red of the walk-plan rule: 0x886d3's phase [21, 22] at
 /// no budget, op 22 (`Get(7)`) visiting 9 while op 21 (`Get(19)`) holds it.
 /// Op 21's attempt lands 20, 19, 18 and 17 Clean, is wounded and gives 9
