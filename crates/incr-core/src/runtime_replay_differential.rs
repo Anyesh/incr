@@ -8522,7 +8522,7 @@ fn replay_seeds() {
 /// leaves a node Dirty and the bounded run lands it Clean; 0xa5b returns
 /// other outcomes too.
 #[test]
-#[ignore = "T8-strict-group-c-dirty-for-clean"]
+#[cfg_attr(miri, ignore)]
 fn strict_dirty_for_clean_seeds() {
     for seed in [0xa5b, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d] {
         let case = gen_base(seed);
@@ -9347,32 +9347,31 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
+    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant, T10-diff-local-release-uncaught-cycle"]
     fn replay_differential_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
+    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant, T10-diff-local-release-uncaught-cycle"]
     fn replay_differential_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
     fn replay_differential_shared_two_threads(seed in any::<u64>()) {
         quiet(|| differential_two(&gen_case(seed, false, true), seed));
     }
 
     #[test]
-    #[ignore = "cross-runtime reads record no edge, so a speculative entry's early read keeps a value a later set changed"]
+    #[ignore = "T10-cross-diff-0x1684812d06f040c3-native-runs"]
     fn replay_differential_cross_runtime_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, true, false), seed));
     }
 
     #[test]
-    #[ignore = "cross-runtime reads record no edge, so a speculative entry's early read keeps a value a later set changed"]
+    #[ignore = "T10-cross-diff-0xeb8a5eb5f0cdc317-deps, T10-cross-diff-0xa122ae288d458244-failed-for-new"]
     fn replay_differential_cross_runtime_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, true, false), seed));
     }
@@ -11092,7 +11091,7 @@ fn first_changed_get<C: Cells>(seed: u64) -> Option<(usize, Vec<Out>)> {
 /// Dirty landing's outcome for its revision (T8-get-alternates-without-set,
 /// rule (b)) is beta.7 work.
 #[test]
-#[ignore = "beta.7: T8-get-alternates-without-set rule (b)"]
+#[ignore = "beta.7: T10-pin-get-alternates-rule-b"]
 fn a_member_catching_a_co_members_cycle_panic_repeats_its_get() {
     for seed in [0x1a7, 0x4ea, 0x701] {
         assert_eq!(first_changed_get::<Local>(seed), None, "{seed:#x}");

@@ -1620,7 +1620,7 @@ fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead, steady: bool
 }
 
 #[test]
-#[ignore = "T10-speculative-landing-third-foreign-reader-run"]
+#[ignore = "beta.7: B7-foreign-computed-adoption, the leaf runs once more than unbounded"]
 fn landed_foreign_reader_runs_twice() {
     rereading_foreign_reader_runs(FirstRead::ForeignLandedClean, false);
 }
