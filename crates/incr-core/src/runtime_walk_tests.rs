@@ -2384,13 +2384,13 @@ fn walk_enters_a_cycle_where_a_fresh_read_does<C: Cells>() {
 }
 
 #[test]
-#[ignore = "a walk enters a cycle where it recomputes first, not where a fresh read does"]
+#[ignore = "beta.7: T10-pin-walk-enters-cycle-at-recompute, a walk enters a cycle where it recomputes first, not where a fresh read does"]
 fn local_walk_enters_a_cycle_where_a_fresh_read_does() {
     walk_enters_a_cycle_where_a_fresh_read_does::<Local>();
 }
 
 #[test]
-#[ignore = "a walk enters a cycle where it recomputes first, not where a fresh read does"]
+#[ignore = "beta.7: T10-pin-walk-enters-cycle-at-recompute, a walk enters a cycle where it recomputes first, not where a fresh read does"]
 fn shared_walk_enters_a_cycle_where_a_fresh_read_does() {
     walk_enters_a_cycle_where_a_fresh_read_does::<Shared>();
 }

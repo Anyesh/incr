@@ -8786,13 +8786,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
+    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant"]
     fn replay_differential_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean"]
+    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant"]
     fn replay_differential_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, false, false), seed));
     }
@@ -10492,7 +10492,7 @@ fn first_changed_get<C: Cells>(seed: u64) -> Option<(usize, Vec<Out>)> {
 /// Dirty landing's outcome for its revision (T8-get-alternates-without-set,
 /// rule (b)) is beta.7 work.
 #[test]
-#[ignore = "beta.7: T8-get-alternates-without-set rule (b)"]
+#[ignore = "beta.7: T10-pin-get-alternates-rule-b"]
 fn a_member_catching_a_co_members_cycle_panic_repeats_its_get() {
     for seed in [0x1a7, 0x4ea, 0x701] {
         assert_eq!(first_changed_get::<Local>(seed), None, "{seed:#x}");
