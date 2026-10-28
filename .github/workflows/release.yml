@@ -16,6 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/check-release-versions.sh
+      - run: bash scripts/check-release-notes.sh
       - run: cargo test --release -p incr-core -p incr-compute -p incr-concurrent -p incr-kube -p incr-persist --features incr-persist/sqlite
 
   publish-crates:
