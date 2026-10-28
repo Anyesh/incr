@@ -4421,6 +4421,22 @@ fn cross_seed_reading_back_under_virtual_frames() {
     });
 }
 
+/// Cross seeds where a cycle member's Native run, recorded under the
+/// thread's speculation, reads the other runtime's Clean node: the real
+/// look keeps that run, as the unbounded run does, not run it again
+/// (0x16a03 node 5 in revision 4, 0x3ce9 node 4 in revision 8).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_seeds_native_member_run_over_a_checked_foreign_read() {
+    for seed in [0x16a03, 0x3ce9] {
+        let case = gen_case(seed, true, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// 0x1684812d06f040c3 at budget 1: Native node 8 runs under 6 as a member
 /// of their cycle, recorded under speculation, and reads the other
 /// runtime's Clean node 0. The real read after it must keep that run, as
