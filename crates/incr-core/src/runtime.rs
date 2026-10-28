@@ -1791,9 +1791,7 @@ impl<C: Cells> Runtime<C> {
             "create_input called during compute; not permitted (a compute creates its \
              nodes through a NodeTable)",
         );
-        let handle = self.create_input_unchecked(value);
-        self.count_created();
-        handle
+        self.create_input_unchecked(value)
     }
 
     /// Internal: create an input without the dep-stack-empty check.
@@ -1824,6 +1822,7 @@ impl<C: Cells> Runtime<C> {
             };
             (slot, self.nodes.get(slot).generation())
         };
+        self.count_created();
         Incr::new(slot, generation, self.runtime_id)
     }
 
@@ -1983,9 +1982,7 @@ impl<C: Cells> Runtime<C> {
             }
             (slot, self.nodes.get(slot).generation())
         };
-        if CHECKED {
-            self.count_created();
-        }
+        self.count_created();
         Incr::new(slot, generation, self.runtime_id)
     }
 
@@ -2198,16 +2195,27 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// A node created outside a compute may be the recreate of one a
-    /// speculative run read dead, which a closure reads in its place. A
-    /// compute cannot recreate one: it reaches a node only through a handle
-    /// it captured, a dep's value or a table, which never returns a dead
-    /// node. A dead read this load sees began its run before the reshape
-    /// it counts; one it misses stays pending for the next creation.
+    /// A node created outside a compute, by a create or a table miss, may be
+    /// the recreate of one a speculative run read dead, which a closure
+    /// reads in its place. A compute cannot recreate one: it reaches a node
+    /// only through a handle it captured, a dep's value or a table, which
+    /// never returns a dead node; and a run's own miss counting would end
+    /// its own stash. A dead read this load sees began its run before the
+    /// reshape it counts; one it misses stays pending for the next creation.
     #[inline(always)]
     fn count_created(&self) {
         let dead = C::u64_load_acquire(&self.dead_reads);
-        if dead != 0 && C::u64_fetch_max(&self.dead_reads_counted, dead) < dead {
+        if dead != C::u64_load_relaxed(&self.dead_reads_counted) {
+            self.count_dead_reads(dead);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_dead_reads(&self, dead: u64) {
+        if !self.dep_stack.current_frame_active(self.runtime_id)
+            && C::u64_fetch_max(&self.dead_reads_counted, dead) < dead
+        {
             C::u64_fetch_add(&self.reshapes, 1);
         }
     }

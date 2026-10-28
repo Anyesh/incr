@@ -995,10 +995,23 @@ fn reads_alike<C: Cells>(world: &World<C>, reads: &[Read]) -> bool {
     })
 }
 
+thread_local! {
+    /// While set, `make` creates through a table miss, as user code outside
+    /// a compute may, and leaves a Native `FirstRun` query unpinned.
+    static BY_TABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// While set, a `Recreate` makes its node with `BY_TABLE`.
+    static RECREATE_BY_TABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Node `i`'s query or input on `side`, its closure having run as `ran`.
 fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran: Ran) -> Handle {
     let rt = world.rt(side);
+    let by_table = BY_TABLE.get();
     match spec {
+        Spec::Input(v) if by_table => Handle::Plain(
+            rt.create_table::<u8, u64>()
+                .get_or_insert_input(rt, 0, || *v),
+        ),
         Spec::Input(v) => Handle::Plain(rt.create_input(*v)),
         Spec::Query {
             expr,
@@ -1072,7 +1085,27 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                 running.returned(v);
                 v
             };
-            if *bare {
+            if by_table && *bare {
+                let opts = QueryOpts {
+                    cycle: strategy.build((side, i), |v| Bare(v, false)),
+                    replay,
+                };
+                Handle::Bare(rt.create_table::<u8, Bare>().get_or_insert_query_with(
+                    rt,
+                    0,
+                    move |rt| Bare::made(compute(rt)),
+                    opts,
+                ))
+            } else if by_table {
+                let opts = QueryOpts {
+                    cycle: strategy.build((side, i), |v| v),
+                    replay,
+                };
+                Handle::Plain(
+                    rt.create_table::<u8, u64>()
+                        .get_or_insert_query_with(rt, 0, compute, opts),
+                )
+            } else if *bare {
                 Handle::Bare(rt.create_query_erased::<true, _, _>(
                     move |rt| Bare::made(compute(rt)),
                     erased(
@@ -1406,7 +1439,9 @@ impl<C: Cells> Live<C> {
                 if w.rt(0).is_alive(old.erased()) {
                     return Out::Done;
                 }
+                BY_TABLE.set(RECREATE_BY_TABLE.get());
                 let new = make(&self.world, 0, *i, spec, Ran::Never);
+                BY_TABLE.set(false);
                 w.replace(0, *i, new);
                 self.retired.lock().unwrap().push(old);
                 Out::Recreated(new.erased().slot() == old.erased().slot())
@@ -3557,6 +3592,32 @@ fn seed_48e9_stash_over_a_dead_handle_then_a_recreate() {
         differential::<Local>(&case, 0x48e9);
         differential::<Shared>(&case, 0x48e9);
     });
+}
+
+/// As above, with the recreate made by a table miss from outside a
+/// compute, which must count the dead reads before it as a create does.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_48e9_stash_over_a_dead_handle_then_a_table_recreate() {
+    let case = gen_case(0x48e9, false, false);
+    assert!(matches!(case.ops[4], Op::Delete(13)) && matches!(case.ops[6], Op::Recreate(13, _)));
+    let mut ops = case.ops[..3].to_vec();
+    ops.extend([
+        case.ops[4].clone(),
+        case.ops[3].clone(),
+        case.ops[6].clone(),
+    ]);
+    ops.extend([Op::Get(12), Op::TryGet(11)]);
+    let case = Case { ops, ..case };
+    RECREATE_BY_TABLE.set(true);
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        quiet(|| {
+            differential::<Local>(&case, 0x48e9);
+            differential::<Shared>(&case, 0x48e9);
+        });
+    }));
+    RECREATE_BY_TABLE.set(false);
+    r.unwrap_or_else(|p| std::panic::resume_unwind(p));
 }
 
 /// 0x11203: a speculative run reads a deleted node's handle with no
