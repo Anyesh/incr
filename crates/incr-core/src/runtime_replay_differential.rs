@@ -5496,8 +5496,9 @@ fn two_thread_claimer_of_a_member_another_walk_waits_on_matches_an_order_seed() 
 }
 
 /// The control for the test above: op 7 held before its walk starts until
-/// op 8 has claimed 13, so no walk waits while op 8 runs the region. Both
-/// reads give an order's values, `Value(12)` and `Value(2)`.
+/// op 8's claim of 13 has ended, so op 8 runs the region with no walk
+/// waiting on 13, and op 7's walk must not wait on it after. Both reads
+/// give an order's values, `Value(12)` and `Value(2)`.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_claimer_of_a_member_no_walk_waits_on_matches_an_order_seed() {
@@ -5582,39 +5583,59 @@ impl<'a> Woken<'a> {
 
     /// The control for [`Self::try_at`]: the waiter held at its first park
     /// point of the phase, before its walk does anything, until the holder
-    /// has claimed the node. Checked, and whether the claim released it.
+    /// has claimed the node and the claim has ended. Checked, and whether
+    /// the holder claimed while the waiter was held; a try where it did
+    /// must see no walk of the waiter's wait on the node.
     fn try_unstarted(&self) -> bool {
         let Woken {
             case,
             phases,
             overlap,
             thread,
+            waiter,
             node,
             seed,
             ..
         } = *self;
-        let gate = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicBool::new(false));
+        let claiming = Arc::new(AtomicBool::new(false));
         let claimed = Arc::new(AtomicBool::new(false));
+        let walk_waits = Arc::new(AtomicUsize::new(0));
         let rig = |live: &Live<Shared>| {
-            let (gate, claimed) = (gate.clone(), claimed.clone());
+            let (parked, claiming, claimed, walk_waits) = (
+                parked.clone(),
+                claiming.clone(),
+                claimed.clone(),
+                walk_waits.clone(),
+            );
             let world = live.world.clone();
-            let held_node = world.handle(0, node).erased().slot();
-            let hook: crate::runtime::ParkHook = Box::new(move |_| {
-                if TWO_PHASE.with(std::cell::Cell::get) == overlap
-                    && TWO_THREAD.with(std::cell::Cell::get) == Some(thread)
-                    && !gate.swap(true, SeqCst)
-                {
-                    claimed.store(
-                        wait_for(
-                            || {
-                                matches!(
-                                    world.rt(0).nodes.get(held_node).state(),
-                                    NodeState::Computing | NodeState::ComputingDirty
-                                )
-                            },
-                            2000,
-                        ),
-                        SeqCst,
+            let held_node = NodeId(world.handle(0, node).erased().slot());
+            let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                    return;
+                }
+                if TWO_THREAD.with(std::cell::Cell::get) != Some(thread) {
+                    if p == ParkPoint::BeforeClaim(held_node) {
+                        claiming.store(true, SeqCst);
+                    } else if p == ParkPoint::BeforeReservationCheck(held_node)
+                        && claiming.load(SeqCst)
+                    {
+                        claimed.store(true, SeqCst);
+                    }
+                    return;
+                }
+                if p == ParkPoint::WalkWaits(held_node) {
+                    walk_waits.fetch_add(1, SeqCst);
+                }
+                if !parked.swap(true, SeqCst) && wait_for(|| claimed.load(SeqCst), 2000) {
+                    wait_for(
+                        || {
+                            !matches!(
+                                world.rt(0).nodes.get(held_node.0).state(),
+                                NodeState::Computing | NodeState::ComputingDirty
+                            )
+                        },
+                        2000,
                     );
                 }
             });
@@ -5636,7 +5657,13 @@ impl<'a> Woken<'a> {
                 verdict.into_inner().unwrap(),
             );
         });
-        claimed.load(SeqCst)
+        let claimed = claimed.load(SeqCst);
+        assert!(
+            !claimed || walk_waits.load(SeqCst) == 0,
+            "{seed:#x}: op {waiter} waited on {node} {} times after the claim it was held through",
+            walk_waits.load(SeqCst)
+        );
+        claimed
     }
 
     /// One try with the waiter held at its `k`-th visit of the node until
