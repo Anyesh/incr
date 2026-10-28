@@ -607,6 +607,8 @@ enum Visit {
 struct Planned {
     all: u64,
     own: u64,
+    /// The walk's root, for an entry below it.
+    root: Option<NodeId>,
 }
 
 #[repr(align(64))]
@@ -4179,13 +4181,20 @@ impl<C: Cells> Runtime<C> {
                 if !is_root
                     && !C::SINGLE_THREADED
                     && (MODE & VIRT == 0 || walk.repushed.take() != Some(cur))
-                    && state::load::<C>(root_node.state_cell()) == NodeState::Failed
-                    && !self.root_failed_here(&mut walk, id, gen)
                 {
-                    if taint < NO_TAINT {
-                        walk.taint(taint);
+                    let root_state = state::load::<C>(root_node.state_cell());
+                    if root_state == NodeState::Failed && !self.root_failed_here(&mut walk, id, gen)
+                    {
+                        if taint < NO_TAINT {
+                            walk.taint(taint);
+                        }
+                        continue;
                     }
-                    continue;
+                    if is_computing(root_state) && self.claimed_elsewhere(id, root_node) {
+                        self.wait_for_claimed_root(&mut walk, id, gen);
+                        planned = self.planned();
+                        continue;
+                    }
                 }
                 self.park(ParkPoint::BeforeComputeOne(cur));
                 let visit = if is_root || taint >= NO_TAINT {
@@ -4214,14 +4223,23 @@ impl<C: Cells> Runtime<C> {
                     visit,
                     Some(generation),
                     !is_root,
-                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur)))
-                        .then_some(planned),
+                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur))).then_some(
+                        Planned {
+                            root: (!is_root && cur != id && !walk.root_failed_here).then_some(id),
+                            ..planned
+                        },
+                    ),
                     seen,
                 );
                 ran_unsettled |= computed == Computed::Unsettled;
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
+                    if !is_root && self.root_claimed_elsewhere(id) {
+                        self.wait_for_claimed_root(&mut walk, id, gen);
+                        planned = self.planned();
+                        continue;
+                    }
                     if is_root {
                         walk.restart();
                         planned = self.planned();
@@ -4488,6 +4506,47 @@ impl<C: Cells> Runtime<C> {
         root
     }
 
+    /// Whether another thread holds the claim on the walk root `root`.
+    #[inline(always)]
+    fn root_claimed_elsewhere(&self, root: NodeId) -> bool {
+        let node = self.nodes.get(root.0);
+        is_computing(state::load::<C>(node.state_cell())) && self.claimed_elsewhere(root, node)
+    }
+
+    /// [`Self::root_claimed_elsewhere`], or the root landed Failed, for an
+    /// entry the walk planned after finding the root not Failed by this
+    /// thread's reads.
+    #[inline(always)]
+    fn root_taken_elsewhere(&self, root: NodeId) -> bool {
+        let node = self.nodes.get(root.0);
+        let state = state::load::<C>(node.state_cell());
+        state == NodeState::Failed || is_computing(state) && self.claimed_elsewhere(root, node)
+    }
+
+    /// Whether another thread holds the claim on `id`: neither a frame on
+    /// this thread's stack nor this thread's held landing.
+    #[cold]
+    #[inline(never)]
+    fn claimed_elsewhere(&self, id: NodeId, node: &NodeData<C>) -> bool {
+        self.own_claim_owner(id).is_none()
+            && !(hold::active() && hold::shows(state::cell_key::<C>(node.state_cell())))
+    }
+
+    /// Drops the plan of a walk whose root another thread claimed after the
+    /// walk planned it. That thread cleans the root's deps itself, and
+    /// running them here as well can close a cycle among them that reaches
+    /// this read's catcher, where every order reads the root's landing
+    /// (0x173f8). The walk waits for that landing at the root's visit, as a
+    /// read that came after the claim would.
+    #[cold]
+    #[inline(never)]
+    fn wait_for_claimed_root(&self, walk: &mut Walk, root: NodeId, gen: u32) {
+        walk.work.clear();
+        walk.restart();
+        walk.retracted = self.retraction_count();
+        walk.revisit(root, gen);
+    }
+
     /// Undoes the expansion of `id` from its pending entry at `pending` on,
     /// unless this thread holds the run open on `held` (`id` or a member of
     /// its group), waits another thread's run out, and visits `id` again. A
@@ -4553,7 +4612,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     fn planned(&self) -> Planned {
         if C::SINGLE_THREADED {
-            return Planned { all: 0, own: 0 };
+            return Planned::default();
         }
         let all = C::u64_load_acquire(&self.episodes_landed);
         // This thread's share is at most the count.
@@ -4562,7 +4621,11 @@ impl<C: Cells> Runtime<C> {
         } else {
             cycle_state::own_episodes(self.runtime_id)
         };
-        Planned { all, own }
+        Planned {
+            all,
+            own,
+            root: None,
+        }
     }
 
     /// Whether another thread has landed an episode or released held
@@ -5149,6 +5212,13 @@ impl<C: Cells> Runtime<C> {
                 if self.replan(p) {
                     self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Replan;
+                }
+                // Another thread can claim the root, or land it Failed,
+                // after the walk's check of it before this entry: the walk
+                // then waits for the root instead.
+                if p.root.is_some_and(|root| self.root_taken_elsewhere(root)) {
+                    self.unclaim_unrun(node, claimed_dirty);
+                    return Computed::Revisit;
                 }
             }
             // No entry check covers the root, so its claim checks for
