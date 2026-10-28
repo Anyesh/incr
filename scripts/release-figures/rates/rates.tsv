@@ -1,3 +1,3 @@
 row	seed	mode	profile	runs	trees	match	headline
-L105-36614b5f	36614b5f	two	debug	400	rel,main	budget None frames, 0 bytes && Value(10007)	Under `Shared`, two reads inside one cycle can return a value no serial order gives
-L111-47fe6	47fe6	crosstwo	release	400	rel,main,9ca47e428233972a2c19b37e0896392f47099ea7	got (Value(7793)	Under `Shared`, two threads reading overlapping queries can leave a node in a state no serial order of the same reads leaves
+L105-ae430	ae430	two	release	400	rel,main,9ca47e428233972a2c19b37e0896392f47099ea7	budget None frames, 0 bytes && got (Value(46)	Under `Shared`, two reads inside one cycle can return a value no serial order gives
+L111-17d9a	17d9a	two	release	400	rel,main,9ca47e428233972a2c19b37e0896392f47099ea7	budget None frames, 0 bytes && got (Cycle([14, 15, 16, 17, 18])	Under `Shared`, two threads reading overlapping queries can leave a node in a state no serial order of the same reads leaves
