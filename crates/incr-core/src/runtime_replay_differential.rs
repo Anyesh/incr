@@ -8786,13 +8786,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
-    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant"]
+    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant, T10-diff-local-release-uncaught-cycle"]
     fn replay_differential_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
-    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant"]
+    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant, T10-diff-local-release-uncaught-cycle"]
     fn replay_differential_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, false, false), seed));
     }
