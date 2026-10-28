@@ -1446,6 +1446,37 @@ fn shared_failed_readers_over_each_node_of_a_dirty_chain() {
     });
 }
 
+/// A test build checks the ticket each hold changes. The check looks at a
+/// bounded number of members per hold, so a chain whose ticket gains a
+/// landing per step, or a fan whose ticket gains one per reader, stays
+/// linear in a test build as it is in a user's.
+fn ticket_checks_stay_linear<C: Cells>() {
+    let (n, k) = if cfg!(miri) { (8, 4) } else { (8000, 4000) };
+    crate::replay::take_ticket_checks();
+    contained_chain::<C>(None, n);
+    let chain = crate::replay::take_ticket_checks();
+    assert!(
+        chain <= 256 * n as u64,
+        "{chain} ticket members checked for a {n}-chain"
+    );
+    failed_entry_fan_in_of::<C>(k);
+    let fan = crate::replay::take_ticket_checks();
+    assert!(
+        fan <= 256 * k as u64,
+        "{fan} ticket members checked for {k} readers"
+    );
+}
+
+#[test]
+fn local_ticket_checks_stay_linear() {
+    on_stack(1 << 28, ticket_checks_stay_linear::<Local>);
+}
+
+#[test]
+fn shared_ticket_checks_stay_linear() {
+    on_stack(1 << 28, ticket_checks_stay_linear::<Shared>);
+}
+
 #[cfg(not(debug_assertions))]
 #[derive(Debug)]
 struct ChainPayload(u64);

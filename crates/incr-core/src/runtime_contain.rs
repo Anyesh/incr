@@ -144,6 +144,9 @@ impl Tickets {
     }
 }
 
+/// The most members a test build's ticket check walks in full.
+const FULL_CHECK_MEMBERS: usize = 64;
+
 pub(crate) fn tickets<C: Cells>() -> C::Lock<Tickets> {
     <C::Lock<Tickets> as Lock<Tickets>>::new(Tickets::default())
 }
@@ -508,6 +511,11 @@ impl<C: Cells> Runtime<C> {
                 t.landings.remove(&m.node);
             }
         }
+        let pushed_from = if cfg!(test) {
+            ticket.members.lock().members.len()
+        } else {
+            0
+        };
         for (n, stamp) in nodes {
             if let Some((j, _)) = t.of(n) {
                 t.leave(j, at);
@@ -532,7 +540,7 @@ impl<C: Cells> Runtime<C> {
             ticket.live += 1;
         }
         if cfg!(test) {
-            self.check_members(&t, id, &ticket);
+            self.check_members(&t, id, &ticket, pushed_from);
         }
         if ticket.live == 0 {
             self.sync_held(&t);
@@ -572,10 +580,22 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Every landing a ticket keeps is in its Failed landing and indexed to
-    /// it: every change from that landing releases it.
-    fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {
+    /// it: every change from that landing releases it. A ticket of more
+    /// than [`FULL_CHECK_MEMBERS`] is walked whole, count included, only
+    /// when this hold took it past a power of two, and otherwise has only
+    /// the members from `pushed_from` on checked: a ticket that grows by a
+    /// landing per hold costs a test build linear work, as it does a
+    /// user's, and a member gone stale is seen within one doubling.
+    fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket, pushed_from: usize) {
         let members = ticket.members.lock();
-        let live = members.members.iter().filter(|m| m.gone == u64::MAX);
+        let len = members.members.len();
+        let full =
+            len <= FULL_CHECK_MEMBERS || pushed_from == 0 || pushed_from.ilog2() != len.ilog2();
+        let from = if full { 0 } else { pushed_from };
+        crate::replay::ticket_checks(len - from);
+        let live = members.members[from..]
+            .iter()
+            .filter(|m| m.gone == u64::MAX);
         let mut n = 0;
         for m in live {
             n += 1;
@@ -596,7 +616,9 @@ impl<C: Cells> Runtime<C> {
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
         }
-        assert_eq!(n, ticket.live, "incr-core: a ticket counts its landings");
+        if full {
+            assert_eq!(n, ticket.live, "incr-core: a ticket counts its landings");
+        }
     }
 
     /// A set's walk flips `id` from Failed to Dirty, under the tickets'
