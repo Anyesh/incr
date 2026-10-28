@@ -4848,6 +4848,15 @@ fn two_thread_lazy_doomed_frame_placeholder_seeds() {
     let case = gen_case(0x7b5e6, false, true);
     let phases = phases(&case, 0x7b5e6);
     let serial = Serial::new(&case, &phases);
+    let overlap = phases
+        .iter()
+        .position(|p| p.ops().contains(&0) && p.ops().contains(&1))
+        .unwrap();
+    let reader = if phases[overlap].of(0) == Some(1) {
+        0
+    } else {
+        1
+    };
     quiet(|| {
         for _ in 0..8 {
             for frames in [None, Some(1), Some(2), Some(3)] {
@@ -4860,20 +4869,24 @@ fn two_thread_lazy_doomed_frame_placeholder_seeds() {
                         let (waits, held, world) =
                             (waits.clone(), held.clone(), live.world.clone());
                         let hook: crate::runtime::ParkHook = Box::new(move |p| {
-                            if TWO_THREAD.with(std::cell::Cell::get).is_none() {
+                            let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                                return;
+                            };
+                            if TWO_PHASE.with(std::cell::Cell::get) != overlap {
                                 return;
                             }
                             let rt = world.rt(0);
                             let n4 = NodeId(world.handle(0, 4).erased().slot());
                             if p == ParkPoint::WalkWaits(n4) {
                                 waits.store(true, SeqCst);
-                            } else if crate::replay::speculating_in(rt.runtime_id)
+                            } else if t == reader
+                                && crate::replay::speculating_in(rt.runtime_id)
                                 && rt.own_claim_owner(n4).is_some()
                                 && !held.swap(true, SeqCst)
                             {
                                 let begun = std::time::Instant::now();
                                 while !waits.load(SeqCst)
-                                    && begun.elapsed() < std::time::Duration::from_secs(2)
+                                    && begun.elapsed() < std::time::Duration::from_secs(10)
                                 {
                                     std::thread::sleep(std::time::Duration::from_millis(1));
                                 }
