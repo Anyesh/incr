@@ -2049,7 +2049,13 @@ fn doom_reservations_cross(len: usize, frames: u32) {
                     (panic_message(|| rt.get(f)), vx)
                 }
             };
-            orders.get_or_init(|| [serial(true), serial(false)]);
+            let got = [serial(true), serial(false)];
+            assert_eq!(crate::waits::registered(), 0);
+            assert!(
+                !crate::reserve::any(),
+                "a reservation outlived a serial read"
+            );
+            assert_eq!(orders.get_or_init(|| got.clone()), &got);
         }
     });
     let orders = orders.get().cloned().unwrap();
