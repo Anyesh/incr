@@ -5455,6 +5455,161 @@ fn two_thread_walk_entry_after_a_claim_wait_matches_unbounded_seed() {
     });
 }
 
+/// A guard, not a red of the walk-plan rule: 0x886d3's phase [21, 22] at
+/// no budget, op 22 (`Get(7)`) visiting 9 while op 21 (`Get(19)`) holds it.
+/// Op 21's attempt lands 20, 19, 18 and 17 Clean, is wounded and gives 9
+/// to 14 back New; op 22's walk still owes the run of 9 it planned, which
+/// closes the cycle through 15 on its stack. A rule that replans the woken
+/// walk from its root reads op 21's surviving landings and drops that run.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_woken_by_a_wound_keeps_the_run_it_owes_seed() {
+    assert!(matches!(gen_case(0x886d3, true, true).ops[22], Op::Get(7)));
+    walk_woken_by_a_released_claim(0x886d3, 22, 21, 9, true);
+}
+
+/// `seed`'s read phase of ops `waiter` and `holder` at no budget, with the
+/// waiter's walk made to wait on spec `node` under the holder's claim at
+/// its `k`-th visit, for `k` from 1 until a try's walk waits: that try's
+/// trace must be an order's, and if `owes_run`, the waiter must claim
+/// `node` again after the wait.
+fn walk_woken_by_a_released_claim(
+    seed: u64,
+    waiter: usize,
+    holder: usize,
+    node: usize,
+    owes_run: bool,
+) {
+    let case = gen_case(seed, true, true);
+    let phases = phases(&case, seed);
+    let overlap = (phases.iter())
+        .position(|p| p.ops().len() == 2 && p.ops().contains(&waiter) && p.ops().contains(&holder))
+        .unwrap();
+    let thread = (0..2)
+        .find(|&t| phases[overlap].of(t) == Some(waiter))
+        .unwrap();
+    let woken = Woken {
+        case: &case,
+        phases: &phases,
+        overlap,
+        thread,
+        waiter,
+        node,
+        owes_run,
+        seed,
+    };
+    for k in 1..=8 {
+        for _ in 0..5 {
+            if woken.try_at(k) {
+                return;
+            }
+        }
+    }
+    panic!("{seed:#x}: op {waiter} never waited on {node} held by op {holder}");
+}
+
+/// The schedule [`walk_woken_by_a_released_claim`] forces: op `waiter`, on
+/// `thread` in phase `overlap`, meeting spec `node` held by the phase's
+/// other op.
+struct Woken<'a> {
+    case: &'a Case,
+    phases: &'a [Phase],
+    overlap: usize,
+    thread: usize,
+    waiter: usize,
+    node: usize,
+    owes_run: bool,
+    seed: u64,
+}
+
+impl Woken<'_> {
+    /// One try with the waiter held at its `k`-th visit of the node until
+    /// the holder claims it, and the holder held after its claim until the
+    /// waiter's walk waits on it; whether the walk waited, and a try where
+    /// it did is checked.
+    fn try_at(&self, k: usize) -> bool {
+        let Woken {
+            case,
+            phases,
+            overlap,
+            thread,
+            waiter,
+            node,
+            owes_run,
+            seed,
+        } = *self;
+        let reached = Arc::new(AtomicBool::new(false));
+        let waited = Arc::new(AtomicBool::new(false));
+        let reclaimed = Arc::new(AtomicBool::new(false));
+        let rig = |live: &Live<Shared>| {
+            let (reached, waited, reclaimed) = (reached.clone(), waited.clone(), reclaimed.clone());
+            let world = live.world.clone();
+            let held_node = NodeId(world.handle(0, node).erased().slot());
+            let visits = AtomicUsize::new(0);
+            let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                    return;
+                }
+                let held = || {
+                    matches!(
+                        world.rt(0).nodes.get(held_node.0).state(),
+                        NodeState::Computing | NodeState::ComputingDirty
+                    )
+                };
+                let on_waiter = TWO_THREAD.with(std::cell::Cell::get) == Some(thread);
+                if on_waiter && p == ParkPoint::BeforeVisit(held_node) {
+                    if visits.fetch_add(1, SeqCst) + 1 == k {
+                        reached.store(true, SeqCst);
+                        wait_for(held, 2000);
+                    }
+                } else if on_waiter && p == ParkPoint::WalkWaits(held_node) {
+                    if reached.load(SeqCst) {
+                        waited.store(true, SeqCst);
+                    }
+                } else if on_waiter && p == ParkPoint::BeforeClaim(held_node) {
+                    if waited.load(SeqCst) {
+                        reclaimed.store(true, SeqCst);
+                    }
+                } else if !on_waiter && p == ParkPoint::BeforeClaim(held_node) {
+                    wait_for(|| reached.load(SeqCst), 2000);
+                } else if !on_waiter
+                    && p == ParkPoint::AfterWalkClaim(held_node)
+                    && reached.load(SeqCst)
+                {
+                    wait_for(|| waited.load(SeqCst), 2000);
+                }
+            });
+            assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+        };
+        let mut met = false;
+        quiet(|| {
+            let serial = Serial::new(case, phases);
+            let verdict = Mutex::new(None);
+            let label = format!("{seed:#x}");
+            let got = run_two_until(case, phases, None, 0, &rig, &|_, prefix, live| {
+                let v = serial.at_overlap(&label, prefix, live);
+                let stop = v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            if !waited.load(SeqCst) {
+                return;
+            }
+            met = true;
+            assert!(
+                reclaimed.load(SeqCst) || !owes_run,
+                "{seed:#x}: op {waiter} dropped the run of {node} it owed after the wait"
+            );
+            serial.check(
+                &format!("{seed:#x}, waiter waiting at its visit {k} of {node}"),
+                &got,
+                verdict.into_inner().unwrap(),
+            );
+        });
+        met
+    }
+}
+
 /// Two-thread seeds with panics or cycles whose overlapping reads, at most
 /// budgets, come out as the unbounded run of the other order: which read
 /// lands a node both read first decides which gets a closure's payload,
@@ -5745,6 +5900,19 @@ fn a_two_thread_dropped_chain_takes_its_member_runs_failure_counts() {
             differential_two(&case, 0x2b13);
         }
     });
+}
+
+/// Waits up to `ms` milliseconds for `done`, and whether it came: a
+/// forced schedule that may not arise waits this long, then goes on.
+fn wait_for(done: impl Fn() -> bool, ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    while !done() {
+        if start.elapsed().as_millis() as u64 >= ms {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
 }
 
 /// Waits for a forced schedule's `done`, failing the test if it stalls.
