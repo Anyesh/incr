@@ -960,6 +960,11 @@ pub(crate) struct Walk {
     /// attempt's retry counts as the unbounded run's walk does.
     root_failed_here: bool,
     failed_from: usize,
+    /// Whether the walk has waited out another thread's claim of its root.
+    /// It waits once: two walks that each claim the other's root as an
+    /// entry would otherwise give back and wait on each other without end
+    /// (0x124b29). Carries over a resume and a restart.
+    root_waited: bool,
     /// What the walk planned under, kept when a doom stashes it.
     planned: Planned,
     /// The runtime's retraction count as the walk last checked it, loaded
@@ -1069,6 +1074,7 @@ impl Walk {
             repushed: None,
             root_failed_here: false,
             failed_from: 0,
+            root_waited: false,
             planned: Planned::default(),
             retracted: 0,
             #[cfg(test)]
@@ -4288,7 +4294,10 @@ impl<C: Cells> Runtime<C> {
                         }
                         continue;
                     }
-                    if is_computing(root_state) && self.claimed_elsewhere(id, root_node) {
+                    if is_computing(root_state)
+                        && !walk.root_waited
+                        && self.claimed_elsewhere(id, root_node)
+                    {
                         self.wait_for_claimed_root(&mut walk, id, gen);
                         planned = self.planned();
                         continue;
@@ -4323,7 +4332,11 @@ impl<C: Cells> Runtime<C> {
                     !is_root,
                     (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur))).then_some(
                         Planned {
-                            root: (!is_root && cur != id && !walk.root_failed_here).then_some(id),
+                            root: (!is_root
+                                && cur != id
+                                && !walk.root_failed_here
+                                && !walk.root_waited)
+                                .then_some(id),
                             ..planned
                         },
                     ),
@@ -4333,7 +4346,7 @@ impl<C: Cells> Runtime<C> {
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
-                    if !is_root && self.root_claimed_elsewhere(id) {
+                    if !is_root && !walk.root_waited && self.root_claimed_elsewhere(id) {
                         self.wait_for_claimed_root(&mut walk, id, gen);
                         planned = self.planned();
                         continue;
@@ -4641,6 +4654,7 @@ impl<C: Cells> Runtime<C> {
     fn wait_for_claimed_root(&self, walk: &mut Walk, root: NodeId, gen: u32) {
         walk.work.clear();
         walk.restart();
+        walk.root_waited = true;
         walk.retracted = self.retraction_count();
         walk.revisit(root, gen);
     }
