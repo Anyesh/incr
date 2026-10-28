@@ -1364,6 +1364,88 @@ fn shared_failed_entry_fan_in() {
     on_stack(1 << 28, failed_entry_fan_in::<Shared>);
 }
 
+/// `n` readers over an `n`-chain, all over its top (`over_top`) or one over
+/// each chain node, first Clean, then each read as a root after a set that
+/// a caught panic at the chain's bottom answers, so that the chain lands
+/// Dirty and each reader fails over its old dep there, then a set below
+/// the chain. Each Failed landing is noted for that set's walk, which
+/// stops at the chain's bottom, with note work linear in the readers and
+/// the chain, not their product.
+fn failed_readers_over_a_dirty_chain<C: Cells>(over_top: bool) {
+    for &n in FAILED_WALK_SIZES {
+        let n = scaled(n);
+        let rt = Runtime::<C>::new();
+        let fail = rt.create_input(0_u64);
+        let gate = rt.create_input(0_u64);
+        let failed = rt.create_query(move |rt| {
+            assert_eq!(rt.get(fail), 0, "failed below the chain");
+            0
+        });
+        let mut chain = vec![rt.create_query(move |rt| {
+            catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1)
+        })];
+        for _ in 1..n {
+            let below = chain[chain.len() - 1];
+            chain.push(rt.create_query(move |rt| rt.get(below) + 1));
+        }
+        let readers: Vec<Incr<u64>> = (0..n)
+            .map(|i| {
+                let dep = chain[if over_top { n - 1 } else { i }];
+                rt.create_query(move |rt| {
+                    let v = rt.get(dep);
+                    assert_eq!(rt.get(gate), 0, "a reader fails over the chain");
+                    v
+                })
+            })
+            .collect();
+        let read_all = || {
+            for &r in &readers {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+            }
+        };
+        read_all();
+        rt.set(fail, 1);
+        rt.set(gate, 1);
+        let work = rt.past_note_work.load(SeqCst);
+        read_all();
+        let work = rt.past_note_work.load(SeqCst) - work;
+        assert_eq!(rt.state_of(chain[n - 1]), NodeState::Dirty);
+        assert_eq!(rt.state_of(readers[n - 1]), NodeState::Failed);
+        assert!(
+            work <= 4 * n as u64,
+            "{work} units of note work for {n} readers over an {n}-chain"
+        );
+        rt.set(fail, 0);
+        read_all();
+    }
+}
+
+#[test]
+fn local_failed_readers_over_a_dirty_chains_top() {
+    on_stack(1 << 28, || failed_readers_over_a_dirty_chain::<Local>(true));
+}
+
+#[test]
+fn shared_failed_readers_over_a_dirty_chains_top() {
+    on_stack(1 << 28, || {
+        failed_readers_over_a_dirty_chain::<Shared>(true)
+    });
+}
+
+#[test]
+fn local_failed_readers_over_each_node_of_a_dirty_chain() {
+    on_stack(1 << 28, || {
+        failed_readers_over_a_dirty_chain::<Local>(false)
+    });
+}
+
+#[test]
+fn shared_failed_readers_over_each_node_of_a_dirty_chain() {
+    on_stack(1 << 28, || {
+        failed_readers_over_a_dirty_chain::<Shared>(false)
+    });
+}
+
 #[cfg(not(debug_assertions))]
 #[derive(Debug)]
 struct ChainPayload(u64);

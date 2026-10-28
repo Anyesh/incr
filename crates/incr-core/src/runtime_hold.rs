@@ -1070,6 +1070,7 @@ impl<C: Cells> Runtime<C> {
                     if let Some(displaced) = node.install_deps(&live) {
                         bag.push_dep_list(displaced);
                     }
+                    self.deps_installed(e.slot);
                 }
                 if let Some((rec, in_group)) = e.undo.rec.take() {
                     self.restore_rec(&mut inner, e.slot, rec, in_group, own);

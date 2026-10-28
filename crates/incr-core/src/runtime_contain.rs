@@ -24,7 +24,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -63,6 +63,11 @@ pub(crate) struct Tickets {
     /// By the slot of a dep a set's walk stops at, the Failed landings over
     /// it (slot, generation) that no walk flagged; see `note_past_sets`.
     past: BTreeMap<u32, Vec<(u32, u32)>>,
+    /// By the slot of a Dirty node below a noted dep, the slots of the
+    /// nodes that read it, up which a take goes to the noted deps.
+    above: BTreeMap<u32, Vec<u32>>,
+    /// The nodes whose Dirty deps `above` holds, each scanned once.
+    scanned: BTreeSet<u32>,
     /// By slot, the generation and stamp of the node's latest Failed
     /// landing under `Shared`. A note names the landing it was made for by
     /// its stamp, so a containment that comes after the node was flipped
@@ -657,28 +662,22 @@ impl<C: Cells> Runtime<C> {
     /// Before `id` lands Failed over `deps`. A set's walk stops at a Dirty
     /// dep, whose dependents the walk that made it Dirty flagged; a dep a
     /// caught panic left Dirty had no such walk. The landing is noted under
-    /// each such dep for the next walk that reaches it, so it lasts its
-    /// revision and not past the dep's next change, except under `Shared`
-    /// for a set whose walk passed the dep before the note was made. A dep
-    /// is judged as this thread sees it, so a landing it holds toward Dirty
-    /// is noted, and so is one a set flagged while held, which publishes
-    /// as flagged, not as its target. A dep still Computing is not noted: on
+    /// each such dep for the next walk that reaches it or a Dirty node below
+    /// it, where a walk from further down stops first (0x5c05), so it lasts
+    /// its revision and not past the dep's next change, except under
+    /// `Shared` for a set whose walk passed the dep before the note was
+    /// made. A dep is judged as this thread sees it, so a landing it holds
+    /// toward Dirty is noted, and so is one a set flagged while held, which
+    /// publishes as flagged, not as its target. A dep still Computing is
+    /// not noted: on
     /// this thread it is an open cycle head the landing belongs to, and a
     /// flip there reruns the caught cycle on every read (0x1daa).
     /// Speculative landings are noted too: the take checks the node.
     #[inline(always)]
     pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
-        let past = |&(dep, _): &(NodeId, u32)| {
-            let cell = self.nodes.get(dep.0).state_cell();
-            let raw = state::load::<C>(cell);
-            raw == NodeState::ComputingDirty
-                || matches!(
-                    self.seen_quietly(cell, raw),
-                    NodeState::Dirty | NodeState::ComputingDirty
-                )
-        };
-        if deps.iter().any(past) {
-            self.note_past(id, generation, deps.iter().filter(|d| past(d)));
+        let past = |dep: NodeId| self.left_past(dep);
+        if deps.iter().any(|&(d, _)| past(d)) {
+            self.note_past(id, generation, deps, past);
         }
     }
 
@@ -721,13 +720,17 @@ impl<C: Cells> Runtime<C> {
             unpublished(failed, published.as_slice())
         };
         if !new.is_empty() {
-            self.note_past(id, node.generation(), new.into_iter());
+            self.note_held(id, node.generation(), new.into_iter());
         }
     }
 
+    /// Notes `id` under `deps` as the reverse edges its publication installs
+    /// would reach it: only a walk that flips a dep takes it, and a walk
+    /// stopping below a dep reaches it through the dep's own notes, so no
+    /// scan below, which would flip it where the published landing stays.
     #[cold]
     #[inline(never)]
-    fn note_past<'a>(
+    fn note_held<'a>(
         &self,
         id: NodeId,
         generation: u32,
@@ -743,8 +746,100 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    #[inline(always)]
+    fn left_past(&self, dep: NodeId) -> bool {
+        let cell = self.nodes.get(dep.0).state_cell();
+        let raw = state::load::<C>(cell);
+        raw == NodeState::ComputingDirty
+            || matches!(
+                self.seen_quietly(cell, raw),
+                NodeState::Dirty | NodeState::ComputingDirty
+            )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_past(
+        &self,
+        id: NodeId,
+        generation: u32,
+        deps: &[(NodeId, u32)],
+        past: impl Fn(NodeId) -> bool,
+    ) {
+        let mut t = self.tickets.write();
+        for &(dep, _) in deps.iter().filter(|&&(d, _)| past(d)) {
+            #[cfg(test)]
+            self.past_note_work.fetch_add(1, Relaxed);
+            let notes = t.past.entry(dep.0).or_default();
+            if !notes.contains(&(id.0, generation)) {
+                notes.push((id.0, generation));
+            }
+            self.failed_past.fetch_or(past_bit(dep.0), Relaxed);
+            self.scan_below(&mut t, dep);
+        }
+    }
+
+    /// Records, once per node until a take passes it, the deps below `dep`
+    /// a walk may stop at with the nodes that read them. A node scanned
+    /// before keeps the deps it had: its deps change only by a run, after a
+    /// set below it that a take on its way up ended.
+    fn scan_below(&self, t: &mut Tickets, dep: NodeId) {
+        let mut stack = vec![dep];
+        while let Some(node) = stack.pop() {
+            if !t.scanned.insert(node.0) {
+                continue;
+            }
+            self.nodes.get(node.0).for_each_dep(|below| {
+                if self.stops_walks(below) {
+                    #[cfg(test)]
+                    self.past_note_work.fetch_add(1, Relaxed);
+                    let above = t.above.entry(below.0).or_default();
+                    if !above.contains(&node.0) {
+                        above.push(node.0);
+                    }
+                    self.failed_past.fetch_or(past_bit(below.0), Relaxed);
+                    stack.push(below);
+                }
+            });
+        }
+    }
+
+    /// `id` installed a new dep list: if it was scanned, its Dirty deps are
+    /// scanned again, as `above` may lack its new ones and the notes above
+    /// it stand (a closure that reads by run count reruns a memo with no
+    /// set and no take).
+    #[inline(always)]
+    pub(super) fn deps_installed(&self, id: u32) {
+        if self.failed_past.load(Relaxed) & past_bit(id) != 0 {
+            self.unscan(id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unscan(&self, id: u32) {
+        let mut t = self.tickets.write();
+        if t.scanned.remove(&id) {
+            self.scan_below(&mut t, NodeId(id));
+        }
+    }
+
+    /// A node below a noted dep that a later walk may stop at: Dirty, or
+    /// still Computing, which a budget's unwind lands Dirty before the
+    /// unbounded run's landing does, so the scans of both agree (0x9593).
+    fn stops_walks(&self, dep: NodeId) -> bool {
+        state::load::<C>(self.nodes.get(dep.0).state_cell()) == NodeState::Computing
+            || self.left_past(dep)
+    }
+
+    /// Recounts the bits only while few slots are noted, so a take stays
+    /// within the entries it removes; past that the bits stay a superset.
     fn sync_past(&self, t: &Tickets) {
-        let bits = t.past.keys().fold(0, |bits, &slot| bits | past_bit(slot));
+        if t.past.len() + t.above.len() > 64 {
+            return;
+        }
+        let bits =
+            (t.past.keys().chain(t.above.keys())).fold(0, |bits, &slot| bits | past_bit(slot));
         self.failed_past.store(bits, Relaxed);
     }
 
@@ -754,13 +849,21 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn take_past_sets(&self, dep: NodeId, queue: &mut Vec<NodeId>) {
-        if !self.tickets.read().past.contains_key(&dep.0) {
+        let noted = |t: &Tickets| t.past.contains_key(&dep.0) || t.above.contains_key(&dep.0);
+        if !noted(&self.tickets.read()) {
             return;
         }
         let mut t = self.tickets.write();
-        let Some(notes) = t.past.remove(&dep.0) else {
+        if !noted(&t) {
             return;
-        };
+        }
+        let mut notes = Vec::new();
+        let mut up = vec![dep.0];
+        while let Some(slot) = up.pop() {
+            t.scanned.remove(&slot);
+            notes.extend(t.past.remove(&slot).into_iter().flatten());
+            up.extend(t.above.remove(&slot).into_iter().flatten());
+        }
         self.sync_past(&t);
         drop(t);
         for (id, generation) in notes {
@@ -844,7 +947,8 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn bury_past(&self, slot: u32) {
         let mut t = self.tickets.write();
-        if t.past.remove(&slot).is_some() {
+        t.scanned.remove(&slot);
+        if t.past.remove(&slot).is_some() | t.above.remove(&slot).is_some() {
             self.sync_past(&t);
         }
     }
