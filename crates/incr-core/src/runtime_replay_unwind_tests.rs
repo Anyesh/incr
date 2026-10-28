@@ -2034,8 +2034,16 @@ thread_local! {
 /// the chain: every read and state is the unbounded run's. `dep` has the
 /// fan read the input, so the walk after the `set` raises the stashed
 /// boxes again, and `deep` puts the outer query over its own chain, so its
-/// frame's retry delivers the reader's box.
+/// frame's retry delivers the reader's box. Under Miri the grid shrinks to
+/// one width, budgets 1 and 3 and chains of 4, still deeper than the
+/// budget; at budget 1 each run must still deliver some box twice and the
+/// reader's box to the outer frame.
 fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
+    let (widths, budgets, chain): (&[usize], &[u32], usize) = if cfg!(miri) {
+        (&[2], &[1, 3], 4)
+    } else {
+        (&[2, 3, 5], &[1, 2, 3, 8], 12)
+    };
     let run = |frames: Option<u32>, n: usize, through: bool, first: bool, dep: bool, deep: bool| {
         FAN_LAST.with(|b| b.borrow_mut().take());
         FAN_FIRST.with(|b| b.borrow_mut().take());
@@ -2066,7 +2074,7 @@ fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
             .collect();
         let mut top = rt.create_query_with(move |rt| rt.get(p), replayable());
         nodes.push(top);
-        for _ in 0..12 {
+        for _ in 0..chain {
             let below = top;
             top = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
             nodes.push(top);
@@ -2097,7 +2105,7 @@ fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
         nodes.push(reader);
         let mut above = rt.create_query_with(move |rt| rt.get(p), replayable());
         nodes.push(above);
-        for _ in 0..12 {
+        for _ in 0..chain {
             let below = above;
             above = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
             nodes.push(above);
@@ -2111,20 +2119,33 @@ fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
         );
         nodes.push(outer);
         let mut outs = vec![get(&rt, outer)];
+        let before = std::mem::take(&mut *rt.deliveries.lock().unwrap());
         rt.set(p, 1);
         outs.push(get(&rt, outer));
         outs.push(get(&rt, nodes[0]));
         outs.push(get(&rt, reader));
         let states: Vec<NodeState> = nodes.iter().map(|&h| rt.state_of(h)).collect();
-        (outs, states)
+        ((outs, states), before, [reader.slot(), outer.slot()])
     };
     let mut differ = Vec::new();
-    for n in [2, 3, 5] {
+    for &n in widths {
         for through in [false, true] {
             for (first, dep, deep) in (0..8).map(|i| (i & 1 != 0, i & 2 != 0, i & 4 != 0)) {
-                let unbounded = run(None, n, through, first, dep, deep);
-                for frames in [1, 2, 3, 8] {
-                    let bounded = run(Some(frames), n, through, first, dep, deep);
+                let (unbounded, ..) = run(None, n, through, first, dep, deep);
+                for &frames in budgets {
+                    let (bounded, delivered, [reader, outer]) =
+                        run(Some(frames), n, through, first, dep, deep);
+                    if frames == 1 {
+                        let fan: Vec<_> = delivered.iter().filter(|d| !d.cycle).collect();
+                        let keys: std::collections::BTreeSet<_> =
+                            fan.iter().map(|d| (d.frame, d.read)).collect();
+                        assert!(
+                            fan.len() > keys.len()
+                                && fan.iter().any(|d| d.frame == outer && d.read == reader),
+                            "n {n} through {through} first {first} dep {dep} deep {deep}: \
+                             no box delivered twice or none to the outer frame: {delivered:?}"
+                        );
+                    }
                     if bounded != unbounded {
                         differ.push(format!(
                             "n {n} through {through} first {first} dep {dep} deep {deep} \
