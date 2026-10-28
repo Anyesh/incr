@@ -4836,11 +4836,14 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
 /// every order of the overlapping reads panics "boom 0:6". The speculative
 /// entry a lazy doomed frame pushed for a read the unbounded run never makes
 /// waited on the other thread, closed a waits-for cycle, and the wound
-/// retried the attempt that had seen the panic; its run drops instead. A
-/// thread that speculates while it holds the claim on 4 holds before its
-/// speculative reads until the other thread, holding 3, waits on 4, so its
-/// read of 3 waits on a thread that waits on it; without that hold the other
-/// thread lands 3 first under suite load.
+/// retried the attempt that had seen the panic; its run drops instead. Since
+/// 33c30fd66, the held-unwind merge onto increment 16, the drop no longer
+/// decides that value: without it the read still gives every order's value.
+/// The pin keeps the schedule in which both threads meet at 4:
+/// op 1's thread, speculating while it holds the claim on 4, holds before its
+/// speculative reads until op 0's thread, holding 3, waits on 4, so its read
+/// of 3 reaches the speculative claim wait in `wait_registered`; without that
+/// hold op 0's thread lands 3 first under suite load.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_lazy_doomed_frame_placeholder_seeds() {
@@ -4904,7 +4907,7 @@ fn two_thread_lazy_doomed_frame_placeholder_seeds() {
     });
     assert!(
         TWO_WAIT_DROPS.with(|d| d.get()) > 0,
-        "no speculative run dropped at a wait"
+        "no speculative read reached the claim wait in wait_registered"
     );
 }
 
