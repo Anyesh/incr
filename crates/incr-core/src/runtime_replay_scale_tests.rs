@@ -2099,7 +2099,7 @@ fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
 /// The read claims each member a bounded number of times, not once per
 /// member below it.
 fn chained_group_reads_claim_once<C: Cells>() {
-    let k = scaled(2000);
+    let k = if cfg!(miri) { 8 } else { scaled(2000) };
     let rt = Runtime::<C>::new();
     let shape = chained_group(&rt, k);
     let before = rt.group_claims.load(SeqCst);
@@ -2112,13 +2112,11 @@ fn chained_group_reads_claim_once<C: Cells>() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn local_chained_group_reads_claim_once() {
     on_stack(64 << 20, chained_group_reads_claim_once::<Local>);
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn shared_chained_group_reads_claim_once() {
     on_stack(64 << 20, chained_group_reads_claim_once::<Shared>);
 }
@@ -2157,20 +2155,19 @@ fn chained_group_outcome<C: Cells>(k: usize, skip: bool) -> (GroupOutcome, u64) 
 /// computes moves no node: the read and every node's state and value
 /// match the read that claims the group at each member.
 fn chained_group_skip_moves_no_node<C: Cells>() {
-    let (with, skipped) = chained_group_outcome::<C>(64, true);
-    let (without, _) = chained_group_outcome::<C>(64, false);
+    let k = if cfg!(miri) { 8 } else { 64 };
+    let (with, skipped) = chained_group_outcome::<C>(k, true);
+    let (without, _) = chained_group_outcome::<C>(k, false);
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn local_chained_group_skip_moves_no_node() {
     on_stack(16 << 20, chained_group_skip_moves_no_node::<Local>);
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn shared_chained_group_skip_moves_no_node() {
     on_stack(16 << 20, chained_group_skip_moves_no_node::<Shared>);
 }
