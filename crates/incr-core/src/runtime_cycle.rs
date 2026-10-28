@@ -3181,7 +3181,7 @@ impl<C: Cells> Runtime<C> {
         // run would claim the members below it again.
         if let Some((member, depth)) = cycle_state::group_blocker(rt, &group) {
             if self.dep_stack.frame_at_is(depth, rt, NodeId(member)) {
-                #[cfg(test)]
+                #[cfg(all(test, not(loom)))]
                 cycle_state::note_group_blocker_skip();
                 return GroupEnd::Ordinary;
             }
