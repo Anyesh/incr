@@ -2067,6 +2067,17 @@ struct ChainedGroup {
 }
 
 fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
+    chained_group_landing_new(rt, k, None).0
+}
+
+/// [`chained_group`] where `xs[at]`'s run, once armed, first lands the
+/// bottom member New unrun, as a doom's discard of it would.
+fn chained_group_landing_new<C: Cells>(
+    rt: &Runtime<C>,
+    k: usize,
+    at: Option<usize>,
+) -> (ChainedGroup, Arc<std::sync::atomic::AtomicBool>) {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let on = rt.create_input(0_i64);
     let root: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
     let m = {
@@ -2080,9 +2091,18 @@ fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
         )
     };
     let mut xs = vec![rt.create_query(move |rt| rt.get(m) + rt.get(on))];
-    for _ in 1..k {
+    for i in 1..k {
         let below = *xs.last().unwrap();
-        xs.push(rt.create_query(move |rt| rt.get(below) + 1));
+        let (bottom, here, armed) = (xs[0], at == Some(k - 1 - i), armed.clone());
+        xs.push(rt.create_query(move |rt| {
+            if here && armed.swap(false, SeqCst) {
+                let node = rt.nodes.get(bottom.slot());
+                if crate::state::try_claim_compute::<C>(node.state_cell()).is_ok() {
+                    rt.land_unrun(crate::NodeId(bottom.slot()), node, NodeState::New);
+                }
+            }
+            rt.get(below) + 1
+        }));
     }
     xs.reverse();
     let r = {
@@ -2093,7 +2113,7 @@ fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
     assert_eq!(rt.get(r), k as i64 - 1);
     rt.force_group_for_test(&xs.iter().map(|x| x.erase()).collect::<Vec<_>>());
     rt.set(on, 1);
-    ChainedGroup { on, m, r, xs }
+    (ChainedGroup { on, m, r, xs }, armed)
 }
 
 /// The read claims each member a bounded number of times, not once per
@@ -2132,11 +2152,18 @@ type GroupOutcome = (
     Vec<Vec<(u32, u32)>>,
 );
 
-fn chained_group_outcome<C: Cells>(k: usize, skip: bool) -> (GroupOutcome, u64) {
+/// The read of `m` with the blocked-record skip on or off, `xs[unrun_at]`
+/// landing the bottom member New if set, and how many skips it took.
+fn chained_group_outcome<C: Cells>(
+    k: usize,
+    skip: bool,
+    unrun_at: Option<usize>,
+) -> (GroupOutcome, u64) {
     crate::cycle_state::set_group_blocker_skip(skip);
     let skips = crate::cycle_state::group_blocker_skips();
     let rt = Runtime::<C>::new();
-    let shape = chained_group(&rt, k);
+    let (shape, armed) = chained_group_landing_new(&rt, k, unrun_at);
+    armed.store(true, SeqCst);
     let read = |h: Incr<i64>| {
         catch_unwind(AssertUnwindSafe(|| rt.get(h))).map_err(super::race_tests::panic_message)
     };
@@ -2181,8 +2208,8 @@ fn chained_group_outcome<C: Cells>(k: usize, skip: bool) -> (GroupOutcome, u64) 
 /// group at each member.
 fn chained_group_skip_moves_no_node<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
-    let (with, skipped) = chained_group_outcome::<C>(k, true);
-    let (without, _) = chained_group_outcome::<C>(k, false);
+    let (with, skipped) = chained_group_outcome::<C>(k, true, None);
+    let (without, _) = chained_group_outcome::<C>(k, false, None);
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
 }
@@ -2195,4 +2222,26 @@ fn local_chained_group_skip_moves_no_node() {
 #[test]
 fn shared_chained_group_skip_moves_no_node() {
     on_stack(16 << 20, chained_group_skip_moves_no_node::<Shared>);
+}
+
+/// A member landing New unrun under the blocker's frame, as a doom's
+/// discard lands one, keeps its record but ends the skip: the read that
+/// skips matches the one that claims the group at each member.
+fn chained_group_unrun_landing_ends_skip<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    let at = Some(k / 2);
+    let (with, skipped) = chained_group_outcome::<C>(k, true, at);
+    let (without, _) = chained_group_outcome::<C>(k, false, at);
+    assert!(skipped > 0, "no group verify took the skip");
+    assert_eq!(with, without);
+}
+
+#[test]
+fn local_chained_group_unrun_landing_ends_skip() {
+    on_stack(16 << 20, chained_group_unrun_landing_ends_skip::<Local>);
+}
+
+#[test]
+fn shared_chained_group_unrun_landing_ends_skip() {
+    on_stack(16 << 20, chained_group_unrun_landing_ends_skip::<Shared>);
 }

@@ -3150,6 +3150,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> GroupEnd {
         let rt = self.runtime_id;
+        let unrun = C::u64_load_acquire(&self.group_unrun_landings);
         let (group, rec_changes) = {
             let inner = self.inner.read();
             (
@@ -3182,13 +3183,15 @@ impl<C: Cells> Runtime<C> {
             return GroupEnd::Ordinary;
         }
         // Step 1 failed on a member this thread's frame computes, after
-        // claiming every member below it. While that frame runs and no
-        // record has changed, no member below it has landed out of its
-        // group, so step 1 fails the same way and keeps the claims in it:
+        // claiming every member below it. While that frame runs, no record
+        // has changed and no member has landed unrun but not Dirty, no
+        // member below it has become unclaimable, so step 1 fails the same
+        // way and keeps the claims in it:
         // each member read inside a member's run would claim the members
         // below it again.
         if let Some(blocker) = cycle_state::group_blocker(rt, &group) {
             if blocker.rec_changes == rec_changes
+                && blocker.unrun == unrun
                 && self
                     .dep_stack
                     .frame_at_is(blocker.depth, rt, NodeId(blocker.member))
@@ -3234,6 +3237,7 @@ impl<C: Cells> Runtime<C> {
                             member: m,
                             depth,
                             rec_changes,
+                            unrun,
                         };
                         cycle_state::note_group_blocker(rt, group.clone(), blocker);
                     }

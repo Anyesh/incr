@@ -1241,12 +1241,14 @@ struct EntryState {
 type GroupBlockers = HashMap<(RuntimeId, usize), (Arc<GroupInfo>, GroupBlocker), FxBuildHasher>;
 
 /// A member a verify failed on, the depth of this thread's frame computing
-/// it, and the runtime's record change count the verify saw.
+/// it, and the runtime's record change and in-group unrun landing counts
+/// the verify saw.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct GroupBlocker {
     pub(crate) member: u32,
     pub(crate) depth: usize,
     pub(crate) rec_changes: u64,
+    pub(crate) unrun: u64,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,

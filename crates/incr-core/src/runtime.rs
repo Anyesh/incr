@@ -1565,6 +1565,10 @@ pub struct Runtime<C: Cells> {
     /// with no new revision, so a stash stands only at the count its run
     /// began under.
     pub(crate) reshapes: C::U64,
+    /// Unrun landings of a group member in a state other than `Dirty`,
+    /// which keep its record: a group verify's blocker stands only while
+    /// none has happened since.
+    pub(crate) group_unrun_landings: C::U64,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -1705,6 +1709,7 @@ impl<C: Cells> Runtime<C> {
             changes: crate::changes::Changes::new(),
             read_speculatively: C::new_u8(0),
             reshapes: C::new_u64(0),
+            group_unrun_landings: C::new_u64(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -6421,6 +6426,11 @@ impl<C: Cells> Runtime<C> {
     /// that a read ordered before its own made.
     pub(crate) fn land_unrun(&self, id: NodeId, node: &NodeData<C>, target: NodeState) {
         self.land_as(id, node, target, target, true);
+        if target != NodeState::Dirty
+            && C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0
+        {
+            C::u64_fetch_add(&self.group_unrun_landings, 1);
+        }
     }
 
     #[inline(always)]
