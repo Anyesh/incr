@@ -1977,13 +1977,13 @@ fn wave6_same_type_zst_note_joins_ticket_after_engine_call<C: Cells>() {
 }
 
 #[test]
-#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+#[ignore = "beta.7: T10-pin-same-type-zst-payload, payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
 fn wave6_local_same_type_zst_note_joins_ticket_after_engine_call() {
     wave6_same_type_zst_note_joins_ticket_after_engine_call::<Local>();
 }
 
 #[test]
-#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+#[ignore = "beta.7: T10-pin-same-type-zst-payload, payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
 fn wave6_shared_same_type_zst_note_joins_ticket_after_engine_call() {
     wave6_same_type_zst_note_joins_ticket_after_engine_call::<Shared>();
 }
