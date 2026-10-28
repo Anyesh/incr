@@ -853,6 +853,10 @@ enum Computed {
     /// and unclaimed, and the walk visits it again, as a read that came
     /// after that landing expands its deps before claiming it.
     Revisit,
+    /// Another thread claimed the walk's root, or landed it Failed, after
+    /// the walk planned this entry: the node was left unrun and unclaimed,
+    /// and the walk waits out the root.
+    RootTaken,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
     /// walk skips it and taints the path under this memo owner.
@@ -3257,7 +3261,7 @@ impl<C: Cells> Runtime<C> {
                     observed = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
                     continue;
                 }
-                Computed::Skipped(_) | Computed::Revisit => {
+                Computed::Skipped(_) | Computed::Revisit | Computed::RootTaken => {
                     unreachable!("incr-core: a walk's root is never skipped or revisited")
                 }
             }
@@ -4356,6 +4360,21 @@ impl<C: Cells> Runtime<C> {
                         planned = self.planned();
                     }
                     walk.revisit(cur, generation);
+                    continue;
+                }
+                // A root Failed since the plan passes the entry at its next
+                // pop. A claimed one is waited out even if its claim has
+                // ended by now: two walks giving back each other's roots
+                // between the checks would otherwise repeat without end.
+                if !C::SINGLE_THREADED && computed == Computed::RootTaken {
+                    #[cfg(test)]
+                    revisited.push(cur);
+                    if state::load::<C>(root_node.state_cell()) == NodeState::Failed {
+                        walk.revisit(cur, generation);
+                    } else {
+                        self.wait_for_claimed_root(&mut walk, id, gen);
+                        planned = self.planned();
+                    }
                     continue;
                 }
                 if !C::SINGLE_THREADED && computed == Computed::Replan {
@@ -5459,7 +5478,7 @@ impl<C: Cells> Runtime<C> {
                 // then waits for the root instead.
                 if p.root.is_some_and(|root| self.root_taken_elsewhere(root)) {
                     self.unclaim_unrun(node, claimed_dirty);
-                    return Computed::Revisit;
+                    return Computed::RootTaken;
                 }
             }
             // No entry check covers the root, so its claim checks for
