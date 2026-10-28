@@ -1604,11 +1604,25 @@ impl<C: Cells> Runtime<C> {
         word: u64,
         first: bool,
     ) -> Result<T, Cycle> {
-        let Some(f) = frame.filter(|_| replay::speculative()) else {
-            return self.read_cold_body(handle, observed, kind, frame, word, first);
-        };
+        match frame.filter(|_| replay::speculative()) {
+            Some(f) => self.read_cold_spec(handle, observed, kind, f, word, first),
+            None => self.read_cold_body(handle, observed, kind, frame, word, first),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_cold_spec<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        kind: ReadKind,
+        f: ActiveRead,
+        word: u64,
+        first: bool,
+    ) -> Result<T, Cycle> {
         let scope = SpecReadScope::open(self.runtime_id, handle.slot(), handle.generation(), f.ctl);
-        let read = self.read_cold_body(handle, observed, kind, frame, word, first);
+        let read = self.read_cold_body(handle, observed, kind, Some(f), word, first);
         self.note_spec_source(f, (handle.slot(), handle.generation()), scope.close());
         read
     }
@@ -1636,7 +1650,35 @@ impl<C: Cells> Runtime<C> {
         replay::spec_source(self.runtime_id, handle.slot(), handle.generation(), source);
     }
 
+    #[inline(never)]
     fn read_cold_body<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        kind: ReadKind,
+        frame: Option<ActiveRead>,
+        word: u64,
+        first: bool,
+    ) -> Result<T, Cycle> {
+        let walk = match self.read_cold_prelude(handle, observed, kind, frame, word, first) {
+            ControlFlow::Break(read) => return read,
+            ControlFlow::Continue(walk) => walk,
+        };
+        let (word, node) = (walk.word, self.nodes.get(handle.slot()));
+        match walk.mode {
+            0 => self.read_walk::<T, 0>(handle, node, observed, kind, word, frame),
+            ARMED => self.read_walk::<T, ARMED>(handle, node, observed, kind, word, frame),
+            VIRT => self.read_walk::<T, VIRT>(handle, node, observed, kind, word, frame),
+            _ => self.read_walk::<T, { ARMED | VIRT }>(handle, node, observed, kind, word, frame),
+        }
+    }
+
+    /// What [`Self::read_cold_body`] does before its walk: a read it
+    /// answers on its own, or the word, walk mode and scopes the walk runs
+    /// under. Out of line so that its frame is off the stack while the
+    /// walk recurses through a deep chain.
+    #[inline(never)]
+    fn read_cold_prelude<T: Value>(
         &self,
         handle: Incr<T>,
         observed: NodeState,
@@ -1644,7 +1686,7 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
         mut word: u64,
         first: bool,
-    ) -> Result<T, Cycle> {
+    ) -> ControlFlow<Result<T, Cycle>, ColdWalk> {
         let foreign = word & value_code::FOREIGN_BIT != 0;
         if foreign {
             value_code::clear_foreign_bit();
@@ -1656,7 +1698,9 @@ impl<C: Cells> Runtime<C> {
                 // would read this runtime again.
                 self.dep_stack.hold_foreign_reader();
             }
-            return Ok(self.value_code_read(handle, self.nodes.get(handle.slot())));
+            return ControlFlow::Break(Ok(
+                self.value_code_read(handle, self.nodes.get(handle.slot()))
+            ));
         }
         // A read while a cycle's unwind kind is set comes from a closure that
         // caught that unwind: the kind is stale, and a panic of the node read
@@ -1689,12 +1733,12 @@ impl<C: Cells> Runtime<C> {
             self.regen_read(NodeId(handle.slot()), handle.generation(), observed);
         }
         if foreign {
-            return self.foreign_read(handle, observed, kind, word, first);
+            return ControlFlow::Break(self.foreign_read(handle, observed, kind, word, first));
         }
         // A delivery goes to its frame's retry in a non-speculative run: a
         // speculative run that computes the same node is on another path,
         // and a doomed frame is the run before the retry.
-        let _scope = (word & value_code::REPLAY_BIT != 0 && !replay::speculative()).then(|| {
+        let scope = (word & value_code::REPLAY_BIT != 0 && !replay::speculative()).then(|| {
             replay::ReadScope {
                 rt: self.runtime_id,
                 reading: u64::from(handle.slot()) | (u64::from(handle.generation()) << 32),
@@ -1704,17 +1748,17 @@ impl<C: Cells> Runtime<C> {
             .filter(|&f| Self::takes_deliveries(word, f))
             .and_then(|f| self.take_delivery(f, handle, kind))
         {
-            return read;
+            return ControlFlow::Break(read);
         }
         let mut mode = 0;
-        let mut _speculating = None;
+        let mut speculating = None;
         if let Some(f) = frame {
             // SAFETY: the active frame's control block is live.
             let ctl = unsafe { &*f.ctl };
             if ctl.has(cycle::DOOMED) {
                 self.park(ParkPoint::DoomedRead(NodeId(handle.slot())));
                 if let Some(value) = self.read_doomed(handle, f) {
-                    return Ok(value);
+                    return ControlFlow::Break(Ok(value));
                 }
                 // Past its placeholder the frame never computes or waits.
                 cycle_state::raise_if_lazy();
@@ -1729,18 +1773,18 @@ impl<C: Cells> Runtime<C> {
                         .is_some()
                 {
                     if self.placeholder::<T>().is_some() && self.drop_cooperatively(Some(f.cidx)) {
-                        return Ok(self.placeholder_read::<T>(frame));
+                        return ControlFlow::Break(Ok(self.placeholder_read::<T>(frame)));
                     }
                     self.drop_unwind();
                 }
                 // A doomed frame has read a placeholder, so the unbounded
                 // run may never make this read: what it computes natively
                 // is speculative, as an entry pushed here would be.
-                _speculating = Some(replay::Speculating::enter(self.runtime_id));
+                speculating = Some(replay::Speculating::enter(self.runtime_id));
             } else {
                 if word & value_code::REPLAY_BIT != 0 {
                     if let Some(read) = self.judge_virtual(handle, f, kind) {
-                        return read;
+                        return ControlFlow::Break(read);
                     }
                 }
                 if self.over_budget(f.depth)
@@ -1755,7 +1799,7 @@ impl<C: Cells> Runtime<C> {
             // Another runtime's doomed frame reads this one: its
             // placeholder may have led it to a read the unbounded run never
             // makes, as a doomed frame's own native read is.
-            _speculating = Some(replay::Speculating::enter(chain));
+            speculating = Some(replay::Speculating::enter(chain));
         }
         // A speculative run of a runtime with no context, read from another
         // runtime's doomed frame, runs in VIRT mode too, so that its
@@ -1766,13 +1810,12 @@ impl<C: Cells> Runtime<C> {
         {
             mode |= VIRT;
         }
-        let node = self.nodes.get(handle.slot());
-        match mode {
-            0 => self.read_walk::<T, 0>(handle, node, observed, kind, word, frame),
-            ARMED => self.read_walk::<T, ARMED>(handle, node, observed, kind, word, frame),
-            VIRT => self.read_walk::<T, VIRT>(handle, node, observed, kind, word, frame),
-            _ => self.read_walk::<T, { ARMED | VIRT }>(handle, node, observed, kind, word, frame),
-        }
+        ControlFlow::Continue(ColdWalk {
+            word,
+            mode,
+            _speculating: speculating,
+            _scope: scope,
+        })
     }
 
     /// Passes `low` to the parent of the frame at position `cidx`: the
@@ -6522,4 +6565,14 @@ impl<T> Exclusive<T> {
     fn get_mut(&mut self) -> &mut T {
         &mut self.0
     }
+}
+
+/// The state [`Runtime::read_cold_prelude`] hands to the walk. The scopes
+/// stay open until the walk returns and drop in the order they did as
+/// locals of one function: the speculation first.
+pub(super) struct ColdWalk {
+    word: u64,
+    mode: u8,
+    _speculating: Option<replay::Speculating>,
+    _scope: Option<replay::ReadScope>,
 }
