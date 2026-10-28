@@ -40,7 +40,7 @@
 //! whose Native closures take `FirstLanded`, so a run of one that the
 //! engine does not treat as the node's first shows in its value.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst,
@@ -9735,17 +9735,18 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
     } else {
         1
     };
-    // A run takes the shape about one time in three under a full suite's
-    // load, so each budget runs until it has taken it twice.
-    const RUNS_PER_BUDGET: usize = 16;
-    let mut shaped = 0;
+    // A run takes the shape about one time in four in debug, and whole
+    // stretches of 32 runs miss it under a full suite's load, so each
+    // budget runs until it has taken it twice.
+    const RUNS_PER_BUDGET: usize = 256;
     quiet(|| {
         for (frames, bytes) in [(Some(3), 0), (None, 0)] {
-            let mut here = 0;
+            let (mut here, mut runs, mut missed) = (0, 0, BTreeMap::<String, usize>::new());
             for _ in 0..RUNS_PER_BUDGET {
                 if here == 2 {
                     break;
                 }
+                runs += 1;
                 let (held, released, passes, timed_out, waits) = (
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
@@ -9828,21 +9829,29 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                     "op 15 neither ended nor waited on op 14's claims within 10 s of the hold"
                 );
                 if released.load(SeqCst) && got[15].0 == Out::Panic("cycle".into()) {
-                    shaped += 1;
                     here += 1;
                     let passes = passes.load(SeqCst);
                     assert!(
                         passes <= case.specs.len(),
                         "op 14's replanned walk reached 2 {passes} times after the release"
                     );
+                } else {
+                    let miss = format!(
+                        "held {} released {} op 15 {:?}",
+                        held.load(SeqCst),
+                        released.load(SeqCst),
+                        got.get(15).map(|g| &g.0)
+                    );
+                    *missed.entry(miss).or_default() += 1;
                 }
             }
+            assert!(
+                here > 0,
+                "op 14 never held before 2 until op 15 had ended with the cycle, with frames \
+                 {frames:?} bytes {bytes}, in {runs} runs: {missed:?}"
+            );
         }
     });
-    assert!(
-        shaped > 0,
-        "op 14 never held before 2 until op 15 had ended with the cycle"
-    );
 }
 
 /// Runs `f` with panic messages from closures silenced: the generated
