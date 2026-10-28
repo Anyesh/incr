@@ -4993,7 +4993,7 @@ impl<C: Cells> Runtime<C> {
     fn settle_key(&self) -> Option<(u64, u64)> {
         let revision = self.current_revision();
         let moves = C::u64_load_acquire(&self.unsettled);
-        (moves % 2 == 0 && C::walked(&self.walk, &self.revision) >= revision).then(|| {
+        (moves.is_multiple_of(2) && C::walked(&self.walk, &self.revision) >= revision).then(|| {
             (
                 revision,
                 C::u64_load_acquire(&self.reshapes).wrapping_add(moves),

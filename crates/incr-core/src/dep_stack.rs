@@ -982,7 +982,9 @@ pub trait DepStack: sealed::Sealed + 'static {
             }
             if let Some(&i) = s.deep.get(&(rt, node)) {
                 if i < near && s.frames.get(i).is_some_and(is) {
-                    debug_assert!(!s.frames[i + 1..near].iter().any(is));
+                    debug_assert!(!s.frames[i + 1..near]
+                        .iter()
+                        .any(|f| f.node == node && f.rt() == rt));
                     return Some(s.frames[i].cidx);
                 }
             }
