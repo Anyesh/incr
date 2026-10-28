@@ -4836,15 +4836,60 @@ fn two_thread_doomed_frame_retracted_member_seeds() {
 /// every order of the overlapping reads panics "boom 0:6". The speculative
 /// entry a lazy doomed frame pushed for a read the unbounded run never makes
 /// waited on the other thread, closed a waits-for cycle, and the wound
-/// retried the attempt that had seen the panic; its run drops instead.
+/// retried the attempt that had seen the panic; its run drops instead. The
+/// thread that speculates has claimed 4 and holds before its speculative
+/// reads until the other thread, holding 3, waits on 4, so its read of 3
+/// waits on a thread that waits on it; without that hold the other thread
+/// lands 3 first under suite load.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_lazy_doomed_frame_placeholder_seeds() {
     TWO_WAIT_DROPS.with(|d| d.set(0));
     let case = gen_case(0x7b5e6, false, true);
+    let phases = phases(&case, 0x7b5e6);
+    let serial = Serial::new(&case, &phases);
     quiet(|| {
         for _ in 0..8 {
-            differential_two(&case, 0x7b5e6);
+            for frames in [None, Some(1), Some(2), Some(3)] {
+                for bytes in [0, 16 * 1024] {
+                    let (waits, held) = (
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    let rig = |live: &Live<Shared>| {
+                        let (waits, held, world) =
+                            (waits.clone(), held.clone(), live.world.clone());
+                        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                            if TWO_THREAD.with(std::cell::Cell::get).is_none() {
+                                return;
+                            }
+                            let rt = world.rt(0);
+                            let n4 = NodeId(world.handle(0, 4).erased().slot());
+                            if p == ParkPoint::WalkWaits(n4) {
+                                waits.store(true, SeqCst);
+                            } else if crate::replay::speculating_in(rt.runtime_id)
+                                && matches!(
+                                    rt.nodes.get(n4.0).state(),
+                                    NodeState::Computing | NodeState::ComputingDirty
+                                )
+                                && !held.swap(true, SeqCst)
+                            {
+                                let begun = std::time::Instant::now();
+                                while !waits.load(SeqCst)
+                                    && begun.elapsed() < std::time::Duration::from_secs(2)
+                                {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                        });
+                        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                    };
+                    let label = format!(
+                        "seed 0x7b5e6, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
+                    );
+                    serial.differential(&label, frames, bytes, &rig);
+                }
+            }
         }
     });
     assert!(
