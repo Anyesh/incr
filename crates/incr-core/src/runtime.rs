@@ -4185,18 +4185,16 @@ impl<C: Cells> Runtime<C> {
         } else {
             self.planned()
         };
-        let mut walk = match resume {
-            Some(walk) => *walk,
-            None => {
-                let mut walk = Walk::new(id, gen, observed);
-                if !C::SINGLE_THREADED {
-                    walk.failed_from = cycle_state::failed_here_count();
-                    walk.retracted = self.retraction_count();
-                    walk.first_planned = planned;
-                }
-                walk
-            }
-        };
+        // Built in place and overwritten by a resumed walk: choosing between
+        // the two in one expression copies the whole walk on every read.
+        let mut walk = Walk::new(id, gen, observed);
+        if let Some(resumed) = resume {
+            walk = *resumed;
+        } else if !C::SINGLE_THREADED {
+            walk.failed_from = cycle_state::failed_here_count();
+            walk.retracted = self.retraction_count();
+            walk.first_planned = planned;
+        }
         let mut ran_unsettled = false;
         let mut root = Computed::Done;
         let root_node = self.nodes.get(id.0);
