@@ -3081,6 +3081,22 @@ impl<C: Cells> Runtime<C> {
         {
             return self.read_cold(handle, observed, kind, frame, word, first);
         }
+        self.read_hot_walk(handle, node, observed, kind, word, frame)
+    }
+
+    /// [`Self::read_walk`] for a read that stays off [`Self::read_cold`],
+    /// out of line so that the frame of a read that goes cold, as every
+    /// read past the frame budget does, does not hold this walk's locals.
+    #[inline(never)]
+    fn read_hot_walk<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        observed: NodeState,
+        kind: ReadKind,
+        word: u64,
+        frame: Option<ActiveRead>,
+    ) -> Result<T, Cycle> {
         self.read_walk::<T, 0, false>(handle, node, observed, kind, word, frame)
     }
 
