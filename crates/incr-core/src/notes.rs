@@ -344,7 +344,6 @@ struct Renoted {
     epoch: u64,
     from_base: u32,
     rt: RuntimeId,
-    key: PayloadKey,
     base: u32,
     cut: Option<Cut>,
 }
@@ -382,11 +381,11 @@ impl Notes {
     /// first `len` entries of its log still noted at removal `epoch`, at
     /// their depths above the copy's base, but those its cut took. When
     /// the copy of the log noted last went to the same place, at an epoch
-    /// no later, under the same cut, and no note has gone since, the
-    /// entries it held are noted already, so only later ones are: a second
-    /// note of a node at the same place retires with the first, and one
-    /// deeper retires with its own frame, as each note of a whole renote
-    /// does.
+    /// no later, under the same cut, and no note has gone since, only the
+    /// later entries are noted, under `key`. The earlier ones stay under
+    /// the key that noted them, so a removal of one key's notes does not
+    /// reach the other's. A second note of a node at the same place
+    /// retires with the first, and one deeper with its own frame.
     pub(crate) fn note_copy(
         &mut self,
         rt: RuntimeId,
@@ -406,8 +405,8 @@ impl Notes {
         } = copy;
         let from = match &log.borrow().renoted {
             Some(r)
-                if (r.renote_gen, r.rt, r.key, r.base, r.from_base)
-                    == (self.renote_gen, rt, key, base, from_base)
+                if (r.renote_gen, r.rt, r.base, r.from_base)
+                    == (self.renote_gen, rt, base, from_base)
                     && r.len <= len
                     && r.epoch <= epoch
                     && match (&r.cut, cut) {
@@ -430,7 +429,6 @@ impl Notes {
             epoch,
             from_base,
             rt,
-            key,
             base,
             cut: cut.cloned(),
         });
@@ -474,7 +472,6 @@ impl Notes {
             epoch,
             from_base: base,
             rt,
-            key,
             base,
             cut: None,
         });

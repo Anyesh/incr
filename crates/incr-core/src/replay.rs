@@ -430,6 +430,37 @@ impl Landings {
     fn retire(&mut self, cidx: u32, ev: &Retire, resumed: Option<PayloadKey>) {
         let source = self.source;
         let ours = |p: PayloadKey| source == Some(p) || resumed == Some(p);
+        // A shared copy's log can hold many other copies' notes, so a
+        // positional event lowers its bounds instead of reading it.
+        if let Nodes::Shared { depth, cut, .. } = &mut self.nodes {
+            let top = match *ev {
+                Retire::Above(at) => Some(i64::from(at)),
+                Retire::Contained { cidx: at, payload } => {
+                    Some(i64::from(at) - i64::from(ours(payload)))
+                }
+                Retire::Landing { .. } => None,
+            };
+            if let Some(top) = top {
+                let Ok(keep) = u32::try_from(top - i64::from(cidx) - 1) else {
+                    self.nodes = Nodes::Owned(Vec::new());
+                    return;
+                };
+                if keep < *depth {
+                    *depth = keep;
+                    match cut {
+                        Some(c) => c.depth = c.depth.min(keep),
+                        None => {
+                            *cut = Some(Cut {
+                                depth: keep,
+                                seen: 0,
+                                landed: Rc::default(),
+                            })
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let gone: Box<dyn Fn((u32, u32), u32) -> bool> = match *ev {
             Retire::Above(at) => Box::new(move |_, pos| pos > at),
             Retire::Contained { cidx: at, payload } => {
@@ -4989,16 +5020,22 @@ mod tests {
         let rt = RuntimeId::for_test(7);
         let source: Box<dyn Any + Send> = Box::new("s");
         let s = payload_key(&*source);
-        let mut from = Notes::new();
-        from.push(rt, s, 1, ((5, 0), 10), false);
-        let early = from.copy(rt, s, 0);
-        from.push(rt, s, 3, ((5, 0), 20), false);
-        let late = from.copy(rt, s, 0);
+        // Each Notes renotes its own source log, as each thread's does.
+        let copies = || {
+            let mut from = Notes::new();
+            from.push(rt, s, 1, ((5, 0), 10), false);
+            let early = from.copy(rt, s, 0);
+            from.push(rt, s, 3, ((5, 0), 20), false);
+            (early, from.copy(rt, s, 0))
+        };
+        let (early, late) = copies();
         let mut reused = Notes::new();
         reused.note_copy(rt, key(&P), 0, early.as_shared().unwrap());
         take_note_work();
         reused.note_copy(rt, key(&P), 0, late.as_shared().unwrap());
         let reusing = take_note_work();
+        let (_, late) = copies();
+        take_note_work();
         let mut whole = Notes::new();
         whole.note_copy(rt, key(&Q), 0, late.as_shared().unwrap());
         assert!(
