@@ -4113,13 +4113,20 @@ impl<C: Cells> Runtime<C> {
                 if !is_root
                     && !C::SINGLE_THREADED
                     && (MODE & VIRT == 0 || walk.repushed.take() != Some(cur))
-                    && state::load::<C>(root_node.state_cell()) == NodeState::Failed
-                    && !self.root_failed_here(&mut walk, id, gen)
                 {
-                    if taint < NO_TAINT {
-                        walk.taint(taint);
+                    let root_state = state::load::<C>(root_node.state_cell());
+                    if root_state == NodeState::Failed && !self.root_failed_here(&mut walk, id, gen)
+                    {
+                        if taint < NO_TAINT {
+                            walk.taint(taint);
+                        }
+                        continue;
                     }
-                    continue;
+                    if is_computing(root_state) && self.claimed_elsewhere(id, root_node) {
+                        self.wait_for_claimed_root(&mut walk, id, gen);
+                        planned = self.planned();
+                        continue;
+                    }
                 }
                 self.park(ParkPoint::BeforeComputeOne(cur));
                 let visit = if is_root || taint >= NO_TAINT {
@@ -4420,6 +4427,30 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// Whether another thread holds the claim on `id`: neither a frame on
+    /// this thread's stack nor this thread's held landing.
+    #[cold]
+    #[inline(never)]
+    fn claimed_elsewhere(&self, id: NodeId, node: &NodeData<C>) -> bool {
+        self.own_claim_owner(id).is_none()
+            && !(hold::active() && hold::shows(state::cell_key::<C>(node.state_cell())))
+    }
+
+    /// Drops the plan of a walk whose root another thread claimed after the
+    /// walk planned it. That thread cleans the root's deps itself, and
+    /// running them here as well can close a cycle among them that reaches
+    /// this read's catcher, where every order reads the root's landing
+    /// (0x173f8). The walk waits for that landing at the root's visit, as a
+    /// read that came after the claim would.
+    #[cold]
+    #[inline(never)]
+    fn wait_for_claimed_root(&self, walk: &mut Walk, root: NodeId, gen: u32) {
+        walk.work.clear();
+        walk.restart();
+        walk.retracted = self.retraction_count();
+        walk.revisit(root, gen);
     }
 
     /// Undoes the expansion of `id` from its pending entry at `pending` on,

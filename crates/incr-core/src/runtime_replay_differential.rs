@@ -8775,6 +8775,85 @@ fn hook() {
     });
 }
 
+/// 0x173f8's ops 3 and 4 with op 4's walk from 2 planned while 2 is
+/// unclaimed: op 4 holds before its entry for 14 until op 3 has claimed 2.
+/// Running 2's deps while op 3 computes 2 closes the 5-6 cycle on op 4's
+/// stack, and the cycle reaches op 4's catcher in 3, which returns 7777
+/// where every order reads 2 Failed and fails.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_waits_for_a_root_another_read_claimed_after_its_plan() {
+    let case = gen_case(0x173f8, false, true);
+    let phases = phases(&case, 0x173f8);
+    let overlap = phases
+        .iter()
+        .position(|p| p.ops().contains(&3) && p.ops().contains(&4))
+        .unwrap();
+    let reader = if phases[overlap].of(0) == Some(4) {
+        0
+    } else {
+        1
+    };
+    let mut shaped = 0;
+    quiet(|| {
+        for (frames, bytes) in [(None, 0), (None, 16384), (Some(2), 0)] {
+            for _ in 0..4 {
+                let (held, seen) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let rig = |live: &Live<Shared>| {
+                    let (held, seen, world) = (held.clone(), seen.clone(), live.world.clone());
+                    let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                    let (n2, n14) = (slot(2), slot(14));
+                    let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                        if TWO_THREAD.with(std::cell::Cell::get) != Some(reader)
+                            || TWO_PHASE.with(std::cell::Cell::get) != overlap
+                            || p != ParkPoint::BeforeComputeOne(n14)
+                        {
+                            return;
+                        }
+                        let rt = world.rt(0);
+                        let state = |n: NodeId| rt.nodes.get(n.0).state();
+                        let is_computing = |s: NodeState| {
+                            matches!(s, NodeState::Computing | NodeState::ComputingDirty)
+                        };
+                        if is_computing(state(n14)) || is_computing(state(n2)) {
+                            return;
+                        }
+                        if held.swap(true, SeqCst) {
+                            return;
+                        }
+                        let begun = std::time::Instant::now();
+                        while !is_computing(state(n2))
+                            && state(n2) != NodeState::Failed
+                            && begun.elapsed() < std::time::Duration::from_secs(10)
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        seen.store(is_computing(state(n2)), SeqCst);
+                    });
+                    assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                };
+                let serial = Serial::new(&case, &phases);
+                let verdict = Mutex::new(None);
+                let got = run_two_until(&case, &phases, frames, bytes, &rig, &|p, prefix, live| {
+                    let v = serial.at_overlap("0x173f8", prefix, live);
+                    let stop = p == overlap || v.is_some();
+                    *verdict.lock().unwrap() = v;
+                    stop
+                });
+                shaped += usize::from(seen.load(SeqCst));
+                serial.check("0x173f8", &got, verdict.into_inner().unwrap());
+            }
+        }
+    });
+    assert!(
+        shaped > 0,
+        "op 4 never reached its entry for 14 with 2 claimed by op 3 after its plan"
+    );
+}
+
 /// Runs `f` with panic messages from closures silenced: the generated
 /// graphs panic on purpose.
 fn quiet(f: impl FnOnce()) {
