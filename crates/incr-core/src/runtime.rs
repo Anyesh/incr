@@ -1508,6 +1508,9 @@ pub struct Runtime<C: Cells> {
     /// The node of every group verification, in order.
     #[cfg(test)]
     pub(crate) group_verifies: std::sync::Mutex<Vec<u32>>,
+    /// Members group verifications tried to claim.
+    #[cfg(test)]
+    pub(crate) group_claims: std::sync::atomic::AtomicU64,
     /// Every claim a wound or a T8 discard landed as unrun: the node,
     /// whether its episode had dissolved on that thread, whether its group
     /// record then named a member that had left it, and whether it landed
@@ -1674,6 +1677,8 @@ impl<C: Cells> Runtime<C> {
             walk_pops: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             group_verifies: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            group_claims: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             unwound_landings: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]

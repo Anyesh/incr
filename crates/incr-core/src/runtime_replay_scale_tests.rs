@@ -2054,3 +2054,71 @@ fn local_speculative_fan_100k_adopts_its_stashes() {
 fn shared_speculative_fan_100k_adopts_its_stashes() {
     speculative_fan_100k::<Shared>();
 }
+
+/// A `k`-member landed group on a chain under `m`, which reads the chain's
+/// top once `on` is set. The read of `m` after that computes the chain
+/// member by member inside `m`'s run, and each member's read of the one
+/// below verifies the group, which fails on the member computing above it.
+struct ChainedGroup {
+    on: Incr<i64>,
+    m: Incr<i64>,
+    r: Incr<i64>,
+    xs: Vec<Incr<i64>>,
+}
+
+fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
+    let on = rt.create_input(0_i64);
+    let root: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let m = {
+        let root = root.clone();
+        rt.create_query_with_fallback(
+            move |rt| match rt.get(on) {
+                0 => 0,
+                _ => rt.get(*root.get().unwrap()) + 1,
+            },
+            |_c: &crate::cycle::Cycle| 100,
+        )
+    };
+    let mut xs = vec![rt.create_query(move |rt| rt.get(m) + rt.get(on))];
+    for _ in 1..k {
+        let below = *xs.last().unwrap();
+        xs.push(rt.create_query(move |rt| rt.get(below) + 1));
+    }
+    xs.reverse();
+    let r = {
+        let top = xs[0];
+        rt.create_query(move |rt| rt.get(top))
+    };
+    root.set(r).unwrap();
+    assert_eq!(rt.get(r), k as i64 - 1);
+    rt.force_group_for_test(&xs.iter().map(|x| x.erase()).collect::<Vec<_>>());
+    rt.set(on, 1);
+    ChainedGroup { on, m, r, xs }
+}
+
+/// The read claims each member a bounded number of times, not once per
+/// member below it.
+fn chained_group_reads_claim_once<C: Cells>() {
+    let k = scaled(2000);
+    let rt = Runtime::<C>::new();
+    let shape = chained_group(&rt, k);
+    let before = rt.group_claims.load(SeqCst);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let claims = rt.group_claims.load(SeqCst) - before;
+    assert!(
+        claims <= 2 * k as u64,
+        "{claims} member claims for a {k}-member group in one read"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_chained_group_reads_claim_once() {
+    on_stack(64 << 20, chained_group_reads_claim_once::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_chained_group_reads_claim_once() {
+    on_stack(64 << 20, chained_group_reads_claim_once::<Shared>);
+}

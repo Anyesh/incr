@@ -3188,6 +3188,9 @@ impl<C: Cells> Runtime<C> {
             // this thread's stack, whose claim the unbounded run fails.
             let virtual_member = value_code::thread_word() & value_code::REPLAY_BIT != 0
                 && self.virtual_position(m, generation).is_some();
+            #[cfg(test)]
+            self.group_claims
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let took = !virtual_member && self.claim_member(x, m, &claimed, bag);
             let mut ok = took;
             if ok && node.generation() != generation {
