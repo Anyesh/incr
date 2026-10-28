@@ -8149,6 +8149,7 @@ fn replay_seeds() {
 /// leaves a node Dirty and the bounded run lands it Clean; 0xa5b returns
 /// other outcomes too.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn strict_dirty_for_clean_seeds() {
     for seed in [0xa5b, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d] {
         let case = gen_base(seed);
