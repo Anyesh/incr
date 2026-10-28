@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::arena_registry::{ArenaRegistry, ArenaTags};
@@ -3143,7 +3144,23 @@ impl<C: Cells> Runtime<C> {
         {
             return self.read_cold(handle, observed, kind, frame, word, first);
         }
-        self.read_walk::<T, 0>(handle, node, observed, kind, word, frame)
+        self.read_hot_walk(handle, node, observed, kind, word, frame)
+    }
+
+    /// [`Self::read_walk`] for a read that stays off [`Self::read_cold`],
+    /// out of line so that the frame of a read that goes cold, as every
+    /// read past the frame budget does, does not hold this walk's locals.
+    #[inline(never)]
+    fn read_hot_walk<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        observed: NodeState,
+        kind: ReadKind,
+        word: u64,
+        frame: Option<ActiveRead>,
+    ) -> Result<T, Cycle> {
+        self.read_walk::<T, 0, false>(handle, node, observed, kind, word, frame)
     }
 
     /// [`Self::read_slow`] for this runtime's first entry inside another
@@ -3176,9 +3193,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The rest of a slow read: a cycle read, or a walk in `MODE` and
-    /// then the slot.
+    /// then the slot. A `COLD` read came through [`Self::read_cold`] and
+    /// reads the slot out of line ([`Self::read_after_walk`]).
     #[inline(always)]
-    fn read_walk<T: Value, const MODE: u8>(
+    fn read_walk<T: Value, const MODE: u8, const COLD: bool>(
         &self,
         handle: Incr<T>,
         node: &NodeData<C>,
@@ -3255,84 +3273,122 @@ impl<C: Cells> Runtime<C> {
                     unreachable!("incr-core: a walk's root is never skipped or revisited")
                 }
             }
-            self.park(ParkPoint::AfterWalk(NodeId(slot)));
-            let (type_tag, arena_slot) = self.fields_under(handle, node);
-            // Under Shared also loaded before the slot is read, so a value
-            // another thread lands Clean after a Dirty read is still noted
-            // as Dirty.
-            let dirty = || {
-                self.seen(node.state_cell(), state::load::<C>(node.state_cell()))
-                    == NodeState::Dirty
-            };
-            let dirty_before = !C::SINGLE_THREADED && frame.is_some() && dirty();
-            // The published state before the slot read, and an unchanged
-            // stash the read may stand on, which must be the same stash once
-            // the value is pinned.
-            let settled_before = spec && state::load::<C>(node.state_cell()).is_settled();
-            let unchanged_before = (spec && !settled_before)
-                .then(|| self.unchanged_serial(slot, handle.generation()))
-                .flatten();
-            let mut dirty_pinned = false;
-            let mut reserving = false;
-            // Under Shared the value is pinned before the clone, which is
-            // user code and may wait on a thread that reads this node, so the
-            // read's reservation of its own node ends there. Local holds no
-            // reservation and no other thread lands the node during the clone.
-            let read = if C::SINGLE_THREADED {
-                self.try_read_slot(handle, node, type_tag, arena_slot)
+            let after = if COLD {
+                self.read_after_walk(handle, node, frame, spec, &mut root)
             } else {
-                self.try_read_slot_then(handle, node, type_tag, arena_slot, || {
-                    // Outside an open context only a doom's pending claims are
-                    // reserved, and no read takes a value before they are adopted.
-                    reserving =
-                        value_code::thread_word() & value_code::REPLAY_BIT != 0 && reserve::any();
-                    dirty_pinned = (frame.is_some() || reserving) && (dirty_before || dirty());
-                    drop(root.take());
-                })
+                self.after_walk(handle, node, frame, spec, &mut root)
             };
-            match read {
-                Some(value) => {
-                    if settled_before {
+            match after {
+                ControlFlow::Break(read) => return read,
+                ControlFlow::Continue(now) => {
+                    observed = now;
+                    root = Some(arm());
+                }
+            }
+        }
+    }
+
+    /// [`Self::after_walk`] out of line, for a read through
+    /// [`Self::read_cold`]: such reads recurse through chains deeper than
+    /// the frame budget, and this keeps the slot read's locals off the
+    /// stack while the walk computes.
+    #[inline(never)]
+    fn read_after_walk<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        frame: Option<ActiveRead>,
+        spec: bool,
+        root: &mut Option<reserve::Root>,
+    ) -> ControlFlow<Result<T, Cycle>, NodeState> {
+        self.after_walk(handle, node, frame, spec, root)
+    }
+
+    /// [`Self::read_walk`] after its walk: the slot read, or the state to
+    /// walk again from.
+    #[inline(always)]
+    fn after_walk<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        frame: Option<ActiveRead>,
+        spec: bool,
+        root: &mut Option<reserve::Root>,
+    ) -> ControlFlow<Result<T, Cycle>, NodeState> {
+        let slot = handle.slot();
+        self.park(ParkPoint::AfterWalk(NodeId(slot)));
+        let (type_tag, arena_slot) = self.fields_under(handle, node);
+        // Under Shared also loaded before the slot is read, so a value
+        // another thread lands Clean after a Dirty read is still noted
+        // as Dirty.
+        let dirty = || {
+            self.seen(node.state_cell(), state::load::<C>(node.state_cell())) == NodeState::Dirty
+        };
+        let dirty_before = !C::SINGLE_THREADED && frame.is_some() && dirty();
+        // The published state before the slot read, and an unchanged
+        // stash the read may stand on, which must be the same stash once
+        // the value is pinned.
+        let settled_before = spec && state::load::<C>(node.state_cell()).is_settled();
+        let unchanged_before = (spec && !settled_before)
+            .then(|| self.unchanged_serial(slot, handle.generation()))
+            .flatten();
+        let mut dirty_pinned = false;
+        let mut reserving = false;
+        // Under Shared the value is pinned before the clone, which is
+        // user code and may wait on a thread that reads this node, so the
+        // read's reservation of its own node ends there. Local holds no
+        // reservation and no other thread lands the node during the clone.
+        let read = if C::SINGLE_THREADED {
+            self.try_read_slot(handle, node, type_tag, arena_slot)
+        } else {
+            self.try_read_slot_then(handle, node, type_tag, arena_slot, || {
+                // Outside an open context only a doom's pending claims are
+                // reserved, and no read takes a value before they are adopted.
+                reserving =
+                    value_code::thread_word() & value_code::REPLAY_BIT != 0 && reserve::any();
+                dirty_pinned = (frame.is_some() || reserving) && (dirty_before || dirty());
+                drop(root.take());
+            })
+        };
+        match read {
+            Some(value) => {
+                if settled_before {
+                    self.spec_source(handle, replay::SpecSource::Settled);
+                }
+                let noted = if C::SINGLE_THREADED {
+                    frame.is_some() && dirty()
+                } else {
+                    dirty_pinned
+                };
+                if noted {
+                    if let Some(f) = frame {
+                        match self.unchanged_serial(handle.slot(), handle.generation()) {
+                            Some(serial) if spec && unchanged_before == Some(serial) => {
+                                self.spec_source(handle, replay::SpecSource::Stash(serial))
+                            }
+                            Some(_) => {}
+                            None => self.note_dirty_read(f, handle, &value),
+                        }
+                    }
+                    if reserving {
+                        self.end_unowed_reservation(slot, handle.generation());
+                    }
+                }
+                ControlFlow::Break(Ok(value))
+            }
+            None => match self.read_missing(handle, node) {
+                Ok(cycle) => {
+                    self.unregenerable(frame);
+                    ControlFlow::Break(Err(cycle))
+                }
+                Err(NodeState::Clean) => {
+                    if spec && state::load::<C>(node.state_cell()).is_settled() {
                         self.spec_source(handle, replay::SpecSource::Settled);
                     }
-                    let noted = if C::SINGLE_THREADED {
-                        frame.is_some() && dirty()
-                    } else {
-                        dirty_pinned
-                    };
-                    if noted {
-                        if let Some(f) = frame {
-                            match self.unchanged_serial(handle.slot(), handle.generation()) {
-                                Some(serial) if spec && unchanged_before == Some(serial) => {
-                                    self.spec_source(handle, replay::SpecSource::Stash(serial))
-                                }
-                                Some(_) => {}
-                                None => self.note_dirty_read(f, handle, &value),
-                            }
-                        }
-                        if reserving {
-                            self.end_unowed_reservation(slot, handle.generation());
-                        }
-                    }
-                    return Ok(value);
+                    ControlFlow::Break(Ok(self.read_slot(handle, node, type_tag, arena_slot)))
                 }
-                None => match self.read_missing(handle, node) {
-                    Ok(cycle) => {
-                        self.unregenerable(frame);
-                        return Err(cycle);
-                    }
-                    Err(NodeState::Clean) => {
-                        if spec && state::load::<C>(node.state_cell()).is_settled() {
-                            self.spec_source(handle, replay::SpecSource::Settled);
-                        }
-                        return Ok(self.read_slot(handle, node, type_tag, arena_slot));
-                    }
-                    Err(now) => {
-                        observed = now;
-                        root = Some(arm());
-                    }
-                },
-            }
+                Err(now) => ControlFlow::Continue(now),
+            },
         }
     }
 
