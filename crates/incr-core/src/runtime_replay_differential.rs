@@ -8775,14 +8775,19 @@ fn hook() {
     });
 }
 
-/// 0x173f8's ops 3 and 4 with op 4's walk from 2 planned while 2 is
-/// unclaimed: op 4 holds before its entry for 14 until op 3 has claimed 2.
-/// Running 2's deps while op 3 computes 2 closes the 5-6 cycle on op 4's
-/// stack, and the cycle reaches op 4's catcher in 3, which returns 7777
-/// where every order reads 2 Failed and fails.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn two_thread_walk_waits_for_a_root_another_read_claimed_after_its_plan() {
+/// Runs 0x173f8's ops 3 and 4 with op 3 held at its first park point until
+/// op 4 reaches a point `at` accepts, then op 4 held there until op 3 has
+/// claimed spec node `ancestor` (or landed it Failed), op 3 held after
+/// that claim until op 4 has looked, and checks every run against the
+/// serial orders. Returns how many runs reached that order.
+fn order_173f8(
+    at: impl Fn(ParkPoint, &dyn Fn(usize) -> NodeId, &dyn Fn(usize) -> bool) -> bool
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    ancestor: usize,
+) -> usize {
     let case = gen_case(0x173f8, false, true);
     let phases = phases(&case, 0x173f8);
     let overlap = phases
@@ -8798,40 +8803,62 @@ fn two_thread_walk_waits_for_a_root_another_read_claimed_after_its_plan() {
     quiet(|| {
         for (frames, bytes) in [(None, 0), (None, 16384), (Some(2), 0)] {
             for _ in 0..4 {
-                let (held, seen) = (
+                let (gated, reached, checked, seen) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                 );
                 let rig = |live: &Live<Shared>| {
-                    let (held, seen, world) = (held.clone(), seen.clone(), live.world.clone());
-                    let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
-                    let (n2, n14) = (slot(2), slot(14));
+                    let (gated, reached, checked, seen, world, at) = (
+                        gated.clone(),
+                        reached.clone(),
+                        checked.clone(),
+                        seen.clone(),
+                        live.world.clone(),
+                        at.clone(),
+                    );
                     let hook: crate::runtime::ParkHook = Box::new(move |p| {
-                        if TWO_THREAD.with(std::cell::Cell::get) != Some(reader)
-                            || TWO_PHASE.with(std::cell::Cell::get) != overlap
-                            || p != ParkPoint::BeforeComputeOne(n14)
-                        {
+                        let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                            return;
+                        };
+                        if TWO_PHASE.with(std::cell::Cell::get) != overlap {
                             return;
                         }
                         let rt = world.rt(0);
-                        let state = |n: NodeId| rt.nodes.get(n.0).state();
-                        let is_computing = |s: NodeState| {
-                            matches!(s, NodeState::Computing | NodeState::ComputingDirty)
+                        let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                        let state = |i: usize| rt.nodes.get(slot(i).0).state();
+                        let computing = |i: usize| {
+                            matches!(state(i), NodeState::Computing | NodeState::ComputingDirty)
                         };
-                        if is_computing(state(n14)) || is_computing(state(n2)) {
-                            return;
-                        }
-                        if held.swap(true, SeqCst) {
-                            return;
-                        }
                         let begun = std::time::Instant::now();
-                        while !is_computing(state(n2))
-                            && state(n2) != NodeState::Failed
-                            && begun.elapsed() < std::time::Duration::from_secs(10)
-                        {
-                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        let hold = |done: &dyn Fn() -> bool| {
+                            while !done() && begun.elapsed() < std::time::Duration::from_secs(10) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        };
+                        if t != reader {
+                            if !gated.swap(true, SeqCst) {
+                                hold(&|| reached.load(SeqCst));
+                            } else if p == ParkPoint::BeforeReservationCheck(slot(ancestor))
+                                && reached.load(SeqCst)
+                            {
+                                hold(&|| checked.load(SeqCst));
+                            }
+                            return;
                         }
-                        seen.store(is_computing(state(n2)), SeqCst);
+                        if at(p, &slot, &computing)
+                            && !computing(ancestor)
+                            && !computing(2)
+                            && !reached.swap(true, SeqCst)
+                        {
+                            hold(&|| computing(ancestor) || state(ancestor) == NodeState::Failed);
+                            seen.store(
+                                computing(ancestor) && (ancestor == 2 || !computing(2)),
+                                SeqCst,
+                            );
+                            checked.store(true, SeqCst);
+                        }
                     });
                     assert!(live.world.rt(0).park_hook.set(hook).is_ok());
                 };
@@ -8843,6 +8870,146 @@ fn two_thread_walk_waits_for_a_root_another_read_claimed_after_its_plan() {
                     *verdict.lock().unwrap() = v;
                     stop
                 });
+                reached.store(true, SeqCst);
+                checked.store(true, SeqCst);
+                shaped += usize::from(seen.load(SeqCst));
+                serial.check("0x173f8", &got, verdict.into_inner().unwrap());
+            }
+        }
+    });
+    shaped
+}
+
+/// 0x173f8's ops 3 and 4 with op 4's walk from 2 planned while 2 is
+/// unclaimed: op 4 holds before its entry for 14 until op 3 has claimed 2.
+/// Running 2's deps while op 3 computes 2 closes the 5-6 cycle on op 4's
+/// stack, and the cycle reaches op 4's catcher in 3, which returns 7777
+/// where every order reads 2 Failed and fails.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_waits_for_a_root_another_read_claimed_after_its_plan() {
+    let shaped = order_173f8(
+        |p, slot, computing| p == ParkPoint::BeforeComputeOne(slot(14)) && !computing(14),
+        2,
+    );
+    assert!(
+        shaped > 0,
+        "op 4 never reached its entry for 14 with 2 claimed by op 3 after its plan"
+    );
+}
+
+/// 0x173f8's ops 3 and 4 with a pending ancestor below the root claimed
+/// after op 4's visit: op 4's walk from 2 queues 8 and 14 under it and
+/// holds before its entry for 14 until op 3 has run 14 and claimed 8 while
+/// 2 is unclaimed. Op 4 then runs 14 below a node op 3 computes, so the
+/// cycle under 14 passes no catcher of op 4's until 3.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_entry_below_an_ancestor_another_read_claimed_seed() {
+    let shaped = order_173f8(
+        |p, slot, computing| p == ParkPoint::BeforeComputeOne(slot(14)) && !computing(14),
+        8,
+    );
+    assert!(
+        shaped > 0,
+        "op 4 never reached its entry for 14 with 8 claimed by op 3 and 2 unclaimed"
+    );
+}
+
+/// 0x173f8's ops 3 and 4 with op 3 claiming 2 while op 4's entry for 14
+/// waits on op 3's claim of 14: op 4 holds before that entry until op 3
+/// has claimed 14, so its root wait sees 2 unclaimed, and op 3 holds after
+/// its claim of 14 until op 4 waits on it. Op 4 then claims 14 under a root
+/// op 3 holds, closes the 5-6 cycle on its own stack, and the cycle reaches
+/// its catcher in 3 as 7777 where every order reads 2 Failed and fails.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
+    let case = gen_case(0x173f8, false, true);
+    let phases = phases(&case, 0x173f8);
+    let overlap = phases
+        .iter()
+        .position(|p| p.ops().contains(&3) && p.ops().contains(&4))
+        .unwrap();
+    let reader = if phases[overlap].of(0) == Some(4) {
+        0
+    } else {
+        1
+    };
+    let mut shaped = 0;
+    quiet(|| {
+        for (frames, bytes) in [(None, 0), (None, 16384), (Some(2), 0)] {
+            for _ in 0..4 {
+                let (gated, at14, waits, seen) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let rig = |live: &Live<Shared>| {
+                    let (gated, at14, waits, seen, world) = (
+                        gated.clone(),
+                        at14.clone(),
+                        waits.clone(),
+                        seen.clone(),
+                        live.world.clone(),
+                    );
+                    let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                    let (n2, n14) = (slot(2), slot(14));
+                    let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                        let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                            return;
+                        };
+                        if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                            return;
+                        }
+                        let rt = world.rt(0);
+                        let state = |n: NodeId| rt.nodes.get(n.0).state();
+                        let computing = |n: NodeId| {
+                            matches!(state(n), NodeState::Computing | NodeState::ComputingDirty)
+                        };
+                        let begun = std::time::Instant::now();
+                        let hold = |done: &dyn Fn() -> bool| {
+                            while !done() && begun.elapsed() < std::time::Duration::from_secs(10) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        };
+                        if t != reader {
+                            if !gated.swap(true, SeqCst) {
+                                hold(&|| at14.load(SeqCst));
+                            }
+                            if (p == ParkPoint::AfterWalkClaim(n14)
+                                || p == ParkPoint::BeforeClaim(n2))
+                                && at14.load(SeqCst)
+                            {
+                                hold(&|| waits.load(SeqCst));
+                            }
+                            return;
+                        }
+                        if p == ParkPoint::BeforeComputeOne(n14)
+                            && !computing(n14)
+                            && !computing(n2)
+                            && !at14.swap(true, SeqCst)
+                        {
+                            hold(&|| computing(n14));
+                        } else if p == ParkPoint::ComputeWaits(n14) && at14.load(SeqCst) {
+                            waits.store(true, SeqCst);
+                        } else if p == ParkPoint::AfterWalkClaim(n14) && waits.load(SeqCst) {
+                            seen.store(computing(n2), SeqCst);
+                        }
+                    });
+                    assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                };
+                let serial = Serial::new(&case, &phases);
+                let verdict = Mutex::new(None);
+                let got = run_two_until(&case, &phases, frames, bytes, &rig, &|p, prefix, live| {
+                    let v = serial.at_overlap("0x173f8", prefix, live);
+                    let stop = p == overlap || v.is_some();
+                    *verdict.lock().unwrap() = v;
+                    stop
+                });
+                at14.store(true, SeqCst);
+                waits.store(true, SeqCst);
                 shaped += usize::from(seen.load(SeqCst));
                 serial.check("0x173f8", &got, verdict.into_inner().unwrap());
             }
@@ -8850,7 +9017,7 @@ fn two_thread_walk_waits_for_a_root_another_read_claimed_after_its_plan() {
     });
     assert!(
         shaped > 0,
-        "op 4 never reached its entry for 14 with 2 claimed by op 3 after its plan"
+        "op 4 never claimed 14 after waiting on it with 2 claimed by op 3"
     );
 }
 

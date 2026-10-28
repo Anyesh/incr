@@ -607,6 +607,8 @@ enum Visit {
 struct Planned {
     all: u64,
     own: u64,
+    /// The walk's root, for an entry below it.
+    root: Option<NodeId>,
 }
 
 #[repr(align(64))]
@@ -4155,14 +4157,23 @@ impl<C: Cells> Runtime<C> {
                     visit,
                     Some(generation),
                     !is_root,
-                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur)))
-                        .then_some(planned),
+                    (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur))).then_some(
+                        Planned {
+                            root: (!is_root && !walk.root_failed_here).then_some(id),
+                            ..planned
+                        },
+                    ),
                     seen,
                 );
                 ran_unsettled |= computed == Computed::Unsettled;
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
+                    if !is_root && self.root_claimed_elsewhere(id) {
+                        self.wait_for_claimed_root(&mut walk, id, gen);
+                        planned = self.planned();
+                        continue;
+                    }
                     if is_root {
                         walk.restart();
                         planned = self.planned();
@@ -4429,6 +4440,23 @@ impl<C: Cells> Runtime<C> {
         root
     }
 
+    /// Whether another thread holds the claim on the walk root `root`.
+    #[inline(always)]
+    fn root_claimed_elsewhere(&self, root: NodeId) -> bool {
+        let node = self.nodes.get(root.0);
+        is_computing(state::load::<C>(node.state_cell())) && self.claimed_elsewhere(root, node)
+    }
+
+    /// [`Self::root_claimed_elsewhere`], or the root landed Failed, for an
+    /// entry the walk planned after finding the root not Failed by this
+    /// thread's reads.
+    #[inline(always)]
+    fn root_taken_elsewhere(&self, root: NodeId) -> bool {
+        let node = self.nodes.get(root.0);
+        let state = state::load::<C>(node.state_cell());
+        state == NodeState::Failed || is_computing(state) && self.claimed_elsewhere(root, node)
+    }
+
     /// Whether another thread holds the claim on `id`: neither a frame on
     /// this thread's stack nor this thread's held landing.
     #[cold]
@@ -4518,7 +4546,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     fn planned(&self) -> Planned {
         if C::SINGLE_THREADED {
-            return Planned { all: 0, own: 0 };
+            return Planned::default();
         }
         let all = C::u64_load_acquire(&self.episodes_landed);
         // This thread's share is at most the count.
@@ -4527,7 +4555,11 @@ impl<C: Cells> Runtime<C> {
         } else {
             cycle_state::own_episodes(self.runtime_id)
         };
-        Planned { all, own }
+        Planned {
+            all,
+            own,
+            root: None,
+        }
     }
 
     /// Whether another thread has landed an episode or released held
@@ -5087,6 +5119,13 @@ impl<C: Cells> Runtime<C> {
                 if self.replan(p) {
                     self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Replan;
+                }
+                // Another thread can claim the root, or land it Failed,
+                // after the walk's check of it before this entry: the walk
+                // then waits for the root instead.
+                if p.root.is_some_and(|root| self.root_taken_elsewhere(root)) {
+                    self.unclaim_unrun(node, claimed_dirty);
+                    return Computed::Revisit;
                 }
             }
             // No entry check covers the root, so its claim checks for
