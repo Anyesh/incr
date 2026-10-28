@@ -1258,11 +1258,14 @@ type GroupExternalsMap =
     HashMap<(RuntimeId, usize), (Arc<GroupInfo>, GroupExternals), FxBuildHasher>;
 
 /// A group's deps outside it, in the order an expansion reads them, as the
-/// runtime's record change and in-group unrun landing counts left them.
+/// runtime's record change and in-group unrun landing counts left them,
+/// less those found settled while the revision and the runtime's count of
+/// settled nodes made unsettled stood at `settle`.
 #[derive(Clone)]
 pub(crate) struct GroupExternals {
     pub(crate) rec_changes: u64,
     pub(crate) unrun: u64,
+    pub(crate) settle: (u64, u64),
     pub(crate) deps: Rc<[GroupExternal]>,
     /// The runtime's held-mark change count and the first held member it
     /// left, once a `Shared` expansion has scanned the marks.
@@ -1773,12 +1776,12 @@ pub(crate) fn group_blocker(rt: RuntimeId, group: &Arc<GroupInfo>) -> Option<Gro
     })
 }
 
-/// What an expansion of `group` read in this outermost entry, if neither
-/// count has changed since.
+/// What an expansion of `group` read in this outermost entry, if no count
+/// has changed since.
 pub(crate) fn group_externals(
     rt: RuntimeId,
     group: &Arc<GroupInfo>,
-    (rec_changes, unrun): (u64, u64),
+    (rec_changes, unrun, settle): (u64, u64, (u64, u64)),
 ) -> Option<GroupExternals> {
     if !group_externals_reuse() {
         return None;
@@ -1790,7 +1793,8 @@ pub(crate) fn group_externals(
         }
         let key = (rt, Arc::as_ptr(group) as usize);
         let (_, ext) = o.group_externals.get(&key)?;
-        (ext.rec_changes == rec_changes && ext.unrun == unrun).then(|| ext.clone())
+        (ext.rec_changes == rec_changes && ext.unrun == unrun && ext.settle == settle)
+            .then(|| ext.clone())
     })
 }
 

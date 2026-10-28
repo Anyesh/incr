@@ -1534,6 +1534,9 @@ pub struct Runtime<C: Cells> {
     /// Group expansions that listed the group's deps.
     #[cfg(test)]
     pub(crate) group_listings: std::sync::atomic::AtomicU64,
+    /// States of deps outside an expanded group loaded.
+    #[cfg(test)]
+    pub(crate) group_external_loads: std::sync::atomic::AtomicU64,
     /// Every claim a wound or a T8 discard landed as unrun: the node,
     /// whether its episode had dissolved on that thread, whether its group
     /// record then named a member that had left it, and whether it landed
@@ -1592,6 +1595,11 @@ pub struct Runtime<C: Cells> {
     /// which keep its record: a group verify's blocker stands only while
     /// none has happened since.
     pub(crate) group_unrun_landings: C::U64,
+    /// Moves of a settled node to unsettled with no new revision that
+    /// `reshapes` does not count: a held landing's give-back unverifying
+    /// its readers, and a replay rerun of a Failed node. Counted before
+    /// the move.
+    pub(crate) unsettled: C::U64,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -1713,6 +1721,8 @@ impl<C: Cells> Runtime<C> {
             #[cfg(test)]
             group_listings: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
+            group_external_loads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             unwound_landings: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             dooms: std::sync::Mutex::new(Vec::new()),
@@ -1736,6 +1746,7 @@ impl<C: Cells> Runtime<C> {
             reshapes: C::new_u64(0),
             held_marks: C::new_u64(0),
             group_unrun_landings: C::new_u64(0),
+            unsettled: C::new_u64(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -4829,22 +4840,40 @@ impl<C: Cells> Runtime<C> {
         let pending = walk.visit_pending_marked(cur, generation, NO_TAINT_GROUP);
         // Each read in a member's run of a member below it expands the
         // group again, so the group's deps are listed once per entry.
-        let listed = cycle_state::group_externals(self.runtime_id, &group, (rec_changes, unrun));
+        let settle = self.settle_key();
+        let listed =
+            cycle_state::group_externals(self.runtime_id, &group, (rec_changes, unrun, settle));
         #[cfg(all(test, not(loom)))]
         if listed.is_some() {
             cycle_state::note_group_externals_reuse();
         }
         let mut changed = listed.is_none();
-        let mut ext = listed.unwrap_or_else(|| self.list_group_externals(&group));
-        for &step in ext.deps.iter() {
-            match step {
+        let mut ext = listed.unwrap_or_else(|| self.list_group_externals(&group, settle));
+        // A dep found settled stays settled until the settle key moves, so
+        // later expansions in the entry skip it.
+        let mut kept: Option<Vec<cycle_state::GroupExternal>> = None;
+        for (i, &step) in ext.deps.iter().enumerate() {
+            let keep = match step {
                 cycle_state::GroupExternal::Dep(dep) => self.expand_external(walk, NodeId(dep)),
-                cycle_state::GroupExternal::Left(m) => self.nodes.get(m).for_each_dep(|dep| {
-                    if !group.has_slot(dep.0) {
-                        self.expand_external(walk, dep);
-                    }
-                }),
+                cycle_state::GroupExternal::Left(m) => {
+                    self.nodes.get(m).for_each_dep(|dep| {
+                        if !group.has_slot(dep.0) {
+                            self.expand_external(walk, dep);
+                        }
+                    });
+                    true
+                }
+            };
+            match (&mut kept, keep) {
+                (Some(kept), true) => kept.push(step),
+                (None, false) => kept = Some(ext.deps[..i].to_vec()),
+                _ => {}
             }
+        }
+        if let Some(kept) = kept {
+            ext.deps = kept.into();
+            ext.settle = settle;
+            changed = true;
         }
         if !C::SINGLE_THREADED {
             let marks = C::u64_load_acquire(&self.held_marks);
@@ -4881,7 +4910,11 @@ impl<C: Cells> Runtime<C> {
     /// the record change count they stand at.
     #[cold]
     #[inline(never)]
-    fn list_group_externals(&self, group: &Arc<GroupInfo>) -> cycle_state::GroupExternals {
+    fn list_group_externals(
+        &self,
+        group: &Arc<GroupInfo>,
+        settle: (u64, u64),
+    ) -> cycle_state::GroupExternals {
         #[cfg(test)]
         self.group_listings
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4917,22 +4950,39 @@ impl<C: Cells> Runtime<C> {
         cycle_state::GroupExternals {
             rec_changes,
             unrun,
+            settle,
             deps: deps.into(),
             held: None,
         }
     }
 
     /// Pushes `dep`, a dep outside an expanded group, unless it is settled.
+    /// False if its state loaded settled.
     #[inline]
-    fn expand_external(&self, walk: &mut Walk, dep: NodeId) {
+    fn expand_external(&self, walk: &mut Walk, dep: NodeId) -> bool {
+        #[cfg(test)]
+        self.group_external_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dep_node = self.nodes.get(dep.0);
         let dep_state = state::load::<C>(dep_node.state_cell());
-        if !dep_state.is_settled() {
-            let dep_state = self.seen(dep_node.state_cell(), dep_state);
-            if !dep_state.is_settled() {
-                walk.expand(dep, dep_node.generation(), dep_state);
-            }
+        if dep_state.is_settled() {
+            return false;
         }
+        let dep_state = self.seen(dep_node.state_cell(), dep_state);
+        if !dep_state.is_settled() {
+            walk.expand(dep, dep_node.generation(), dep_state);
+        }
+        true
+    }
+
+    /// The revision, and the reshapes and other moves of a settled node to
+    /// unsettled within it: a state loaded settled stays so while neither
+    /// moves.
+    fn settle_key(&self) -> (u64, u64) {
+        (
+            self.current_revision(),
+            C::u64_load_acquire(&self.reshapes).wrapping_add(C::u64_load_acquire(&self.unsettled)),
+        )
     }
 
     /// Whether another thread changed `id`'s group record since the walk

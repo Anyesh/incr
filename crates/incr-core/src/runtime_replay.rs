@@ -2976,6 +2976,7 @@ impl<C: Cells> Runtime<C> {
         // which never waits, so this waits it out. The claim is noted first,
         // so a rerun that finds the node Computing sees it.
         replay::regen_claim(self.runtime_id, id.0, true);
+        C::u64_fetch_add(&self.unsettled, 1);
         let mut spins = 0;
         loop {
             // A ticket keeps the node while it reruns (`in_failed_landing`).

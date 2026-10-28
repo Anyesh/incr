@@ -2067,16 +2067,18 @@ struct ChainedGroup {
 }
 
 fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
-    chained_group_landing_new(rt, k, None).0
+    chained_group_with(rt, k, None, false).0
 }
 
-/// [`chained_group`] where `xs[at]`'s run, once armed (1), first lands the
-/// bottom member New unrun from the claim a blocked verify kept on it, as
-/// a doom's discard of that claim would, and then reads 2.
-fn chained_group_landing_new<C: Cells>(
+/// [`chained_group`] where each member also reads an input of its own if
+/// `inputs`, and where `xs[at]`'s run, once armed (1), first claims the
+/// bottom member and lands it New unrun, as a doom's discard of its claim
+/// would, and then reads 2.
+fn chained_group_with<C: Cells>(
     rt: &Runtime<C>,
     k: usize,
     at: Option<usize>,
+    inputs: bool,
 ) -> (ChainedGroup, Arc<AtomicU32>) {
     let armed = Arc::new(AtomicU32::new(0));
     let on = rt.create_input(0_i64);
@@ -2091,19 +2093,22 @@ fn chained_group_landing_new<C: Cells>(
             |_c: &crate::cycle::Cycle| 100,
         )
     };
-    let mut xs = vec![rt.create_query(move |rt| rt.get(m) + rt.get(on))];
+    let own = || inputs.then(|| rt.create_input(0_i64));
+    let y = own();
+    let mut xs =
+        vec![rt.create_query(move |rt| rt.get(m) + rt.get(on) + y.map_or(0, |y| rt.get(y)))];
     for i in 1..k {
         let below = *xs.last().unwrap();
-        let (bottom, here, armed) = (xs[0], at == Some(k - 1 - i), armed.clone());
+        let (bottom, here, armed, y) = (xs[0], at == Some(k - 1 - i), armed.clone(), own());
         xs.push(rt.create_query(move |rt| {
             if here && armed.swap(0, SeqCst) == 1 {
                 let node = rt.nodes.get(bottom.slot());
-                if crate::state::load::<C>(node.state_cell()) == NodeState::Computing {
+                if crate::state::try_claim_compute::<C>(node.state_cell()).is_ok() {
                     rt.land_unrun(crate::NodeId(bottom.slot()), node, NodeState::New);
                     armed.store(2, SeqCst);
                 }
             }
-            rt.get(below) + 1
+            rt.get(below) + y.map_or(0, |y| rt.get(y)) + 1
         }));
     }
     xs.reverse();
@@ -2121,14 +2126,22 @@ fn chained_group_landing_new<C: Cells>(
 /// The read claims each member a bounded number of times, not once per
 /// member below it.
 fn chained_group_reads_claim_once<C: Cells>() {
-    let k = if cfg!(miri) { 8 } else { scaled(2000) };
+    let k = if cfg!(miri) {
+        8
+    } else if cfg!(debug_assertions) {
+        scaled(500)
+    } else {
+        scaled(2000)
+    };
     let rt = Runtime::<C>::new();
     let shape = chained_group(&rt, k);
     let before = rt.group_claims.load(SeqCst);
     let listed = rt.group_listings.load(SeqCst);
+    let loaded = rt.group_external_loads.load(SeqCst);
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
     let claims = rt.group_claims.load(SeqCst) - before;
     let listings = rt.group_listings.load(SeqCst) - listed;
+    let loads = rt.group_external_loads.load(SeqCst) - loaded;
     assert!(got.is_ok(), "the read of m panicked");
     assert!(
         (k as u64 - 1..=2 * k as u64).contains(&claims),
@@ -2138,6 +2151,43 @@ fn chained_group_reads_claim_once<C: Cells>() {
         listings <= 4,
         "{listings} listings of a {k}-member group's deps in one read"
     );
+    assert!(
+        loads <= 4 * k as u64,
+        "{loads} loads of a {k}-member group's deps in one read"
+    );
+}
+
+/// A group whose members each read an input of their own has k deps
+/// outside it; the read loads each a bounded number of times, not once
+/// per nested expansion.
+fn input_chained_group_loads_each_dep_once<C: Cells>() {
+    let k = if cfg!(miri) {
+        8
+    } else if cfg!(debug_assertions) {
+        scaled(500)
+    } else {
+        scaled(2000)
+    };
+    let rt = Runtime::<C>::new();
+    let (shape, _) = chained_group_with(&rt, k, None, true);
+    let loaded = rt.group_external_loads.load(SeqCst);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let loads = rt.group_external_loads.load(SeqCst) - loaded;
+    assert!(got.is_ok(), "the read of m panicked");
+    assert!(
+        loads <= 4 * k as u64,
+        "{loads} loads of a {k}-member group's {k} outside deps in one read"
+    );
+}
+
+#[test]
+fn local_input_chained_group_loads_each_dep_once() {
+    on_stack(64 << 20, input_chained_group_loads_each_dep_once::<Local>);
+}
+
+#[test]
+fn shared_input_chained_group_loads_each_dep_once() {
+    on_stack(64 << 20, input_chained_group_loads_each_dep_once::<Shared>);
 }
 
 #[test]
@@ -2161,19 +2211,21 @@ type GroupOutcome = (
 );
 
 /// The read of `m` with the blocked-record skip and the listed-externals
-/// reuse as given, `xs[unrun_at]` landing the bottom member New if set,
-/// how many skips and reuses it took, and whether the bottom landed.
+/// reuse as given, `xs[unrun_at]` landing the bottom member New if set and
+/// each member reading its own input if `inputs`, how many skips and reuses
+/// it took, and whether the bottom landed.
 fn chained_group_outcome<C: Cells>(
     k: usize,
     (skip, reuse): (bool, bool),
     unrun_at: Option<usize>,
+    inputs: bool,
 ) -> (GroupOutcome, u64, u64, bool) {
     crate::cycle_state::set_group_blocker_skip(skip);
     crate::cycle_state::set_group_externals_reuse(reuse);
     let skips = crate::cycle_state::group_blocker_skips();
     let reuses = crate::cycle_state::group_externals_reuses();
     let rt = Runtime::<C>::new();
-    let (shape, armed) = chained_group_landing_new(&rt, k, unrun_at);
+    let (shape, armed) = chained_group_with(&rt, k, unrun_at, inputs);
     armed.store(1, SeqCst);
     let read = |h: Incr<i64>| {
         catch_unwind(AssertUnwindSafe(|| rt.get(h))).map_err(super::race_tests::panic_message)
@@ -2222,8 +2274,8 @@ fn chained_group_outcome<C: Cells>(
 /// group at each member.
 fn chained_group_skip_moves_no_node<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
-    let (with, skipped, ..) = chained_group_outcome::<C>(k, (true, true), None);
-    let (without, ..) = chained_group_outcome::<C>(k, (false, true), None);
+    let (with, skipped, ..) = chained_group_outcome::<C>(k, (true, true), None, false);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), None, false);
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
 }
@@ -2244,8 +2296,8 @@ fn shared_chained_group_skip_moves_no_node() {
 fn chained_group_unrun_landing_ends_skip<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
     let at = Some(k / 2);
-    let (with, skipped, _, landed) = chained_group_outcome::<C>(k, (true, true), at);
-    let (without, ..) = chained_group_outcome::<C>(k, (false, true), at);
+    let (with, skipped, _, landed) = chained_group_outcome::<C>(k, (true, true), at, false);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), at, false);
     assert!(landed, "the bottom member was not claimed to land");
     assert!(skipped > 0, "no group verify took the skip");
     assert_eq!(with, without);
@@ -2266,11 +2318,14 @@ fn shared_chained_group_unrun_landing_ends_skip() {
 /// group record match the read that lists them at each expansion.
 fn chained_group_reuse_moves_no_node<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
-    for at in [None, Some(k / 2)] {
-        let (with, _, reused, _) = chained_group_outcome::<C>(k, (true, true), at);
-        let (without, ..) = chained_group_outcome::<C>(k, (true, false), at);
+    for (at, inputs) in [(None, false), (Some(k / 2), false), (None, true)] {
+        let (with, _, reused, _) = chained_group_outcome::<C>(k, (true, true), at, inputs);
+        let (without, ..) = chained_group_outcome::<C>(k, (true, false), at, inputs);
         assert!(reused > 0, "no group expansion reused a listing");
-        assert_eq!(with, without, "bottom landed New at {at:?}");
+        assert_eq!(
+            with, without,
+            "bottom landed New at {at:?}, inputs {inputs}"
+        );
     }
 }
 
