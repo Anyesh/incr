@@ -1236,9 +1236,18 @@ struct EntryState {
 }
 
 /// Per (runtime, group record address): the record, the member a verify
-/// of it failed on, and the depth of this thread's frame computing that
-/// member.
-type GroupBlockers = HashMap<(RuntimeId, usize), (Arc<GroupInfo>, u32, usize), FxBuildHasher>;
+/// of it failed on, the depth of this thread's frame computing that
+/// member, and the runtime's record change count the verify saw.
+type GroupBlockers = HashMap<(RuntimeId, usize), (Arc<GroupInfo>, GroupBlocker), FxBuildHasher>;
+
+/// A member a verify failed on, the depth of this thread's frame computing
+/// it, and the runtime's record change count the verify saw.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct GroupBlocker {
+    pub(crate) member: u32,
+    pub(crate) depth: usize,
+    pub(crate) rec_changes: u64,
+}
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
 /// and the cycle the last uncaught cycle panic reported.
@@ -1706,30 +1715,25 @@ pub(crate) fn is_dissolved_group(rt: RuntimeId, root: u32, group: &Arc<GroupInfo
     })
 }
 
-/// Notes that a verify of `group` failed on `member`, which this
-/// thread's frame at `depth` computes.
-pub(crate) fn note_group_blocker(rt: RuntimeId, group: Arc<GroupInfo>, member: u32, depth: usize) {
+/// Notes the blocker a verify of `group` failed on.
+pub(crate) fn note_group_blocker(rt: RuntimeId, group: Arc<GroupInfo>, blocker: GroupBlocker) {
     let key = (rt, Arc::as_ptr(&group) as usize);
-    OUTER.with(|o| {
-        o.borrow_mut()
-            .group_blockers
-            .insert(key, (group, member, depth))
-    });
+    OUTER.with(|o| o.borrow_mut().group_blockers.insert(key, (group, blocker)));
     ENTRY.with(|e| e.outer_set.set(true));
 }
 
-/// The member and frame depth a verify of `group` last failed on in this
-/// outermost entry.
-pub(crate) fn group_blocker(rt: RuntimeId, group: &Arc<GroupInfo>) -> Option<(u32, usize)> {
+/// The blocker a verify of `group` last failed on in this outermost entry.
+pub(crate) fn group_blocker(rt: RuntimeId, group: &Arc<GroupInfo>) -> Option<GroupBlocker> {
     if !group_blocker_skip() {
         return None;
     }
-    let key = (rt, Arc::as_ptr(group) as usize);
     OUTER.with(|o| {
-        o.borrow()
-            .group_blockers
-            .get(&key)
-            .map(|&(_, member, depth)| (member, depth))
+        let o = o.borrow();
+        if o.group_blockers.is_empty() {
+            return None;
+        }
+        let key = (rt, Arc::as_ptr(group) as usize);
+        o.group_blockers.get(&key).map(|&(_, blocker)| blocker)
     })
 }
 

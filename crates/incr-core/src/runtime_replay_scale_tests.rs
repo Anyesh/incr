@@ -2103,10 +2103,11 @@ fn chained_group_reads_claim_once<C: Cells>() {
     let rt = Runtime::<C>::new();
     let shape = chained_group(&rt, k);
     let before = rt.group_claims.load(SeqCst);
-    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
     let claims = rt.group_claims.load(SeqCst) - before;
+    assert!(got.is_ok(), "the read of m panicked");
     assert!(
-        claims <= 2 * k as u64,
+        (k as u64 - 1..=2 * k as u64).contains(&claims),
         "{claims} member claims for a {k}-member group in one read"
     );
 }
@@ -2121,11 +2122,14 @@ fn shared_chained_group_reads_claim_once() {
     on_stack(64 << 20, chained_group_reads_claim_once::<Shared>);
 }
 
-/// The read's answer, then every node's state, then every node's value.
+/// The read's answer, every node's state and value, then every slot's
+/// deps and group record.
 type GroupOutcome = (
     Result<i64, String>,
     Vec<NodeState>,
     Vec<Result<i64, String>>,
+    Vec<Vec<u32>>,
+    Vec<Vec<(u32, u32)>>,
 );
 
 fn chained_group_outcome<C: Cells>(k: usize, skip: bool) -> (GroupOutcome, u64) {
@@ -2143,17 +2147,38 @@ fn chained_group_outcome<C: Cells>(k: usize, skip: bool) -> (GroupOutcome, u64) 
         .collect();
     let states = nodes.iter().map(|&h| rt.state_of(h)).collect();
     let values = nodes.iter().map(|&h| read(h)).collect();
+    let slots = 0..rt.nodes.len();
+    let deps = slots
+        .clone()
+        .map(|x| {
+            let mut d = Vec::new();
+            rt.nodes.get(x).for_each_dep(|n| d.push(n.0));
+            d
+        })
+        .collect();
+    let groups = {
+        let inner = rt.inner.read();
+        slots
+            .map(|x| {
+                inner
+                    .member_recs
+                    .get(&x)
+                    .map_or(Vec::new(), |g| g.members.clone())
+            })
+            .collect()
+    };
     crate::cycle_state::set_group_blocker_skip(true);
     rt.assert_invariant_i();
     (
-        (got, states, values),
+        (got, states, values, deps, groups),
         crate::cycle_state::group_blocker_skips() - skips,
     )
 }
 
 /// Ending a verify early on a record blocked by a member this thread
-/// computes moves no node: the read and every node's state and value
-/// match the read that claims the group at each member.
+/// computes moves no node: the read, every node's state and value, and
+/// every slot's deps and group record match the read that claims the
+/// group at each member.
 fn chained_group_skip_moves_no_node<C: Cells>() {
     let k = if cfg!(miri) { 8 } else { 64 };
     let (with, skipped) = chained_group_outcome::<C>(k, true);

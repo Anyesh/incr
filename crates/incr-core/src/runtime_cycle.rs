@@ -3150,7 +3150,13 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> GroupEnd {
         let rt = self.runtime_id;
-        let group = self.inner.read().member_recs.get(&x.0).cloned();
+        let (group, rec_changes) = {
+            let inner = self.inner.read();
+            (
+                inner.member_recs.get(&x.0).cloned(),
+                inner.member_rec_changes,
+            )
+        };
         // The flags byte was loaded under the claim, and a record and its
         // bit change together under the claim, so a missing record is a
         // stale bit.
@@ -3175,12 +3181,18 @@ impl<C: Cells> Runtime<C> {
         if cycle_state::is_dissolved_group(rt, x.0, &group) {
             return GroupEnd::Ordinary;
         }
-        // A member this thread's frame computes fails step 1 of every
-        // verify of the record while the frame runs, and that failure keeps
-        // the claims in their group, so each member read inside a member's
-        // run would claim the members below it again.
-        if let Some((member, depth)) = cycle_state::group_blocker(rt, &group) {
-            if self.dep_stack.frame_at_is(depth, rt, NodeId(member)) {
+        // Step 1 failed on a member this thread's frame computes, after
+        // claiming every member below it. While that frame runs and no
+        // record has changed, no member below it has landed out of its
+        // group, so step 1 fails the same way and keeps the claims in it:
+        // each member read inside a member's run would claim the members
+        // below it again.
+        if let Some(blocker) = cycle_state::group_blocker(rt, &group) {
+            if blocker.rec_changes == rec_changes
+                && self
+                    .dep_stack
+                    .frame_at_is(blocker.depth, rt, NodeId(blocker.member))
+            {
                 #[cfg(all(test, not(loom)))]
                 cycle_state::note_group_blocker_skip();
                 return GroupEnd::Ordinary;
@@ -3218,7 +3230,12 @@ impl<C: Cells> Runtime<C> {
                     self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
                 if !took && !virtual_member && is_computing(seen) {
                     if let Some(depth) = self.dep_stack.frame_depth(rt, NodeId(m)) {
-                        cycle_state::note_group_blocker(rt, group.clone(), m, depth);
+                        let blocker = cycle_state::GroupBlocker {
+                            member: m,
+                            depth,
+                            rec_changes,
+                        };
+                        cycle_state::note_group_blocker(rt, group.clone(), blocker);
                     }
                 }
                 self.release_group_claims(

@@ -12450,5 +12450,6 @@ fn group_blocker_skip_moves_no_trace(seeds: std::ops::Range<u64>) -> u64 {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_blocked_group_skip_moves_no_trace() {
-    group_blocker_skip_moves_no_trace(0..300);
+    let skips = group_blocker_skip_moves_no_trace(0..300);
+    assert!(skips > 0, "no seed's verify took the skip");
 }

@@ -95,6 +95,8 @@ pub(crate) struct Inner<C: Cells> {
     /// The group each landed cycle member belongs to, flagged by
     /// `IN_GROUP`.
     pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
+    /// How many times `member_recs` has changed.
+    pub(crate) member_rec_changes: u64,
     /// Each query whose deps a user panic's union replaced as it released
     /// the query New ([`Runtime::land_panic_released`]): that union's
     /// length, and how many of its deps, from the front, it held before
@@ -139,6 +141,7 @@ impl<C: Cells> Inner<C> {
         slot: u32,
         rec: Option<Arc<GroupInfo>>,
     ) -> Option<Arc<GroupInfo>> {
+        self.member_rec_changes += 1;
         match rec {
             Some(r) => self.member_recs.insert(slot, r),
             None => self.member_recs.remove(&slot),
@@ -159,6 +162,7 @@ impl<C: Cells> Inner<C> {
             children: HashMap::default(),
             cycle_strategies: HashMap::new(),
             member_recs: HashMap::new(),
+            member_rec_changes: 0,
             released_deps: HashMap::new(),
         }
     }
