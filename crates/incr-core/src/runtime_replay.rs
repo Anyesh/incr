@@ -3264,10 +3264,21 @@ impl<C: Cells> Runtime<C> {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             None => catch_unwind(AssertUnwindSafe(|| {
-                if observed == NodeState::Clean && flags.has(cycle::SPECULATIVE) {
-                    if let Some((value, s)) = self.checked_clean_read(handle) {
-                        seen = Some(s);
-                        return Ok(value);
+                // A member run recorded under the thread's speculation keeps
+                // a basis over the read only if it is checked.
+                if flags.has(cycle::SPECULATIVE) || replay::speculative() {
+                    if observed == NodeState::Clean {
+                        if let Some((value, s)) = self.checked_clean_read(handle) {
+                            seen = Some(s);
+                            return Ok(value);
+                        }
+                    } else {
+                        let revision = self.current_revision();
+                        let read = self.read_unframed(handle, observed, kind, word);
+                        if read.is_ok() {
+                            seen = self.checked_landing(handle, revision);
+                        }
+                        return read;
                     }
                 }
                 self.read_unframed(handle, observed, kind, word)
@@ -3393,6 +3404,22 @@ impl<C: Cells> Runtime<C> {
         let (type_tag, arena_slot) = self.fields_under(handle, node);
         let value = self.try_read_slot(handle, node, type_tag, arena_slot)?;
         Some((value, seen))
+    }
+
+    /// For a read that found `handle` not Clean and landed it: this
+    /// runtime's changes as found after it, as [`Self::checked_clean_read`]
+    /// gives, if no set ended since revision `revision`, read before it,
+    /// and the node is Clean at its handle's generation.
+    fn checked_landing<T: Value>(&self, handle: Incr<T>, revision: u64) -> Option<Count> {
+        if !self.checked_reads_ready() {
+            return None;
+        }
+        let seen = self.changes.count()?;
+        let node = self.nodes.get(handle.slot());
+        (self.current_revision() == revision
+            && node.generation() == handle.generation()
+            && state::load::<C>(node.state_cell()) == NodeState::Clean)
+            .then_some(seen)
     }
 
     /// Whether sets and deletes of this runtime all count themselves in
