@@ -8928,16 +8928,23 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                     );
                     let n2 = NodeId(world.handle(0, 2).erased().slot());
                     let rts = [world.rt(0).runtime_id, world.rt(1).runtime_id];
-                    // A walk waiting on another thread's subtree parks at
-                    // WalkWaits whatever it holds, and parks nowhere until
-                    // the wait ends; a wait that holds nothing never
-                    // registers. So op 15 waits while its last park was one.
+                    // A wait on another thread's claim parks at WalkWaits
+                    // (a walk) or ComputeWaits (a compute) whatever it holds,
+                    // and parks nowhere until it ends; a wait that holds
+                    // nothing never registers. So op 15 waits while its last
+                    // park was one of those.
                     let waits_on = move |waits: Arc<AtomicBool>| {
                         move |p: ParkPoint| {
                             if TWO_PHASE.with(std::cell::Cell::get) == overlap
                                 && TWO_THREAD.with(std::cell::Cell::get) == Some(1 - reader)
                             {
-                                waits.store(matches!(p, ParkPoint::WalkWaits(_)), SeqCst);
+                                waits.store(
+                                    matches!(
+                                        p,
+                                        ParkPoint::WalkWaits(_) | ParkPoint::ComputeWaits(_)
+                                    ),
+                                    SeqCst,
+                                );
                             }
                         }
                     };
