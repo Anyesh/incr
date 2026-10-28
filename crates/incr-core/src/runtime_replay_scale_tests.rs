@@ -311,7 +311,7 @@ fn redelivered_root_reads_hold_a_direct_per_virtual_frame() {
 /// chain in the same attempt: under `Shared` the ring's members stay
 /// recorded as taken verdicts while every chain node lands.
 fn verdict_then_chain_100k<C: Cells>() {
-    let n = 100_000;
+    let n = scaled(100_000_usize);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     rt.set_placeholder(0_u64);
@@ -1451,7 +1451,11 @@ fn shared_failed_readers_over_each_node_of_a_dirty_chain() {
 /// landing per step, or a fan whose ticket gains one per reader, stays
 /// linear in a test build as it is in a user's.
 fn ticket_checks_stay_linear<C: Cells>() {
-    let (n, k) = if cfg!(miri) { (8, 4) } else { (8000, 4000) };
+    let (n, k) = if cfg!(miri) {
+        (8, 4)
+    } else {
+        (scaled(8000), scaled(4000))
+    };
     crate::replay::take_ticket_checks();
     contained_chain::<C>(None, n);
     let chain = crate::replay::take_ticket_checks();
@@ -1988,7 +1992,7 @@ fn shared_same_text_fan_through_a_frame_over_chain_stays_linear() {
 /// node runs at most twice, and the stash reads cost the fan linear time.
 #[cfg(not(debug_assertions))]
 fn speculative_fan_100k<C: Cells>() {
-    let n = 100_000;
+    let n = scaled(100_000_usize);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
