@@ -144,7 +144,7 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: see `Self::index_at`.
         let index = unsafe { &*index };
         let found = value_code::run(|| index.with(|s| s.find::<K, T, QUERY>(key)))?;
-        if self.is_alive(found) {
+        if self.alive(found) {
             return Some(Incr::new(found.slot(), found.generation(), self.runtime_id));
         }
         let unbound = value_code::run(|| index.with(|s| s.unbind::<K, T, QUERY>(key)));
@@ -248,6 +248,58 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(crate) fn land_children(
+        &self,
+        id: NodeId,
+        landing: ChildLanding,
+        opened: bool,
+        bag: &mut Deferred<C>,
+    ) {
+        if !C::SINGLE_THREADED && crate::hold::active() {
+            let cell = crate::state::cell_key::<C>(self.nodes.get(id.0).state_cell());
+            if landing == ChildLanding::Sweep && !crate::hold::holds(cell) {
+                self.hold_for_held_child(id, cell, opened);
+            }
+            if crate::hold::holds(cell) {
+                crate::hold::defer_children(cell, landing, opened);
+                return;
+            }
+        }
+        self.land_children_now(id, landing, opened, bag);
+    }
+
+    /// A sweep cannot delete a child whose landing this thread holds, as
+    /// its word stays `Computing`, though once published it could: the
+    /// creator's landing is held too, so its sweep runs at publication,
+    /// after the child's.
+    fn hold_for_held_child(&self, id: NodeId, cell: usize, opened: bool) {
+        let candidates = self
+            .index_at(id)
+            .with(|s| s.pending_sweep_candidates(opened));
+        let held = candidates.iter().any(|c| {
+            crate::hold::holds(crate::state::cell_key::<C>(
+                self.nodes.get(c.slot()).state_cell(),
+            ))
+        });
+        if held {
+            let node = self.nodes.get(id.0);
+            let own = crate::hold::open(
+                cell,
+                self.runtime_id,
+                id.0,
+                node.generation(),
+                false,
+                None,
+                None,
+            );
+            debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
+            if crate::hold::holds(cell) {
+                self.set_held_mark(node, true);
+            }
+        }
+    }
+
+    /// [`Self::land_children`] past the hold.
+    pub(crate) fn land_children_now(
         &self,
         id: NodeId,
         landing: ChildLanding,

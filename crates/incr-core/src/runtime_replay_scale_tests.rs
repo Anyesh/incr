@@ -17,6 +17,29 @@ use crate::dep_stack::DepStack;
 use crate::handle::Incr;
 use crate::state::NodeState;
 
+/// `n` times `INCR_TEST_SCALE` (1 when unset), so a test can be timed at a
+/// multiple of its size against its stated growth class. When the variable
+/// is set, each call prints `SCALED k=<k> n=<n>` to stderr, so a timing run
+/// can tell a test whose size ignores it.
+fn scaled<T: std::ops::Mul<Output = T> + From<u8> + std::fmt::Display + Copy>(n: T) -> T {
+    static SCALE: OnceLock<Option<u8>> = OnceLock::new();
+    let k = *SCALE.get_or_init(|| {
+        std::env::var("INCR_TEST_SCALE")
+            .ok()
+            .map(|v| match v.parse() {
+                Ok(k) if k > 0 => k,
+                _ => panic!("INCR_TEST_SCALE={v} is not an integer from 1 to 255"),
+            })
+    });
+    match k {
+        Some(k) => {
+            eprintln!("SCALED k={k} n={n}");
+            n * T::from(k)
+        }
+        None => n,
+    }
+}
+
 fn counters(n: usize) -> Arc<Vec<AtomicU32>> {
     Arc::new((0..n).map(|_| AtomicU32::new(0)).collect())
 }
@@ -85,7 +108,7 @@ fn ring<C: Cells>(
 /// member to 5. Every member runs at most twice per pass, the discovery
 /// pass counted with the iterations.
 fn cycle_100k<C: Cells>(strategy: Strategy, frames: u32) {
-    let n = 100_000;
+    let n = scaled(100_000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     rt.set_max_frames(frames);
@@ -135,7 +158,9 @@ macro_rules! cycle_100k_tests {
             #[test]
             #[cfg_attr(miri, ignore)]
             fn $name() {
-                on_stack(8 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
+                // Under a TSan debug build, budget 256's Shared ring
+                // levels overflow an 8 MiB stack.
+                on_stack(16 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
             }
         )*
     };
@@ -152,6 +177,182 @@ cycle_100k_tests! {
     shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
 }
 
+/// Two threads read one 100k Fallback ring at budget 256, from member 0
+/// and from member n / 2, so each walk meets the other thread's cycle
+/// unwinds; the ring lands as one thread's read lands it. Member n / 2 has
+/// no strategy, so its read is a `try_get`, which gets the cycle if that
+/// thread discovers it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_fallback_cycle_100k_read_from_two_threads() {
+    let n = scaled(100_000);
+    let rt = Runtime::<Shared>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(256);
+    let runs = counters(n);
+    let iterations = Arc::new(AtomicU32::new(0));
+    let members = ring(
+        &rt,
+        n,
+        Strategy::Fallback,
+        &runs,
+        &iterations,
+        |rt, next, _| (rt.get(next) + 1).min(5),
+    );
+    let (head, middle) = std::thread::scope(|s| {
+        let stack = || std::thread::Builder::new().stack_size(16 << 20);
+        let head = stack().spawn_scoped(s, || rt.get(members[0]));
+        let middle = stack().spawn_scoped(s, || rt.try_get(members[n / 2]));
+        (head.expect("spawn").join(), middle.expect("spawn").join())
+    });
+    assert_eq!(head.unwrap(), 3);
+    let middle = middle.unwrap();
+    assert!(matches!(middle, Ok(5) | Err(_)), "{middle:?}");
+    assert_eq!(rt.get(members[0]), 3);
+    for (k, &m) in members.iter().enumerate().skip(1) {
+        assert_eq!(rt.get(m), if k == n - 1 { 4 } else { 5 }, "member {k}");
+    }
+    for &m in &members {
+        assert_eq!(rt.state_of(m), NodeState::Clean);
+    }
+    rt.assert_invariant_i();
+}
+
+/// The deep budget the redelivered root read tests run a 5,000-member
+/// ring under. TSan's shadow stack holds 64Ki calls per thread and does not
+/// check its end, so a deeper call stack corrupts TSan's own memory; a
+/// Local ring level takes about 23, so the TSan job (which sets
+/// `INCR_TEST_REDUCED`) stops at 2048 levels.
+fn deep_budget() -> u32 {
+    if std::env::var_os("INCR_TEST_REDUCED").is_some() {
+        2048
+    } else {
+        4096
+    }
+}
+
+/// A ring's retries redeliver each discarded walk root's direct read, one
+/// per doom: the delivery index work that costs stays per doom, not per
+/// delivery its maker made, so it does not grow with the budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn redelivered_root_reads_cost_the_same_at_any_budget() {
+    let work = |frames: u32| {
+        let units = Arc::new(Mutex::new(0));
+        let out = units.clone();
+        on_stack(1 << 30, move || {
+            let n = scaled(5_000);
+            let rt = Runtime::<Local>::new();
+            rt.set_placeholder(0_i64);
+            rt.set_max_frames(frames);
+            let runs = counters(n);
+            let iterations = Arc::new(AtomicU32::new(0));
+            let members = ring(
+                &rt,
+                n,
+                Strategy::Fallback,
+                &runs,
+                &iterations,
+                |rt, next, _| (rt.get(next) + 1).min(5),
+            );
+            crate::replay::take_note_work();
+            assert_eq!(rt.get(members[0]), 3);
+            *out.lock().unwrap() = crate::replay::take_note_work();
+        });
+        let units = *units.lock().unwrap();
+        units
+    };
+    let (narrow, wide) = (work(256), work(deep_budget()));
+    assert!(
+        wide * 4 <= narrow * 5,
+        "{narrow} units of note work at budget 256, {wide} at {}",
+        deep_budget()
+    );
+}
+
+/// A ring's root dooms each leave a direct delivery for the root's read
+/// until the run that made it ends, one per virtual frame below it: they
+/// cost no more than the virtual frames do, and the context's other
+/// deliveries stay as few as at a budget the ring never dooms under.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn redelivered_root_reads_hold_a_direct_per_virtual_frame() {
+    for frames in [256, deep_budget()] {
+        let peak = Arc::new(Mutex::new((0, 0, 0)));
+        let out = peak.clone();
+        on_stack(1 << 30, move || {
+            let n = scaled(5_000);
+            let rt = Runtime::<Local>::new();
+            rt.set_placeholder(0_i64);
+            rt.set_max_frames(frames);
+            let runs = counters(n);
+            let iterations = Arc::new(AtomicU32::new(0));
+            let members = ring(
+                &rt,
+                n,
+                Strategy::Fallback,
+                &runs,
+                &iterations,
+                |rt, next, _| (rt.get(next) + 1).min(5),
+            );
+            crate::replay::take_peak_live();
+            assert_eq!(rt.get(members[0]), 3);
+            *out.lock().unwrap() = crate::replay::take_peak_live();
+        });
+        let (live, directs, depth) = *peak.lock().unwrap();
+        assert!(
+            live <= 1 && (1..=depth).contains(&directs),
+            "at budget {frames}: {live} deliveries and {directs} direct ones live at once, {depth} virtual frames"
+        );
+    }
+}
+
+/// A read that takes a 100k ring's cycle verdict and then lands a 100k
+/// chain in the same attempt: under `Shared` the ring's members stay
+/// recorded as taken verdicts while every chain node lands.
+fn verdict_then_chain_100k<C: Cells>() {
+    let n = scaled(100_000_usize);
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let runs = counters(n);
+    let iterations = Arc::new(AtomicU32::new(0));
+    let members = ring(&rt, n, Strategy::None, &runs, &iterations, |rt, next, _| {
+        rt.get(next) + 1
+    });
+    let head = members[0];
+    let tail = chain(&rt, n).nodes[0];
+    let watched = Arc::new(AtomicU32::new(0));
+    let saw = watched.clone();
+    let top = rt.create_query(move |rt: &Runtime<C>| {
+        let caught = u64::from(rt.try_get(head).is_err());
+        saw.store(C::u32_load_relaxed(&rt.watching), SeqCst);
+        (caught << 40) + rt.get(tail)
+    });
+    assert_eq!(rt.get(top), (1 << 40) + n as u64);
+    let expected = if C::SINGLE_THREADED { 0 } else { n as u32 };
+    assert_eq!(
+        watched.load(SeqCst),
+        expected,
+        "ring members watched under the chain"
+    );
+    assert_eq!(rt.verdict_reruns.load(SeqCst), 0);
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_verdict_then_chain_100k() {
+    on_stack(16 << 20, verdict_then_chain_100k::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_verdict_then_chain_100k() {
+    on_stack(16 << 20, verdict_then_chain_100k::<Shared>);
+}
+
 thread_local! {
     static DEEPEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -160,7 +361,7 @@ thread_local! {
 /// over-budget read of an unbuffered member dooms its reader and pushes
 /// the member as a held entry instead of running it nested.
 fn ring_member_runs_within_budget<C: Cells>(strategy: Strategy) {
-    let n = 2000;
+    let n = scaled(2000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     rt.set_max_frames(1);
@@ -277,7 +478,7 @@ fn taint_shape<C: Cells>(rt: &Runtime<C>, n: usize) -> Taint {
 /// most n + B + 1 expansions at budget 256, 2n + 3 at budget 1.
 #[cfg(not(debug_assertions))]
 fn taint_100k<C: Cells>(frames: u32) {
-    let n = 100_000;
+    let n = scaled(100_000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     rt.set_max_frames(frames);
@@ -486,9 +687,10 @@ fn first_doom_depth<C: Cells>(rt: &Runtime<C>) -> usize {
 
 /// The byte budget dooms a 1000-chain of 16 KiB frames well below the
 /// frame budget of 256, which alone would overflow a 2 MiB thread, under
-/// `get` and under `stabilize` at the same depth, with the unbounded value.
+/// `get` and at most one level earlier under `stabilize`, with the
+/// unbounded value.
 fn byte_budget_first<C: Cells>() {
-    let n = 1000;
+    let n = scaled(1000);
     let rt = Runtime::<C>::new();
     let nodes = heavy_chain(&rt, n);
     assert_eq!(rt.get(nodes[0]), n as u64);
@@ -502,7 +704,15 @@ fn byte_budget_first<C: Cells>() {
     rt.observe(nodes[0], move |&v| seen.lock().unwrap().push(v));
     rt.stabilize();
     assert_eq!(*fired.lock().unwrap(), vec![n as u64]);
-    assert_eq!(first_doom_depth(&rt), depth);
+    // The budget counts from the outermost entry, so stabilize's observer
+    // frames come before the chain's; under TSan, Local's first level under
+    // get ends less than 1 KiB inside the 64 KiB, so stabilize dooms one
+    // level earlier.
+    let stabilized = first_doom_depth(&rt);
+    assert!(
+        stabilized <= depth && depth - stabilized <= 1,
+        "the doom came at depth {stabilized} under stabilize, {depth} under get"
+    );
     assert_eq!(rt.state_of(nodes[0]), NodeState::Clean);
 }
 
@@ -525,8 +735,9 @@ fn doom_under_stabilize<C: Cells>() {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
-    let first = chain(&rt, 100);
-    let second = chain(&rt, 100);
+    let len = scaled(100);
+    let first = chain(&rt, len);
+    let second = chain(&rt, len);
     let fired: Arc<Mutex<Vec<(usize, u64)>>> = Arc::default();
     for (i, c) in [&first, &second].into_iter().enumerate() {
         let fired = fired.clone();
@@ -535,7 +746,7 @@ fn doom_under_stabilize<C: Cells>() {
     rt.stabilize();
     let mut fired = fired.lock().unwrap().clone();
     fired.sort_unstable();
-    assert_eq!(fired, vec![(0, 100), (1, 100)]);
+    assert_eq!(fired, vec![(0, len as u64), (1, len as u64)]);
     for c in [&first, &second] {
         assert_eq!(rt.state_of(c.nodes[0]), NodeState::Clean);
         assert!(c.max_runs() <= 2, "a node ran {} times", c.max_runs());
@@ -586,7 +797,7 @@ fn shared_doom_under_stabilize() {
 /// `caught_delivery_after_its_node_lands`, whose T reads the nodes first.
 #[cfg(not(debug_assertions))]
 fn wide_diverted_retry<C: Cells>() {
-    let n = 100_000;
+    let n = scaled(100_000);
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -651,7 +862,7 @@ const FAILED_WALK_SIZES: &[usize] = if cfg!(miri) {
 /// raises, so the walks stay linear.
 fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
     for &n in FAILED_WALK_SIZES {
-        failed_entry_chain_of::<C>(n, frames);
+        failed_entry_chain_of::<C>(scaled(n), frames);
     }
 }
 
@@ -740,7 +951,7 @@ enum Caught {
 /// copy a read keeps matches every earlier note: the work on notes, their
 /// copies and the kept reads stays linear only if copies share the notes.
 fn many_caught_unwinds<C: Cells>(shape: Caught) {
-    let n = 2000;
+    let n = scaled(2000);
     let rt = Runtime::<C>::new();
     rt.set_max_frames(1);
     let failing = |rt: &Runtime<C>, i: usize| match shape {
@@ -827,7 +1038,7 @@ fn shared_many_caught_unwinds_stay_linear() {
 /// finding that ordinal must not cost a pass over the frame's earlier
 /// reads.
 fn many_foreign_reads<C: Cells>(clean: bool) {
-    let n = 2000;
+    let n = scaled(2000);
     let foreign = Arc::new(Runtime::<Shared>::new());
     let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
     if clean {
@@ -871,7 +1082,7 @@ fn many_foreign_reads<C: Cells>(clean: bool) {
 /// An unbudgeted runtime's frame reading `n` Clean nodes of another
 /// runtime settles once that it keeps none of them, and keeps none.
 fn unbudgeted_foreign_clean_reads<C: Cells>() {
-    let n = 1000;
+    let n = scaled(1000);
     let foreign = Arc::new(Runtime::<Shared>::new());
     let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
     for &x in &reads {
@@ -930,12 +1141,12 @@ fn shared_many_foreign_clean_reads_stay_linear() {
     many_foreign_reads::<Shared>(true);
 }
 
-/// The note work of the second read of a chain of `n` queries over a
-/// Failed node at budget `frames`, after a set below the chain. One
-/// payload goes up the chain, and its ticket
-/// gains a landing per step: each reader takes the ticket and the next
-/// landing holds it again.
-fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
+/// The note work of the first read of a chain of `n` queries over a
+/// panicking node at budget `frames`, and of the second read after a set
+/// below the chain. One payload goes up the chain, and its ticket gains a
+/// landing per step: each reader takes the ticket and the next landing
+/// holds it again.
+fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
     let rt = Runtime::<C>::new();
     let opts = || match frames {
         Some(_) => replayable(),
@@ -953,11 +1164,13 @@ fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
         below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
     }
     let top = below;
+    crate::replay::take_note_work();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let first = crate::replay::take_note_work();
     rt.set(input, 1);
     crate::replay::take_note_work();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
-    crate::replay::take_note_work()
+    (first, crate::replay::take_note_work())
 }
 
 fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
@@ -967,7 +1180,12 @@ fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
         &[1000, 2000, 4000]
     };
     for &n in sizes {
-        let work = contained_chain::<C>(frames, n);
+        let n = scaled(n);
+        let (first, work) = contained_chain::<C>(frames, n);
+        assert!(
+            first <= 24 * n as u64,
+            "{frames:?}: {first} units of note work for a {n}-chain's first read"
+        );
         assert!(
             work <= 16 * n as u64,
             "{frames:?}: {work} units of note work for a {n}-chain"
@@ -995,12 +1213,107 @@ fn shared_contained_chain_stays_linear_at_budget_1() {
     on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
 }
 
+#[test]
+fn local_contained_chain_stays_linear_at_budget_2() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(2)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_2() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(2)));
+}
+
+#[test]
+fn local_contained_chain_stays_linear_at_budget_16() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(16)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_16() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(16)));
+}
+
+/// A panicking query under an `n`-deep chain, read and then read again
+/// after an input change: each level's read takes the unwind and its frame
+/// lands Failed, which keys what the read took by the frame's path. The
+/// stack frames folded into paths on the first read and on the second, and
+/// the entries the second read's walks pushed.
+fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64, u64) {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let mut below = rt.create_query_with(move |rt| rt.get(input) + rt.get(failed), opts());
+    for _ in 1..n {
+        let dep = below;
+        below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
+    }
+    let top = below;
+    crate::replay::take_path_steps();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let first = crate::replay::take_path_steps();
+    rt.set(input, 1);
+    crate::runtime::take_walk_pushes();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    (
+        first,
+        crate::replay::take_path_steps(),
+        crate::runtime::take_walk_pushes(),
+    )
+}
+
+fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
+    let n = scaled(if cfg!(miri) { 8 } else { 4000 });
+    let (first, second, pushes) = panicking_chain_path_steps::<C>(frames, n);
+    assert!(
+        first <= 8 * n as u64 && second <= 8 * n as u64,
+        "{frames:?}: {first} and {second} frames folded into paths for a {n}-chain"
+    );
+    assert!(
+        pushes <= 8 * n as u64,
+        "{frames:?}: the second read's walks pushed {pushes} entries for a {n}-chain"
+    );
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || panicking_chain_paths_stay_linear::<Local>(None));
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(None)
+    });
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Local>(Some(1))
+    });
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(Some(1))
+    });
+}
+
 /// `k` Dirty readers over one Failed node with a Failed chain of `k` below
 /// it, whose edges a Clean run recorded, all entries of one walk: the walk
 /// passes the Failed node without walking the chain once per reader.
 fn failed_entry_fan_in<C: Cells>() {
     for &k in FAILED_WALK_SIZES {
-        failed_entry_fan_in_of::<C>(k);
+        failed_entry_fan_in_of::<C>(scaled(k));
     }
 }
 
@@ -1051,6 +1364,131 @@ fn shared_failed_entry_fan_in() {
     on_stack(1 << 28, failed_entry_fan_in::<Shared>);
 }
 
+/// `n` readers over an `n`-chain, all over its top (`over_top`) or one over
+/// each chain node, first Clean, then each read as a root after a set that
+/// a caught panic at the chain's bottom answers, so that the chain lands
+/// Dirty and each reader fails over its old dep there, then a set below
+/// the chain. Each Failed landing is noted for that set's walk, which
+/// stops at the chain's bottom, with note work linear in the readers and
+/// the chain, not their product.
+fn failed_readers_over_a_dirty_chain<C: Cells>(over_top: bool) {
+    for &n in FAILED_WALK_SIZES {
+        let n = scaled(n);
+        let rt = Runtime::<C>::new();
+        let fail = rt.create_input(0_u64);
+        let gate = rt.create_input(0_u64);
+        let failed = rt.create_query(move |rt| {
+            assert_eq!(rt.get(fail), 0, "failed below the chain");
+            0
+        });
+        let mut chain = vec![rt.create_query(move |rt| {
+            catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1)
+        })];
+        for _ in 1..n {
+            let below = chain[chain.len() - 1];
+            chain.push(rt.create_query(move |rt| rt.get(below) + 1));
+        }
+        let readers: Vec<Incr<u64>> = (0..n)
+            .map(|i| {
+                let dep = chain[if over_top { n - 1 } else { i }];
+                rt.create_query(move |rt| {
+                    let v = rt.get(dep);
+                    assert_eq!(rt.get(gate), 0, "a reader fails over the chain");
+                    v
+                })
+            })
+            .collect();
+        let read_all = || {
+            for &r in &readers {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+            }
+        };
+        read_all();
+        rt.set(fail, 1);
+        rt.set(gate, 1);
+        let work = rt.past_note_work.load(SeqCst);
+        read_all();
+        let work = rt.past_note_work.load(SeqCst) - work;
+        assert_eq!(rt.state_of(chain[n - 1]), NodeState::Dirty);
+        assert_eq!(rt.state_of(readers[n - 1]), NodeState::Failed);
+        assert!(
+            work <= 4 * n as u64,
+            "{work} units of note work for {n} readers over an {n}-chain"
+        );
+        rt.set(fail, 0);
+        read_all();
+    }
+}
+
+#[test]
+fn local_failed_readers_over_a_dirty_chains_top() {
+    on_stack(1 << 28, || failed_readers_over_a_dirty_chain::<Local>(true));
+}
+
+#[test]
+fn shared_failed_readers_over_a_dirty_chains_top() {
+    on_stack(1 << 28, || {
+        failed_readers_over_a_dirty_chain::<Shared>(true)
+    });
+}
+
+#[test]
+fn local_failed_readers_over_each_node_of_a_dirty_chain() {
+    on_stack(1 << 28, || {
+        failed_readers_over_a_dirty_chain::<Local>(false)
+    });
+}
+
+#[test]
+fn shared_failed_readers_over_each_node_of_a_dirty_chain() {
+    on_stack(1 << 28, || {
+        failed_readers_over_a_dirty_chain::<Shared>(false)
+    });
+}
+
+/// A test build checks the ticket each hold changes. The check looks at a
+/// bounded number of members per hold, so a chain whose ticket gains a
+/// landing per step, or a fan whose ticket gains one per reader, stays
+/// linear in a test build as it is in a user's. The sizes are the largest
+/// the chain and fan tests above run on the same stack in debug builds,
+/// reduced under TSan; a check walking every member would still take about
+/// `n / 2` per node at each.
+fn ticket_checks_stay_linear<C: Cells>() {
+    let (n, k) = if cfg!(miri) {
+        (8, 4)
+    } else {
+        (
+            scaled(crate::test_size::test_size(4000)),
+            scaled(crate::test_size::test_size(
+                *FAILED_WALK_SIZES.last().unwrap(),
+            )),
+        )
+    };
+    crate::replay::take_ticket_checks();
+    contained_chain::<C>(None, n);
+    let chain = crate::replay::take_ticket_checks();
+    assert!(
+        chain <= 256 * n as u64,
+        "{chain} ticket members checked for a {n}-chain"
+    );
+    failed_entry_fan_in_of::<C>(k);
+    let fan = crate::replay::take_ticket_checks();
+    assert!(
+        fan <= 256 * k as u64,
+        "{fan} ticket members checked for {k} readers"
+    );
+}
+
+#[test]
+fn local_ticket_checks_stay_linear() {
+    on_stack(1 << 28, ticket_checks_stay_linear::<Local>);
+}
+
+#[test]
+fn shared_ticket_checks_stay_linear() {
+    on_stack(1 << 28, ticket_checks_stay_linear::<Shared>);
+}
+
 #[cfg(not(debug_assertions))]
 #[derive(Debug)]
 struct ChainPayload(u64);
@@ -1091,7 +1529,7 @@ fn quiet_chain_payload() {
 #[cfg(not(debug_assertions))]
 fn custom_payload_chain_100k<C: Cells>(frames: u32) {
     quiet_chain_payload();
-    let n = crate::test_size::test_size(100_000) as u64;
+    let n = scaled(crate::test_size::test_size(100_000)) as u64;
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     let j = rt.create_input(1_u64);
@@ -1172,19 +1610,49 @@ fn shared_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread() {
 /// reads and catches its own panicking query and then reads the level
 /// below. Every caught panic's Failed landing is copied into a delivery,
 /// and a later landing of a node no copy holds must not cost a pass over
-/// the context's deliveries.
-fn nested_caught_chain<C: Cells>(frames: u32) {
-    let n: u64 = if cfg!(miri) { 8 } else { 4000 };
+/// the context's deliveries. `through` puts a query between each level and
+/// its panicking one, so each copy holds a landing a level deeper.
+fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
+    // Each doomed level's retry catches its kept reads up on what up to
+    // `frames` levels above it did, so the work per level grows with the
+    // budget, never with the chain.
+    let per_level = match (through, frames) {
+        (false, _) => 48,
+        (true, 1) => 72,
+        (true, _) => 240,
+    };
+    let n = scaled(if cfg!(miri) { 8 } else { 4000 });
+    let work = nested_caught_chain_work::<C>(frames, through, n);
+    assert!(
+        work <= per_level * n,
+        "budget {frames}: {work} units of note work for a {n}-chain"
+    );
+    if through && !cfg!(miri) {
+        let short = scaled(1000);
+        let small = nested_caught_chain_work::<C>(frames, through, short);
+        assert!(
+            work <= 6 * small,
+            "budget {frames}: {small} and {work} units of note work for {short}- and {n}-chains"
+        );
+    }
+}
+
+/// The note work of a chain of `n` levels as [`nested_caught_chain`] builds it.
+fn nested_caught_chain_work<C: Cells>(frames: u32, through: bool, n: u64) -> u64 {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
     let input = rt.create_input(7_u64);
     let mut below = rt.create_query_with(move |rt| rt.get(input), replayable());
     for k in 0..n {
-        let failing = rt.create_query_with(
+        let mut failing = rt.create_query_with(
             move |rt: &Runtime<C>| -> u64 { panic!("chain {}", k + rt.get(input)) },
             replayable(),
         );
+        if through {
+            let panicking = failing;
+            failing = rt.create_query_with(move |rt| rt.get(panicking), replayable());
+        }
         let dep = below;
         below = rt.create_query_with(
             move |rt| {
@@ -1196,38 +1664,54 @@ fn nested_caught_chain<C: Cells>(frames: u32) {
     }
     crate::replay::take_note_work();
     assert_eq!(rt.get(below), n + 7);
-    let work = crate::replay::take_note_work();
-    assert!(
-        work <= 24 * n,
-        "budget {frames}: {work} units of note work for a {n}-chain"
-    );
+    crate::replay::take_note_work()
 }
 
 #[test]
 fn local_nested_caught_chain_stays_linear() {
-    on_stack(1 << 26, || nested_caught_chain::<Local>(256));
+    on_stack(1 << 26, || nested_caught_chain::<Local>(256, false));
 }
 
 #[test]
 fn shared_nested_caught_chain_stays_linear() {
-    on_stack(1 << 26, || nested_caught_chain::<Shared>(256));
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(256, false));
+}
+
+#[test]
+fn local_nested_caught_chain_through_a_query_stays_linear() {
+    on_stack(1 << 26, || nested_caught_chain::<Local>(256, true));
+}
+
+#[test]
+fn shared_nested_caught_chain_through_a_query_stays_linear() {
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(256, true));
 }
 
 #[test]
 fn local_nested_caught_chain_stays_linear_at_budget_1() {
-    on_stack(1 << 26, || nested_caught_chain::<Local>(1));
+    on_stack(1 << 26, || nested_caught_chain::<Local>(1, false));
 }
 
 #[test]
 fn shared_nested_caught_chain_stays_linear_at_budget_1() {
-    on_stack(1 << 26, || nested_caught_chain::<Shared>(1));
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(1, false));
+}
+
+#[test]
+fn local_nested_caught_chain_through_a_query_stays_linear_at_budget_1() {
+    on_stack(1 << 26, || nested_caught_chain::<Local>(1, true));
+}
+
+#[test]
+fn shared_nested_caught_chain_through_a_query_stays_linear_at_budget_1() {
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(1, true));
 }
 
 /// One replayable reader catches `n / 2` panics and then reads a chain
 /// `n / 2` deep, which the budget dooms: the caught reads kept for the
 /// reader's retry must not each cost a pass over the chain's landings.
 fn caught_fan_over_deep_chain<C: Cells>(frames: u32) {
-    let n: u64 = if cfg!(miri) { 8 } else { 4000 };
+    let n: u64 = scaled(if cfg!(miri) { 8 } else { 4000 });
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
@@ -1272,4 +1756,593 @@ fn local_caught_fan_over_deep_chain_stays_linear() {
 #[test]
 fn shared_caught_fan_over_deep_chain_stays_linear() {
     on_stack(1 << 26, || caught_fan_over_deep_chain::<Shared>(256));
+}
+
+/// The note work of the first read of a replayed query 300 hops above a
+/// parent that reads `n` New leaf queries, at the default budget: each
+/// leaf's run under the open context takes its path from the parent's
+/// step, which needs the parent's read count of that leaf. Note work counts
+/// only a frame's read-count lookups past `SCAN_DEPS` deps, since one at or
+/// under it costs at most that constant.
+fn fan_out_under_replayed_chain<C: Cells>(n: u64) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    let leaves: Vec<Incr<u64>> = (0..n)
+        .map(|i| rt.create_query_with(move |_| i, replayable()))
+        .collect();
+    let mut top = rt.create_query_with(
+        move |rt| leaves.iter().map(|&l| rt.get(l)).sum::<u64>(),
+        replayable(),
+    );
+    for _ in 0..300 {
+        let below = top;
+        top = rt.create_query_with(move |rt| rt.get(below), replayable());
+    }
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(top), n * (n - 1) / 2);
+    crate::replay::take_note_work()
+}
+
+fn fan_out_under_replayed_chain_stays_linear<C: Cells>() {
+    let n = scaled(crate::test_size::test_size(8_000)) as u64;
+    let half = fan_out_under_replayed_chain::<C>(n / 2);
+    let full = fan_out_under_replayed_chain::<C>(n);
+    assert!(
+        full <= 2 * half + half / 4 && full <= 64 * n,
+        "{half} units of note work at {} leaves, {full} at {n}",
+        n / 2
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_fan_out_under_replayed_chain_stays_linear() {
+    on_stack(1 << 26, fan_out_under_replayed_chain_stays_linear::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_fan_out_under_replayed_chain_stays_linear() {
+    on_stack(1 << 26, fan_out_under_replayed_chain_stays_linear::<Shared>);
+}
+
+/// One budgeted frame reading `n` nodes of another runtime and then a
+/// 600-deep chain, which dooms it: the reads are kept as deliveries for
+/// its retry, sharing the frame's, maker's and node's lists, and removing
+/// them must not cost a pass over those lists each.
+fn wide_frame_deliveries<C: Cells>() {
+    let n = scaled(4000);
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let top = chain(&rt, 600).nodes[0];
+    let reader = rt.create_query_with(
+        move |rt| reads.iter().map(|&x| foreign.get(x)).sum::<u64>() + rt.get(top),
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n * (n - 1) / 2 + 600);
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 16 * n,
+        "{work} units of note work for {n} delivered foreign reads"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Shared>);
+}
+
+/// A read of one runtime holds `n` landings of its two-node cycles, then
+/// reads `n` nodes of another runtime, each a first entry inside the
+/// read: each entry's check and exit go over the other runtime's held
+/// landings only.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_first_entries_under_held_landings_stay_linear() {
+    let n: usize = scaled(4000);
+    let held = Runtime::<Shared>::new();
+    let cycles: Vec<Incr<i64>> = (0..n / 2)
+        .map(|_| {
+            let other: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+            let a = {
+                let other = other.clone();
+                held.create_query_with_fallback(
+                    move |rt| rt.get(*other.get().unwrap()) + 1,
+                    |_: &crate::cycle::Cycle| 100,
+                )
+            };
+            other
+                .set(held.create_query(move |rt| rt.get(a) * 2))
+                .unwrap();
+            a
+        })
+        .collect();
+    let read = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<i64>> = (0..n as i64)
+        .map(|i| read.create_query(move |_| i))
+        .collect();
+    let root = {
+        let read = read.clone();
+        held.create_query(move |rt| {
+            let sum = cycles.iter().map(|&c| rt.get(c)).sum::<i64>();
+            assert_eq!(crate::hold::held_count(), n);
+            sum + reads.iter().map(|&r| read.get(r)).sum::<i64>()
+        })
+    };
+    crate::hold::take_visits();
+    assert_eq!(
+        held.get(root),
+        100 * (n / 2) as i64 + (n as i64) * (n as i64 - 1) / 2
+    );
+    let visits = crate::hold::take_visits();
+    assert!(
+        visits <= 8 * n,
+        "{visits} held places visited for {n} first entries"
+    );
+}
+
+thread_local! {
+    static LAST_FAN: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// As above with one text for every panic: each panic raises again the
+/// box the reader caught last, so the panics share a payload key and a
+/// note log per address whatever the allocator does, and each kept read's
+/// copy holds every landing caught on its log before it. The retry must
+/// not pay that prefix again per read. `through` puts a query between the frame and each panicking
+/// one, so every copy also holds landings a level deeper, which each
+/// later caught panic's landings take from it.
+fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool, frames: u32, len: usize) -> u64 {
+    LAST_FAN.with(|l| l.borrow_mut().take());
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let failing: Vec<Incr<u64>> = (0..n)
+        .map(|_| {
+            let f = rt.create_query_with(
+                |_| -> u64 {
+                    let caught = LAST_FAN.with(|l| l.borrow_mut().take());
+                    std::panic::resume_unwind(caught.unwrap_or_else(|| Box::new("fan")))
+                },
+                replayable(),
+            );
+            if through {
+                rt.create_query_with(move |rt| rt.get(f) + 1, replayable())
+            } else {
+                f
+            }
+        })
+        .collect();
+    let top = chain(&rt, len).nodes[0];
+    let reader = rt.create_query_with(
+        move |rt| {
+            let mut caught = 0;
+            for &f in &failing {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                    if payload.is::<&'static str>() {
+                        LAST_FAN.with(|l| *l.borrow_mut() = Some(payload));
+                    }
+                    caught += 1;
+                }
+            }
+            caught + rt.get(top)
+        },
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n + len as u64);
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
+    crate::replay::take_note_work()
+}
+
+fn same_text_fan_over_chain_stays_linear<C: Cells>(through: bool) {
+    // Below about 1000 panics the chain's own notes take a share of the
+    // bound that only a shorter chain under a smaller budget leaves room for.
+    let (frames, len, sizes): (u32, usize, &[u64]) = if cfg!(miri) {
+        (8, 24, &[512])
+    } else {
+        (256, 600, &[1000, 4000, 16000])
+    };
+    for &n in sizes {
+        let n = scaled(n);
+        let work = same_text_fan_over_chain::<C>(n, through, frames, len);
+        let per_panic = if through { 40 } else { 32 };
+        assert!(
+            work <= per_panic * n,
+            "{work} units of note work for {n} caught panics of one text, through={through}"
+        );
+    }
+}
+
+#[test]
+fn local_same_text_fan_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Local>(false)
+    });
+}
+
+#[test]
+fn shared_same_text_fan_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Shared>(false);
+    });
+}
+
+#[test]
+fn local_same_text_fan_through_a_frame_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Local>(true)
+    });
+}
+
+#[test]
+fn shared_same_text_fan_through_a_frame_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Shared>(true)
+    });
+}
+
+/// A speculative run of a fan over 100k leaves, stashed under a one-frame
+/// budget, then the real read of the fan, which adopts every stash: each
+/// node runs at most twice, and the stash reads cost the fan linear time.
+#[cfg(not(debug_assertions))]
+fn speculative_fan_100k<C: Cells>() {
+    let n = scaled(100_000_usize);
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let runs = counters(n + 1);
+    let input = rt.create_input(1_u64);
+    let leaves: Vec<Incr<u64>> = (0..n)
+        .map(|i| {
+            let runs = runs.clone();
+            rt.create_query_with(
+                move |rt: &Runtime<C>| {
+                    runs[i].fetch_add(1, SeqCst);
+                    rt.get(input) + i as u64
+                },
+                replayable(),
+            )
+        })
+        .collect();
+    let fan = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                runs[n].fetch_add(1, SeqCst);
+                leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
+            },
+            replayable(),
+        )
+    };
+    let b = rt.create_query(|_: &Runtime<C>| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(fan)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(reader), 5);
+    assert_eq!(rt.get(fan), (1..=n as u64).sum::<u64>());
+    assert!(max_of(&runs) <= 2);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_speculative_fan_100k_adopts_its_stashes() {
+    speculative_fan_100k::<Local>();
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_speculative_fan_100k_adopts_its_stashes() {
+    speculative_fan_100k::<Shared>();
+}
+
+/// A `k`-member landed group on a chain under `m`, which reads the chain's
+/// top once `on` is set. The read of `m` after that computes the chain
+/// member by member inside `m`'s run, and each member's read of the one
+/// below verifies the group, which fails on the member computing above it.
+struct ChainedGroup {
+    on: Incr<i64>,
+    m: Incr<i64>,
+    r: Incr<i64>,
+    xs: Vec<Incr<i64>>,
+}
+
+fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
+    chained_group_with(rt, k, None, false).0
+}
+
+/// [`chained_group`] where each member also reads an input of its own if
+/// `inputs`, and where `xs[at]`'s run, once armed (1), first claims the
+/// bottom member and lands it New unrun, as a doom's discard of its claim
+/// would, and then reads 2.
+fn chained_group_with<C: Cells>(
+    rt: &Runtime<C>,
+    k: usize,
+    at: Option<usize>,
+    inputs: bool,
+) -> (ChainedGroup, Arc<AtomicU32>) {
+    let armed = Arc::new(AtomicU32::new(0));
+    let on = rt.create_input(0_i64);
+    let root: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let m = {
+        let root = root.clone();
+        rt.create_query_with_fallback(
+            move |rt| match rt.get(on) {
+                0 => 0,
+                _ => rt.get(*root.get().unwrap()) + 1,
+            },
+            |_c: &crate::cycle::Cycle| 100,
+        )
+    };
+    let own = || inputs.then(|| rt.create_input(0_i64));
+    let y = own();
+    let mut xs =
+        vec![rt.create_query(move |rt| rt.get(m) + rt.get(on) + y.map_or(0, |y| rt.get(y)))];
+    for i in 1..k {
+        let below = *xs.last().unwrap();
+        let (bottom, here, armed, y) = (xs[0], at == Some(k - 1 - i), armed.clone(), own());
+        xs.push(rt.create_query(move |rt| {
+            if here && armed.compare_exchange(1, 0, SeqCst, SeqCst).is_ok() {
+                let node = rt.nodes.get(bottom.slot());
+                if crate::state::try_claim_compute::<C>(node.state_cell()).is_ok() {
+                    rt.land_unrun(crate::NodeId(bottom.slot()), node, NodeState::New);
+                    armed.store(2, SeqCst);
+                }
+            }
+            rt.get(below) + y.map_or(0, |y| rt.get(y)) + 1
+        }));
+    }
+    xs.reverse();
+    let r = {
+        let top = xs[0];
+        rt.create_query(move |rt| rt.get(top))
+    };
+    root.set(r).unwrap();
+    assert_eq!(rt.get(r), k as i64 - 1);
+    rt.force_group_for_test(&xs.iter().map(|x| x.erase()).collect::<Vec<_>>());
+    rt.set(on, 1);
+    (ChainedGroup { on, m, r, xs }, armed)
+}
+
+/// The read claims each member a bounded number of times, not once per
+/// member below it.
+fn chained_group_reads_claim_once<C: Cells>() {
+    let k = if cfg!(miri) {
+        8
+    } else if cfg!(debug_assertions) {
+        scaled(500)
+    } else {
+        scaled(2000)
+    };
+    let rt = Runtime::<C>::new();
+    let shape = chained_group(&rt, k);
+    let before = rt.group_claims.load(SeqCst);
+    let listed = rt.group_listings.load(SeqCst);
+    let loaded = rt.group_external_loads.load(SeqCst);
+    let scanned = crate::dep_stack::frames_scanned();
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let scans = crate::dep_stack::frames_scanned() - scanned;
+    let claims = rt.group_claims.load(SeqCst) - before;
+    let listings = rt.group_listings.load(SeqCst) - listed;
+    let loads = rt.group_external_loads.load(SeqCst) - loaded;
+    assert!(got.is_ok(), "the read of m panicked");
+    assert!(
+        (k as u64 - 1..=2 * k as u64).contains(&claims),
+        "{claims} member claims for a {k}-member group in one read"
+    );
+    assert!(
+        listings <= 4,
+        "{listings} listings of a {k}-member group's deps in one read"
+    );
+    assert!(
+        loads <= 4 * k as u64,
+        "{loads} loads of a {k}-member group's deps in one read"
+    );
+    assert!(
+        scans <= 64 * k as u64,
+        "{scans} frames compared finding frames in a {k}-deep chain in one read"
+    );
+}
+
+/// A group whose members each read an input of their own has k deps
+/// outside it; the read loads each a bounded number of times, not once
+/// per nested expansion.
+fn input_chained_group_loads_each_dep_once<C: Cells>() {
+    let k = if cfg!(miri) {
+        8
+    } else if cfg!(debug_assertions) {
+        scaled(500)
+    } else {
+        scaled(2000)
+    };
+    let rt = Runtime::<C>::new();
+    let (shape, _) = chained_group_with(&rt, k, None, true);
+    let loaded = rt.group_external_loads.load(SeqCst);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let loads = rt.group_external_loads.load(SeqCst) - loaded;
+    assert!(got.is_ok(), "the read of m panicked");
+    assert!(
+        loads <= 4 * k as u64,
+        "{loads} loads of a {k}-member group's {k} outside deps in one read"
+    );
+}
+
+#[test]
+fn local_input_chained_group_loads_each_dep_once() {
+    on_stack(64 << 20, input_chained_group_loads_each_dep_once::<Local>);
+}
+
+#[test]
+fn shared_input_chained_group_loads_each_dep_once() {
+    on_stack(64 << 20, input_chained_group_loads_each_dep_once::<Shared>);
+}
+
+#[test]
+fn local_chained_group_reads_claim_once() {
+    on_stack(64 << 20, chained_group_reads_claim_once::<Local>);
+}
+
+#[test]
+fn shared_chained_group_reads_claim_once() {
+    on_stack(64 << 20, chained_group_reads_claim_once::<Shared>);
+}
+
+/// The read's answer, every node's state and value, then every slot's
+/// deps and group record.
+type GroupOutcome = (
+    Result<i64, String>,
+    Vec<NodeState>,
+    Vec<Result<i64, String>>,
+    Vec<Vec<u32>>,
+    Vec<Vec<(u32, u32)>>,
+);
+
+/// The read of `m` with the blocked-record skip and the listed-externals
+/// reuse as given, `xs[unrun_at]` landing the bottom member New if set and
+/// each member reading its own input if `inputs`, how many skips and reuses
+/// it took, and whether the bottom landed.
+fn chained_group_outcome<C: Cells>(
+    k: usize,
+    (skip, reuse): (bool, bool),
+    unrun_at: Option<usize>,
+    inputs: bool,
+) -> (GroupOutcome, u64, u64, bool) {
+    crate::cycle_state::set_group_blocker_skip(skip);
+    crate::cycle_state::set_group_externals_reuse(reuse);
+    let skips = crate::cycle_state::group_blocker_skips();
+    let reuses = crate::cycle_state::group_externals_reuses();
+    let rt = Runtime::<C>::new();
+    let (shape, armed) = chained_group_with(&rt, k, unrun_at, inputs);
+    armed.store(1, SeqCst);
+    let read = |h: Incr<i64>| {
+        catch_unwind(AssertUnwindSafe(|| rt.get(h))).map_err(super::race_tests::panic_message)
+    };
+    let got = read(shape.m);
+    let nodes: Vec<Incr<i64>> = [shape.on, shape.m, shape.r]
+        .into_iter()
+        .chain(shape.xs.iter().copied())
+        .collect();
+    let states = nodes.iter().map(|&h| rt.state_of(h)).collect();
+    let values = nodes.iter().map(|&h| read(h)).collect();
+    let slots = 0..rt.nodes.len();
+    let deps = slots
+        .clone()
+        .map(|x| {
+            let mut d = Vec::new();
+            rt.nodes.get(x).for_each_dep(|n| d.push(n.0));
+            d
+        })
+        .collect();
+    let groups = {
+        let inner = rt.inner.read();
+        slots
+            .map(|x| {
+                inner
+                    .member_recs
+                    .get(&x)
+                    .map_or(Vec::new(), |g| g.members.clone())
+            })
+            .collect()
+    };
+    crate::cycle_state::set_group_blocker_skip(true);
+    crate::cycle_state::set_group_externals_reuse(true);
+    rt.assert_invariant_i();
+    (
+        (got, states, values, deps, groups),
+        crate::cycle_state::group_blocker_skips() - skips,
+        crate::cycle_state::group_externals_reuses() - reuses,
+        armed.load(SeqCst) == 2,
+    )
+}
+
+/// Ending a verify early on a record blocked by a member this thread
+/// computes moves no node: the read, every node's state and value, and
+/// every slot's deps and group record match the read that claims the
+/// group at each member.
+fn chained_group_skip_moves_no_node<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    let (with, skipped, ..) = chained_group_outcome::<C>(k, (true, true), None, false);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), None, false);
+    assert!(skipped > 0, "no group verify took the skip");
+    assert_eq!(with, without);
+}
+
+#[test]
+fn local_chained_group_skip_moves_no_node() {
+    on_stack(16 << 20, chained_group_skip_moves_no_node::<Local>);
+}
+
+#[test]
+fn shared_chained_group_skip_moves_no_node() {
+    on_stack(16 << 20, chained_group_skip_moves_no_node::<Shared>);
+}
+
+/// A member landing New unrun under the blocker's frame, as a doom's
+/// discard lands one, keeps its record but ends the skip: the read that
+/// skips matches the one that claims the group at each member.
+fn chained_group_unrun_landing_ends_skip<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    let at = Some(k / 2);
+    let (with, skipped, _, landed) = chained_group_outcome::<C>(k, (true, true), at, false);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), at, false);
+    assert!(landed, "the bottom member was not claimed to land");
+    assert!(skipped > 0, "no group verify took the skip");
+    assert_eq!(with, without);
+}
+
+#[test]
+fn local_chained_group_unrun_landing_ends_skip() {
+    on_stack(16 << 20, chained_group_unrun_landing_ends_skip::<Local>);
+}
+
+#[test]
+fn shared_chained_group_unrun_landing_ends_skip() {
+    on_stack(16 << 20, chained_group_unrun_landing_ends_skip::<Shared>);
+}
+
+/// Reusing a group's externals listed earlier in the entry moves no node:
+/// the read, every node's state and value, and every slot's deps and
+/// group record match the read that lists them at each expansion.
+fn chained_group_reuse_moves_no_node<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    for (at, inputs) in [(None, false), (Some(k / 2), false), (None, true)] {
+        let (with, _, reused, _) = chained_group_outcome::<C>(k, (true, true), at, inputs);
+        let (without, ..) = chained_group_outcome::<C>(k, (true, false), at, inputs);
+        assert!(reused > 0, "no group expansion reused a listing");
+        assert_eq!(
+            with, without,
+            "bottom landed New at {at:?}, inputs {inputs}"
+        );
+    }
+}
+
+#[test]
+fn local_chained_group_reuse_moves_no_node() {
+    on_stack(16 << 20, chained_group_reuse_moves_no_node::<Local>);
+}
+
+#[test]
+fn shared_chained_group_reuse_moves_no_node() {
+    on_stack(16 << 20, chained_group_reuse_moves_no_node::<Shared>);
 }

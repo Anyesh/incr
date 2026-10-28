@@ -111,24 +111,28 @@ impl<T: Value> LoomValueSlot<T> {
         unsafe { self.ptr.load(Ordering::Acquire).as_ref() }
     }
 
-    fn swap(&self, ptr: *mut T) -> Option<()> {
+    fn swap(&self, ptr: *mut T) -> Option<LoomDisplaced<T>> {
         let old = self.ptr.swap(ptr, Ordering::Release);
         if old.is_null() {
             return None;
         }
         // SAFETY: `old` came from Box::into_raw and the swap took it out
         // of the slot, so this is its only owner.
-        let old = unsafe { Box::from_raw(old) };
+        let boxed = unsafe { Box::from_raw(old) };
         self.parked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(old);
-        Some(())
+            .push(boxed);
+        Some(LoomDisplaced(old))
     }
 }
 
+/// A value its slot displaced, which stays parked in the slot until the
+/// slot drops; [`ValueSlot::restore`] takes it back out.
+pub struct LoomDisplaced<T>(*mut T);
+
 impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
-    type Displaced = ();
+    type Displaced = LoomDisplaced<T>;
     fn new_empty() -> Self {
         Self::from_raw(std::ptr::null_mut())
     }
@@ -143,21 +147,40 @@ impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
     fn try_read(&self) -> Option<T> {
         self.current().cloned()
     }
-    fn write(&self, v: T) -> Option<()> {
+    fn try_read_then(&self, loaded: impl FnOnce()) -> Option<T> {
+        let cur = self.current();
+        loaded();
+        cur.cloned()
+    }
+    fn write(&self, v: T) -> Option<LoomDisplaced<T>> {
         self.swap(Box::into_raw(Box::new(v)))
     }
     fn eq_current(&self, v: &T) -> bool {
         self.current() == Some(v)
     }
-    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, ()> {
+    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, LoomDisplaced<T>> {
         if value_code::run(|| self.current() == Some(&v)) {
             return Compared::Equal(v);
         }
         on_write();
         Compared::Replaced(self.write(v))
     }
-    fn clear(&self) -> Option<()> {
+    fn clear(&self) -> Option<LoomDisplaced<T>> {
         self.swap(std::ptr::null_mut())
+    }
+    fn restore(&self, old: Option<LoomDisplaced<T>>) -> Option<LoomDisplaced<T>> {
+        let ptr = old.map_or(std::ptr::null_mut(), |LoomDisplaced(p)| {
+            let mut parked = self
+                .parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let at = parked
+                .iter()
+                .position(|b| std::ptr::eq(&**b, p))
+                .expect("incr-core: a restored value is parked in its slot");
+            Box::into_raw(parked.swap_remove(at))
+        });
+        self.swap(ptr)
     }
 }
 

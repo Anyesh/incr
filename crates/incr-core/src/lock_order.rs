@@ -44,6 +44,9 @@ pub enum LockKind {
     /// A runtime's stashes of speculative runs. Only value code, which reads
     /// Clean nodes without a lock, runs under it.
     Stashes,
+    /// A runtime's log of the slots episodes and releases landed, under
+    /// which nothing is taken.
+    Episodes,
 }
 
 impl LockKind {
@@ -64,6 +67,7 @@ impl LockKind {
             LockKind::Directory => 66,
             LockKind::WatchQueue => 70,
             LockKind::Stashes => 75,
+            LockKind::Episodes => 80,
         }
     }
 }
@@ -97,7 +101,9 @@ mod stack {
     pub(super) fn acquire(kind: LockKind) -> Held {
         let frame = FRAME.with(Cell::get);
         let id = NEXT_ID.with(|next| next.replace(next.get() + 1));
-        HELD.with(|held| {
+        // A runtime dropped by TLS destructors can outlive the stack, which
+        // then checks nothing.
+        let _ = HELD.try_with(|held| {
             let mut held = held.borrow_mut();
             if let Some(above) = held
                 .iter()
@@ -206,7 +212,7 @@ impl<G: std::ops::DerefMut> std::ops::DerefMut for Ordered<G> {
 pub(crate) fn enter_frame() {
     #[cfg(all(debug_assertions, not(loom)))]
     {
-        stack::HELD.with(|held| {
+        let _ = stack::HELD.try_with(|held| {
             let held = held.borrow();
             let kinds = stack::kinds(&held);
             drop(held);
@@ -233,7 +239,7 @@ pub(crate) fn leave_frame() {
 #[cfg(all(debug_assertions, not(loom)))]
 pub(crate) fn assert_unlocked(closure: &str) {
     let frame = stack::FRAME.with(std::cell::Cell::get);
-    stack::HELD.with(|held| {
+    let _ = stack::HELD.try_with(|held| {
         let held = held.borrow();
         let locked: Vec<LockKind> = held
             .iter()
@@ -274,7 +280,7 @@ pub(crate) fn unlocked<F>(_closure: &'static str, f: F) -> F {
 #[inline]
 pub(crate) fn assert_may_wait_on_claim() {
     #[cfg(all(debug_assertions, not(loom)))]
-    stack::HELD.with(|held| {
+    let _ = stack::HELD.try_with(|held| {
         let held = held.borrow();
         let kinds = stack::kinds(&held);
         drop(held);

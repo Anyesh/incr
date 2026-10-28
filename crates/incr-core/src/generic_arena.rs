@@ -156,6 +156,14 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         self.slot_or_panic(slot).clear()
     }
 
+    pub(crate) fn restore(
+        &self,
+        slot: u32,
+        old: Option<Displaced<T, C>>,
+    ) -> Option<Displaced<T, C>> {
+        self.slot_or_panic(slot).restore(old)
+    }
+
     /// The slot at `slot`, or `None` if no reserve ever reached it.
     #[inline(always)]
     fn slot(&self, slot: u32) -> Option<&C::ValueSlot<T>> {
@@ -200,6 +208,20 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         match self.slot(slot) {
             Some(s) => s.read_or(missing),
             None => missing(),
+        }
+    }
+
+    /// [`Self::try_read`], with `loaded` run once the value is pinned and
+    /// before it is cloned (see [`ValueSlot::try_read_then`]). `loaded`
+    /// runs even when the slot is out of range.
+    #[inline(always)]
+    pub fn try_read_then(&self, slot: u32, loaded: impl FnOnce()) -> Option<T> {
+        match self.slot(slot) {
+            Some(s) => s.try_read_then(loaded),
+            None => {
+                loaded();
+                None
+            }
         }
     }
 

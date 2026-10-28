@@ -18,7 +18,7 @@ use crate::handle::RuntimeId;
 
 #[cfg(not(loom))]
 use std::sync::{
-    atomic::{AtomicU64, AtomicU8, Ordering},
+    atomic::{AtomicU8, Ordering},
     Arc, Mutex,
 };
 
@@ -44,6 +44,8 @@ pub(crate) type Claim = (RuntimeId, u32);
 
 struct Waiter {
     ticket: u64,
+    /// The waiting thread's attempt word, as [`crate::attempt::word_id`].
+    owner: usize,
     waiting_on: Claim,
     holds: Vec<Claim>,
     state: Arc<AtomicU8>,
@@ -81,18 +83,71 @@ loom::thread_local! {
     static WINNER: std::cell::RefCell<Option<(Arc<AtomicU8>, Claim)>> = std::cell::RefCell::new(None);
 }
 
-/// Wounds dealt, for tests.
-#[cfg(not(loom))]
-pub(crate) static WOUNDS: AtomicU64 = AtomicU64::new(0);
-
-/// Head-start checks a runtime made of a claim of its own, for tests.
+/// Wounds dealt to a waiter on or holding a claim of each runtime, for
+/// tests.
 #[cfg(all(test, not(loom)))]
-pub(crate) static OWN_CLAIM_CHECKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WOUNDS: PerRuntime = PerRuntime::new();
+
+/// Head-start checks each runtime made of a claim of its own, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) static OWN_CLAIM_CHECKS: PerRuntime = PerRuntime::new();
+
+/// A count kept per runtime, so a test reads its own runtimes' events and
+/// not those of tests running beside it in the process.
+#[cfg(all(test, not(loom)))]
+pub(crate) struct PerRuntime(Mutex<Vec<(RuntimeId, u64)>>);
+
+#[cfg(all(test, not(loom)))]
+impl PerRuntime {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    fn counts(&self) -> impl std::ops::DerefMut<Target = Vec<(RuntimeId, u64)>> + '_ {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn add(&self, rt: RuntimeId) {
+        let mut counts = self.counts();
+        match counts.iter_mut().find(|(r, _)| *r == rt) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((rt, 1)),
+        }
+    }
+
+    pub(crate) fn on(&self, rt: RuntimeId) -> u64 {
+        self.counts()
+            .iter()
+            .find(|(r, _)| *r == rt)
+            .map_or(0, |&(_, n)| n)
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+fn count_wound(w: &Waiter) {
+    let mut rts: Vec<RuntimeId> = w.holds.iter().chain([&w.waiting_on]).map(|c| c.0).collect();
+    rts.sort();
+    rts.dedup();
+    for rt in rts {
+        WOUNDS.add(rt);
+    }
+}
 
 /// Threads registered now, for tests.
 #[cfg(test)]
 pub(crate) fn registered() -> usize {
     registry().waiters.len()
+}
+
+/// Threads registered now that wait on or hold a claim of `rt`: the count
+/// one test's runtime sees, whatever other tests' threads register.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn registered_on(rt: RuntimeId) -> usize {
+    registry()
+        .waiters
+        .iter()
+        .filter(|w| w.waiting_on.0 == rt || w.holds.iter().any(|h| h.0 == rt))
+        .count()
 }
 
 /// Whether a registered thread is waiting on `claim`, for tests.
@@ -138,6 +193,7 @@ impl Registration {
         let ticket = ticket(&mut next);
         reg.waiters.push(Waiter {
             ticket,
+            owner: crate::attempt::word_id(),
             waiting_on,
             holds,
             state: state.clone(),
@@ -161,8 +217,8 @@ impl Registration {
                     if i != oldest {
                         reg.waiters[i].winner = Some(winner.clone());
                         reg.waiters[i].state.store(WOUNDED, Ordering::Release);
-                        #[cfg(not(loom))]
-                        WOUNDS.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(all(test, not(loom)))]
+                        count_wound(&reg.waiters[i]);
                     }
                 }
                 break;
@@ -198,6 +254,60 @@ impl Drop for Registration {
         }
         self.state.store(DONE, Ordering::Release);
     }
+}
+
+/// Runs `wound`, a waiter's take-over of the attempt whose word is
+/// `owner`, under the registry lock, unless that owner waits here with an
+/// older ticket than the waiter's `ticket` (0 for one not taken yet, which
+/// is younger than every taken one) on a chain of claims that closes
+/// through registered holders: the registry resolves that wait by the
+/// wound order. A claim on the chain with no registered holder ends the
+/// refusal, as its holder may be in user code that waits on the waiter.
+/// False if refused.
+pub(crate) fn take_over_in_order(owner: usize, ticket: u64, wound: impl FnOnce() -> bool) -> bool {
+    let reg = registry();
+    let mine = if ticket == 0 { u64::MAX } else { ticket };
+    let waits_in_order = reg
+        .waiters
+        .iter()
+        .find(|w| w.owner == owner && w.ticket < mine && w.state.load(Ordering::Acquire) == WAITING)
+        .is_some_and(|o| closes(&reg.waiters, o));
+    if waits_in_order {
+        #[cfg(all(test, not(loom)))]
+        REFUSALS.with(|r| r.set(r.get() + 1));
+        return false;
+    }
+    wound()
+}
+
+/// Whether `from`'s waits-for chain comes back to a waiter on it: every
+/// claim on the way has a registered holder. At most one step per waiter.
+fn closes(waiters: &[Waiter], from: &Waiter) -> bool {
+    let mut seen = vec![from.owner];
+    let mut on = from.waiting_on;
+    for _ in 0..waiters.len() {
+        let Some(holder) = waiters.iter().find(|w| w.holds.contains(&on)) else {
+            return false;
+        };
+        if seen.contains(&holder.owner) {
+            return true;
+        }
+        seen.push(holder.owner);
+        on = holder.waiting_on;
+    }
+    true
+}
+
+#[cfg(all(test, not(loom)))]
+std::thread_local! {
+    static REFUSALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The take-overs the wound order refused on this thread since the last
+/// call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_refusals() -> u32 {
+    REFUSALS.with(|r| r.replace(0))
 }
 
 /// Before a wounded entry retries: waits until the oldest waiter on the
@@ -257,6 +367,28 @@ mod tests {
                     },
                 );
                 assert_eq!(backoffs, 0);
+            },
+        )
+        .assert_clean();
+    }
+
+    /// A wound counts once for each runtime whose claims its waiter waits
+    /// on or holds, and for no other runtime.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_wound_counts_for_its_waiters_runtimes_only() {
+        crate::child_test::run_in_child(
+            "waits::tests::a_wound_counts_for_its_waiters_runtimes_only",
+            || {
+                let [a, b, c] = [9, 11, 13].map(|n| RuntimeId::for_test(u64::MAX - n));
+                let older = Registration::new(|_| 1, (b, 2), vec![(a, 1), (c, 5)]);
+                let younger = Registration::new(|_| 2, (a, 1), vec![(a, 3), (b, 2)]);
+                assert!(younger.wounded() && !older.wounded());
+                assert_eq!(
+                    [a, b, c].map(|rt| WOUNDS.on(rt)),
+                    [1, 1, 0],
+                    "wounds on a, b, c"
+                );
             },
         )
         .assert_clean();

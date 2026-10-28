@@ -204,13 +204,9 @@ fn group_by_refuses<C: Cells>() {
 
     // The refusal left the router marked for a rebuild, whose key_fn pass
     // over the snapshot meets M again. The read's walk runs the router as
-    // M's dep, and the cycle it closes runs wholly above that entry, so the
-    // walk contains it and M reruns as from scratch: its read is refused
-    // again and it lands its fallback.
+    // M's dep, before M's closure, so the cycle reaches this `try_get`.
     s.insert(&rt, 4);
-    refused.store(false, SeqCst);
-    assert_eq!(rt.try_get(m).ok(), Some(7));
-    assert!(refused.load(SeqCst), "the rebuild read a provisional M");
+    assert!(rt.try_get(m).is_err(), "the rebuild read a provisional M");
     assert_eq!(
         grouped.routed_state(&rt),
         routed,
@@ -516,7 +512,7 @@ mod wounds {
     use std::thread;
 
     use super::*;
-    use crate::runtime::race_tests::Gate;
+    use crate::runtime::race_tests::{release_parked_on_unwind, Gate};
     use crate::runtime::wound_tests::{assert_wounded, wait_registered};
 
     fn wound_at(on: usize, episode_older: bool) {
@@ -535,6 +531,7 @@ mod wounds {
         let rt = &*ep.rt;
         let (m, w) = (ep.m, ep.w);
         thread::scope(|scope| {
+            let _released = release_parked_on_unwind();
             m_gate.arm();
             let episode = scope.spawn(move || rt.get(m));
             m_gate.wait_parked();
@@ -547,12 +544,12 @@ mod wounds {
                 (&w_gate, &m_gate)
             };
             first.release();
-            wait_registered(1);
+            wait_registered(rt.runtime_id, 1);
             second.release();
             assert_eq!(episode.join().unwrap(), 5);
             assert_eq!(reader.join().unwrap(), 0);
         });
-        assert_wounded();
+        assert_wounded(ep.rt.runtime_id);
         ep.assert_landed(Shape::plain(), 5, false);
     }
 

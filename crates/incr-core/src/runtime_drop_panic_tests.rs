@@ -512,6 +512,7 @@ fn shared_stale_path_drain_panic_under_a_swallowing_parent_lands_dirty() {
                 let rt = Arc::clone(&rt);
                 let z_gate = z_gate.clone();
                 thread::spawn(move || {
+                    let _released = z_gate.released_on_unwind();
                     z_gate.wait_parked();
                     rt.delete_node(z);
                     z_gate.release();
@@ -618,6 +619,7 @@ fn shared_gone_exit_after_a_recycle_drops_its_bag_item_once() {
                 let rt = Arc::clone(&rt);
                 let (z_gate, claim_gate) = (z_gate.clone(), claim_gate.clone());
                 thread::spawn(move || {
+                    let _released = (z_gate.released_on_unwind(), claim_gate.released_on_unwind());
                     z_gate.wait_parked();
                     rt.delete_node(z);
                     z_gate.release();
@@ -875,6 +877,38 @@ fn shared_ticket_drop_panic_keeps_the_set_walk() {
     run_in_child(
         "runtime::drop_panic_tests::shared_ticket_drop_panic_keeps_the_set_walk",
         || ticket_drop_panic_keeps_the_set_walk(&Runtime::<Shared>::new()),
+    )
+    .assert_clean();
+}
+
+/// As [`ticket_drop_panic_keeps_the_set_walk`], once another runtime's
+/// speculative run has read this one, so the set counts its change: the
+/// panic out of its end must not end the change a second time.
+fn ticket_drop_panic_ends_the_set_change_once<C: Cells>(rt: &Runtime<C>) {
+    assert!(rt.checked_reads_ready());
+    ticket_drop_panic_keeps_the_set_walk(rt);
+    assert!(
+        rt.changes.count().is_some(),
+        "a set's change is left in progress"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_drop_panic_ends_the_set_change_once() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_ticket_drop_panic_ends_the_set_change_once",
+        || ticket_drop_panic_ends_the_set_change_once(&Runtime::<Local>::new()),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_drop_panic_ends_the_set_change_once() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_ticket_drop_panic_ends_the_set_change_once",
+        || ticket_drop_panic_ends_the_set_change_once(&Runtime::<Shared>::new()),
     )
     .assert_clean();
 }

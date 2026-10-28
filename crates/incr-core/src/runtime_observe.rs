@@ -261,7 +261,7 @@ impl<C: Cells> Runtime<C> {
     /// thread if duplicate notifications matter.
     pub fn stabilize(&self) {
         value_code::check();
-        self.enter(|| self.stabilize_entered());
+        self.nested_entry(|| self.enter(|| self.stabilize_entered()));
     }
 
     fn stabilize_entered(&self) {
@@ -365,6 +365,16 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         stamp: u64,
     ) -> Result<(), ObsErr> {
+        cycle_state::KeptUnwind::around(|| self.observer_walk_kept(handle, observed, stamp))
+    }
+
+    #[inline(always)]
+    fn observer_walk_kept<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        stamp: u64,
+    ) -> Result<(), ObsErr> {
         let id = NodeId(handle.slot());
         if observed == NodeState::Cyclic || is_computing(observed) {
             // `Ok` is a node on this thread's stack or held map, in a
@@ -378,8 +388,10 @@ impl<C: Cells> Runtime<C> {
         }
         let _observing = Observing::record(self.runtime_id, id.0);
         let walked = catch_unwind(AssertUnwindSafe(|| {
-            self.entered(ReadKind::TryGet, || {
-                self.ensure_clean(id, handle.generation())
+            self.nested_entry(|| {
+                self.entered(ReadKind::TryGet, || {
+                    self.ensure_clean(id, handle.generation())
+                })
             })
         }));
         let computed = match walked {
@@ -392,7 +404,7 @@ impl<C: Cells> Runtime<C> {
             Computed::Deferred => Err(ObsErr::Cycle(stamp)),
             // The reading run is thrown away and its retry reads again.
             Computed::Doomed | Computed::Discarded => Err(ObsErr::Gone),
-            Computed::Skipped(_) | Computed::Replan | Computed::Revisit => {
+            Computed::Skipped(_) | Computed::Replan | Computed::Revisit | Computed::RootTaken => {
                 unreachable!("incr-core: a walk's root is never skipped or replanned")
             }
         }
@@ -410,7 +422,7 @@ impl<C: Cells> Runtime<C> {
         C::fence_acquire();
         let failed = !cycle_state::wounded()
             && cycle_state::unwind_kind().is_none()
-            && node.state() == NodeState::Failed
+            && self.seen_quietly(node.state_cell(), node.state()) == NodeState::Failed
             && node.generation() == handle.generation();
         if !failed {
             resume_unwind(payload);

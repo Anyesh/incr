@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
 use super::cycle_impl::EpisodeSeen;
-use super::race_tests::{id, Gate};
+use super::race_tests::{id, release_parked_on_unwind, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
@@ -1009,11 +1009,10 @@ fn speculative_chain_drops_without_unwinding<C: Cells>() {
 /// `get(G)` or 9999 if it unwinds, and G reads D, so `try_get(D)` closes
 /// the cycle and leaves E and F Dirty over a New G. `try_get(E)`'s walk
 /// then computes G, whose read of D dooms; G's run as a virtual frame
-/// closes the cycle again at D's read of G, and the walk contains that
-/// unwind, as the unbounded run's walk does, because every claim but G's
-/// own ran above G. The unwind releases G's claim too, so counting it
-/// let the cycle out as `try_get(E)`'s `Err` (two-thread seed 0x5b0d).
-fn walk_entry_contains_a_cycle_through_itself<C: Cells>() {
+/// closes the cycle again at D's read of G, and that unwind reaches
+/// `try_get(E)` as its `Err`, at budget 1 as unbounded, and as on main
+/// (two-thread seed 0x5b0d).
+fn walk_entry_cycle_through_itself_reaches_the_reader<C: Cells>() {
     let observe = |frames: Option<u32>| {
         let rt = runtime::<C>(frames);
         let d_cell = cell::<u64>();
@@ -1040,8 +1039,15 @@ fn walk_entry_contains_a_cycle_through_itself<C: Cells>() {
         (first, second, rt.state_of(e), rt.state_of(g))
     };
     let unbounded = observe(None);
-    assert!(matches!(unbounded.0, Outcome::Cycle(_)), "{unbounded:?}");
-    assert_eq!(unbounded.1, Outcome::Value(7777));
+    assert_eq!(
+        unbounded,
+        (
+            Outcome::Cycle(vec![0, 3]),
+            Outcome::Cycle(vec![0, 1, 2, 3]),
+            NodeState::Dirty,
+            NodeState::New
+        )
+    );
     assert_eq!(observe(Some(1)), unbounded);
 }
 
@@ -1406,6 +1412,7 @@ fn reserved_vframe_handed_memo(grouped: bool) {
                     assert!(installed.is_ok(), "park hook installed twice");
                     doomed_read.arm();
                     let (root, f) = std::thread::scope(|s| {
+                        let _released = release_parked_on_unwind();
                         let reader = s.spawn(|| get(&rt, g.g));
                         doomed_read.wait_parked();
                         assert_ne!(rt.state_of(g.f), NodeState::Clean, "frames {frames:?}");
@@ -1473,7 +1480,7 @@ fn shared_reserved_vframe_keeps_handed_memo_in_group() {
 
 local_and_shared!(
     doom_handed_memo_meets_no_chain_drop,
-    walk_entry_contains_a_cycle_through_itself,
+    walk_entry_cycle_through_itself_reaches_the_reader,
     speculative_chain_drops_without_unwinding,
     virtual_hit_above_an_earlier_one,
     drop_through_a_native_frame,

@@ -53,6 +53,7 @@ All notable changes to this project are documented here. Format roughly follows 
 
 ### Known limitations
 
+- A value's `Clone` must not block on another thread's engine work. Under `Shared`, a thread whose compute panicked holds that landing until its outermost read ends, and the reads it makes meanwhile clone values; if a `Clone` waits on a thread that reads the held node, the two wait on each other for good.
 - A repeated `get` of a node in a cycle can return a different result with no `set` in between. Usually only the first `get` differs: it lands the node Dirty, or panics with the cycle on entering it at a query with no cycle strategy, and later `get`s agree with each other. It alternates between two values when a cycle member's closure catches another member's cycle panic and the node sits in two overlapping cycles.
 
 ## [0.2.0-beta.5] - unreleased

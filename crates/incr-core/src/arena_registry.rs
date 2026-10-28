@@ -25,6 +25,7 @@ use crate::deferred::Unbuilt;
 use crate::directory::Directory;
 use crate::generic_arena::GenericArena;
 use crate::value::Value;
+use crate::value_slot::Displaced;
 use crate::value_slot::{Compared, ValueSlot};
 
 /// Object-safe arena interface, for code that holds a node's tag but
@@ -55,6 +56,11 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     /// the value it held.
     #[doc(hidden)]
     fn clear_value(&self, slot: u32) -> Option<Box<dyn Any>>;
+
+    /// [`ValueSlot::restore`] of a value `write_erased` or the compute
+    /// wrapper displaced from `slot`, boxed as they box it.
+    #[doc(hidden)]
+    fn restore_erased(&self, slot: u32, old: Option<Box<dyn Any>>) -> Option<Box<dyn Any>>;
 
     /// [`Self::clear_value`] for a value no run the unbounded one makes
     /// built, dropped under isolation wherever its `Drop` runs.
@@ -113,6 +119,14 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
 
     fn clear_value(&self, slot: u32) -> Option<Box<dyn Any>> {
         self.clear(slot).map(|d| Box::new(d) as Box<dyn Any>)
+    }
+
+    fn restore_erased(&self, slot: u32, old: Option<Box<dyn Any>>) -> Option<Box<dyn Any>> {
+        let old = old.map(|d| {
+            *d.downcast::<Displaced<T, C>>()
+                .expect("incr-core: a displaced value has its slot's type")
+        });
+        self.restore(slot, old).map(|d| Box::new(d) as Box<dyn Any>)
     }
 
     fn clear_unbuilt(&self, slot: u32) -> Option<Unbuilt> {

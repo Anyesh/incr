@@ -12,13 +12,15 @@
 //! larger one cut off by a timeout: B7 sat at bound 2 while a bound-3 run
 //! of the same model spent three hours elsewhere in the search.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
+use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
+use crate::changes::{Changes, Count};
 use crate::generic_arena::GenericArena;
 use crate::handle::Incr;
 use crate::loom_cells::Loom;
@@ -51,16 +53,79 @@ fn silence_expected_panics() {
     ONCE.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let expected = EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false);
-            if !expected {
-                default(info);
+            if IN_MODEL.with(Cell::get) {
+                if fatal(info) {
+                    report_raw(info);
+                } else if EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false) {
+                    return;
+                } else {
+                    LAST_SHOWN.with(|l| *l.borrow_mut() = Some(describe(info)));
+                }
             }
+            default(info);
         }));
     });
 }
 
+/// Loom's own panics (a branch limit, a deadlock, its state touched
+/// outside an execution) and core's non-unwinding ones. While these run
+/// loom's thread-locals panic on access, which in the hook aborts: loom
+/// may hold its state borrowed, or a failed model's teardown drops threads
+/// whose locals hold loom objects outside any execution.
+fn fatal(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    info.location()
+        .is_some_and(|l| l.file().contains("/loom-") || l.file().ends_with("core/src/panicking.rs"))
+}
+
+fn describe(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info.payload();
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("");
+    let at = info.location().map(ToString::to_string).unwrap_or_default();
+    format!("panicked at {at}: {msg}")
+}
+
+/// A fatal panic usually ends in an abort, which loses the test harness's
+/// captured output, so it and the last panic shown before it, often the
+/// model's failed assertion, also go to the process's stderr.
+fn report_raw(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    if let Some(last) = LAST_SHOWN.with(|l| l.take()) {
+        let _ = writeln!(err, "loom model, last panic shown: {last}");
+    }
+    let _ = writeln!(err, "loom model, fatal: {}", describe(info));
+}
+
+std::thread_local! {
+    static IN_MODEL: Cell<bool> = const { Cell::new(false) };
+    static LAST_SHOWN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Marks the thread as inside [`loom::model`] until dropped, unwinding
+/// included.
+struct InModel;
+
+impl InModel {
+    fn enter() -> Self {
+        IN_MODEL.with(|m| m.set(true));
+        LAST_SHOWN.with(|l| *l.borrow_mut() = None);
+        Self
+    }
+}
+
+impl Drop for InModel {
+    fn drop(&mut self) {
+        IN_MODEL.with(|m| m.set(false));
+    }
+}
+
 pub(crate) fn run(f: impl Fn() + Sync + Send + 'static) {
     silence_expected_panics();
+    let _in = InModel::enter();
     loom::model(f);
 }
 
@@ -890,25 +955,39 @@ fn released_group(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
     (r, y)
 }
 
+type SlotRead = Result<u64, Vec<u32>>;
+
+/// A read's result with its cycle as the slots it names, once every
+/// member is checked to be `rt`'s: the serial orders run on runtimes built
+/// alike, whose handles differ from the model's only by runtime.
+fn by_slots(read: Result<u64, crate::cycle::Cycle>, rt: &Rt) -> SlotRead {
+    read.map_err(|c| {
+        assert!(
+            c.participants()
+                .iter()
+                .all(|p| p.runtime_id() == rt.runtime_id),
+            "the cycle {c:?} names another runtime's node"
+        );
+        c.participants().iter().map(|p| p.slot()).collect()
+    })
+}
+
 #[test]
-#[ignore = "T8-44e3-clean-landing-variant"]
 fn loom_released_group_members_stay_grouped_until_the_read_ends() {
     run(|| {
-        let orders: Vec<(
-            Result<u64, crate::cycle::Cycle>,
-            Result<u64, crate::cycle::Cycle>,
-        )> = [true, false]
+        let orders: Vec<(SlotRead, SlotRead)> = [true, false]
             .into_iter()
             .map(|r_first| {
                 let rt = Rt::new();
                 let (r, y) = released_group(&rt);
-                if r_first {
+                let (a, b) = if r_first {
                     let a = rt.try_get(r);
                     (a, rt.try_get(y))
                 } else {
                     let b = rt.try_get(y);
                     (rt.try_get(r), b)
-                }
+                };
+                (by_slots(a, &rt), by_slots(b, &rt))
             })
             .collect();
         let rt = Arc::new(Rt::new());
@@ -921,8 +1000,451 @@ fn loom_released_group_members_stay_grouped_until_the_read_ends() {
             let rt = Arc::clone(&rt);
             thread::spawn(move || rt.try_get(y))
         };
-        let got = (reads_r.join().unwrap(), reads_y.join().unwrap());
+        let got = (
+            by_slots(reads_r.join().unwrap(), &rt),
+            by_slots(reads_y.join().unwrap(), &rt),
+        );
         assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// After k is set to 1, x (Fallback) and y, a landed group, form a cycle;
+/// q reads y and o reads x and then q. A's read of o lands the episode
+/// {x, y} and then waits on B's claim of q, while B's read of q waits on
+/// y: the waits-for cycle wounds one of them. A wounded A retracts the
+/// episode, so B never builds on a value of an attempt that gave its claims
+/// back, both reads match a single-thread order, and no group record names
+/// a node that left it.
+fn held_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let k = rt.create_input(0_u64);
+    let yc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let x = {
+        let yc = yc.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Rt| match rt.get(k) {
+                0 => 0,
+                _ => rt.get(*yc.get().unwrap()) + 1,
+            },
+            |_c: &crate::cycle::Cycle| 10,
+        )
+    };
+    let y = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(x) + 100,
+    });
+    let q = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(y) + 1000,
+    });
+    let o = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(x) + rt.get(q),
+    });
+    yc.set(y).unwrap();
+    assert_eq!((rt.get(o), rt.get(q)), (0, 0));
+    rt.force_group_for_test(&[x.erase(), y.erase()]);
+    rt.set(k, 1);
+    (o, q, x, y)
+}
+
+#[test]
+fn loom_held_episode_wound_retracts_values() {
+    run(|| {
+        let orders: Vec<(SlotRead, SlotRead)> = [true, false]
+            .into_iter()
+            .map(|o_first| {
+                let rt = Rt::new();
+                let (o, q, _, _) = held_episode(&rt);
+                let (a, b) = if o_first {
+                    let a = rt.try_get(o);
+                    (a, rt.try_get(q))
+                } else {
+                    let b = rt.try_get(q);
+                    (rt.try_get(o), b)
+                };
+                (by_slots(a, &rt), by_slots(b, &rt))
+            })
+            .collect();
+        let rt = Arc::new(Rt::new());
+        let (o, q, x, y) = held_episode(&rt);
+        let reads_o = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(o))
+        };
+        let reads_q = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(q))
+        };
+        let got = (
+            by_slots(reads_o.join().unwrap(), &rt),
+            by_slots(reads_q.join().unwrap(), &rt),
+        );
+        assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+        assert!(
+            rt.in_group_of(x.erase(), y.erase()),
+            "x and y left their group"
+        );
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// p panics once k is 1 and w reads p; a catches w's panic and then reads
+/// b, while b reads s and then catches w's panic. A reader of a holds the
+/// unwind's landings of p and w and waits on b's claim; a reader of b waits
+/// on that held w. Returns (a, b, p, w) with k set to 1.
+fn held_panic_wait(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let k = rt.create_input(0_u64);
+    let p = rt.create_query(move |rt: &Rt| {
+        let v = rt.get(k);
+        assert!(v != 1, "p boom");
+        v
+    });
+    let w = rt.create_query(move |rt: &Rt| rt.get(p) + 1);
+    let s = rt.create_query(move |rt: &Rt| rt.get(k) * 10);
+    let caught = move |rt: &Rt| {
+        EXPECTING_UNWIND.with(|e| e.set(true));
+        let v = catch_unwind(AssertUnwindSafe(|| rt.get(w))).unwrap_or(0);
+        EXPECTING_UNWIND.with(|e| e.set(false));
+        v
+    };
+    let b = rt.create_query(move |rt: &Rt| rt.get(s) + caught(rt));
+    let a = rt.create_query(move |rt: &Rt| caught(rt) + rt.get(b));
+    assert_eq!((rt.get(a), rt.get(b)), (2, 1));
+    rt.set(k, 1);
+    (a, b, p, w)
+}
+
+/// Whichever reader of [`held_panic_wait`] is wounded, a wound that
+/// overtakes the held landings of a caught panic takes them back before
+/// the other thread plans from them, and nothing waits on them past it:
+/// both reads and the landed states are a serial order's, and neither
+/// thread is left holding or registered.
+#[test]
+fn loom_wound_overtakes_held_panic_landings() {
+    run(|| {
+        let serial = {
+            let rt = Rt::new();
+            let (a, b, p, w) = held_panic_wait(&rt);
+            ((rt.get(a), rt.get(b)), (rt.state_of(p), rt.state_of(w)))
+        };
+        let rt = Arc::new(Rt::new());
+        let (a, b, p, w) = held_panic_wait(&rt);
+        let reads_a = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || (rt.get(a), crate::hold::held_count()))
+        };
+        let read_b = rt.get(b);
+        assert_eq!(crate::hold::held_count(), 0);
+        let (read_a, held_a) = reads_a.join().unwrap();
+        assert_eq!(held_a, 0);
+        assert_eq!(((read_a, read_b), (rt.state_of(p), rt.state_of(w))), serial);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// A (Fallback) and B, where B also reads x, and o, which reads A and
+/// then B. A reader of o lands the episode {A, B} and is still in o when a
+/// setter changes x: the held members publish Dirty if the set came
+/// first, and the set's walk reaches o either way.
+#[test]
+fn loom_held_landing_publishes_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(0_u64);
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*bc.get().unwrap()) + 1,
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(x));
+        let o = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(b));
+        bc.set(b).unwrap();
+
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(o))
+        };
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 1))
+        };
+        let read = reader.join().unwrap();
+        setter.join().unwrap();
+        assert!(read == 200 || read == 201, "o read {read}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(b), 101, "(V) violated: B stale against x = 1");
+        assert_eq!(rt.get(o), 201, "(V) violated: o stale against x = 1");
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+    });
+}
+
+/// A (Fallback) and B, a landed group made Dirty by a set of x, which B
+/// reads; o reads A and then B. While A's thread holds the episode it ran
+/// for o, B's thread reads B and waits on a member: once A publishes, B's
+/// group verify finds every member under one record, never a group half
+/// published, and both reads match a single-thread order.
+fn republished_group(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
+    let x = rt.create_input(0_u64);
+    let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Rt| rt.get(*bc.get().unwrap()) + 1,
+            |_c: &crate::cycle::Cycle| 100,
+        )
+    };
+    let b = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(x));
+    let o = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(b));
+    bc.set(b).unwrap();
+    assert_eq!(rt.get(o), 200);
+    rt.set(x, 1);
+    (o, a, b)
+}
+
+#[test]
+fn loom_held_group_record_precedes_state() {
+    run(|| {
+        let orders: Vec<(SlotRead, SlotRead)> = [true, false]
+            .into_iter()
+            .map(|o_first| {
+                let rt = Rt::new();
+                let (o, _, b) = republished_group(&rt);
+                let (a, b) = if o_first {
+                    let first = rt.try_get(o);
+                    (first, rt.try_get(b))
+                } else {
+                    let second = rt.try_get(b);
+                    (rt.try_get(o), second)
+                };
+                (by_slots(a, &rt), by_slots(b, &rt))
+            })
+            .collect();
+        let rt = Arc::new(Rt::new());
+        let (o, a, b) = republished_group(&rt);
+        let reads_o = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(o))
+        };
+        let reads_b = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(b))
+        };
+        let got = (
+            by_slots(reads_o.join().unwrap(), &rt),
+            by_slots(reads_b.join().unwrap(), &rt),
+        );
+        assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+        assert!(
+            rt.in_group_of(a.erase(), b.erase()),
+            "A and B left their group"
+        );
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// Which runs a cross-runtime held wait model's executions reached, by
+/// whether some closure ran again after the waits-for cycle was broken.
+static CROSS_HELD_REACH: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+/// Thread 1 reads q of runtime A, which reads c, landing A's two-node cycle
+/// {c, d} held, and then b of runtime B; thread 2 reads b, which reads c.
+/// When thread 2 claims b and then waits on c, its wait in A must see
+/// thread 1's hold although thread 1 waits in B, so the waits-for cycle
+/// through b's claim breaks, one side runs again, and both reads give their
+/// single-thread values. Some executions must break that cycle and some
+/// must never form it.
+#[test]
+fn loom_cross_runtime_held_wait() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    run(|| {
+        let ra = std::sync::Arc::new(Rt::new());
+        let rb = std::sync::Arc::new(Rt::new());
+        let runs = std::sync::Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let dc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let c = {
+            let dc = dc.clone();
+            ra.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*dc.get().unwrap()) + 1,
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let d = ra.create_query(move |rt: &Rt| rt.get(c) * 2);
+        dc.set(d).unwrap();
+        // Weak captures, so the two runtimes' closures form no Arc cycle.
+        let b = {
+            let (ra, runs) = (std::sync::Arc::downgrade(&ra), runs.clone());
+            rb.create_query(move |_: &Rt| {
+                runs[0].fetch_add(1, Relaxed);
+                ra.upgrade().unwrap().get(c) + 1
+            })
+        };
+        let q = {
+            let (rb, runs) = (std::sync::Arc::downgrade(&rb), runs.clone());
+            ra.create_query(move |rt: &Rt| {
+                runs[1].fetch_add(1, Relaxed);
+                rt.get(c) + rb.upgrade().unwrap().get(b)
+            })
+        };
+        let reads_b = {
+            let rb = std::sync::Arc::clone(&rb);
+            thread::spawn(move || rb.get(b))
+        };
+        assert_eq!(ra.get(q), 201);
+        assert_eq!(reads_b.join().unwrap(), 101);
+        for rt in [&ra, &rb] {
+            rt.assert_invariant_i();
+            rt.assert_walks_complete();
+        }
+        assert_eq!(crate::waits::registered(), 0);
+        let again = runs.iter().any(|r| r.load(Relaxed) > 1);
+        CROSS_HELD_REACH[usize::from(again)].store(true, Relaxed);
+    });
+    assert!(
+        CROSS_HELD_REACH[1].load(std::sync::atomic::Ordering::Relaxed),
+        "no execution formed the cross-runtime waits-for cycle"
+    );
+    assert!(
+        CROSS_HELD_REACH[0].load(std::sync::atomic::Ordering::Relaxed),
+        "every execution formed the cross-runtime waits-for cycle"
+    );
+}
+
+/// c (Fallback) reads a and b, and a (while i is 0) and b (Fallback) read
+/// c: a landed group. Once i is 1, a no longer reads c, so the episode at c
+/// that o's read runs shrinks to {c, b} and o re-reads a, released from it,
+/// giving a fresh graph's (21, 1). Counts every closure run. Without b's
+/// fallback the shrunk episode panics, as on main.
+fn shrunk_cut<C: crate::cells::Cells>(
+    rt: &Runtime<C>,
+    runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (Incr<i64>, Incr<i64>) {
+    let i = rt.create_input(0_i64);
+    let ac: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+    let bc: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+    let run = move |runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+        runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    let c = {
+        let (ac, bc, runs) = (ac.clone(), bc.clone(), runs.clone());
+        rt.create_query_with_fallback(
+            move |rt: &Runtime<C>| {
+                run(&runs);
+                rt.get(*ac.get().unwrap()) + rt.get(*bc.get().unwrap())
+            },
+            |cy: &crate::cycle::Cycle| 10 * cy.len() as i64,
+        )
+    };
+    let a = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            if rt.get(i) == 0 {
+                rt.get(c)
+            } else {
+                1
+            }
+        })
+    };
+    let b = {
+        let runs = runs.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Runtime<C>| {
+                run(&runs);
+                rt.get(c) + 2
+            },
+            |cy: &crate::cycle::Cycle| 100 * cy.len() as i64,
+        )
+    };
+    let o = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            rt.get(c) + rt.get(a)
+        })
+    };
+    ac.set(a).unwrap();
+    bc.set(b).unwrap();
+    assert_eq!((rt.get(o), rt.get(a)), (60, 30));
+    rt.set(i, 1);
+    (o, a)
+}
+
+#[test]
+fn loom_own_landed_reread_matches_local() {
+    run(|| {
+        let local_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local = Runtime::<crate::cells::Local>::new();
+        let (o, a) = shrunk_cut(&local, &local_runs);
+        let want = (
+            panic_message(|| local.get(o)),
+            panic_message(|| local.get(a)),
+        );
+        assert_eq!(want, (Ok(21), Ok(1)), "Local differs from a fresh graph");
+        let local_runs = local_runs.load(std::sync::atomic::Ordering::Relaxed);
+        let local_b_first = {
+            let rt = Runtime::<crate::cells::Local>::new();
+            let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
+            let b = panic_message(|| rt.get(a));
+            (panic_message(|| rt.get(o)), b)
+        };
+        assert!(
+            local_b_first.0.is_ok() && local_b_first.1.is_ok(),
+            "Local panics reading a first: {local_b_first:?}"
+        );
+
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = Rt::new();
+        let (o, a) = shrunk_cut(&rt, &runs);
+        assert_eq!(
+            (panic_message(|| rt.get(o)), panic_message(|| rt.get(a))),
+            want
+        );
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            local_runs,
+            "closure runs differ from Local's"
+        );
+
+        let rt = Arc::new(Rt::new());
+        let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
+        let reads_o = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || panic_message(|| rt.get(o)))
+        };
+        let reads_a = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || panic_message(|| rt.get(a)))
+        };
+        let got = (reads_o.join().unwrap(), reads_a.join().unwrap());
+        assert!(
+            got == want || got == local_b_first,
+            "{got:?}, Local {want:?} or {local_b_first:?}"
+        );
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+        assert_eq!(rt.nodes.get(a.slot()).state(), NodeState::Clean);
 
         rt.assert_invariant_i();
         rt.assert_walks_complete();
@@ -1122,6 +1644,48 @@ fn loom_wound_retry() {
         rt.assert_invariant_i();
         rt.assert_walks_complete();
         assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// Another thread computes Y, whose closure reads X, while this thread
+/// reserves X, rests the reservation once that op has begun, and reads Y.
+/// The rested reservation holds the earlier op, so the two wait on each
+/// other: a cycle wound-wait must see, because this thread's wait on Y
+/// lists its rested reservation as held. Both reads finish with the serial
+/// values.
+#[test]
+fn rested_reservation_owner_waits_in_the_engine() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let begun = Arc::new(AtomicU64::new(0));
+        let x = rt.create_query(|_: &Rt| 1_u64);
+        let y = {
+            let begun = Arc::clone(&begun);
+            rt.create_query(move |rt: &Rt| {
+                begun.store(1, Ordering::SeqCst);
+                rt.get(x) + 1
+            })
+        };
+        let claim = (rt.runtime_id, x.slot());
+        {
+            let _scope = crate::reserve::Scope::new(Some(5));
+            crate::reserve::note(claim, x.generation());
+        }
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(y))
+        };
+        while begun.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        crate::reserve::rest(claim, x.generation());
+        let mine = rt.get(y);
+        crate::reserve::end_contexts();
+        assert_eq!((mine, other.join().unwrap()), (2, 2));
+
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any());
     });
 }
 
@@ -1503,18 +2067,33 @@ fn doom_reservations_cross(len: usize, frames: u32) {
         fc.set(f).unwrap();
         (rt, f, x)
     }
+    // One thread, so one execution: the orders are computed once here and
+    // not again in each of the concurrent model's executions.
+    let orders = std::sync::Arc::new(std::sync::OnceLock::new());
+    run({
+        let orders = std::sync::Arc::clone(&orders);
+        move || {
+            let serial = |f_first: bool| {
+                let (rt, f, x) = shape(len, frames);
+                if f_first {
+                    let vf = panic_message(|| rt.get(f));
+                    (vf, panic_message(|| rt.get(x)))
+                } else {
+                    let vx = panic_message(|| rt.get(x));
+                    (panic_message(|| rt.get(f)), vx)
+                }
+            };
+            let got = [serial(true), serial(false)];
+            assert_eq!(crate::waits::registered(), 0);
+            assert!(
+                !crate::reserve::any(),
+                "a reservation outlived a serial read"
+            );
+            assert_eq!(orders.get_or_init(|| got.clone()), &got);
+        }
+    });
+    let orders = orders.get().cloned().unwrap();
     run(move || {
-        let serial = |f_first: bool| {
-            let (rt, f, x) = shape(len, frames);
-            if f_first {
-                let vf = panic_message(|| rt.get(f));
-                (vf, panic_message(|| rt.get(x)))
-            } else {
-                let vx = panic_message(|| rt.get(x));
-                (panic_message(|| rt.get(f)), vx)
-            }
-        };
-        let orders = [serial(true), serial(false)];
         let (rt, f, x) = shape(len, frames);
         let other = {
             let rt = Arc::clone(&rt);
@@ -1595,6 +2174,144 @@ fn give_back_wait_ends_on_a_landing() {
     give_back_wait(true);
 }
 
+/// When [`walk_listing`]'s reader of N starts, and where it is joined.
+#[derive(Clone, Copy, PartialEq)]
+enum WalkReader {
+    /// The read's user code, outside the listing's peers, spawns the
+    /// reader after the listing, which ended at that entry, and joins it.
+    Joined,
+    /// Spawned before the listing, with no user code in the read, and
+    /// joined after the read: if its op began first it waits on the
+    /// listing until the read ends.
+    Early,
+    /// Spawned before the listing and joined by the read's user code,
+    /// outside the listing's peers: the listing ended at that entry, so the
+    /// reader passes whenever its op began.
+    EarlyJoined,
+    /// Spawned before the listing and joined inside the read, with no user
+    /// code, after N's settled landing, which ends the listing.
+    EarlyLanded,
+}
+
+/// A read's walk listing of a Dirty node N ([`crate::reserve::note_walk`])
+/// in the a06beeee9 shape, with a reader of N started as `reader` says.
+/// No listing outlives the read.
+fn walk_listing(reader: WalkReader) {
+    run(move || {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let n = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let q = rt.create_query_with(move |rt: &Rt| rt.get(i) + 2, replayable());
+        assert_eq!(rt.get(n), 2);
+        rt.set(i, 2);
+        let spawn = |rt: &Arc<Rt>| {
+            let rt = Arc::clone(rt);
+            thread::spawn(move || rt.get(n))
+        };
+        let mut early = (reader != WalkReader::Joined).then(|| spawn(&rt));
+        {
+            let _read = crate::reserve::Root::arm(true, (rt.runtime_id, q.slot()));
+            crate::reserve::note_walk(
+                (rt.runtime_id, n.slot()),
+                n.generation(),
+                &crate::reserve::Peers::new([n.slot()]),
+            );
+            match reader {
+                WalkReader::Joined => {
+                    crate::reserve::user_code((rt.runtime_id, q.slot()));
+                    assert_eq!(spawn(&rt).join().unwrap(), 3);
+                }
+                WalkReader::EarlyJoined => {
+                    crate::reserve::user_code((rt.runtime_id, q.slot()));
+                    assert_eq!(early.take().unwrap().join().unwrap(), 3);
+                }
+                WalkReader::EarlyLanded => {
+                    crate::reserve::end_walk_landed((rt.runtime_id, n.slot()), n.generation());
+                    assert_eq!(early.take().unwrap().join().unwrap(), 3);
+                }
+                WalkReader::Early => {}
+            }
+        }
+        if let Some(r) = early {
+            assert_eq!(r.join().unwrap(), 3);
+        }
+        assert!(!crate::reserve::any(), "a walk listing outlived its read");
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+#[test]
+fn walk_listing_passes_a_reader_its_read_joins() {
+    walk_listing(WalkReader::Joined);
+}
+
+#[test]
+fn walk_listing_holds_an_earlier_reader_until_its_read_ends() {
+    walk_listing(WalkReader::Early);
+}
+
+#[test]
+fn walk_listing_ends_where_its_read_enters_user_code() {
+    walk_listing(WalkReader::EarlyJoined);
+}
+
+#[test]
+fn walk_listing_ends_at_its_nodes_settled_landing() {
+    walk_listing(WalkReader::EarlyLanded);
+}
+
+/// [`give_back_wait`] where the other thread takes over: this thread's
+/// reservation of X is held by an attempt whose discard is in flight, and
+/// the other thread wounds that attempt, claims X and keeps the claim until
+/// this thread's wait has returned. The wait must end once the wound takes
+/// the reservation away, not wait out a claim that outlives it.
+#[test]
+fn give_back_wait_ends_when_a_take_over_keeps_the_claim() {
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        assert_eq!(rt.get(x), 2);
+        rt.set(i, 2);
+        let (slot, generation) = (x.slot(), x.generation());
+        crate::attempt::begin();
+        {
+            let _scope = crate::reserve::Scope::new(Some(1));
+            crate::reserve::note((rt.runtime_id, slot), generation);
+        }
+        crate::attempt::enter_flight();
+        let attempt = crate::attempt::mine();
+        let returned = Arc::new(AtomicBool::new(false));
+        let taker = {
+            let rt = Arc::clone(&rt);
+            let returned = Arc::clone(&returned);
+            thread::spawn(move || {
+                if !attempt.wound_in_flight((rt.runtime_id, slot)) {
+                    return false;
+                }
+                let cell = rt.nodes.get(slot).state_cell();
+                crate::state::try_transition::<Loom>(cell, NodeState::Dirty, NodeState::Computing)
+                    .unwrap();
+                while !returned.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                crate::state::try_transition::<Loom>(cell, NodeState::Computing, NodeState::Clean)
+                    .unwrap();
+                true
+            })
+        };
+        let left = rt.given_back_state(slot, generation);
+        returned.store(true, Ordering::Release);
+        assert!(left.is_none() || left == Some(NodeState::Dirty), "{left:?}");
+        let wounded = crate::attempt::leave_flight();
+        crate::reserve::end_all();
+        let took = taker.join().unwrap();
+        assert_eq!(took, wounded);
+        assert!(left.is_some() || took, "the wait ended with no take-over");
+    });
+}
+
 /// [`doom_reservations_cross`] on F <-> X at budget 1: each read dooms on
 /// the other thread's entry node.
 #[test]
@@ -1608,6 +2325,343 @@ fn doom_reservations_cross_direct() {
 #[test]
 fn doom_reservations_cross_held() {
     doom_reservations_cross(3, 2);
+}
+
+/// T catches its read of X, which dooms at budget 1, and joins a thread
+/// that reads X before its pop. The reader meets X reserved for T's
+/// retry while T's discard is in flight, takes it over, which wounds T's
+/// attempt, and both reads give the unbounded run's values.
+#[test]
+fn doom_caught_joins_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let t = {
+            let me = Arc::clone(&me);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                    let other = me.lock().unwrap().clone().unwrap();
+                    v + thread::spawn(move || other.get(x)).join().unwrap()
+                },
+                replayable(),
+            )
+        };
+        assert_eq!(rt.get(t), 28);
+        *me.lock().unwrap() = None;
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+    });
+}
+
+/// T reads X, which dooms at budget 1, while another thread reads X. The
+/// reader can meet X's reservation while T's discard is in flight, before
+/// the engine's pop catches it, and take it over, which restarts T's
+/// read; or the pop ends the flight first and the reader waits for T's
+/// context. Either way both reads give X's value and nothing stays
+/// reserved.
+#[test]
+fn doom_in_flight_race() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let t = rt.create_query_with(move |rt: &Rt| rt.get(x) + 100, replayable());
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(x))
+        };
+        assert_eq!(rt.get(t), 114);
+        assert_eq!(other.join().unwrap(), 14);
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+    });
+}
+
+/// T reads X, which dooms at budget 1, so T takes the placeholder and runs
+/// on with its doom's flight open, into a join of a thread that reads X.
+/// The reader meets X reserved for T's retry, takes it over and computes
+/// X; T's run ends as the wound its read retries from, and both reads give
+/// the unbounded run's values.
+#[test]
+fn doom_lazy_joins_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let t = {
+            let me = Arc::clone(&me);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    let other = me.lock().unwrap().clone().unwrap();
+                    v + thread::spawn(move || other.get(x)).join().unwrap()
+                },
+                replayable(),
+            )
+        };
+        assert_eq!(rt.get(t), 28);
+        *me.lock().unwrap() = None;
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+    });
+}
+
+/// T reads X, which dooms at budget 1, then Z, while another thread reads
+/// X. T runs on past X's placeholder with its flight open and raises the
+/// discard at its read of Z; the reader may take X over in that window or
+/// wait for T's context. Both reads give the unbounded run's values and
+/// nothing stays reserved.
+#[test]
+fn doom_lazy_reads_again() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let z = rt.create_query_with(move |rt: &Rt| rt.get(i) + 20, replayable());
+        let t = rt.create_query_with(move |rt: &Rt| rt.get(x) + rt.get(z) + 100, replayable());
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(x))
+        };
+        assert_eq!(rt.get(t), 137);
+        assert_eq!(other.join().unwrap(), 14);
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+    });
+}
+
+/// The orders a lazy doom model's executions reached, kept outside the
+/// model in plain atomics and checked once every execution has run.
+struct Reached {
+    take_over: std::sync::atomic::AtomicBool,
+    no_take_over: std::sync::atomic::AtomicBool,
+    /// The other thread waited on X's reservation and did not take over.
+    waited_untaken: std::sync::atomic::AtomicBool,
+}
+
+impl Reached {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicBool;
+        Self {
+            take_over: AtomicBool::new(false),
+            no_take_over: AtomicBool::new(false),
+            waited_untaken: AtomicBool::new(false),
+        }
+    }
+
+    fn note(&self, (took, waited): (bool, bool)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if took {
+            self.take_over.store(true, Relaxed);
+        } else {
+            self.no_take_over.store(true, Relaxed);
+            if waited {
+                self.waited_untaken.store(true, Relaxed);
+            }
+        }
+    }
+
+    fn assert_both(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        assert!(
+            self.take_over.load(Relaxed),
+            "no execution took the doom over"
+        );
+        assert!(
+            self.no_take_over.load(Relaxed),
+            "every execution took the doom over"
+        );
+    }
+
+    fn assert_waited_untaken(&self) {
+        assert!(
+            self.waited_untaken
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "no execution waited on X without taking it over"
+        );
+    }
+}
+
+/// A lazy doom world at budget 1: T's closure is `t_run` over X (= Y + 10,
+/// Y = I + 1, I = 3) and Z (= I + 20). T's runs push the attempt epoch
+/// they ran in, which moves on only when the outermost entry retries
+/// after a wound.
+struct LazyWorld {
+    rt: Arc<Rt>,
+    x: Incr<u64>,
+    t: Incr<u64>,
+    epochs: Arc<std::sync::Mutex<Vec<u32>>>,
+}
+
+impl LazyWorld {
+    fn new(t_run: impl Fn(&Rt, Incr<u64>, Incr<u64>) -> u64 + Send + Sync + 'static) -> Self {
+        // Shared by every model in the process: run one model per process.
+        crate::attempt::TAKE_OVERS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let z = rt.create_query_with(move |rt: &Rt| rt.get(i) + 20, replayable());
+        let epochs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t = {
+            let epochs = Arc::clone(&epochs);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    epochs.lock().unwrap().push(crate::attempt::epoch());
+                    t_run(rt, x, z)
+                },
+                replayable(),
+            )
+        };
+        Self { rt, x, t, epochs }
+    }
+
+    /// Reads T against another thread's read of X; checks both values, that
+    /// T's read retried exactly when a waiter took the doom over.
+    /// Returns whether one did, and whether the other thread waited on X.
+    fn race(&self, want: u64, user_panics: bool) -> (bool, bool) {
+        let other = {
+            let (rt, x) = (Arc::clone(&self.rt), self.x);
+            thread::spawn(move || rt.get(x))
+        };
+        EXPECTING_UNWIND.with(|e| e.set(user_panics));
+        let got = self.rt.get(self.t);
+        EXPECTING_UNWIND.with(|e| e.set(false));
+        assert_eq!(got, want);
+        assert_eq!(other.join().unwrap(), 14);
+        let took = crate::attempt::TAKE_OVERS.load(std::sync::atomic::Ordering::Relaxed);
+        let epochs = self.epochs.lock().unwrap().clone();
+        let retried = epochs.first() != epochs.last();
+        assert!(took <= 1, "{took} take-overs of one doom");
+        assert_eq!(
+            retried,
+            took == 1,
+            "T's read retried {retried} with {took} take-overs (epochs {epochs:?})"
+        );
+        self.rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+        let waited = self
+            .rt
+            .reservation_waits
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0;
+        (took == 1, waited)
+    }
+}
+
+static END_RACE: Reached = Reached::new();
+
+/// T reads X, which dooms at budget 1, takes the placeholder and returns
+/// at once, so its run's end closes the lazy doom's flight while another
+/// thread waits on X's reservation. The waiter's wound and the end's
+/// `leave_flight` race in both orders, each reached with the waiter
+/// waiting: T's read retries exactly when the wound came first, and both
+/// reads give the unbounded run's values.
+#[test]
+fn doom_lazy_end_races_take_over() {
+    run(|| {
+        let world = LazyWorld::new(|rt, x, _| rt.get(x) + 100);
+        END_RACE.note(world.race(114, false));
+    });
+    END_RACE.assert_both();
+    END_RACE.assert_waited_untaken();
+}
+
+static RAISE_RACE: Reached = Reached::new();
+
+/// T reads X, which dooms at budget 1, runs on past the placeholder and
+/// reads Z, which raises the doom's discard, while another thread waits on
+/// X's reservation. A take-over in any order around that raise leaves T's
+/// read retried exactly when it happened, and both reads give the
+/// unbounded run's values. `settle_discard`'s wound only stops the attempt
+/// sooner: the sticky wound turns the discard into a wound at its catch
+/// anyway, so its red is the unit test
+/// `a_discard_the_engine_raises_again_is_back_in_flight`.
+#[test]
+fn doom_lazy_wound_before_raise() {
+    run(|| {
+        let world = LazyWorld::new(|rt, x, z| rt.get(x) + rt.get(z) + 100);
+        RAISE_RACE.note(world.race(137, false));
+    });
+    RAISE_RACE.assert_both();
+}
+
+/// On drop, reads W from the frame it runs in, under a catch, and notes
+/// whether the read unwound.
+struct ReadOnDrop<'a> {
+    rt: &'a Rt,
+    w: Incr<u64>,
+    unwound: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ReadOnDrop<'_> {
+    fn drop(&mut self) {
+        if catch_unwind(AssertUnwindSafe(|| self.rt.get(self.w))).is_err() {
+            self.unwound
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+static PANIC_RACE: Reached = Reached::new();
+
+/// T reads X, which dooms at budget 1, and on the placeholder panics in
+/// user code while another thread waits on X's reservation; a destructor
+/// in that panic reads W. The destructor's read never unwinds and the
+/// waiter can still take X over; T's read retries exactly when it does,
+/// and both reads give the unbounded run's values. A doomed frame takes
+/// placeholders while panicking with or without `KeptUnwind` keeping the
+/// lazy doom, so that guard's red is the unit test
+/// `a_destructors_discard_leaves_a_lazy_doom_in_flight`.
+#[test]
+fn doom_lazy_take_over_during_user_panic() {
+    run(|| {
+        let unwound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let world = {
+            let unwound = Arc::clone(&unwound);
+            LazyWorld::new(move |rt, x, z| {
+                let v = rt.get(x);
+                if v == 0 {
+                    let _read = ReadOnDrop {
+                        rt,
+                        w: z,
+                        unwound: &unwound,
+                    };
+                    panic!("a doomed run panics past its placeholder");
+                }
+                v + 100
+            })
+        };
+        PANIC_RACE.note(world.race(114, true));
+        assert!(
+            !unwound.load(std::sync::atomic::Ordering::Relaxed),
+            "the destructor's read raised the lazy doom's discard"
+        );
+    });
+    PANIC_RACE.assert_both();
 }
 
 /// F, Clean at s = 0, reads a New query N once s is set, so at budget 1
@@ -1646,7 +2700,7 @@ fn discard_under_set() {
 }
 
 /// A read's panic message, its panic expected.
-fn panic_message(f: impl FnOnce() -> u64) -> Result<u64, String> {
+fn panic_message<R>(f: impl FnOnce() -> R) -> Result<R, String> {
     EXPECTING_UNWIND.with(|e| e.set(true));
     let out = catch_unwind(AssertUnwindSafe(f)).map_err(|e| {
         e.downcast_ref::<String>()
@@ -1845,5 +2899,825 @@ fn flip_racing_a_contained_hold_releases_the_ticket() {
             "F is Clean but its contained payload is still held"
         );
         rt.assert_invariant_i();
+    });
+}
+/// A Clean check and a read made against a runtime's `Changes` while a
+/// change stores a value and then dirties it, as a set's swap and walk do.
+/// A count found before the change moves once the reader has seen any part
+/// of it, and one found after it ended comes with all of it, so a stash
+/// adopted while its count holds read what a read at the adoption would.
+#[test]
+fn loom_checked_read_vs_change() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let value = Arc::new(AtomicU64::new(0));
+        let dirty = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (changes, value, dirty) = (changes.clone(), value.clone(), dirty.clone());
+            thread::spawn(move || {
+                let _change = changes.change(false);
+                value.store(1, Ordering::Release);
+                dirty.store(1, Ordering::Release);
+            })
+        };
+        if let Some(seen) = changes.count() {
+            let clean = dirty.load(Ordering::Acquire) == 0;
+            let read = value.load(Ordering::Acquire);
+            let later = (dirty.load(Ordering::Acquire), value.load(Ordering::Acquire));
+            if seen.before_any() {
+                if !clean || read == 1 || later != (0, 0) {
+                    assert!(!seen.holds());
+                }
+            } else {
+                assert!(!clean && read == 1);
+            }
+        }
+        writer.join().unwrap();
+    });
+}
+
+/// A speculative and a non-speculative change race a checked read: once the
+/// reader has seen any part of the non-speculative one, or it has ended, a
+/// count found before both no longer passes as moved by speculative runs
+/// only.
+#[test]
+fn loom_speculative_changes_vs_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let real = Arc::new(AtomicU64::new(0));
+        let writers = [true, false].map(|speculative| {
+            let (changes, real) = (changes.clone(), real.clone());
+            thread::spawn(move || {
+                let _change = changes.change(speculative);
+                if !speculative {
+                    real.store(1, Ordering::Release);
+                }
+            })
+        });
+        let seen = changes.count();
+        if let Some(seen) = &seen {
+            if seen.before_any() && real.load(Ordering::Acquire) == 1 {
+                assert!(!seen.only_speculative_since());
+            }
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(!seen.only_speculative_since());
+        }
+    });
+}
+
+/// [`loom_speculative_changes_vs_check`]'s other side: with only a
+/// speculative change, a count found before it passes once it has ended.
+#[test]
+fn loom_speculative_change_passes_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let writer = {
+            let changes = changes.clone();
+            thread::spawn(move || drop(changes.change(true)))
+        };
+        let seen = changes.count();
+        writer.join().unwrap();
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(seen.only_speculative_since());
+        }
+    });
+}
+
+/// Which outcomes a hand-over model's executions reached.
+struct HandOvers {
+    taken: std::sync::atomic::AtomicBool,
+    kept: std::sync::atomic::AtomicBool,
+}
+
+impl HandOvers {
+    const fn new() -> Self {
+        Self {
+            taken: std::sync::atomic::AtomicBool::new(false),
+            kept: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn note(&self, taken: bool) {
+        let flag = if taken { &self.taken } else { &self.kept };
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn assert_both(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        assert!(
+            self.taken.load(Relaxed),
+            "no execution handed the landing over"
+        );
+        assert!(
+            self.kept.load(Relaxed),
+            "every execution handed the landing over"
+        );
+    }
+}
+
+/// A waiter's claim wait on the held landing of `HELD_CELL`, `calls`
+/// checks yielding between them as the engine's claim wait does. Its
+/// patience starts one check short of `STUCK_AFTER` on the owner's flight
+/// at the spawn: loom resumes a yielded waiter only by preempting a
+/// runnable owner, so a waiter starting from nothing could not outlast
+/// one within the bound.
+fn wait_to_hand_over(
+    rt: crate::handle::RuntimeId,
+    mut patience: crate::attempt::Patience,
+    calls: usize,
+) -> bool {
+    for _ in 0..calls {
+        if crate::hold::hand_over(HELD_CELL, (rt, HELD_SLOT), &mut patience).is_some() {
+            return true;
+        }
+        thread::yield_now();
+    }
+    false
+}
+
+/// A waiter on `rt`'s held landing, spawned by its owner.
+fn spawn_waiter(rt: crate::handle::RuntimeId, calls: usize) -> thread::JoinHandle<bool> {
+    let patience = crate::attempt::patience_one_check_short();
+    thread::spawn(move || wait_to_hand_over(rt, patience, calls))
+}
+
+const HELD_CELL: usize = 0x1000;
+const HELD_SLOT: u32 = 7;
+
+/// The owner opens and lands a held entry and makes no more progress, as
+/// one parked in a join, then publishes.
+fn hold_one(rt: crate::handle::RuntimeId) {
+    crate::attempt::begin();
+    let own = crate::hold::open(HELD_CELL, rt, HELD_SLOT, 0, true, None, None);
+    assert!(own.is_none());
+    crate::hold::land(HELD_CELL, NodeState::Clean, NodeState::Clean, false);
+}
+
+static PUBLISH_RACE: HandOvers = HandOvers::new();
+
+/// A waiter on a held landing races the owner's publication of it
+/// (`hold::hand_over` against `hold::take`): the entry is published or
+/// taken, never both and never neither, and the owner's take reports the
+/// wound exactly when the waiter took it, so a publication never rests on
+/// a landing a waiter retracted.
+#[test]
+fn hand_over_races_publication() {
+    run(|| {
+        let rt = crate::handle::RuntimeId::allocate();
+        hold_one(rt);
+        let waiter = spawn_waiter(rt, 4);
+        let taken = crate::hold::take(rt);
+        let handed = waiter.join().unwrap();
+        assert_eq!(taken.wounded, handed);
+        assert_eq!(taken.entries.len(), usize::from(!handed));
+        assert!(!crate::hold::active());
+        PUBLISH_RACE.note(handed);
+    });
+    PUBLISH_RACE.assert_both();
+}
+
+static RECLAIM_RACE: HandOvers = HandOvers::new();
+
+/// A waiter on a held landing races the owner claiming it again
+/// (`hold::reclaim`): exactly one of them gets the entry, so one the owner
+/// computes again is never taken, and one taken is gone from its view.
+#[test]
+fn hand_over_races_reclaim() {
+    run(|| {
+        let rt = crate::handle::RuntimeId::allocate();
+        hold_one(rt);
+        let waiter = spawn_waiter(rt, 4);
+        let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean, NodeState::Computing);
+        let handed = waiter.join().unwrap();
+        assert_ne!(reclaimed, handed, "reclaimed {reclaimed}, taken {handed}");
+        assert_eq!(crate::hold::holds(HELD_CELL), !handed);
+        let taken = crate::hold::take(rt);
+        assert_eq!(taken.wounded, handed);
+        RECLAIM_RACE.note(handed);
+    });
+    RECLAIM_RACE.assert_both();
+}
+
+static PROGRESS_RACE: HandOvers = HandOvers::new();
+
+/// A waiter's patience against a holder that keeps landing: each landing
+/// is engine progress and restarts it, so only a holder that stops is
+/// wounded, and the owner learns of it at the take that ends its hold.
+/// Two checks: the first wounds if it precedes the landing; otherwise the
+/// landing's flight resets the patience and the second stays short.
+#[test]
+fn hand_over_waits_out_a_holder_that_progresses() {
+    run(|| {
+        let rt = crate::handle::RuntimeId::allocate();
+        hold_one(rt);
+        let waiter = spawn_waiter(rt, 2);
+        crate::hold::land(HELD_CELL, NodeState::Clean, NodeState::Clean, false);
+        let wounded = crate::attempt::hold_wounded();
+        let handed = waiter.join().unwrap();
+        let taken = crate::hold::take(rt);
+        assert_eq!(taken.wounded, handed);
+        assert!(!wounded || handed);
+        PROGRESS_RACE.note(handed);
+    });
+    PROGRESS_RACE.assert_both();
+}
+
+/// A read `r` that, before reading `c`, joins a thread reading `n`, where
+/// `n` and `c` read each other with `try_get` below `r`. The unbounded run
+/// finishes: the joined reader computes `n` itself, as `r` has not read
+/// below itself yet. With
+/// `reaches_r`, `n` also reads `r`, and the joined reader waits on `r`'s
+/// claim while `r` waits on the join, a deadlock in any engine.
+fn cycle_join(reaches_r: bool) {
+    run(move || {
+        type Handles = (std::sync::Weak<Rt>, Incr<u64>, Incr<u64>, Incr<u64>);
+        let cell: std::sync::Arc<std::sync::OnceLock<Handles>> = std::sync::Arc::default();
+        let rt = std::sync::Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let n = {
+            let cell = std::sync::Arc::clone(&cell);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let (_, _, c, r) = cell.get().unwrap().clone();
+                    let up = if reaches_r {
+                        rt.try_get(r).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    rt.try_get(c).unwrap_or(0) + up + rt.get(i)
+                },
+                replayable(),
+            )
+        };
+        let c = rt.create_query_with(
+            move |rt: &Rt| rt.try_get(n).map_or(0, |v| v + 1),
+            replayable(),
+        );
+        let r = {
+            let cell = std::sync::Arc::clone(&cell);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(i);
+                    if v == 2 {
+                        let (w, n, _, _) = cell.get().unwrap().clone();
+                        let rt = w.upgrade().unwrap();
+                        let _ = thread::spawn(move || rt.try_get(n)).join().unwrap();
+                    }
+                    rt.try_get(c).unwrap_or(0) + v
+                },
+                replayable(),
+            )
+        };
+        assert!(cell.set((std::sync::Arc::downgrade(&rt), n, c, r)).is_ok());
+        let _ = rt.try_get(r);
+        rt.set(i, 2);
+        let _ = rt.try_get(r);
+    });
+}
+
+/// A held landing of `n` would make the joined reader wait on a holder
+/// blocked in the join; the hand-over gives the reader the landing, as the
+/// unbounded run lets it compute `n` itself.
+#[test]
+fn a_read_joining_a_reader_of_a_cycle_below_it_finishes() {
+    cycle_join(false);
+}
+
+/// Not a CI model: loom reports the branch limit, because the unbounded run
+/// deadlocks too. Kept as a probe of the deadlocking shape.
+#[test]
+#[ignore]
+fn a_read_joining_a_reader_of_a_cycle_through_it_deadlocks() {
+    cycle_join(true);
+}
+
+/// x and w read each other with `try_get`, so a read of x lands both
+/// Cyclic, held by the reading attempt.
+fn try_get_pair(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
+    try_get_ring_counted(rt, 2, false, &std::sync::Arc::default())
+}
+
+/// [`try_get_pair`] as a ring of `ring` nodes: x reads w, each member
+/// reads the one created before it, and the first reads x. Adds every
+/// run of the ring's nodes to `runs`. With `fails`, w panics after its
+/// read, so the ring's members land Failed.
+fn try_get_ring_counted(
+    rt: &Rt,
+    ring: usize,
+    fails: bool,
+    runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (Incr<u64>, Incr<u64>) {
+    let i = rt.create_input(3_u64);
+    let xc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+    let mut next: Option<Incr<u64>> = None;
+    for k in 1..ring {
+        let (xc, runs, after) = (
+            std::sync::Arc::clone(&xc),
+            std::sync::Arc::clone(runs),
+            next,
+        );
+        let panics = fails && k + 1 == ring;
+        next = Some(rt.create_query(move |rt: &Rt| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let v = rt
+                .try_get(after.unwrap_or_else(|| *xc.get().unwrap()))
+                .map_or(5, |v| v + 1);
+            assert!(!panics, "w fails");
+            v
+        }));
+    }
+    let w = next.expect("a ring has a member besides x");
+    let runs = std::sync::Arc::clone(runs);
+    let x = rt.create_query(move |rt: &Rt| {
+        runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000)
+    });
+    assert!(xc.set(x).is_ok());
+    (x, w)
+}
+
+/// Most runs of a ring's nodes in one execution of an exit-race model:
+/// 8n - 2 on the hand-over alone, plus one episode attempt (2n) when the
+/// owner's retry wounds the reader once more, as x waits on the reader's
+/// claim of w while the reader waits on x. A second extra attempt, or
+/// attempts growing with n, exceed it; a run whose own landing makes it
+/// run again loops past it until loom's branch limit or clock wrap.
+const fn exit_race_ring_runs(ring: usize) -> usize {
+    10 * ring - 2
+}
+
+/// T catches its read of x, which holds x and w, and joins a thread that
+/// reads w. T is blocked in user code on that reader, so the reader wounds
+/// T's attempt and takes w over; T's next pop ends its run as the wound,
+/// and its retry, in which w is never held again, gives what the unbounded
+/// test `a_join_reads_a_member_its_reader_holds_cyclic` does.
+#[test]
+fn hand_over_wounds_a_holder_that_joins_a_reader() {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let (x, w) = try_get_pair(&rt);
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let t = {
+            let (me, runs) = (Arc::clone(&me), Arc::clone(&runs));
+            rt.create_query(move |rt: &Rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                let other = me.lock().unwrap().clone().unwrap();
+                v + thread::spawn(move || other.try_get(w).unwrap_or(9))
+                    .join()
+                    .unwrap()
+            })
+        };
+        assert_eq!(rt.get(t), 9);
+        *me.lock().unwrap() = None;
+        // The reader can only end by taking w over, and the run it wounds
+        // retries once: in the retry w is never held, so its reader waits
+        // for nothing.
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "T's runs");
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+        assert!(!crate::hold::active(), "a held landing outlived the read");
+    });
+}
+
+/// Which ends of a held landing's publication a model's executions reached:
+/// published, or wounded by a waiter's hand-over while the owner stood at
+/// its publication.
+static EXIT_RACE: HandOvers = HandOvers::new();
+static NESTED_EXIT_RACE: HandOvers = HandOvers::new();
+static RING_EXIT_RACE: HandOvers = HandOvers::new();
+static NESTED_RING_EXIT_RACE: HandOvers = HandOvers::new();
+static FAILED_EXIT_RACE: HandOvers = HandOvers::new();
+static NESTED_FAILED_EXIT_RACE: HandOvers = HandOvers::new();
+
+/// The owner stands at [`ParkPoint::BeforeHeldPublish`] of `rt` on the
+/// model's main thread as one descheduled there, so the waiter's patience
+/// can run out between its last progress and its publication; `reached`
+/// notes, at its first publication only (a retry's publish says nothing
+/// about the race), whether a hand-over wounded it there. Yields are not loom
+/// choices: with two the waiter never took the landing at bound 2 and
+/// with four it always did, so three leave it to a preemption.
+fn park_before_publish(rt: &Rt, reached: &'static HandOvers) {
+    let owner = thread::current().id();
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let hook: crate::runtime::ParkHook = Box::new(move |point| {
+        if point != crate::runtime::ParkPoint::BeforeHeldPublish || thread::current().id() != owner
+        {
+            return;
+        }
+        let before = crate::attempt::hold_wounded();
+        for _ in 0..3 {
+            thread::yield_now();
+        }
+        if !before && first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            reached.note(crate::attempt::hold_wounded());
+        }
+    });
+    assert!(rt.park_hook.set(hook).is_ok());
+}
+
+/// Messages of panics `caught` took that were neither the ring's own
+/// failure nor a read of its Failed landing, for the model to assert none.
+static UNEXPECTED_UNWINDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// `f`'s value, or `None` if it unwinds; an `expected` unwind's panic is
+/// not printed. An engine unwind carries no message.
+fn caught<R>(expected: bool, f: impl FnOnce() -> R) -> Option<R> {
+    if !expected {
+        return catch_unwind(AssertUnwindSafe(f)).ok();
+    }
+    match panic_message(f) {
+        Ok(v) => Some(v),
+        Err(m) => {
+            if !(m.is_empty() || m == "w fails" || m.contains("its last compute panicked")) {
+                UNEXPECTED_UNWINDS.lock().unwrap().push(m);
+            }
+            None
+        }
+    }
+}
+
+/// T's read of x and a reader's `try_get` of w, in serial order on a
+/// fresh runtime: T first, or the reader first.
+fn exit_race_orders(nested: bool, ring: usize, fails: bool) -> [(u64, u64); 2] {
+    [true, false].map(|t_first| {
+        let rt = Arc::new(Rt::new());
+        let inner = Arc::new(Rt::new());
+        let holder = if nested { &inner } else { &rt };
+        let (x, w) = try_get_ring_counted(holder, ring, fails, &std::sync::Arc::default());
+        let read_t = move |rt: &Rt| caught(fails, || rt.get(x)).unwrap_or(0);
+        let t = if nested {
+            let inner = Arc::clone(&inner);
+            let q = inner.create_query(read_t);
+            rt.create_query(move |_: &Rt| inner.get(q))
+        } else {
+            rt.create_query(read_t)
+        };
+        let read_w = || caught(fails, || holder.try_get(w).unwrap_or(9)).unwrap_or(8);
+        if t_first {
+            let v = rt.get(t);
+            (v, read_w())
+        } else {
+            let r = read_w();
+            (rt.get(t), r)
+        }
+    })
+}
+
+/// T catches its read of x, which holds x and w, starts a thread that
+/// reads w and returns; with `nested`, x and w are another runtime's, read
+/// in T's first entry of it. The owner may be descheduled before it
+/// publishes, so the reader may take w over then: the publication finds
+/// the wound and retries (the outermost entry's exit, or `first_entry`'s
+/// raise when nested), or publishes and the reader reads what it
+/// published. Both reads give one serial order's values. With `fails`, w
+/// panics, so T and the reader read the ring Failed.
+fn hand_over_races_publication_at(
+    nested: bool,
+    ring: usize,
+    fails: bool,
+    reached: &'static HandOvers,
+) {
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    run(move || {
+        UNEXPECTED_UNWINDS.lock().unwrap().clear();
+        let orders = exit_race_orders(nested, ring, fails);
+        let rt = Arc::new(Rt::new());
+        let inner = Arc::new(Rt::new());
+        let holder = if nested { &inner } else { &rt };
+        let ring_runs = std::sync::Arc::default();
+        let (x, w) = try_get_ring_counted(holder, ring, fails, &ring_runs);
+        park_before_publish(holder, reached);
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(holder))));
+        let reader: Arc<Mutex<Option<thread::JoinHandle<u64>>>> = Arc::new(Mutex::new(None));
+        let spawned = Arc::new(AtomicBool::new(false));
+        let read_t = {
+            let (me, reader, spawned) = (Arc::clone(&me), Arc::clone(&reader), spawned);
+            move |rt: &Rt| {
+                let v = caught(fails, || rt.get(x)).unwrap_or(0);
+                if !spawned.swap(true, Ordering::Relaxed) {
+                    let other = me.lock().unwrap().clone().unwrap();
+                    let handle = thread::spawn(move || {
+                        caught(fails, || other.try_get(w).unwrap_or(9)).unwrap_or(8)
+                    });
+                    *reader.lock().unwrap() = Some(handle);
+                }
+                v
+            }
+        };
+        let t = if nested {
+            let inner = Arc::clone(&inner);
+            let q = inner.create_query(read_t);
+            rt.create_query(move |_: &Rt| inner.get(q))
+        } else {
+            rt.create_query(read_t)
+        };
+        let got_t = rt.get(t);
+        let handle = reader.lock().unwrap().take().unwrap();
+        let got_w = handle.join().unwrap();
+        *me.lock().unwrap() = None;
+        let ring_runs = ring_runs.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ring_runs <= exit_race_ring_runs(ring),
+            "a ring of {ring} ran {ring_runs} times"
+        );
+        assert!(
+            orders.contains(&(got_t, got_w)),
+            "T {got_t}, reader {got_w}: no serial order's, {orders:?}"
+        );
+        assert_eq!(*UNEXPECTED_UNWINDS.lock().unwrap(), Vec::<String>::new());
+        for rt in [&rt, &inner] {
+            rt.assert_invariant_i();
+        }
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the reads");
+        assert!(!crate::hold::active(), "a held landing outlived the reads");
+    });
+    reached.assert_both();
+}
+
+#[test]
+fn hand_over_races_publication_at_the_outermost_exit() {
+    hand_over_races_publication_at(false, 2, false, &EXIT_RACE);
+}
+
+#[test]
+fn hand_over_races_publication_at_a_first_entry_exit() {
+    hand_over_races_publication_at(true, 2, false, &NESTED_EXIT_RACE);
+}
+
+#[test]
+fn hand_over_races_publication_of_a_ring_of_three_at_the_outermost_exit() {
+    hand_over_races_publication_at(false, 3, false, &RING_EXIT_RACE);
+}
+
+#[test]
+fn hand_over_races_publication_of_a_ring_of_three_at_a_first_entry_exit() {
+    hand_over_races_publication_at(true, 3, false, &NESTED_RING_EXIT_RACE);
+}
+
+/// CI runs the two Failed variants at bound 1: at bound 2 neither finishes
+/// in its 90 minutes, the wound, retraction and retry of a Failed ring
+/// widening the schedules. Bound 1 reaches both ends of the race but
+/// misses a wounded attempt publishing its Failed landing, which bound 2
+/// catches; `runtime::hold_tests::shared_wounded_publication_of_a_failed_ring_publishes_nothing`
+/// pins that path.
+#[test]
+fn hand_over_races_a_failed_publication_at_the_outermost_exit() {
+    hand_over_races_publication_at(false, 2, true, &FAILED_EXIT_RACE);
+}
+
+#[test]
+fn hand_over_races_a_failed_publication_at_a_first_entry_exit() {
+    hand_over_races_publication_at(true, 2, true, &NESTED_FAILED_EXIT_RACE);
+}
+
+/// x (a Fallback head) and w read each other with `try_get`, and w also
+/// reads i. T catches its read of x, which holds x and w, and joins a
+/// thread that reads w and then sets i, so every run of T runs the cycle
+/// again. The first reader takes w over; a taken claim is never held
+/// again in T's outermost entry, so the next reader reads w published and
+/// T ends. Were w held again, every reader would take it over and T would
+/// restart for good. The model of worker-5's
+/// `a_reader_that_dirties_the_cycle_each_run_restarts_its_holder_boundedly`.
+#[test]
+fn hand_over_restarts_a_holder_boundedly() {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(0_u64);
+        let xc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+        let w = {
+            let xc = std::sync::Arc::clone(&xc);
+            rt.create_query(move |rt: &Rt| {
+                rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1) + rt.get(i)
+            })
+        };
+        let x = rt.create_query_with(
+            move |rt: &Rt| rt.try_get(w).map_or(100, |v| v + 1000),
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+                ..crate::cycle::QueryOpts::default()
+            },
+        );
+        assert!(xc.set(x).is_ok());
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let t = {
+            let (me, runs) = (Arc::clone(&me), Arc::clone(&runs));
+            rt.create_query(move |rt: &Rt| {
+                let run = runs.fetch_add(1, Ordering::Relaxed) + 1;
+                assert!(run <= 2, "T restarts for good: run {run}");
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                let other = me.lock().unwrap().clone().unwrap();
+                let reader = thread::spawn(move || {
+                    let r = other.try_get(w).unwrap_or(9);
+                    other.set(i, other.get(i) + 1);
+                    r
+                });
+                v + reader.join().unwrap()
+            })
+        };
+        rt.get(t);
+        *me.lock().unwrap() = None;
+        assert!(runs.load(Ordering::Relaxed) >= 2, "no reader took w over");
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+        assert!(!crate::hold::active(), "a held landing outlived the read");
+    });
+}
+
+/// T reads `held`, which the read leaves held at one of the caught-cycle
+/// hold sites, and joins a thread that reads it too (both with `try_get`:
+/// a read of a caught cycle's member after another entry into the cycle
+/// may raise it, on main too). T is blocked in user code on that reader, so the reader
+/// takes `held` over and T's run ends as the wound and retries once.
+/// Returns T's value.
+fn join_reader_of_held(rt: &Arc<Rt>, held: Incr<u64>) -> u64 {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(rt))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let t = {
+        let (me, runs) = (Arc::clone(&me), Arc::clone(&runs));
+        rt.create_query(move |rt: &Rt| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            let v = rt.try_get(held).unwrap_or(9);
+            let other = me.lock().unwrap().clone().unwrap();
+            v + thread::spawn(move || other.try_get(held).unwrap_or(9))
+                .join()
+                .unwrap()
+        })
+    };
+    let got = rt.get(t);
+    *me.lock().unwrap() = None;
+    assert_eq!(runs.load(Ordering::Relaxed), 2, "T's runs");
+    rt.assert_invariant_i();
+    assert_eq!(crate::waits::registered(), 0);
+    assert!(!crate::reserve::any(), "a reservation outlived the read");
+    assert!(!crate::hold::active(), "a held landing outlived the read");
+    got
+}
+
+/// c and d read each other with `get`, so a read of c raises their cycle.
+fn raised_cycle(rt: &Rt) -> Incr<u64> {
+    let dc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+    let c = {
+        let dc = std::sync::Arc::clone(&dc);
+        rt.create_query(move |rt: &Rt| rt.get(*dc.get().unwrap()) + 1)
+    };
+    let d = rt.create_query(move |rt: &Rt| rt.get(c) * 2);
+    assert!(dc.set(d).is_ok());
+    c
+}
+
+/// R3 (`cycle_read`): a catches the cycle a -> b -> a it entered at a, so a
+/// is held for its reader. The joined reader takes a over. What each read
+/// of a gives depends on where the cycle was entered (main's entry-order
+/// class), so the model pins one value across every order.
+#[test]
+fn hand_over_at_a_cycle_closed_on_the_stack() {
+    static VALUE: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let bc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+        let a = {
+            let bc = std::sync::Arc::clone(&bc);
+            rt.create_query(move |rt: &Rt| rt.try_get(*bc.get().unwrap()).unwrap_or(7777))
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + 1);
+        assert!(bc.set(b).is_ok());
+        let got = join_reader_of_held(&rt, a);
+        assert_eq!(*VALUE.lock().unwrap().get_or_insert(got), got);
+    });
+}
+
+/// `first_entry` with a closed cycle: x catches another runtime's cycle,
+/// which closes inside that runtime's first entry, so x is held for its
+/// reader. The joined reader takes x over: both read 7777.
+#[test]
+fn hand_over_at_a_cycle_caught_across_runtimes() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let other = Arc::new(Rt::new());
+        let c = raised_cycle(&other);
+        let x = {
+            let other = Arc::clone(&other);
+            rt.create_query(move |_: &Rt| other.try_get(c).unwrap_or(7777))
+        };
+        assert_eq!(join_reader_of_held(&rt, x), 2 * 7777);
+        other.assert_invariant_i();
+    });
+}
+
+/// A cycle closed under another runtime's frame (`cycle_read` with no
+/// active frame of a's runtime): a reads e of another runtime, and e
+/// catches its read of a, so a is held for its reader. The joined reader
+/// takes a over: both read 7778.
+#[test]
+fn hand_over_at_a_cycle_closed_under_another_runtimes_frame() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let other = Arc::new(Rt::new());
+        let ac: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+        // e's runtime would otherwise keep a's alive past the model.
+        let back: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let e = {
+            let (back, ac) = (Arc::clone(&back), std::sync::Arc::clone(&ac));
+            other.create_query(move |_: &Rt| {
+                let rt = back.lock().unwrap().clone().unwrap();
+                rt.try_get(*ac.get().unwrap()).unwrap_or(7777)
+            })
+        };
+        let a = {
+            let other = Arc::clone(&other);
+            rt.create_query(move |_: &Rt| other.get(e) + 1)
+        };
+        assert!(ac.set(a).is_ok());
+        assert_eq!(join_reader_of_held(&rt, a), 2 * 7778);
+        *back.lock().unwrap() = None;
+        other.assert_invariant_i();
+    });
+}
+
+/// A query lands Dirty with a memo for revision 5, then a set moves the
+/// revision to 6 and the next claim lands it Dirty without one (a
+/// poisoned run), raising `changed_at` to 6. A reader at revision 6 that
+/// loads the node Dirty never takes the memo for 5, through `memo_at`'s
+/// second load of the bit.
+#[test]
+fn loom_memo_ends_before_a_later_landings_changed_at() {
+    use crate::state::{store, try_transition};
+    run(|| {
+        let node: Arc<NodeData<Loom>> = Arc::new(NodeData::new_query(0, 0));
+        let lander = {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let state = node.state_cell();
+                try_transition::<Loom>(state, NodeState::New, NodeState::Computing).unwrap();
+                node.max_changed_at(5);
+                node.set_memo(5);
+                store::<Loom>(state, NodeState::Dirty);
+                try_transition::<Loom>(state, NodeState::Dirty, NodeState::Computing).unwrap();
+                node.max_changed_at(6);
+                node.set_verified_at(0);
+                store::<Loom>(state, NodeState::Dirty);
+            })
+        };
+        if node.state() == NodeState::Dirty {
+            assert!(
+                !node.memo_at(|| 6),
+                "a reader at 6 took the memo for 5 with the later landing's changed_at"
+            );
+        }
+        lander.join().unwrap();
+    });
+}
+
+/// [`loom_memo_ends_before_a_later_landings_changed_at`] with the later
+/// landing on another thread: its `max_changed_at` reads the bit with a
+/// relaxed load, which sees the memo only through the claim's acquire of
+/// the first landing's store.
+#[test]
+fn loom_memo_ends_before_another_threads_landings_changed_at() {
+    use crate::state::{store, try_transition};
+    run(|| {
+        let node: Arc<NodeData<Loom>> = Arc::new(NodeData::new_query(0, 0));
+        let first = {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let state = node.state_cell();
+                try_transition::<Loom>(state, NodeState::New, NodeState::Computing).unwrap();
+                node.max_changed_at(5);
+                node.set_memo(5);
+                store::<Loom>(state, NodeState::Dirty);
+            })
+        };
+        let second = {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let state = node.state_cell();
+                if try_transition::<Loom>(state, NodeState::Dirty, NodeState::Computing).is_ok() {
+                    node.max_changed_at(6);
+                    node.set_verified_at(0);
+                    store::<Loom>(state, NodeState::Dirty);
+                }
+            })
+        };
+        if node.state() == NodeState::Dirty {
+            assert!(
+                !node.memo_at(|| 6),
+                "a reader at 6 took the memo for 5 with another thread's later changed_at"
+            );
+        }
+        first.join().unwrap();
+        second.join().unwrap();
     });
 }

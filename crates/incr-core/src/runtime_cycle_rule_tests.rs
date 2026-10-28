@@ -932,8 +932,9 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
 
 /// A group verify's episode panics in member b: b lands Failed, released
 /// with the Fixpoint co-member a it reads. A later set that reaches only a
-/// must still let b recompute, so with j back at
-/// 1 the cycle converges to a = 2, b = 3 as it first did.
+/// must still let b recompute: b is no longer Failed, and its read reports
+/// the cycle it closes through a, as a fresh read of b alone does (the
+/// first read's 3 comes from reading a first).
 fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
     let rt = Runtime::<C>::new();
     let j = rt.create_input(1_i64);
@@ -971,8 +972,10 @@ fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
-    assert_eq!(rt.get(a), 2);
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2"));
+    // Entry order (B7-fixpoint-head-after-member-cycle): a's walk recomputes
+    // b first and enters the cycle at b again; a fresh read of a gives 2.
+    assert!(is_cycle(&*quiet(|| rt.get(a)).unwrap_err(), "1, 2"));
     rt.assert_invariant_i();
 }
 
@@ -1016,7 +1019,7 @@ fn failed_member_two_hops_from_the_set<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2, 3"));
     assert_eq!(rt.get(c), 2);
     rt.assert_invariant_i();
 }
@@ -1061,12 +1064,13 @@ fn failed_member_cured_through_a_recorded_dep<C: Cells>() {
 
     rt.set(k, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "2, 3"));
     rt.assert_invariant_i();
 }
 
-/// The cycle forms inside root x's own frame, which panics: x lands
-/// Failed through its compute's panic path, over the member y it read.
+/// Once j is 0, y reads x and closes a cycle inside root x's own frame:
+/// the read reports it and leaves x and y Dirty, as main does, and setting
+/// j back lets x recompute.
 fn failed_frame_node_over_its_released_member<C: Cells>() {
     let rt = Runtime::<C>::new();
     let j = rt.create_input(1_i64);
@@ -1091,13 +1095,21 @@ fn failed_frame_node_over_its_released_member<C: Cells>() {
 
     rt.set(j, 0);
     let err = quiet(|| rt.get(x)).unwrap_err();
-    assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
-    assert_eq!(rt.state_of(x), NodeState::Failed);
+    assert!(is_cycle(&*err, "1, 2"));
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    assert_eq!(rt.state_of(y), NodeState::Dirty);
 
     rt.set(j, 1);
-    assert_ne!(rt.state_of(x), NodeState::Failed);
     assert_eq!(quiet(|| rt.get(x)).ok(), Some(2));
+    assert_eq!(rt.state_of(x), NodeState::Clean);
+    assert_eq!(rt.state_of(y), NodeState::Clean);
     rt.assert_invariant_i();
+}
+
+/// Whether `err` is the depth-0 cycle panic naming exactly `participants`.
+fn is_cycle(err: &(dyn std::any::Any + Send), participants: &str) -> bool {
+    err.downcast_ref::<String>()
+        .is_some_and(|m| m.ends_with(&format!("dependency cycle: {participants}")))
 }
 
 /// An `i64` whose compare panics only between 3 and 6.
@@ -1151,7 +1163,7 @@ fn failed_compare_over_a_co_member<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok().map(|v| v.0), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2, 3"));
     rt.assert_invariant_i();
 }
 
@@ -1249,6 +1261,7 @@ pairs!(
     cross_runtime_read_records_nothing,
     foreign_reader_is_doomed_and_retried,
     foreign_ring_read_is_not_rerun,
+    foreign_caught_cycle_is_not_rerun,
 );
 
 /// A runtime that another runtime's closures read. Test-only: it outlives
@@ -1476,6 +1489,9 @@ enum FirstRead {
     Own,
     /// Another runtime's input, Clean when read.
     ForeignClean,
+    /// That input, which the last leaf, replayable and so keeping its
+    /// reads of other runtimes, reads again after its set, Clean.
+    ForeignCleanAgain,
     /// Another runtime's query over that input, New when read, so the
     /// read computes it.
     ForeignComputed,
@@ -1500,48 +1516,76 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
     for first in [
         FirstRead::Own,
         FirstRead::ForeignClean,
+        FirstRead::ForeignCleanAgain,
         FirstRead::ForeignComputed,
         FirstRead::ForeignLandedClean,
     ] {
-        let runs = doomed_reader_runs::<A, B>(n, first);
+        let runs = doomed_reader_runs::<A, B>(n, first, false);
         // The landed case runs a third time; the ignored
         // `landed_foreign_reader_runs_twice` tracks it.
         if !matches!(first, FirstRead::ForeignLandedClean) {
-            assert_eq!(runs, 2, "{first:?}");
+            assert_eq!(runs, (2, 1), "{first:?}");
         }
     }
 }
 
 /// One case of [`foreign_reader_is_doomed_with`], asserting the reader's
-/// value and its doom and returning how many times its closure ran.
-fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead) -> u32 {
+/// value and its doom and returning how many times its closure and the
+/// last leaf's, which sets the other runtime's input, ran. If `steady`, the
+/// last leaf first runs alone and the reader leaves it out until a set of
+/// an input both read, and the counts are of that second revision: the
+/// reader's run is doomed on a leaf whose last run read the other runtime
+/// and that no walk of the reader's deps cleans first.
+fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead, steady: bool) -> (u32, u32) {
     let r1 = Box::new(Runtime::<A>::new());
     let r2 = Box::new(Runtime::<B>::new());
     r1.set_placeholder(0_u64);
     r1.set_max_frames(1);
+    let y = r1.create_input(0_u64);
     let x = r2.create_input(1000_u64);
     let q = r2.create_query(move |rt| rt.get(x));
     let mut leaves: Vec<Incr<u64>> = (0..n - 1).map(|i| r1.create_query(move |_| i)).collect();
     let r2_ = OtherRt(&*r2);
-    leaves.push(r1.create_query(move |_| {
-        r2_.set(x, 2000);
-        if matches!(first, FirstRead::ForeignLandedClean) {
-            r2_.get(q);
-        }
-        n - 1
-    }));
+    let leaf_runs = Arc::new(AtomicU32::new(0));
+    let leaf = leaf_runs.clone();
+    let last = r1.create_query_with(
+        move |rt| {
+            leaf.fetch_add(1, Ordering::Relaxed);
+            rt.get(y);
+            r2_.set(x, 2000);
+            match first {
+                FirstRead::ForeignCleanAgain => assert_eq!(r2_.get(x), 2000),
+                FirstRead::ForeignLandedClean => assert_eq!(r2_.get(q), 2000),
+                _ => {}
+            }
+            n - 1
+        },
+        QueryOpts {
+            replay: match first {
+                FirstRead::ForeignCleanAgain => Replay::Allowed,
+                _ => Replay::Native,
+            },
+            ..Default::default()
+        },
+    );
+    leaves.push(last);
     let runs = Arc::new(AtomicU32::new(0));
     let wide = {
         let (r2, runs) = (OtherRt(&*r2), runs.clone());
         r1.create_query_with(
             move |rt| {
                 runs.fetch_add(1, Ordering::Relaxed);
+                let all = !steady || rt.get(y) != 0;
                 let base = match first {
                     FirstRead::Own => 1000,
-                    FirstRead::ForeignClean => r2.get(x),
+                    FirstRead::ForeignClean | FirstRead::ForeignCleanAgain => r2.get(x),
                     FirstRead::ForeignComputed | FirstRead::ForeignLandedClean => r2.get(q),
                 };
-                base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
+                let read = if all { n } else { n - 1 };
+                base + leaves[..read as usize]
+                    .iter()
+                    .map(|&l| rt.get(l))
+                    .sum::<u64>()
             },
             QueryOpts {
                 replay: Replay::Allowed,
@@ -1549,19 +1593,387 @@ fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead) -> u32 {
             },
         )
     };
-    assert_eq!(r1.get(wide), 1000 + (0..n).sum::<u64>(), "{first:?}");
+    if steady {
+        r1.get(last);
+        r1.get(wide);
+    } else {
+        assert_eq!(r1.get(wide), 1000 + (0..n).sum::<u64>(), "{first:?}");
+    }
     assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
-    runs.load(Ordering::Relaxed)
+    if steady {
+        r1.set(y, 1);
+        r1.dooms.lock().unwrap().clear();
+        runs.store(0, Ordering::Relaxed);
+        leaf_runs.store(0, Ordering::Relaxed);
+        let base = if matches!(first, FirstRead::Own) {
+            1000
+        } else {
+            2000
+        };
+        assert_eq!(r1.get(wide), base + (0..n).sum::<u64>(), "{first:?}");
+        assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
+    }
+    (
+        runs.load(Ordering::Relaxed),
+        leaf_runs.load(Ordering::Relaxed),
+    )
 }
 
 #[test]
-#[ignore = "T10-speculative-landing-third-foreign-reader-run"]
+#[ignore = "beta.7: B7-foreign-computed-adoption, the leaf runs once more than unbounded"]
 fn landed_foreign_reader_runs_twice() {
-    let first = FirstRead::ForeignLandedClean;
-    assert_eq!(doomed_reader_runs::<Local, Local>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Local, Shared>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Shared, Local>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Shared, Shared>(64, first), 2);
+    rereading_foreign_reader_runs(FirstRead::ForeignLandedClean, false);
+}
+
+/// [`landed_foreign_reader_runs_twice`] in a second revision, where the
+/// last leaf's previous run read the other runtime.
+#[test]
+fn landed_foreign_reader_runs_twice_in_steady_state() {
+    rereading_foreign_reader_runs(FirstRead::ForeignLandedClean, true);
+}
+
+/// The last leaf's speculative run reads the other runtime's input Clean
+/// after its set, and nothing changes that runtime before the retry adopts
+/// the run.
+#[test]
+fn clean_foreign_rereader_runs_twice() {
+    rereading_foreign_reader_runs(FirstRead::ForeignCleanAgain, false);
+}
+
+#[test]
+fn clean_foreign_rereader_runs_twice_in_steady_state() {
+    rereading_foreign_reader_runs(FirstRead::ForeignCleanAgain, true);
+}
+
+fn rereading_foreign_reader_runs(first: FirstRead, steady: bool) {
+    for n in [64, 4, 2] {
+        let runs = [
+            doomed_reader_runs::<Local, Local>(n, first, steady),
+            doomed_reader_runs::<Local, Shared>(n, first, steady),
+            doomed_reader_runs::<Shared, Local>(n, first, steady),
+            doomed_reader_runs::<Shared, Shared>(n, first, steady),
+        ];
+        assert_eq!(runs, [(2, 1); 4], "{n}");
+    }
+}
+
+/// A reader doomed on its first leaf, whose later leaves run speculatively:
+/// a replayable one reads another runtime's input Clean, and the next sets
+/// that input. Returns the reader's value, how many times the replayable
+/// leaf ran, and whether the reader was doomed.
+fn set_after_clean_read_runs<A: Cells, B: Cells>(budget: bool) -> (u64, u32, bool) {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    // Unbudgeted wins over `INCR_MAX_DEPTH`.
+    r1.set_max_frames(if budget { 1 } else { u32::MAX });
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query(|_| 1_u64);
+    let reader = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let setter = {
+        let r2 = OtherRt(&*r2);
+        r1.create_query(move |_| {
+            r2.set(x, 3000);
+            0_u64
+        })
+    };
+    let wide = r1.create_query_with(
+        move |rt| rt.get(first) + rt.get(reader) + rt.get(setter),
+        replayable(),
+    );
+    let value = r1.get(wide);
+    let doomed = !r1.dooms.lock().unwrap().is_empty();
+    (value, runs.load(Ordering::Relaxed), doomed)
+}
+
+/// [`set_after_clean_read_runs`] one native frame below a replayable one,
+/// with a frame budget of `budget` (`u32::MAX` for none): the native frame
+/// stops a doom's marking, and the replayable reader above it is doomed on
+/// an earlier leaf, so the native frame's run is speculative and a doom
+/// below it opens a context of its own.
+fn nested_set_after_clean_read_runs<A: Cells, B: Cells>(budget: u32) -> (u64, u32, bool) {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    r1.set_max_frames(budget);
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let native = || QueryOpts {
+        replay: Replay::Native,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query_with(|_| 1_u64, native());
+    let reader = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let setter = {
+        let r2 = OtherRt(&*r2);
+        r1.create_query_with(
+            move |_| {
+                r2.set(x, 3000);
+                0_u64
+            },
+            native(),
+        )
+    };
+    let inner = r1.create_query_with(
+        move |rt| rt.get(first) + rt.get(reader) + rt.get(setter),
+        replayable(),
+    );
+    let mid = r1.create_query_with(move |rt| rt.get(inner), native());
+    let lead = r1.create_query_with(|_| 0_u64, native());
+    let outer = r1.create_query_with(move |rt| rt.get(lead) + rt.get(mid), replayable());
+    let value = r1.get(outer);
+    let doomed = !r1.dooms.lock().unwrap().is_empty();
+    (value, runs.load(Ordering::Relaxed), doomed)
+}
+
+/// The inner doom's context has ended when the outer retry adopts the
+/// reader's stash, but the outer context that made it is still open.
+#[test]
+fn nested_set_after_clean_read_keeps_the_read() {
+    for budget in [u32::MAX, 1, 2, 3] {
+        let runs = [
+            nested_set_after_clean_read_runs::<Local, Local>(budget),
+            nested_set_after_clean_read_runs::<Local, Shared>(budget),
+            nested_set_after_clean_read_runs::<Shared, Local>(budget),
+            nested_set_after_clean_read_runs::<Shared, Shared>(budget),
+        ];
+        assert_eq!(runs, [(1001, 1, budget != u32::MAX); 4], "{budget}");
+    }
+}
+
+/// The setter's speculative run moves the other runtime's count before the
+/// retry adopts the reader's stash, in the context that made both, as the
+/// unbounded run sets after the read.
+#[test]
+fn set_after_clean_read_keeps_the_read() {
+    for budget in [false, true] {
+        let runs = [
+            set_after_clean_read_runs::<Local, Local>(budget),
+            set_after_clean_read_runs::<Local, Shared>(budget),
+            set_after_clean_read_runs::<Shared, Local>(budget),
+            set_after_clean_read_runs::<Shared, Shared>(budget),
+        ];
+        assert_eq!(runs, [(1001, 1, budget); 4], "{budget}");
+    }
+}
+
+/// A reader doomed on its first leaf reads that leaf's placeholder and so
+/// a replayable leaf its retry does not read: the leaf's speculative run
+/// reads another runtime's input Clean and stays stashed. The input is set
+/// after the operation, so the next read of the leaf, outside the context
+/// that made the stash, adopts it only while the other runtime is
+/// unchanged. Returns the leaf's value and runs.
+fn stashed_clean_read_after_set<A: Cells, B: Cells>(budget: bool) -> (u64, u32) {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    // Unbudgeted wins over `INCR_MAX_DEPTH`.
+    r1.set_max_frames(if budget { 1 } else { u32::MAX });
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query(|_| 1_u64);
+    let leaf = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let wide = r1.create_query_with(
+        move |rt| match rt.get(first) {
+            0 => rt.get(leaf),
+            v => v,
+        },
+        replayable(),
+    );
+    assert_eq!(r1.get(wide), 1);
+    assert_eq!(!r1.dooms.lock().unwrap().is_empty(), budget);
+    r2.set(x, 2000);
+    (r1.get(leaf), runs.load(Ordering::Relaxed))
+}
+
+/// The stash tests' values and leaf runs for Local and Shared readers: the
+/// budget's extra run is the speculative one off the placeholder.
+fn stashed_leaf_runs(budget: bool) -> [(u64, u32); 4] {
+    [(2000, if budget { 2 } else { 1 }); 4]
+}
+
+#[test]
+fn stashed_clean_read_is_not_adopted_after_a_set() {
+    for budget in [false, true] {
+        let runs = [
+            stashed_clean_read_after_set::<Local, Local>(budget),
+            stashed_clean_read_after_set::<Local, Shared>(budget),
+            stashed_clean_read_after_set::<Shared, Local>(budget),
+            stashed_clean_read_after_set::<Shared, Shared>(budget),
+        ];
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
+    }
+}
+
+/// [`stashed_clean_read_after_set`] with the set made by the retry, on the
+/// branch the real first leaf takes, before it reads the stashed leaf: the
+/// context that made the stash is still open, but the set is no speculative
+/// run's. Returns the reader's value and the leaf's runs.
+fn retry_set_before_stashed_read<A: Cells, B: Cells>(budget: bool) -> (u64, u32) {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    // Unbudgeted wins over `INCR_MAX_DEPTH`.
+    r1.set_max_frames(if budget { 1 } else { u32::MAX });
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query(|_| 1_u64);
+    let leaf = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let setter = {
+        let r2 = OtherRt(&*r2);
+        r1.create_query(move |_| {
+            r2.set(x, 2000);
+            0_u64
+        })
+    };
+    let wide = r1.create_query_with(
+        move |rt| match rt.get(first) {
+            0 => rt.get(leaf),
+            _ => rt.get(setter) + rt.get(leaf),
+        },
+        replayable(),
+    );
+    let value = r1.get(wide);
+    assert_eq!(!r1.dooms.lock().unwrap().is_empty(), budget);
+    (value, runs.load(Ordering::Relaxed))
+}
+
+#[test]
+fn retry_set_before_stashed_read_is_seen() {
+    for budget in [false, true] {
+        let runs = [
+            retry_set_before_stashed_read::<Local, Local>(budget),
+            retry_set_before_stashed_read::<Local, Shared>(budget),
+            retry_set_before_stashed_read::<Shared, Local>(budget),
+            retry_set_before_stashed_read::<Shared, Shared>(budget),
+        ];
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
+    }
+}
+
+/// [`stashed_clean_read_after_set`] run from a replayable query of a third
+/// runtime, doomed on its first leaf, whose retry reads the reader, sets
+/// the input and reads the stashed leaf: the third runtime's context is
+/// still open, but the set is no speculative run's. Returns the query's
+/// value and the leaf's runs.
+fn stashed_read_under_other_context<A: Cells, B: Cells>(budget: bool) -> (u64, u32) {
+    let r0 = Box::new(Runtime::<A>::new());
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    // Unbudgeted wins over `INCR_MAX_DEPTH`.
+    let frames = if budget { 1 } else { u32::MAX };
+    for r in [&r0, &r1] {
+        r.set_placeholder(0_u64);
+        r.set_max_frames(frames);
+    }
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query(|_| 1_u64);
+    let leaf = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let wide = r1.create_query_with(
+        move |rt| match rt.get(first) {
+            0 => rt.get(leaf),
+            v => v,
+        },
+        replayable(),
+    );
+    let lead = r0.create_query(|_| 1_u64);
+    let query = {
+        let (r1, r2) = (OtherRt(&*r1), OtherRt(&*r2));
+        r0.create_query_with(
+            move |rt| match rt.get(lead) {
+                0 => 0,
+                _ => {
+                    r1.get(wide);
+                    r2.set(x, 2000);
+                    r1.get(leaf)
+                }
+            },
+            replayable(),
+        )
+    };
+    let value = r0.get(query);
+    assert_eq!(!r1.dooms.lock().unwrap().is_empty(), budget);
+    (value, runs.load(Ordering::Relaxed))
+}
+
+#[test]
+fn stashed_read_under_other_context_sees_the_set() {
+    for budget in [false, true] {
+        let runs = [
+            stashed_read_under_other_context::<Local, Local>(budget),
+            stashed_read_under_other_context::<Local, Shared>(budget),
+            stashed_read_under_other_context::<Shared, Local>(budget),
+            stashed_read_under_other_context::<Shared, Shared>(budget),
+        ];
+        assert_eq!(runs, stashed_leaf_runs(budget), "{budget}");
+    }
 }
 
 /// A value whose `Clone` reads another runtime's input, as the value-code
@@ -1686,6 +2098,66 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
     assert_eq!(run(u32::MAX), Ok(7777));
     for frames in [1, 2] {
         assert_eq!(run(frames), Ok(7777), "budget {frames}");
+    }
+}
+
+/// Seed 0x985b shrunk: a replayable reader of runtime A catches the cycle
+/// its `get` of runtime B's c closes (c and d read each other), then is
+/// doomed by a read past the budget. The retry takes the caught cycle the
+/// first read kept instead of computing c again, so c runs as often as in
+/// the unbounded run. The same holds when c catches the cycle and panics
+/// on its own, which unwinds with the cycle's kind, and when the reader
+/// reads c by `try_get`.
+fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
+    let run = |frames: u32, own_panic: bool, try_get: bool| {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_max_frames(frames);
+        r1.set_placeholder(0_u64);
+        let runs = Arc::new(AtomicU32::new(0));
+        let d = cell::<u64>();
+        let c = {
+            let (runs, d) = (runs.clone(), d.clone());
+            r2.create_query(move |rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                let d = *d.get().unwrap();
+                if own_panic {
+                    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(d)));
+                    panic!("c gave up on its cycle");
+                }
+                rt.get(d)
+            })
+        };
+        d.set(r2.create_query(move |rt| rt.get(c))).unwrap();
+        let dep = r1.create_query(|_| 1_u64);
+        let reader = {
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with(
+                move |rt| {
+                    let read = || {
+                        if try_get {
+                            r2.try_get(c).unwrap_or(9999)
+                        } else {
+                            r2.get(c)
+                        }
+                    };
+                    catch_unwind(AssertUnwindSafe(read)).unwrap_or(9999) + rt.get(dep)
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            )
+        };
+        let value = r1.get(reader);
+        let doomed = !r1.dooms.lock().unwrap().is_empty();
+        (value, runs.load(Ordering::Relaxed), doomed)
+    };
+    for (own_panic, try_get) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("own panic {own_panic}, try_get {try_get}");
+        let (value, runs, doomed) = run(u32::MAX, own_panic, try_get);
+        assert_eq!((value, doomed), (10000, false), "{case}");
+        assert_eq!(run(1, own_panic, try_get), (value, runs, true), "{case}");
     }
 }
 
@@ -2409,4 +2881,177 @@ mod review_8b_mid_compute_budget {
         assert_eq!(own_panic_then_own_read::<Local>(unbudgeted, frames_2), 12);
         assert_eq!(own_panic_then_own_read::<Shared>(unbudgeted, frames_2), 12);
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BareValue(u64);
+
+fn get_outcome(f: impl FnOnce() -> u64) -> String {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v.to_string(),
+        Err(_) => "panic".to_owned(),
+    }
+}
+
+fn set_outcome(f: impl FnOnce()) -> String {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(()) => "done".to_owned(),
+        Err(_) => "panic".to_owned(),
+    }
+}
+
+/// The harness's `PanicIf`, with its payload.
+fn panic_if(v: u64, when: u64, side: usize, at: usize) -> u64 {
+    if v % 7 == when {
+        std::panic::panic_any(format!("boom {side}:{at}"));
+    }
+    v
+}
+
+/// Seed 0x366152c0, shrunk (frames 1, single thread, cross): the last op,
+/// `Get(6)`, gives 0 either way, but node 10 is Failed unbounded and Dirty
+/// at frames 1. Every node is kept and made in the harness's order (each
+/// runtime's list reversed). Returns each op's outcome and the first
+/// runtime's nodes 10, 11, 12, 13, 15 and 16's states after the last op.
+fn seed_366152c0<C: Cells>(frames: u32) -> (Vec<String>, Vec<(usize, NodeState)>) {
+    let r1 = Box::new(Runtime::<C>::new());
+    let r2 = Box::new(Runtime::<C>::new());
+    for rt in [&r1, &r2] {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let bare_replayable = || QueryOpts::<BareValue> {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let late_b0 = Arc::new(OnceLock::<Incr<BareValue>>::new());
+    let _x20 = r1.create_input(1_u64);
+    let x19 = r1.create_input(2_u64);
+    let n18 = r1.create_query_with(
+        move |rt: &Runtime<C>| {
+            let a = rt.try_get(x19).unwrap_or(7777).wrapping_add(rt.get(x19));
+            a.wrapping_add(rt.try_get(x19).unwrap_or(7777).wrapping_add(1))
+        },
+        replayable(),
+    );
+    let n17 = r1.create_query(move |rt: &Runtime<C>| rt.get(n18));
+    let n16 =
+        r1.create_query(move |rt: &Runtime<C>| panic_if(rt.try_get(n17).unwrap_or(7777), 1, 0, 16));
+    let n15 = r1.create_query_with(
+        move |rt: &Runtime<C>| panic_if(rt.get(n16), 0, 0, 15),
+        replayable(),
+    );
+    let n14 = r1.create_query(|_| 0_u64);
+    let n13 = r1.create_query_with(
+        move |rt: &Runtime<C>| rt.try_get(n15).unwrap_or(7777),
+        replayable(),
+    );
+    let n12 = r1.create_query_with(move |rt: &Runtime<C>| rt.get(n13), replayable());
+    let n11 = r1.create_query_with(
+        move |rt: &Runtime<C>| rt.try_get(n12).unwrap_or(7777),
+        replayable(),
+    );
+    let n10 = r1.create_query(move |rt: &Runtime<C>| rt.try_get(n11).unwrap_or(7777));
+    let n9 = {
+        let (r2, late_b0) = (OtherRt(&*r2), late_b0.clone());
+        r1.create_query_with(
+            move |rt: &Runtime<C>| {
+                let b0 = *late_b0.get().expect("node 0 of the second runtime is made");
+                rt.get(x19)
+                    .wrapping_add(r2.try_get(b0).map_or(7777, |b| b.0))
+            },
+            replayable(),
+        )
+    };
+    let n8 = r1.create_query_with(
+        move |rt: &Runtime<C>| {
+            if rt.get(n9).is_multiple_of(2) {
+                rt.try_get(n10).unwrap_or(7777)
+            } else {
+                0
+            }
+        },
+        replayable(),
+    );
+    let n7 = r1.create_query_with(move |rt: &Runtime<C>| rt.get(n8), replayable());
+    let n6 = r1.create_query_with(
+        move |rt: &Runtime<C>| {
+            let c = if rt.get(n14).is_multiple_of(2) {
+                rt.try_get(n7).unwrap_or(7777)
+            } else {
+                0
+            };
+            BareValue(if c.is_multiple_of(2) { rt.get(n7) } else { 0 })
+        },
+        bare_replayable(),
+    );
+    let _n5 = r1.create_query_with(|_| 4_u64, replayable());
+    let _n4 = r1.create_query(|_| 0_u64);
+    let _n3 = r1.create_query_with(|_| 0_u64, replayable());
+    let _n2 = r1.create_query_with(|_| BareValue(0), bare_replayable());
+    let _n1 = r1.create_query_with(|_| 2_u64, replayable());
+    let _n0 = r1.create_query_with(|_| 0_u64, replayable());
+
+    let _y4 = r2.create_input(0_u64);
+    let y3 = r2.create_input(0_u64);
+    let _b2 = {
+        let r1 = OtherRt(&*r1);
+        r2.create_query_with(move |_| r1.get(n7), replayable())
+    };
+    let b1 = {
+        let (r1, late_b0) = (OtherRt(&*r1), late_b0.clone());
+        r2.create_query(move |rt: &Runtime<C>| {
+            let b0 = *late_b0.get().expect("node 0 of the second runtime is made");
+            let a = r1.get(n9).wrapping_add(rt.get(b0).0);
+            BareValue(a.wrapping_add(panic_if(rt.get(b0).0, 2, 1, 1)))
+        })
+    };
+    let b0 = r2.create_query_with(
+        move |rt: &Runtime<C>| BareValue(rt.try_get(y3).unwrap_or(7777)),
+        bare_replayable(),
+    );
+    assert!(late_b0.set(b0).is_ok());
+
+    let outs = vec![
+        get_outcome(|| r1.get(n8)),
+        set_outcome(|| r2.set(y3, 3)),
+        set_outcome(|| r1.set(x19, 0)),
+        get_outcome(|| r1.get(n11)),
+        get_outcome(|| r2.get(b1).0),
+        get_outcome(|| r1.get(n6).0),
+    ];
+    let states = vec![
+        (10, r1.state_of(n10)),
+        (11, r1.state_of(n11)),
+        (12, r1.state_of(n12)),
+        (13, r1.state_of(n13)),
+        (15, r1.state_of(n15)),
+        (16, r1.state_of(n16)),
+    ];
+    (outs, states)
+}
+
+/// At frames 1 the doomed read of 7 runs 8's walk speculatively, which
+/// stashes 10's panic and leaves 10 Dirty; the retry adopts 8's stash
+/// nested, over 8's recorded dep 10 that 8's rerun now skips. The
+/// unbounded walk of 8 lands 10 Failed first, so the adoption must too.
+#[test]
+fn an_adoption_lands_a_recorded_dep_its_rerun_skips_as_unbounded() {
+    fn check<C: Cells>() {
+        let want = seed_366152c0::<C>(u32::MAX);
+        assert_eq!(
+            want.1[0],
+            (10, NodeState::Failed),
+            "the unbounded walk lands 10"
+        );
+        for frames in [1, 2, 3] {
+            assert_eq!(seed_366152c0::<C>(frames), want, "frames {frames}");
+        }
+    }
+    check::<Local>();
+    check::<Shared>();
 }

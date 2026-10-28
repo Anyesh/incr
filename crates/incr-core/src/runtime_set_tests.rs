@@ -3,6 +3,7 @@
 //! `Shared`; the tests that need no second thread run under both.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -458,4 +459,62 @@ fn local_wide_input_rewires_in_sublinear_time() {
 #[test]
 fn shared_wide_input_rewires_in_sublinear_time() {
     wide_input_rewires_in_sublinear_time(&Runtime::<Shared>::new());
+}
+
+/// A reader that failed over a memo D stays reachable when D, rerun after
+/// an unrelated set (its closure reads by run count), moves onto a new dep
+/// Z a caught panic left Dirty: a set below Z reruns the reader.
+fn failed_reader_over_a_memo_that_moved_onto_a_new_dep<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let fail_y = rt.create_input(0_u64);
+    let fail_z = rt.create_input(1_u64);
+    let other = rt.create_input(0_u64);
+    let failed_y = rt.create_query(move |rt| {
+        assert_eq!(rt.get(fail_y), 0, "failed below y");
+        0
+    });
+    let failed_z = rt.create_query(move |rt| {
+        assert_eq!(rt.get(fail_z), 0, "failed below z");
+        0
+    });
+    let y =
+        rt.create_query(move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(failed_y))).unwrap_or(1));
+    let z =
+        rt.create_query(move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(failed_z))).unwrap_or(1));
+    let runs = Arc::new(AtomicU32::new(0));
+    let d = {
+        let runs = runs.clone();
+        rt.create_query(move |rt| {
+            if runs.fetch_add(1, SeqCst) < 2 {
+                rt.get(y)
+            } else {
+                rt.get(z)
+            }
+        })
+    };
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(d);
+        assert_eq!(v, 0, "the reader fails over d");
+        v
+    });
+    assert_eq!(rt.get(f), 0);
+    rt.set(fail_y, 1);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err());
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    rt.set(other, 1);
+    assert_eq!(rt.get(d), 1);
+    assert_eq!(runs.load(SeqCst), 3);
+    rt.set(fail_z, 0);
+    assert_eq!(catch_unwind(AssertUnwindSafe(|| rt.get(f))).ok(), Some(0));
+}
+
+#[test]
+fn local_failed_reader_over_a_memo_that_moved_onto_a_new_dep() {
+    failed_reader_over_a_memo_that_moved_onto_a_new_dep::<Local>();
+}
+
+#[test]
+fn shared_failed_reader_over_a_memo_that_moved_onto_a_new_dep() {
+    failed_reader_over_a_memo_that_moved_onto_a_new_dep::<Shared>();
 }

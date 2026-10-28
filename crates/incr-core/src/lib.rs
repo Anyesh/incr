@@ -19,8 +19,10 @@
 
 pub mod arena;
 mod arena_registry;
+mod attempt;
 mod bits;
 pub mod cells;
+mod changes;
 mod children;
 pub mod collection;
 pub mod cycle;
@@ -36,6 +38,7 @@ pub mod generic_arena;
 pub mod grid_table;
 pub mod handle;
 mod hashed_multiset;
+mod hold;
 pub mod lock_order;
 pub mod locks;
 #[cfg(loom)]

@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use super::race_tests::{clean_node_that_can_turn_cyclic, id, panic_message, park_at, Gate};
+use super::race_tests::{
+    clean_node_that_can_turn_cyclic, id, panic_message, park_at, spawn_joined, Gate, Joined,
+};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::handle::Incr;
@@ -61,9 +63,9 @@ fn set_reading<T: crate::Value>(
     rt: &Arc<Rt>,
     x: Incr<Probe>,
     y: Incr<T>,
-) -> thread::JoinHandle<Result<Vec<T>, String>> {
+) -> Joined<Result<Vec<T>, String>> {
     let rt = Arc::clone(rt);
-    thread::spawn(move || {
+    spawn_joined("setter", move || {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let hook = {
             let rt = Arc::clone(&rt);

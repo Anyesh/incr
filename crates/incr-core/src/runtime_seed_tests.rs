@@ -60,6 +60,8 @@ both!(
     a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle,
     a_seeded_hit_leaves_its_key_and_closure_in_the_bag,
     a_seeded_type_fallback_miss_needs_the_types_fallback,
+    a_seed_ends_a_speculative_stash_of_its_node,
+    a_seed_ends_the_stashes_that_read_its_node,
 );
 
 fn dep<T>(h: Incr<T>) -> SeedDep {
@@ -641,6 +643,79 @@ fn changed_at_erased_refuses_dead_and_foreign_handles<C: Cells>() {
     let recycled = rt.create_input(3_u64);
     assert_eq!(recycled.slot(), x.slot());
     assert_eq!(changed_at_erased(&rt, x.erase()), None);
+}
+
+/// A speculative run stashes `q` and lands it back New; a seed then lands
+/// it at W0, and a read takes the seeded value, as the unbounded run, which
+/// never ran `q`, does.
+fn a_seed_ends_a_speculative_stash_of_its_node<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let x = rt.create_input(3_u64);
+    let (q, runs) = counted(&rt, x);
+    let b = rt.create_query(|_: &Runtime<C>| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt| {
+            let v = rt.get(b);
+            if v == 0 {
+                rt.get(q)
+            } else {
+                v
+            }
+        },
+        super::replay_tests::replayable(),
+    );
+    assert_eq!(rt.get(reader), 5);
+    assert_eq!(runs.load(SeqCst), 1, "q had no speculative run");
+    assert_eq!(rt.state_of(q), NodeState::New);
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, q, 40, &[dep(x)], Reuse::IfUnchanged),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.get(q), 40);
+    assert_eq!(runs.load(SeqCst), 1);
+}
+
+/// A speculative run stashes `q` and, over `q`'s stash, its reader `r`; a
+/// seed then lands `q` at W0, a read verifies it, and `r`'s real claim
+/// reads the seeded value, as the unbounded run, which never ran `q`, does.
+fn a_seed_ends_the_stashes_that_read_its_node<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let x = rt.create_input(3_u64);
+    let (q, runs) = counted(&rt, x);
+    let r = rt.create_query_with(
+        move |rt: &Runtime<C>| rt.get(q) + 1,
+        super::replay_tests::replayable(),
+    );
+    let b = rt.create_query(|_: &Runtime<C>| 5_u64);
+    let top = rt.create_query_with(
+        move |rt| {
+            let v = rt.get(b);
+            if v == 0 {
+                rt.get(r)
+            } else {
+                v
+            }
+        },
+        super::replay_tests::replayable(),
+    );
+    assert_eq!(rt.get(top), 5);
+    assert_eq!(runs.load(SeqCst), 1, "q had no speculative run");
+    assert!(
+        rt.stashed(r.slot(), r.generation(), false),
+        "r has no stash"
+    );
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, q, 40, &[dep(x)], Reuse::IfUnchanged),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.get(q), 40);
+    assert_eq!(rt.get(r), 41);
 }
 
 /// Outside a compute and in the retry nothing is doomed; in the doomed

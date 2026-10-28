@@ -19,9 +19,15 @@
 //! and their positions on the thread.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED, UNREGENERABLE};
+use crate::cells::Cells;
+use crate::cycle::{
+    ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, KEPT_UNCHECKED, POISONED, SPECULATIVE,
+    UNREGENERABLE,
+};
+use crate::fx::FxBuildHasher;
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -50,10 +56,46 @@ pub struct Frame {
     pub(crate) reading: u64,
 }
 
+/// Up to this many deps a frame finds how often it read a node by scanning
+/// them, at a cost bounded by this constant, which note work leaves out;
+/// past it, through [`ReadCounts`], so that a frame reading n nodes pays
+/// O(n) for their ordinals, not O(n^2).
+const SCAN_DEPS: usize = 32;
+
+/// Lookups a frame past `SCAN_DEPS` deps answers by scanning before it
+/// builds [`ReadCounts`]. Filling the table costs about 10 scans of the
+/// same deps when they repeat a few nodes and over 100 when all differ, so
+/// a frame looked up a few times pays only its scans, and one looked up
+/// per child of a fan-out pays this many before its lookups turn constant.
+const SCANS_BEFORE_COUNTING: u32 = 32;
+
+/// A frame's reads per node, keyed as `Frame::reading`, over the first
+/// `counted` of its deps, which only grow while the frame is on the stack.
+/// Kept beside the frames rather than in them, so that a frame, which
+/// every compute level builds on its stack, stays its size. They are the
+/// frame's at their index only while its control block is `ctl` and has
+/// `reads_counted` set, so a frame's pop leaves them in place.
+struct ReadCounts {
+    ctl: *const ComputeCtl,
+    scans: u32,
+    counted: usize,
+    by_node: HashMap<u64, u32, FxBuildHasher>,
+}
+
+fn read_key(&(dep, generation): &(NodeId, u32)) -> u64 {
+    u64::from(dep.0) | (u64::from(generation) << 32)
+}
+
 impl Frame {
     #[inline(always)]
     pub(crate) fn rt(&self) -> RuntimeId {
         self.tagged_rt.rt()
+    }
+
+    fn note_read_at(&self) {
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        unsafe { (*self.ctl).read_at.set(self.deps.len() as u32) };
     }
 
     /// Whether the frame is `rt`'s, never the sentinel. A frame that does
@@ -70,27 +112,13 @@ impl Frame {
         self.read_rt != self.rt()
     }
 
-    /// How many times the frame has read the node it reads now, this read
-    /// included.
-    fn reads_of_reading(&self) -> u32 {
-        self.deps
-            .iter()
-            .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == self.reading)
-            .count() as u32
-    }
-
-    /// The frame's step in the paths of the frames above it.
-    pub(crate) fn step(&self) -> Step {
+    /// The frame's step in the paths of the frames above it, given how
+    /// many times it has read the node it reads now.
+    fn step_with(&self, reads: u32) -> Step {
         // SAFETY: the frame is on the stack, so its control block is live
         // (see `Frame::ctl`).
         let member = unsafe { &*self.ctl }.has(BUFFERED);
-        Step::of(
-            self.rt(),
-            self.node.0,
-            member,
-            self.reading,
-            self.reads_of_reading(),
-        )
+        Step::of(self.rt(), self.node.0, member, self.reading, reads)
     }
 }
 
@@ -125,6 +153,45 @@ pub struct Frames {
     /// against its byte budget there, since at a doom the stack is past it.
     /// Indexes increase, and a hold drops the entries at or above its own.
     holds: Vec<(u32, *const ComputeCtl, usize)>,
+    /// The read counts of frames past `SCAN_DEPS` deps, by frame index,
+    /// indexes increasing. Popped frames' entries go at the next counted
+    /// lookup, so until then a thread keeps the tables of its last frames
+    /// looked up more than `SCANS_BEFORE_COUNTING` times: a constant times
+    /// the deps their nodes keep. Dropping them at a pop or a context's
+    /// close would cost every compute, or every replayed level's stack.
+    read_counts: Vec<(u32, ReadCounts)>,
+    /// The index of a frame found below the top `NEAR_FRAMES`, by runtime
+    /// and node: each group expansion nested in a deep chain of member runs
+    /// asks for the same frame at the stack's bottom. A push of a frame for
+    /// the node drops its entry, so an entry whose frame still computes the
+    /// node is the innermost one that does.
+    deep: HashMap<(RuntimeId, NodeId), usize, FxBuildHasher>,
+}
+
+/// Frames from the top that [`DepStack::frame_cidx`] scans before it looks
+/// up a deeper frame.
+const NEAR_FRAMES: usize = 16;
+
+/// Deeper frames remembered before the table starts afresh.
+const DEEP_FRAMES_MAX: usize = 64;
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static FRAMES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Frames this thread's [`DepStack::frame_cidx`] calls have compared.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn frames_scanned() -> u64 {
+    FRAMES_SCANNED.with(std::cell::Cell::get)
+}
+
+/// Counts once per scan rather than per frame compared, so the test
+/// binary the cost gates time runs the scan as user builds do.
+#[inline(always)]
+fn note_scanned(_frames: usize) {
+    #[cfg(all(test, not(loom)))]
+    FRAMES_SCANNED.with(|n| n.set(n.get() + _frames as u64));
 }
 
 /// The most spare deps buffers a thread keeps, and the largest capacity
@@ -178,6 +245,8 @@ impl Frames {
     /// kept read can carry: within its own runtime's budget, that frame can
     /// no longer be doomed, because its retry would read the other runtime
     /// again (see [`FOREIGN_HOLD`]). A frame doomed already keeps its doom.
+    /// A `SPECULATIVE` frame is also marked `KEPT_UNCHECKED`, since its
+    /// stash adoption could not see that runtime change.
     #[cold]
     #[inline(never)]
     fn hold_foreign_reader(&mut self) {
@@ -190,6 +259,9 @@ impl Frames {
         let ctl = unsafe { &*top.ctl };
         // A rerun of the reader's node reads the other runtime again.
         ctl.raise(UNREGENERABLE);
+        if ctl.has(SPECULATIVE) {
+            ctl.raise(KEPT_UNCHECKED);
+        }
         if !ctl.has(DOOMED) {
             let held = ctl.has(FOREIGN_HOLD);
             ctl.raise(FOREIGN_HOLD);
@@ -246,6 +318,83 @@ impl Frames {
             placed: u32::MAX,
             spare: Vec::new(),
             holds: Vec::new(),
+            read_counts: Vec::new(),
+            deep: HashMap::with_hasher(FxBuildHasher),
+        }
+    }
+
+    /// Frame `i`'s step in the paths of the frames above it.
+    #[inline]
+    pub(crate) fn step(&mut self, i: usize) -> Step {
+        let reads = self.reads_of_reading(i);
+        self.frames[i].step_with(reads)
+    }
+
+    /// How many times frame `i` has read the node it reads now, this read
+    /// included.
+    #[inline]
+    fn reads_of_reading(&mut self, i: usize) -> u32 {
+        self.reads_of_key(i, self.frames[i].reading)
+    }
+
+    /// How many reads frame `i` has recorded of the node keyed `key`.
+    #[inline]
+    fn reads_of_key(&mut self, i: usize, key: u64) -> u32 {
+        let deps = &self.frames[i].deps;
+        if deps.len() <= SCAN_DEPS {
+            return deps.iter().filter(|d| read_key(d) == key).count() as u32;
+        }
+        self.counted_reads_of(i, key)
+    }
+
+    #[inline(never)]
+    fn counted_reads_of(&mut self, i: usize, key: u64) -> u32 {
+        self.drop_popped_counts();
+        let at = match self.read_counts.binary_search_by_key(&(i as u32), |e| e.0) {
+            Ok(at) => at,
+            Err(at) => {
+                let counts = ReadCounts {
+                    ctl: std::ptr::null(),
+                    scans: 0,
+                    counted: 0,
+                    by_node: HashMap::default(),
+                };
+                self.read_counts.insert(at, (i as u32, counts));
+                at
+            }
+        };
+        let frame = &self.frames[i];
+        let counts = &mut self.read_counts[at].1;
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        let ctl = unsafe { &*frame.ctl };
+        if counts.ctl != frame.ctl || !ctl.reads_counted() {
+            counts.ctl = frame.ctl;
+            counts.scans = 0;
+            counts.counted = 0;
+            // A fresh table, since clearing one costs its capacity, which
+            // a wider frame counted here before may have left large.
+            counts.by_node = HashMap::default();
+            ctl.count_reads();
+        }
+        let deps = &frame.deps;
+        if counts.scans < SCANS_BEFORE_COUNTING {
+            counts.scans += 1;
+            crate::replay::note_work(deps.len());
+            return deps.iter().filter(|d| read_key(d) == key).count() as u32;
+        }
+        crate::replay::note_work(deps.len() - counts.counted);
+        for d in &deps[counts.counted..] {
+            *counts.by_node.entry(read_key(d)).or_default() += 1;
+        }
+        counts.counted = deps.len();
+        counts.by_node.get(&key).copied().unwrap_or(0)
+    }
+
+    fn drop_popped_counts(&mut self) {
+        let len = self.frames.len() as u32;
+        while self.read_counts.last().is_some_and(|e| e.0 >= len) {
+            self.read_counts.pop();
         }
     }
 
@@ -254,7 +403,16 @@ impl Frames {
         if self.frames.capacity() == 0 {
             first_push();
         }
+        if !self.deep.is_empty() {
+            self.forget_deep(frame.rt(), frame.node);
+        }
         self.frames.push(frame);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn forget_deep(&mut self, rt: RuntimeId, node: NodeId) {
+        self.deep.remove(&(rt, node));
     }
 
     #[inline(always)]
@@ -283,20 +441,40 @@ impl Frames {
 /// frame's Clean read; no registry hands it out.
 pub(crate) const DIVERTED_TAG: u16 = u16::MAX;
 
+mod sealed {
+    /// Keeps [`super::DepStack`] to this crate's stacks: its default
+    /// methods dereference the control-block pointers its methods return,
+    /// which an outside implementation could forge.
+    pub trait Sealed {}
+}
+
 /// Strategy-parameterized dep tracker used by the runtime during compute.
-pub trait DepStack: 'static {
+pub trait DepStack: sealed::Sealed + 'static {
     fn new() -> Self;
 
     /// Runs `f` on the stack. `f` must not reach user code or the stack.
     #[doc(hidden)]
     fn with<R>(&self, f: impl FnOnce(&mut Frames) -> R) -> R;
 
+    /// The top frame's runtime tag, node and control block, for
+    /// [`Self::unrecorded_lookup`].
+    #[doc(hidden)]
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        self.with(|s| top_fields(s))
+    }
+
     /// Push a frame for `node` of runtime `rt` at the top of the stack,
     /// with the frame's depth as its conceptual-stack position, which is
-    /// returned.
+    /// returned. `ctl` serves this frame only: the read-count side table
+    /// tells frames at one index apart by it.
     #[doc(hidden)]
     #[inline(always)]
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
+        debug_assert!(
+            !ctl.reads_counted(),
+            "incr-core: a control block serves one frame"
+        );
         crate::lock_order::enter_frame();
         // Left to the inliner, any change to what the push writes has
         // moved this closure out of line, at about 57 instructions a push.
@@ -312,14 +490,50 @@ pub trait DepStack: 'static {
     }
 
     /// Push a frame at conceptual-stack position `cidx`: an episode's
-    /// member runs all sit at the root's.
+    /// member runs all sit at the root's. `ctl` serves this frame only, as
+    /// in [`Self::push_frame`].
     #[doc(hidden)]
     fn push_frame_at(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl, cidx: u32) {
+        debug_assert!(
+            !ctl.reads_counted(),
+            "incr-core: a control block serves one frame"
+        );
         crate::lock_order::enter_frame();
         self.with(|s| {
             let frame = s.frame(node, rt, ctl, cidx);
             s.push(frame);
         })
+    }
+
+    /// Whether any frame on the stack, of any runtime, has a control block
+    /// for which `f` holds.
+    fn any_frame(&self, f: impl Fn(&ComputeCtl) -> bool) -> bool {
+        self.with(|s| {
+            s.frames.iter().any(|frame| {
+                // SAFETY: the frame is on the stack, so its control block is
+                // live (see `Frame::ctl`).
+                f(unsafe { &*frame.ctl })
+            })
+        })
+    }
+
+    fn each_frame(&self, f: impl Fn(&ComputeCtl)) {
+        self.with(|s| {
+            for frame in &s.frames {
+                // SAFETY: the frame is on the stack, so its control block is
+                // live (see `Frame::ctl`).
+                f(unsafe { &*frame.ctl });
+            }
+        });
+    }
+
+    /// The top frame raises from its own code here, after any read so far.
+    fn note_raise(&self) {
+        self.with(|s| {
+            if let Some(top) = s.frames.last() {
+                top.note_read_at();
+            }
+        });
     }
 
     /// Pop the top frame and return the deps it recorded, each with the
@@ -391,7 +605,9 @@ pub trait DepStack: 'static {
     /// The top frame's runtime, control block and position, when it is
     /// another runtime's than `rt` and keeps `rt`'s Clean reads (see
     /// [`FrameRt`]). A frame still untested is settled here,
-    /// by its runtime, once.
+    /// by its runtime, once: a `SPECULATIVE` frame that settles keeping
+    /// none reads `rt` unrecorded, so its resolver marks it
+    /// `KEPT_UNCHECKED`.
     fn foreign_keeper(&self, rt: RuntimeId) -> Option<(RuntimeId, *const ComputeCtl, u32)> {
         let (tagged, node, ctl, cidx) = self.with(|s| {
             s.frames
@@ -399,18 +615,63 @@ pub trait DepStack: 'static {
                 .filter(|top| top.rt() != rt)
                 .map(|top| (top.tagged_rt, top.node, top.ctl, top.cidx))
         })?;
-        let keeps = if tagged.is_untested() {
+        // SAFETY: the frame is on the stack, so it is running and its
+        // control block is live.
+        self.top_keeps_foreign(tagged, node, unsafe { &*ctl })
+            .then(|| (tagged.rt(), ctl, cidx))
+    }
+
+    /// Whether the top frame, read as `tagged`, `node` and `ctl`, keeps
+    /// other runtimes' Clean reads, settling it when still untested.
+    fn top_keeps_foreign(&self, tagged: FrameRt, node: NodeId, ctl: &ComputeCtl) -> bool {
+        if tagged.is_untested() {
             #[cfg(all(test, not(loom)))]
             KEEP_SETTLES.with(|n| n.set(n.get() + 1));
-            // SAFETY: the frame is on the stack, so it is running and its
-            // control block is live.
-            let keeps = unsafe { (*ctl).keeps_foreign(node.0) };
+            // SAFETY: the frame is on the stack, so it is running.
+            let keeps = unsafe { ctl.keeps_foreign(node.0) };
             self.settle_foreign_keeping(keeps);
             keeps
         } else {
             tagged.keeps_foreign()
-        };
-        keeps.then(|| (tagged.rt(), ctl, cidx))
+        }
+    }
+
+    /// For a lookup that records no dependency, such as
+    /// `Runtime::is_alive` or a table's `get`: the top frame's runtime
+    /// (`SENTINEL` for a callback's barrier, `None` outside any compute),
+    /// after raising `UNREGENERABLE` on a compute frame that keeps other
+    /// runtimes' Clean reads, since a rerun of its node would look again
+    /// as things are then, and `KEPT_UNCHECKED` on a `SPECULATIVE` one,
+    /// since its stash adoption could not see the answer change.
+    ///
+    /// Inlined so that a lookup outside any compute costs one look at the
+    /// stack; the marking stays out of line.
+    #[inline(always)]
+    fn unrecorded_lookup(&self) -> Option<RuntimeId> {
+        let (tagged, node, ctl) = self.top_for_lookup()?;
+        let top = tagged.rt();
+        if top != RuntimeId::SENTINEL {
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            self.mark_unrecorded_lookup(tagged, node, unsafe { &*ctl });
+        }
+        Some(top)
+    }
+
+    /// [`Self::unrecorded_lookup`]'s marking of the top compute frame.
+    #[inline(never)]
+    fn mark_unrecorded_lookup(&self, tagged: FrameRt, node: NodeId, ctl: &ComputeCtl) {
+        if self.top_keeps_foreign(tagged, node, ctl) {
+            ctl.raise(UNREGENERABLE);
+        }
+        if ctl.has(SPECULATIVE | BUFFERED) {
+            if ctl.has(SPECULATIVE) {
+                ctl.raise(KEPT_UNCHECKED);
+            }
+            if ctl.has(BUFFERED) {
+                ctl.look_up_unrecorded();
+            }
+        }
     }
 
     /// Sends the top frame's Clean reads to the slow path (see
@@ -428,6 +689,25 @@ pub trait DepStack: 'static {
         self.with(|s| {
             if let Some(top) = s.frames.last_mut().filter(|top| top.rt() == rt) {
                 top.read_rt = rt;
+            }
+        });
+    }
+
+    /// A read of a deleted node's handle by the top compute frame, of any
+    /// runtime: it panics with no dep recorded, so a stash of the frame's
+    /// outcome could not see the slot recreated (`KEPT_UNCHECKED`).
+    #[cold]
+    #[inline(never)]
+    fn stale_read(&self) {
+        self.with(|s| {
+            if let Some(top) = s
+                .frames
+                .last()
+                .filter(|top| top.rt() != RuntimeId::SENTINEL)
+            {
+                // SAFETY: the frame is on the stack, so its control block
+                // is live (see `Frame::ctl`).
+                unsafe { &*top.ctl }.raise(KEPT_UNCHECKED);
             }
         });
     }
@@ -455,10 +735,10 @@ pub trait DepStack: 'static {
     /// recorded: a read's ordinal less one.
     fn reads_of(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> u32 {
         self.with(|s| {
-            s.active(rt).map_or(0, |top| {
-                top.deps.iter().filter(|&&d| d == (dep, generation)).count() as u32
-            })
+            s.active(rt)?;
+            Some(s.reads_of_key(s.frames.len() - 1, read_key(&(dep, generation))))
         })
+        .unwrap_or(0)
     }
 
     /// Records `dep` in `rt`'s top frame, for a diverted Clean read that
@@ -531,13 +811,15 @@ pub trait DepStack: 'static {
             let depth = s.frames.len() as u32;
             let top = match s.frames.last_mut() {
                 Some(top) if top.is_of(rt) => top,
-                Some(_) => {
+                Some(top) => {
+                    top.note_read_at();
                     s.foreign_non_clean_read();
                     return None;
                 }
                 None => return None,
             };
             top.deps.push((dep, generation));
+            top.note_read_at();
             top.reading = u64::from(dep.0) | (u64::from(generation) << 32);
             Some(ActiveRead {
                 node: top.node,
@@ -576,6 +858,31 @@ pub trait DepStack: 'static {
         });
     }
 
+    /// Marks the nearest `Shared` compute frame, past any callback's
+    /// barrier, as having read a landing this thread holds, so its own
+    /// landing is held. Returns the frame's runtime. A `Local` frame between
+    /// lands at once, as no exit publishes a `Local` runtime's holds.
+    fn raise_hold(&self) -> Option<RuntimeId> {
+        self.with(|s| {
+            let f = s.frames.iter().rev().find(|f| holds_for(f.rt()))?;
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            unsafe { (*f.ctl).raise(HOLD) };
+            Some(f.rt())
+        })
+    }
+
+    /// The control block of the frame [`Self::raise_hold`] marks.
+    fn hold_reader(&self) -> Option<*const ComputeCtl> {
+        self.with(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .find(|f| holds_for(f.rt()))
+                .map(|f| f.ctl)
+        })
+    }
+
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
@@ -607,7 +914,8 @@ pub trait DepStack: 'static {
                 cidx: top.cidx,
                 depth,
             };
-            Some((f, top.reading, top.reads_of_reading()))
+            let reading = top.reading;
+            Some((f, reading, s.reads_of_reading(depth as usize - 1)))
         })
     }
 
@@ -615,15 +923,20 @@ pub trait DepStack: 'static {
     /// how many times it has read it, this read included.
     fn active_read(&self, rt: RuntimeId) -> Option<(NodeId, u32, u64, u32)> {
         self.with(|s| {
-            s.active(rt)
-                .map(|top| (top.node, top.cidx, top.reading, top.reads_of_reading()))
+            let (node, cidx, reading) =
+                s.active(rt).map(|top| (top.node, top.cidx, top.reading))?;
+            Some((node, cidx, reading, s.reads_of_reading(s.frames.len() - 1)))
         })
     }
 
     /// How many times `rt`'s active frame has read the node it reads
     /// now, this read included.
     fn reads_of_current(&self, rt: RuntimeId) -> u32 {
-        self.with(|s| s.active(rt).map_or(0, |top| top.reads_of_reading()))
+        self.with(|s| {
+            s.active(rt)?;
+            Some(s.reads_of_reading(s.frames.len() - 1))
+        })
+        .unwrap_or(0)
     }
 
     fn active_frame(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32)> {
@@ -642,15 +955,15 @@ pub trait DepStack: 'static {
         })
     }
 
-    /// Whether the thread's top frame is another runtime's than `rt` and
-    /// doomed, so a read `rt` serves now comes from a closure that has
-    /// read a placeholder.
-    fn other_top_doomed(&self, rt: RuntimeId) -> bool {
+    /// The runtime of the thread's top frame if it is another than `rt`
+    /// and the frame is doomed, so a read `rt` serves now comes from a
+    /// closure that has read a placeholder.
+    fn other_top_doomed(&self, rt: RuntimeId) -> Option<RuntimeId> {
         self.with(|s| {
-            s.frames.last().is_some_and(|top| {
+            s.frames.last().and_then(|top| {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
-                top.rt() != rt && unsafe { &*top.ctl }.has(DOOMED)
+                (top.rt() != rt && unsafe { &*top.ctl }.has(DOOMED)).then(|| top.rt())
             })
         })
     }
@@ -678,15 +991,47 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// Whether the frame at `depth` computes `node` of runtime `rt`.
+    fn frame_at_is(&self, depth: usize, rt: RuntimeId, node: NodeId) -> bool {
+        self.with(|s| {
+            s.frames
+                .get(depth)
+                .is_some_and(|f| f.node == node && f.rt() == rt)
+        })
+    }
+
     /// The position of the innermost frame on this stack computing
     /// `node` of runtime `rt`, if one is.
     fn frame_cidx(&self, rt: RuntimeId, node: NodeId) -> Option<u32> {
         self.with(|s| {
-            s.frames
-                .iter()
-                .rev()
-                .find(|f| f.node == node && f.rt() == rt)
-                .map(|f| f.cidx)
+            let is = |f: &Frame| f.node == node && f.rt() == rt;
+            let len = s.frames.len();
+            let near = len.saturating_sub(NEAR_FRAMES);
+            if let Some(j) = s.frames[near..].iter().rposition(is) {
+                note_scanned(len - near - j);
+                return Some(s.frames[near + j].cidx);
+            }
+            note_scanned(len - near);
+            if near == 0 {
+                return None;
+            }
+            if let Some(&i) = s.deep.get(&(rt, node)) {
+                if i < near {
+                    note_scanned(1);
+                    if is(&s.frames[i]) {
+                        debug_assert!(!s.frames[i + 1..near].iter().any(is));
+                        return Some(s.frames[i].cidx);
+                    }
+                }
+            }
+            let found = s.frames[..near].iter().rposition(is);
+            note_scanned(near - found.unwrap_or(0));
+            let i = found?;
+            if s.deep.len() >= DEEP_FRAMES_MAX {
+                s.deep.clear();
+            }
+            s.deep.insert((rt, node), i);
+            Some(s.frames[i].cidx)
         })
     }
 
@@ -715,6 +1060,8 @@ pub struct LocalDepStack {
     frames: *const RefCell<Frames>,
 }
 
+impl sealed::Sealed for LocalDepStack {}
+
 impl DepStack for LocalDepStack {
     fn new() -> Self {
         Self {
@@ -730,6 +1077,38 @@ impl DepStack for LocalDepStack {
         // not outlive this call.
         f(&mut unsafe { &*self.frames }.borrow_mut())
     }
+
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        // SAFETY: as in `with`.
+        top_unguarded(unsafe { &*self.frames })
+    }
+}
+
+#[inline(always)]
+fn top_fields(s: &Frames) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+    s.frames
+        .last()
+        .map(|top| (top.tagged_rt, top.node, top.ctl))
+}
+
+/// [`top_fields`] without writing the borrow flag, which a lookup outside
+/// any compute would otherwise pay for on every call.
+#[inline(always)]
+fn top_unguarded(frames: &RefCell<Frames>) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+    // SAFETY: the shared reference lives only for the copy in
+    // `top_fields`, which takes no borrow of the frames.
+    top_fields(
+        unsafe { frames.try_borrow_unguarded() }
+            .expect("incr-core: dep stack borrowed during a lookup"),
+    )
+}
+
+/// [`DepStack::unrecorded_lookup`] on this thread's stack, for a lookup
+/// with no runtime at hand, such as a collection's snapshot.
+#[inline(always)]
+pub(crate) fn unrecorded_lookup<C: Cells>() {
+    <C::DepStack as DepStack>::new().unrecorded_lookup();
 }
 
 pub struct SharedDepStack;
@@ -753,8 +1132,9 @@ thread_local! {
     static KEEP_SETTLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many untested frames [`DepStack::foreign_keeper`] settled on this
-/// thread since the last call.
+/// How many untested frames a foreign read or a lookup without a
+/// dependency settled on this thread since the last call (see
+/// [`DepStack::foreign_keeper`]).
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_keep_settles() -> u64 {
     KEEP_SETTLES.with(|n| n.replace(0))
@@ -782,6 +1162,12 @@ impl Drop for FramesGuard {
     }
 }
 
+/// Whether a frame of `rt` can hold its landing: a compute frame of a
+/// `Shared` runtime.
+fn holds_for(rt: RuntimeId) -> bool {
+    rt != RuntimeId::SENTINEL && crate::cycle_state::shared_open(rt)
+}
+
 /// Registers `FRAMES_GUARD`'s destructor, on the push that allocates the
 /// thread's buffer. During thread-local destruction the registration is
 /// refused, and that late buffer is leaked.
@@ -790,6 +1176,8 @@ impl Drop for FramesGuard {
 fn first_push() {
     let _ = FRAMES_GUARD.try_with(|_| {});
 }
+
+impl sealed::Sealed for SharedDepStack {}
 
 impl DepStack for SharedDepStack {
     fn new() -> Self {
@@ -807,6 +1195,13 @@ impl DepStack for SharedDepStack {
         // does not outlive this call.
         f(&mut unsafe { &*frames }.borrow_mut())
     }
+
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        let frames: *const RefCell<Frames> = SHARED_FRAMES.with(|f| std::ptr::from_ref(&**f));
+        // SAFETY: as in `with`.
+        top_unguarded(unsafe { &*frames })
+    }
 }
 
 #[cfg(loom)]
@@ -816,6 +1211,9 @@ pub struct LoomDepStack;
 loom::thread_local! {
     static LOOM_FRAMES: RefCell<Frames> = RefCell::new(Frames::new());
 }
+
+#[cfg(loom)]
+impl sealed::Sealed for LoomDepStack {}
 
 #[cfg(loom)]
 impl DepStack for LoomDepStack {
@@ -980,6 +1378,29 @@ mod tests {
         assert!(!s.is_computing(rt(1), NodeId(7)));
     }
 
+    /// A frame for a node pushed above a deep frame for it that a lookup
+    /// remembered is the one found.
+    #[test]
+    fn a_node_pushed_again_above_a_remembered_deep_frame_is_found() {
+        let s = SharedDepStack::new();
+        let ctls: Vec<ComputeCtl> = (0..40).map(|_| ComputeCtl::new(0)).collect();
+        for (i, ctl) in ctls.iter().enumerate() {
+            let node = if i == 0 || i == 20 {
+                5
+            } else {
+                1000 + i as u32
+            };
+            s.push_frame_at(rt(1), NodeId(node), ctl, 100 + i as u32);
+            if i == 19 {
+                assert_eq!(s.frame_cidx(rt(1), NodeId(5)), Some(100));
+            }
+        }
+        assert_eq!(s.frame_cidx(rt(1), NodeId(5)), Some(120));
+        for _ in 0..40 {
+            s.pop_frame();
+        }
+    }
+
     #[test]
     fn frames_are_scoped_to_their_runtime() {
         let s = SharedDepStack::new();
@@ -1040,10 +1461,10 @@ mod tests {
         s1.record_dep(rt(1), NodeId(9), 0, 0);
         s1.poison_current_frame(rt(1));
         assert!(!a.has(POISONED));
-        assert!(!s1.other_top_doomed(rt(1)));
+        assert_eq!(s1.other_top_doomed(rt(1)), None);
         b.raise(DOOMED);
-        assert!(s1.other_top_doomed(rt(1)));
-        assert!(!s2.other_top_doomed(rt(2)));
+        assert_eq!(s1.other_top_doomed(rt(1)), Some(rt(2)));
+        assert_eq!(s2.other_top_doomed(rt(2)), None);
         assert!(s2.pop_frame().is_empty());
         assert!(s1.current_frame_active(rt(1)));
         s1.record_dep(rt(1), NodeId(10), 0, 0);
@@ -1062,6 +1483,149 @@ mod tests {
         })
         .join()
         .unwrap();
+        s.pop_frame();
+    }
+
+    /// A frame's read counts agree with its deps on both sides of
+    /// `SCAN_DEPS`, Clean reads recorded between the counted ones too.
+    #[test]
+    fn read_counts_follow_the_deps_past_the_scan_limit() {
+        let s = LocalDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        for i in 0..3 * SCAN_DEPS as u32 {
+            let node = NodeId(i % 7);
+            if i % 3 == 0 {
+                s.record_dep(rt(1), node, 1, 4);
+            } else {
+                s.record_read(rt(1), node, 1);
+                let want = (0..=i).filter(|k| k % 7 == i % 7).count() as u32;
+                assert_eq!(s.reads_of_current(rt(1)), want, "read {i}");
+            }
+            assert_eq!(
+                s.reads_of(rt(1), NodeId(3), 1),
+                (0..=i).filter(|k| k % 7 == 3).count() as u32,
+                "read {i}"
+            );
+            assert_eq!(s.reads_of(rt(1), NodeId(3), 2), 0);
+        }
+        s.pop_frame();
+    }
+
+    /// Nested frames past `SCAN_DEPS` keep their own counts, and a frame
+    /// pushed where a counted one popped, with nothing counted below in
+    /// between, starts from its own deps, for the same node and a control
+    /// block at the same address too.
+    #[test]
+    fn read_counts_belong_to_their_frame() {
+        let s = LocalDepStack::new();
+        let outer = ComputeCtl::new(0);
+        let reads = 2 * SCAN_DEPS as u32;
+        s.push_frame(rt(1), NodeId(100), &outer);
+        for _ in 0..reads {
+            s.record_read(rt(1), NodeId(1), 1);
+        }
+        assert_eq!(s.reads_of_current(rt(1)), reads);
+        let mut ctl = ComputeCtl::new(0);
+        for (round, inner) in [NodeId(2), NodeId(3), NodeId(3)].into_iter().enumerate() {
+            s.push_frame(rt(1), NodeId(101), &ctl);
+            for k in 1..=reads {
+                s.record_read(rt(1), inner, 1);
+                assert_eq!(s.reads_of_current(rt(1)), k, "round {round}");
+                assert_eq!(s.reads_of(rt(1), NodeId(1), 1), 0, "round {round}");
+            }
+            s.pop_frame();
+            ctl = ComputeCtl::new(0);
+        }
+        assert_eq!(s.reads_of(rt(1), NodeId(1), 1), reads);
+        s.pop_frame();
+    }
+
+    /// A control block whose frame built read counts cannot serve a second
+    /// frame, whose lookups would take those counts as its own.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a control block serves one frame")]
+    fn a_counted_control_block_is_not_pushed_again() {
+        let s = LocalDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        for _ in 0..2 * SCAN_DEPS {
+            s.record_read(rt(1), NodeId(1), 1);
+        }
+        s.reads_of_current(rt(1));
+        s.pop_frame();
+        s.push_frame(rt(1), NodeId(100), &ctl);
+    }
+
+    /// A frame counted at an index where a much wider one was counted
+    /// before starts from a table its own size, so that resetting a
+    /// reused entry costs what the new frame reads, not what the old one
+    /// did.
+    #[test]
+    fn a_reused_count_entry_starts_small() {
+        let s = LocalDepStack::new();
+        let outer = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &outer);
+        for (round, width) in [(0, 64 * SCAN_DEPS as u32), (1, SCAN_DEPS as u32 + 1)] {
+            let ctl = ComputeCtl::new(0);
+            s.push_frame(rt(1), NodeId(101), &ctl);
+            for k in 0..width {
+                s.record_read(rt(1), NodeId(k), 1);
+            }
+            for _ in 0..=SCANS_BEFORE_COUNTING {
+                assert_eq!(s.reads_of_current(rt(1)), 1, "round {round}");
+            }
+            let capacity = s.with(|f| f.read_counts[0].1.by_node.capacity());
+            assert!(
+                capacity < 4 * width as usize,
+                "round {round}: {capacity} slots for {width} reads"
+            );
+            s.pop_frame();
+        }
+        s.pop_frame();
+    }
+
+    /// A counted lookup drops the counts of popped frames and keeps those
+    /// of frames still on the stack.
+    #[test]
+    fn a_lookup_drops_popped_counts() {
+        let s = LocalDepStack::new();
+        let (outer, inner) = (ComputeCtl::new(0), ComputeCtl::new(0));
+        let reads = 2 * SCAN_DEPS as u32;
+        for ctl in [&outer, &inner] {
+            s.push_frame(rt(1), NodeId(100), ctl);
+            for _ in 0..reads {
+                s.record_read(rt(1), NodeId(1), 1);
+            }
+            assert_eq!(s.reads_of_current(rt(1)), reads);
+        }
+        s.pop_frame();
+        assert_eq!(s.reads_of_current(rt(1)), reads);
+        assert_eq!(
+            s.with(|f| f.read_counts.iter().map(|e| e.0).collect::<Vec<_>>()),
+            [0]
+        );
+        s.pop_frame();
+    }
+
+    /// A frame past `SCAN_DEPS` deps looked up a few times answers by
+    /// scanning and builds no table.
+    #[test]
+    fn a_few_lookups_build_no_table() {
+        let s = LocalDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        let reads = 4 * SCAN_DEPS as u32;
+        for k in 0..reads {
+            s.record_read(rt(1), NodeId(k % 3), 1);
+        }
+        for _ in 0..SCANS_BEFORE_COUNTING {
+            assert_eq!(s.reads_of(rt(1), NodeId(0), 1), reads.div_ceil(3));
+        }
+        assert_eq!(s.with(|f| f.read_counts[0].1.by_node.capacity()), 0);
+        assert_eq!(s.reads_of(rt(1), NodeId(0), 1), reads.div_ceil(3));
+        assert!(s.with(|f| f.read_counts[0].1.by_node.capacity()) > 0);
         s.pop_frame();
     }
 }

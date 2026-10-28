@@ -140,6 +140,7 @@ pub trait Cells: 'static + Sized {
     /// branch budget instead of letting the awaited thread run.
     #[inline]
     fn backoff(spins: u32) {
+        let _waiting = crate::attempt::Outside::enter(true);
         if spins < 64 {
             std::hint::spin_loop();
         } else {

@@ -13,16 +13,17 @@
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
+use crate::changes::Count;
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::deferred::Unbuilt;
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
-use crate::notes::Log;
+use crate::notes::{Cut, CutLandings, Landed, Log, Marked};
 use crate::state::NodeState;
 use crate::taint_memo;
 use crate::value_code;
@@ -286,16 +287,17 @@ pub(crate) struct Landings {
 
 #[derive(Clone)]
 enum Nodes {
-    Owned(Vec<((u32, u32), u32)>),
+    Owned(Vec<Landed>),
     /// The notes of `log` the copy was taken of: its first `len` entries
-    /// but those gone before removal `epoch`, at their depths above
-    /// `base`, none deeper than `depth`.
+    /// but those gone before removal `epoch` and those `cut` took, at
+    /// their depths above `base`, none deeper than `depth`.
     Shared {
         log: Rc<RefCell<Log>>,
         len: usize,
         epoch: u64,
         base: u32,
         depth: u32,
+        cut: Option<Cut>,
     },
 }
 
@@ -305,8 +307,17 @@ impl Default for Nodes {
     }
 }
 
+/// The fields of a [`Nodes::Shared`] copy.
+pub(crate) struct SharedCopy<'a> {
+    pub(crate) log: &'a Rc<RefCell<Log>>,
+    pub(crate) len: usize,
+    pub(crate) epoch: u64,
+    pub(crate) base: u32,
+    pub(crate) cut: Option<&'a Cut>,
+}
+
 impl Landings {
-    pub(crate) fn owned(source: Option<PayloadKey>, nodes: Vec<((u32, u32), u32)>) -> Self {
+    pub(crate) fn owned(source: Option<PayloadKey>, nodes: Vec<Landed>) -> Self {
         Self {
             source,
             nodes: Nodes::Owned(nodes),
@@ -331,20 +342,22 @@ impl Landings {
                 epoch,
                 base,
                 depth: top.saturating_sub(base),
+                cut: None,
             },
         }
     }
 
-    fn owned_nodes(&mut self) -> &mut Vec<((u32, u32), u32)> {
+    fn owned_nodes(&mut self) -> &mut Vec<Landed> {
         if let Nodes::Shared {
             log,
             len,
             epoch,
             base,
+            cut,
             ..
         } = &self.nodes
         {
-            let nodes = log.borrow().landings(*len, *epoch, *base);
+            let nodes = log.borrow().landings(*len, *epoch, *base, cut.as_ref());
             self.nodes = Nodes::Owned(nodes);
         }
         match &mut self.nodes {
@@ -356,39 +369,56 @@ impl Landings {
     fn holds(&mut self, node: (u32, u32)) -> bool {
         let nodes = self.owned_nodes();
         note_work(nodes.len());
-        nodes.iter().any(|&(n, _)| n == node)
+        nodes.iter().any(|&(n, _, _)| n == node)
     }
 
-    pub(crate) fn into_nodes(mut self) -> Vec<((u32, u32), u32)> {
-        std::mem::take(self.owned_nodes())
-    }
-
-    fn is_deep(&self) -> bool {
+    /// A copy that still shares its log, as [`Nodes::Shared`] holds it.
+    pub(crate) fn as_shared(&self) -> Option<SharedCopy<'_>> {
         match &self.nodes {
-            Nodes::Owned(nodes) => {
-                note_work(nodes.len());
-                nodes.iter().any(|&(_, depth)| depth > 0)
-            }
             Nodes::Shared {
                 log,
                 len,
                 epoch,
                 base,
+                cut,
                 ..
-            } => log
-                .borrow()
-                .landings(*len, *epoch, *base)
-                .iter()
-                .any(|&(_, depth)| depth > 0),
+            } => Some(SharedCopy {
+                log,
+                len: *len,
+                epoch: *epoch,
+                base: *base,
+                cut: cut.as_ref(),
+            }),
+            Nodes::Owned(_) => None,
         }
     }
 
-    /// At least the deepest landing's depth.
+    pub(crate) fn into_nodes(mut self) -> Vec<Landed> {
+        std::mem::take(self.owned_nodes())
+    }
+
+    /// A bound on the depth of the deepest landing the copy still holds:
+    /// exact for an owned copy, `None` once it holds none; a shared copy
+    /// answers its depth unread, even once its notes are all removed.
+    fn deepest(&self) -> Option<u32> {
+        match &self.nodes {
+            Nodes::Owned(nodes) => {
+                note_work(nodes.len());
+                nodes.iter().map(|&(_, depth, _)| depth).max()
+            }
+            // No landing is deeper than `depth`, and finding the deepest
+            // would take each delivery of a deep chain's copy apart.
+            Nodes::Shared { depth, .. } => Some(*depth),
+        }
+    }
+
+    /// A bound on the deepest landing's depth, without reading a shared
+    /// copy's log.
     fn depth(&self) -> u32 {
         match &self.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
-                nodes.iter().map(|&(_, depth)| depth).max().unwrap_or(0)
+                nodes.iter().map(|&(_, depth, _)| depth).max().unwrap_or(0)
             }
             Nodes::Shared { depth, .. } => *depth,
         }
@@ -400,6 +430,37 @@ impl Landings {
     fn retire(&mut self, cidx: u32, ev: &Retire, resumed: Option<PayloadKey>) {
         let source = self.source;
         let ours = |p: PayloadKey| source == Some(p) || resumed == Some(p);
+        // A shared copy's log can hold many other copies' notes, so a
+        // positional event lowers its bounds instead of reading it.
+        if let Nodes::Shared { depth, cut, .. } = &mut self.nodes {
+            let top = match *ev {
+                Retire::Above(at) => Some(i64::from(at)),
+                Retire::Contained { cidx: at, payload } => {
+                    Some(i64::from(at) - i64::from(ours(payload)))
+                }
+                Retire::Landing { .. } => None,
+            };
+            if let Some(top) = top {
+                let Ok(keep) = u32::try_from(top - i64::from(cidx) - 1) else {
+                    self.nodes = Nodes::Owned(Vec::new());
+                    return;
+                };
+                if keep < *depth {
+                    *depth = keep;
+                    match cut {
+                        Some(c) => c.depth = c.depth.min(keep),
+                        None => {
+                            *cut = Some(Cut {
+                                depth: keep,
+                                seen: 0,
+                                landed: Rc::default(),
+                            })
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let gone: Box<dyn Fn((u32, u32), u32) -> bool> = match *ev {
             Retire::Above(at) => Box::new(move |_, pos| pos > at),
             Retire::Contained { cidx: at, payload } => {
@@ -417,7 +478,7 @@ impl Landings {
         };
         let nodes = self.owned_nodes();
         note_work(nodes.len());
-        nodes.retain(|&(n, depth)| !gone(n, cidx + 1 + depth));
+        nodes.retain(|&(n, depth, _)| !gone(n, cidx + 1 + depth));
     }
 }
 
@@ -464,13 +525,17 @@ pub(crate) struct Pending {
     slots: Vec<Option<Delivery>>,
     live: usize,
     by_key: Index<ReadKey, usize>,
-    by_maker: Index<u32, usize>,
+    /// A removal leaves its index in its maker's list until the list holds
+    /// as many removed as live, so a removal from a budget-long list
+    /// passes over none of it; readers skip emptied slots, which no push
+    /// reuses while a list holds them.
+    by_maker: HashMap<u32, Made, FxBuildHasher>,
     by_frame: Index<(u32, u32, u32), usize>,
     /// By the frame and the node it reads.
     by_read: Index<(u32, u32, u32, u64), usize>,
     /// How many deliveries each frame's own runtime's reads have still to
     /// take: those with no `foreign` key and not `taken`, kept by `push`,
-    /// `remove` and `set_taken`.
+    /// `unindex` and `set_taken`.
     untaken: HashMap<(u32, u32, u32), u32, FxBuildHasher>,
     /// By the frame's node and generation, at any position.
     by_node: Index<(u32, u32), usize>,
@@ -483,9 +548,48 @@ pub(crate) struct Pending {
     /// The deliveries with a record, by the position of the lowest frame
     /// they stand for, which the pop of the virtual frame below extends.
     by_frontier: Index<u32, usize>,
-    /// The passed deliveries that carry a landing deeper than just above
-    /// their frame, which a pop can retire.
-    deep: Vec<usize>,
+    /// The passed deliveries with a landing deeper than just above their
+    /// frame, by the highest position one of their landings may have.
+    by_top: BTreeSet<(u32, usize)>,
+    /// The passed deliveries whose landings are all just above their frame,
+    /// by that position and each payload they stand for: short of a copied
+    /// node's landing, only a walk's entry there containing that payload
+    /// retires them.
+    by_payload: BTreeSet<(u32, PayloadKey, usize)>,
+    filed: HashMap<usize, Filed, FxBuildHasher>,
+}
+
+/// Where a passed delivery is filed for the events that retire its
+/// landings (`Pending::retire`).
+#[derive(Clone, Copy)]
+enum Filed {
+    Deep(u32),
+    Shallow(u32, [Option<PayloadKey>; 2]),
+}
+
+/// The deliveries a level's run made, oldest first, and how many of them
+/// are live.
+#[derive(Default)]
+struct Made {
+    live: u32,
+    list: Few<usize>,
+}
+
+impl Made {
+    /// One of its entries went: whether none is left, else the list sheds
+    /// the indexes `keep` refuses once it holds twice as many as live, so a
+    /// removal from a long list passes over none of it.
+    fn shed(&mut self, keep: impl FnMut(&usize) -> bool) -> bool {
+        self.live -= 1;
+        if self.live == 0 {
+            return true;
+        }
+        if self.list.as_slice().len() >= 2 * self.live as usize {
+            note_work(self.list.as_slice().len());
+            self.list.retain(keep);
+        }
+        false
+    }
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -518,8 +622,34 @@ fn list<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: K, x: T) {
 
 /// Drops the items `gone` accepts from the list `map` holds under `at`.
 fn unlist<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: &K, gone: impl Fn(&T) -> bool) {
-    if map.get_mut(at).is_some_and(|l| l.retain(|x| !gone(x))) {
+    if map.get_mut(at).is_some_and(|l| {
+        note_work(l.as_slice().len());
+        l.retain(|x| !gone(x))
+    }) {
         map.remove(at);
+    }
+}
+
+/// Drops the items `gone` accepts from each list `map` holds under `keys`,
+/// passing over each list once; with `many` false the keys are taken as
+/// distinct, which spares a single removal the set.
+fn unlist_all<K: std::hash::Hash + Eq + Copy>(
+    map: &mut Index<K, usize>,
+    keys: impl Iterator<Item = K>,
+    gone: impl Fn(&usize) -> bool,
+    many: bool,
+) {
+    if !many {
+        for k in keys {
+            unlist(map, &k, &gone);
+        }
+        return;
+    }
+    let mut seen = HashSet::with_hasher(FxBuildHasher);
+    for k in keys {
+        if seen.insert(k) {
+            unlist(map, &k, &gone);
+        }
     }
 }
 
@@ -531,7 +661,9 @@ impl Pending {
     pub(crate) fn push(&mut self, d: Delivery) {
         let i = self.slots.len();
         list(&mut self.by_key, d.key, i);
-        list(&mut self.by_maker, d.maker, i);
+        let made = self.by_maker.entry(d.maker).or_default();
+        made.live += 1;
+        made.list.push(i);
         list(&mut self.by_frame, frame_of(&d.key), i);
         list(&mut self.by_read, read_of(&d.key), i);
         list(&mut self.by_node, (d.key.node, d.key.generation), i);
@@ -546,44 +678,100 @@ impl Pending {
             }
             list(&mut self.by_frontier, frontier(&d), i);
         }
-        if d.passed && d.is_deep() {
-            self.deep.push(i);
-        }
+        let passed = d.passed;
         self.slots.push(Some(d));
+        if passed {
+            self.file_passed(i);
+        }
         self.live += 1;
+        #[cfg(all(test, not(loom)))]
+        PEAK_LIVE.with(|p| p.set(p.get().max(self.live)));
     }
 
     pub(crate) fn remove(&mut self, i: usize) -> Delivery {
         let d = self.slots[i]
             .take()
             .expect("incr-core: a delivery is removed once");
-        unlist(&mut self.by_key, &d.key, |&j| j == i);
-        unlist(&mut self.by_maker, &d.maker, |&j| j == i);
-        unlist(&mut self.by_frame, &frame_of(&d.key), |&j| j == i);
-        unlist(&mut self.by_read, &read_of(&d.key), |&j| j == i);
-        if awaits(&d) {
-            self.count_taken(frame_of(&d.key));
+        self.unfile_passed(i);
+        self.unindex(std::slice::from_ref(&d));
+        d
+    }
+
+    /// Removes deliveries `is`, in that order.
+    fn remove_all(&mut self, is: Vec<usize>) -> Vec<Delivery> {
+        let out: Vec<Delivery> = is
+            .into_iter()
+            .map(|i| {
+                self.unfile_passed(i);
+                self.slots[i]
+                    .take()
+                    .expect("incr-core: a delivery is removed once")
+            })
+            .collect();
+        self.unindex(&out);
+        out
+    }
+
+    /// Drops `out`, deliveries just taken from their slots, from every
+    /// index, passing over each list they share once rather than once per
+    /// delivery: a wide frame's deliveries share its frame's, maker's and
+    /// node's lists.
+    fn unindex(&mut self, out: &[Delivery]) {
+        if out.is_empty() {
+            return;
         }
-        unlist(&mut self.by_node, &(d.key.node, d.key.generation), |&j| {
-            j == i
-        });
-        if d.provenance.is_some() {
-            self.traced -= 1;
-            let own = (d.key.cidx, d.key.node, d.key.generation);
-            for stand in std::iter::once(&own).chain(&d.below) {
-                unlist(&mut self.by_stand, stand, |&j| j == i);
+        let many = out.len() > 1;
+        let slots = &self.slots;
+        let gone = |&j: &usize| slots[j].is_none();
+        unlist_all(&mut self.by_key, out.iter().map(|d| d.key), gone, many);
+        unlist_all(
+            &mut self.by_frame,
+            out.iter().map(|d| frame_of(&d.key)),
+            gone,
+            many,
+        );
+        unlist_all(
+            &mut self.by_read,
+            out.iter().map(|d| read_of(&d.key)),
+            gone,
+            many,
+        );
+        unlist_all(
+            &mut self.by_node,
+            out.iter().map(|d| (d.key.node, d.key.generation)),
+            gone,
+            many,
+        );
+        let traced = || out.iter().filter(|d| d.provenance.is_some());
+        if traced().next().is_some() {
+            self.traced -= traced().count();
+            let stands = traced().flat_map(|d| {
+                std::iter::once((d.key.cidx, d.key.node, d.key.generation))
+                    .chain(d.below.iter().copied())
+            });
+            unlist_all(&mut self.by_stand, stands, gone, many);
+            unlist_all(&mut self.by_frontier, traced().map(frontier), gone, many);
+        }
+        for d in out {
+            self.unmake(d.maker);
+            if awaits(d) {
+                self.count_taken(frame_of(&d.key));
             }
-            unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        if d.passed {
-            self.deep.retain(|&j| j != i);
-        }
-        self.live -= 1;
+        self.live -= out.len();
         // No index is held across a point where none is live.
         if self.live == 0 {
+            debug_assert!(
+                self.by_maker.is_empty(),
+                "a maker list outlived its deliveries"
+            );
             self.slots.clear();
         }
-        d
+    }
+
+    fn unmake(&mut self, maker: u32) {
+        let slots = &self.slots;
+        unmade(&mut self.by_maker, maker, |&j| slots[j].is_some());
     }
 
     pub(crate) fn get(&self, i: usize) -> &Delivery {
@@ -603,18 +791,65 @@ impl Pending {
         let d = self.get_mut(i);
         if !d.passed {
             d.passed = true;
-            if d.is_deep() {
-                self.deep.push(i);
+            self.file_passed(i);
+        }
+    }
+
+    /// Delivery `i`'s latest take raised a copy of its payload keyed `key`.
+    pub(crate) fn resume(&mut self, i: usize, key: PayloadKey) {
+        let old = self.get_mut(i).resumed.replace(key);
+        // Only a shallow filing is keyed by the copy's payload.
+        if let Some(Filed::Shallow(above, payloads)) = self.filed.get_mut(&i) {
+            // A copy keyed as the source shares the source's entry.
+            if let Some(old) = old.filter(|&old| Some(old) != payloads[0]) {
+                self.by_payload.remove(&(*above, old, i));
             }
+            self.by_payload.insert((*above, key, i));
+            payloads[1] = Some(key);
+        }
+    }
+
+    fn file_passed(&mut self, i: usize) {
+        let d = self.get(i);
+        let Delivered::Unwind { nodes, .. } = &d.what else {
+            return;
+        };
+        let above = d.key.cidx + 1;
+        let filed = match nodes.deepest() {
+            None => return,
+            Some(0) => {
+                let payloads = [nodes.source, d.resumed];
+                for p in payloads.into_iter().flatten() {
+                    self.by_payload.insert((above, p, i));
+                }
+                Filed::Shallow(above, payloads)
+            }
+            Some(depth) => {
+                self.by_top.insert((above + depth, i));
+                Filed::Deep(above + depth)
+            }
+        };
+        self.filed.insert(i, filed);
+    }
+
+    fn unfile_passed(&mut self, i: usize) {
+        match self.filed.remove(&i) {
+            Some(Filed::Deep(top)) => {
+                self.by_top.remove(&(top, i));
+            }
+            Some(Filed::Shallow(above, payloads)) => {
+                for p in payloads.into_iter().flatten() {
+                    self.by_payload.remove(&(above, p, i));
+                }
+            }
+            None => {}
         }
     }
 
     /// Applies `ev` to the landings the passed deliveries carry: those of
     /// every passed delivery for a node's landing that a copy may hold,
-    /// else only the deeper ones, since an event at or below a frame
-    /// ends that frame's run.
+    /// else only those of deliveries with a landing the event can reach.
     fn retire(&mut self, ev: &Retire, all: bool) {
-        let slots = &mut self.slots;
         let apply = |d: &mut Delivery| {
             note_work(1);
             if d.key.cidx < ev.cidx() || all {
@@ -624,19 +859,66 @@ impl Pending {
                 }
             }
         };
-        if all {
-            for d in slots.iter_mut().flatten().filter(|d| d.passed) {
+        let hit: Vec<usize> = if all {
+            for d in self.slots.iter_mut().flatten().filter(|d| d.passed) {
                 apply(d);
             }
-        }
-        self.deep.retain(|&i| {
-            let d = slots[i]
-                .as_mut()
-                .expect("incr-core: a delivery's index is live");
+            self.filed.keys().copied().collect()
+        } else {
+            // Short of a copied node's landing, an event retires only
+            // landings of a frame below it that are above its position, or
+            // at it for a containment of the delivery's own payload, so a
+            // delivery none of whose landings reaches that high keeps them
+            // all.
+            let (from, contained) = match *ev {
+                Retire::Above(at) | Retire::Landing { cidx: at, .. } => {
+                    (at.saturating_add(1), None)
+                }
+                Retire::Contained { cidx: at, payload } => (at, Some((at, payload))),
+            };
+            let deep = self.by_top.range((from, 0)..).map(|&(_, i)| i);
+            let shallow = contained.into_iter().flat_map(|(at, p)| {
+                (self.by_payload.range((at, p, 0)..=(at, p, usize::MAX))).map(|&(_, _, i)| i)
+            });
+            let hit: Vec<usize> = deep.chain(shallow).collect();
+            #[cfg(all(test, not(loom)))]
+            self.check_unhit(ev, &hit);
+            hit
+        };
+        for i in hit {
+            self.unfile_passed(i);
             if !all {
-                apply(d);
+                apply(self.get_mut(i));
             }
-            d.is_deep()
+            self.file_passed(i);
+        }
+    }
+
+    /// Checks that `ev` would leave as they are the landings of every
+    /// passed delivery `retire` does not visit, on a list small enough to
+    /// check whole.
+    #[cfg(all(test, not(loom)))]
+    fn check_unhit(&self, ev: &Retire, hit: &[usize]) {
+        if self.slots.len() > 64 {
+            return;
+        }
+        without_note_work(|| {
+            for (i, d) in self.slots.iter().enumerate() {
+                let reached = |d: &&Delivery| d.passed && d.key.cidx < ev.cidx();
+                let Some(d) = d.as_ref().filter(reached).filter(|_| !hit.contains(&i)) else {
+                    continue;
+                };
+                let Delivered::Unwind { nodes, .. } = &d.what else {
+                    continue;
+                };
+                let mut retired = nodes.clone();
+                retired.retire(d.key.cidx, ev, d.resumed);
+                assert!(
+                    nodes.clone().into_nodes() == retired.into_nodes(),
+                    "incr-core: an event at {} skipped delivery {i}",
+                    ev.cidx()
+                );
+            }
         });
     }
 
@@ -746,15 +1028,21 @@ impl Pending {
 
     /// The deliveries the run at `level` made, oldest first.
     pub(crate) fn of_maker(&self, level: u32) -> Vec<usize> {
-        listed(&self.by_maker, &level)
+        self.by_maker.get(&level).map_or_else(Vec::new, |made| {
+            note_work(made.list.as_slice().len());
+            made.list
+                .as_slice()
+                .iter()
+                .copied()
+                .filter(|&j| self.slots[j].is_some())
+                .collect()
+        })
     }
 
     /// Removes the deliveries the run at `level` made, oldest first.
     pub(crate) fn extract_maker(&mut self, level: u32) -> Vec<Delivery> {
-        self.of_maker(level)
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = self.of_maker(level);
+        self.remove_all(is)
     }
 
     /// The deliveries for reads by the frame of `node` at `generation` and
@@ -765,10 +1053,8 @@ impl Pending {
 
     /// Removes the deliveries for reads by that frame, oldest first.
     pub(crate) fn extract_frame(&mut self, node: u32, generation: u32, cidx: u32) -> Vec<Delivery> {
-        self.of_frame(node, generation, cidx)
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = self.of_frame(node, generation, cidx);
+        self.remove_all(is)
     }
 
     /// Whether a frame of `node` at `generation`, at any position, has an
@@ -789,10 +1075,8 @@ impl Pending {
     /// Removes, oldest first, the deliveries for reads by the frames of
     /// `node` at `generation`, at any position.
     pub(crate) fn extract_node(&mut self, node: u32, generation: u32) -> Vec<Delivery> {
-        listed(&self.by_node, &(node, generation))
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = listed(&self.by_node, &(node, generation));
+        self.remove_all(is)
     }
 
     /// Whether any delivery carries a provenance record.
@@ -834,6 +1118,684 @@ impl Pending {
     }
 }
 
+/// A virtual frame's blocked read that ran its node's compute, a virtual
+/// frame above the frame's, which the retry runs again as that compute: a
+/// walk would first visit deps the replay of that frame's run has left
+/// Failed or Dirty (see [`Context::deliver_direct`]). It stays, taken or
+/// not, until its maker's run ends, as a [`Delivery`] does. It keeps its
+/// [`ReadKey`] less the position, which is where [`Directs`] holds it, and
+/// the foreign runtime, which a blocked read has none of. Its [`RunSlot`]'s
+/// path is the one through the read's compute (`run_path`), and its counts
+/// are the runs of the node read, other nodes' in [`Directs::more_runs`].
+/// A deep ring keeps one per virtual frame, so it is packed: 56 bytes.
+#[derive(Clone, Copy)]
+struct Direct {
+    reading: u64,
+    path: u64,
+    /// The key's episode when `owner` has [`HAS_EPISODE`].
+    episode: u64,
+    /// [`EMPTY`] in a position holding none.
+    node: u32,
+    generation: u32,
+    ordinal: u32,
+    seq: u32,
+    maker: u32,
+    /// The run slot's owner, with [`TAKEN`], [`HAS_EPISODE`] and
+    /// [`MORE_RUNS`].
+    owner: u32,
+    /// When it was pushed, against [`Directs::released`].
+    stamp: u32,
+    /// The runs of the node read along the run path.
+    runs: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Direct>() == 56);
+
+/// Runs along a path as `(node, generation, count)`.
+type RunCounts = Few<(u32, u32, u32)>;
+
+const EMPTY: u32 = u32::MAX;
+const TAKEN: u32 = 1 << 31;
+const HAS_EPISODE: u32 = 1 << 30;
+const MORE_RUNS: u32 = 1 << 29;
+const OWNER: u32 = MORE_RUNS - 1;
+
+const VACANT: Direct = Direct {
+    reading: 0,
+    path: 0,
+    episode: 0,
+    node: EMPTY,
+    generation: 0,
+    ordinal: 0,
+    seq: 0,
+    maker: 0,
+    owner: 0,
+    stamp: 0,
+    runs: 0,
+};
+
+const CHUNK: usize = 4096;
+
+impl Direct {
+    fn new(key: &ReadKey, maker: u32, owner: u32, stamp: u32) -> Self {
+        debug_assert!(owner <= OWNER, "a run slot's owner is a depth");
+        Self {
+            reading: key.reading,
+            path: key.path,
+            episode: key.episode.unwrap_or(0),
+            node: key.node,
+            generation: key.generation,
+            ordinal: key.ordinal,
+            seq: key.seq,
+            maker,
+            owner: owner
+                | if key.episode.is_some() {
+                    HAS_EPISODE
+                } else {
+                    0
+                },
+            stamp,
+            runs: 0,
+        }
+    }
+
+    fn episode(&self) -> Option<u64> {
+        (self.owner & HAS_EPISODE != 0).then_some(self.episode)
+    }
+
+    fn taken(&self) -> bool {
+        self.owner & TAKEN != 0
+    }
+
+    fn set_taken(&mut self, taken: bool) {
+        if taken {
+            self.owner |= TAKEN;
+        } else {
+            self.owner &= !TAKEN;
+        }
+    }
+
+    /// The node read, as `(slot, generation)`.
+    fn read_node(&self) -> (u32, u32) {
+        (self.reading as u32, (self.reading >> 32) as u32)
+    }
+
+    /// The path of the read's compute, the frame above this one, whose
+    /// runs it counts: [`run_snapshot`]'s.
+    fn run_path(&self) -> u64 {
+        extend_path(
+            self.path,
+            Step {
+                node: self.node,
+                episode: self.episode(),
+                reading: self.reading,
+                ordinal: self.ordinal,
+                seq: self.seq,
+            },
+        )
+    }
+
+    fn is(&self, key: &ReadKey) -> bool {
+        (self.node, self.generation, self.reading, self.ordinal)
+            == (key.node, key.generation, key.reading, key.ordinal)
+            && (self.path, self.seq, self.episode()) == (key.path, key.seq, key.episode)
+            && key.foreign.is_none()
+    }
+
+    fn of(&self, node: u32, generation: u32) -> bool {
+        (self.node, self.generation) == (node, generation)
+    }
+}
+
+/// A context's direct deliveries, at most one per read, by their frame's
+/// position less the context's boundary. A deep chain's retries leave one
+/// per virtual frame until their makers' runs end, so they keep no
+/// [`Pending`] slot or index of their own, and a position holds its first
+/// in place, any further ones in `more_at`.
+#[derive(Default)]
+pub(crate) struct Directs {
+    boundary: u32,
+    /// In chunks of [`CHUNK`] positions, as many as the highest position the
+    /// context has used, empty or not, so a deep direct that goes and comes
+    /// back finds its position made, and growth copies at most a chunk.
+    at: Vec<Vec<Direct>>,
+    more_at: HashMap<u32, Vec<Direct>, FxBuildHasher>,
+    /// Counts of runs of nodes other than the one read, by position and
+    /// stamp, for directs with [`MORE_RUNS`].
+    more_runs: HashMap<(u32, u32), RunCounts, FxBuildHasher>,
+    live: usize,
+    next_stamp: u32,
+    /// Nodes whose frames a user panic's release ended, with the stamp
+    /// their directs then reached: those pushed before it are gone, and
+    /// a removal that reaches them takes them out. Cold: only a release
+    /// fills it, and it empties with the directs.
+    released: HashMap<(u32, u32), u32, FxBuildHasher>,
+    /// Positions by maker, dropped lazily as in [`Pending::by_maker`].
+    by_maker: HashMap<u32, Made, FxBuildHasher>,
+}
+
+impl Directs {
+    fn new(boundary: u32) -> Self {
+        Self {
+            boundary,
+            ..Self::default()
+        }
+    }
+
+    /// Where the frame at `cidx` keeps its directs: none below the
+    /// context's boundary.
+    fn position(&self, cidx: u32) -> Option<usize> {
+        cidx.checked_sub(self.boundary).map(|i| i as usize)
+    }
+
+    fn slot(&self, i: usize) -> Option<&Direct> {
+        self.at.get(i / CHUNK).and_then(|c| c.get(i % CHUNK))
+    }
+
+    fn slot_mut(&mut self, i: usize) -> Option<&mut Direct> {
+        self.at
+            .get_mut(i / CHUNK)
+            .and_then(|c| c.get_mut(i % CHUNK))
+    }
+
+    fn dead(&self, d: &Direct) -> bool {
+        !self.released.is_empty()
+            && (self.released.get(&(d.node, d.generation))).is_some_and(|&s| d.stamp < s)
+    }
+
+    /// The directs at position `i`, gone ones included.
+    fn all_at(&self, i: usize) -> impl Iterator<Item = &Direct> {
+        let first = self.slot(i).filter(|d| d.node != EMPTY);
+        let more = (first.is_some() && !self.more_at.is_empty())
+            .then(|| self.more_at.get(&(i as u32)))
+            .flatten()
+            .map_or(&[][..], Vec::as_slice);
+        first.into_iter().chain(more)
+    }
+
+    /// The first live direct of the frame at `cidx` that `pick` accepts.
+    fn find_at(&self, cidx: u32, pick: impl Fn(&Direct) -> bool) -> Option<&Direct> {
+        let i = self.position(cidx)?;
+        let first = self.slot(i).filter(|d| d.node != EMPTY)?;
+        let found = |d: &&Direct| pick(d) && !self.dead(d);
+        if found(&first) {
+            return Some(first);
+        }
+        if self.more_at.is_empty() {
+            return None;
+        }
+        self.more_at.get(&(i as u32))?.iter().find(found)
+    }
+
+    /// Applies `f` to each direct of the frame at `cidx` that `pick`
+    /// accepts, stopping once `f` returns true.
+    fn find_mut(
+        &mut self,
+        cidx: u32,
+        pick: impl Fn(&Direct) -> bool,
+        mut f: impl FnMut(&mut Direct, &mut RunCounts) -> bool,
+    ) {
+        let Some(i) = self.position(cidx) else {
+            return;
+        };
+        let released = &self.released;
+        let alive = |d: &Direct| {
+            d.node != EMPTY
+                && (released.is_empty()
+                    || (released.get(&(d.node, d.generation))).is_none_or(|&s| d.stamp >= s))
+                && pick(d)
+        };
+        let mut none = Few::None;
+        let first = self
+            .at
+            .get_mut(i / CHUNK)
+            .and_then(|c| c.get_mut(i % CHUNK));
+        let Some(first) = first.filter(|d| d.node != EMPTY) else {
+            return;
+        };
+        let more_runs = &mut self.more_runs;
+        let mut visit = |d: &mut Direct| {
+            if !alive(d) {
+                return false;
+            }
+            if d.owner & MORE_RUNS != 0 {
+                let runs = more_runs.entry((i as u32, d.stamp)).or_default();
+                f(d, runs)
+            } else {
+                let stop = f(d, &mut none);
+                if !matches!(none, Few::None) {
+                    d.owner |= MORE_RUNS;
+                    more_runs.insert((i as u32, d.stamp), std::mem::take(&mut none));
+                }
+                stop
+            }
+        };
+        if visit(first) {
+            return;
+        }
+        if let Some(more) = (!self.more_at.is_empty())
+            .then(|| self.more_at.get_mut(&(i as u32)))
+            .flatten()
+        {
+            for d in more {
+                if visit(d) {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn get(&self, key: &ReadKey) -> Option<&Direct> {
+        self.find_at(key.cidx, |d| d.is(key))
+    }
+
+    fn runs_of(&self, i: usize, d: &Direct) -> RunSlot {
+        let (node, generation) = d.read_node();
+        let mut counts = Few::None;
+        if d.runs != 0 {
+            counts.push((node, generation, d.runs));
+        }
+        if d.owner & MORE_RUNS != 0 {
+            if let Some(more) = self.more_runs.get(&(i as u32, d.stamp)) {
+                for &c in more.as_slice() {
+                    counts.push(c);
+                }
+            }
+        }
+        RunSlot {
+            path: d.run_path(),
+            owner: d.owner & OWNER,
+            counts,
+        }
+    }
+
+    fn push(&mut self, key: ReadKey, maker: u32, runs: RunSlot) {
+        debug_assert!(key.foreign.is_none(), "a blocked read is its own runtime's");
+        let i = self
+            .position(key.cidx)
+            .expect("incr-core: a direct read is its context's frame's");
+        if self.next_stamp == u32::MAX {
+            self.restamp();
+        }
+        let stamp = self.next_stamp;
+        self.next_stamp += 1;
+        let mut d = Direct::new(&key, maker, runs.owner, stamp);
+        debug_assert!(
+            runs.path == d.run_path(),
+            "a direct's runs are along its read's compute"
+        );
+        let read = d.read_node();
+        let mut more = Few::None;
+        for &(n, g, k) in runs.counts.as_slice() {
+            if (n, g) == read {
+                d.runs = k;
+            } else {
+                more.push((n, g, k));
+            }
+        }
+        if !matches!(more, Few::None) {
+            d.owner |= MORE_RUNS;
+            self.more_runs.insert((i as u32, stamp), more);
+        }
+        self.make(i);
+        let first = &mut self.at[i / CHUNK][i % CHUNK];
+        if first.node == EMPTY {
+            *first = d;
+        } else {
+            self.more_at.entry(i as u32).or_default().push(d);
+        }
+        let made = self.by_maker.entry(maker).or_default();
+        made.live += 1;
+        made.list.push(i);
+        self.live += 1;
+        #[cfg(all(test, not(loom)))]
+        PEAK_DIRECTS.with(|p| p.set(p.get().max(self.live)));
+    }
+
+    /// Makes position `i`: the chunks below it whole, its own to the next
+    /// power of two, so a shallow context pays for the positions it uses.
+    fn make(&mut self, i: usize) {
+        let (c, j) = (i / CHUNK, i % CHUNK);
+        let grow = |chunk: &mut Vec<Direct>, len: usize| {
+            if chunk.len() < len {
+                note_work(len - chunk.len());
+                chunk.resize(len, VACANT);
+            }
+        };
+        if let Some(last) = self.at.len().checked_sub(1).filter(|&l| l < c) {
+            grow(&mut self.at[last], CHUNK);
+        }
+        while self.at.len() < c {
+            let mut chunk = Vec::new();
+            grow(&mut chunk, CHUNK);
+            self.at.push(chunk);
+        }
+        if self.at.len() == c {
+            self.at.push(Vec::new());
+        }
+        grow(&mut self.at[c], (j + 1).next_power_of_two().min(CHUNK));
+    }
+
+    /// The stamps ran out: the gone directs are taken out and the rest
+    /// restamped from 0. Once per 2^32 pushes into one context.
+    #[cold]
+    #[inline(never)]
+    fn restamp(&mut self) {
+        let positions: Vec<usize> = (0..self.at.len() * CHUNK)
+            .filter(|&i| self.all_at(i).any(|d| self.dead(d)))
+            .collect();
+        for i in positions {
+            let released = std::mem::take(&mut self.released);
+            self.remove_at(i, true, |d| {
+                released
+                    .get(&(d.node, d.generation))
+                    .is_some_and(|&s| d.stamp < s)
+            });
+            self.released = released;
+        }
+        self.released.clear();
+        let mut old = std::mem::take(&mut self.more_runs);
+        let mut stamp = 0;
+        let mut restamp = |i: u32, d: &mut Direct| {
+            if d.owner & MORE_RUNS != 0 {
+                let runs = old.remove(&(i, d.stamp)).unwrap_or_default();
+                self.more_runs.insert((i, stamp), runs);
+            }
+            d.stamp = stamp;
+            stamp += 1;
+        };
+        for (c, chunk) in self.at.iter_mut().enumerate() {
+            for (j, d) in chunk.iter_mut().enumerate() {
+                if d.node != EMPTY {
+                    restamp((c * CHUNK + j) as u32, d);
+                }
+            }
+        }
+        for (&i, more) in self.more_at.iter_mut() {
+            for d in more {
+                restamp(i, d);
+            }
+        }
+        debug_assert!(old.is_empty(), "more runs outlived their directs");
+        self.next_stamp = stamp;
+    }
+
+    /// Removes the directs at position `i`, gone ones included, that `f`
+    /// picks. A caller removing all of a maker's drops its list itself
+    /// (`maker_listed` false).
+    fn remove_at(&mut self, i: usize, maker_listed: bool, f: impl Fn(&Direct) -> bool) {
+        let Some(first) = self.slot(i).copied().filter(|d| d.node != EMPTY) else {
+            return;
+        };
+        let mut gone = Few::None;
+        let mut more = if self.more_at.is_empty() {
+            None
+        } else {
+            self.more_at.remove(&(i as u32))
+        };
+        if let Some(v) = more.as_mut() {
+            v.retain(|d| {
+                let out = f(d);
+                if out {
+                    gone.push(*d);
+                }
+                !out
+            });
+        }
+        if f(&first) {
+            gone.push(first);
+            let next = match more.as_mut().filter(|v| !v.is_empty()) {
+                Some(v) => v.remove(0),
+                None => VACANT,
+            };
+            *self
+                .slot_mut(i)
+                .expect("a position holding directs is made") = next;
+        }
+        if let Some(v) = more.filter(|v| !v.is_empty()) {
+            self.more_at.insert(i as u32, v);
+        }
+        let gone = gone.as_slice();
+        self.live -= gone.len();
+        for d in gone {
+            if d.owner & MORE_RUNS != 0 {
+                self.more_runs.remove(&(i as u32, d.stamp));
+            }
+            if maker_listed {
+                let (at, more_at) = (&self.at, &self.more_at);
+                let mut seen = HashSet::new();
+                unmade(&mut self.by_maker, d.maker, |&j| {
+                    holds_maker(at, more_at, j, d.maker) && seen.insert(j)
+                });
+            }
+        }
+        if self.live == 0 {
+            self.released.clear();
+            debug_assert!(
+                self.by_maker.is_empty() && self.more_at.is_empty() && self.more_runs.is_empty(),
+                "a direct list outlived its directs"
+            );
+        }
+    }
+
+    /// Sends the read `key` to its compute, unless a direct one already
+    /// does.
+    pub(crate) fn deliver(&mut self, key: ReadKey, maker: u32, runs: RunSlot) {
+        if self.get(&key).is_none() {
+            self.push(key, maker, runs);
+        }
+    }
+
+    /// Sends it again with `runs`: one from `maker` is read again in place,
+    /// one from another maker is replaced.
+    pub(crate) fn redeliver(&mut self, key: ReadKey, maker: u32, runs: RunSlot) {
+        match self.get(&key).map(|d| d.maker) {
+            Some(m) if m == maker => self.find_mut(
+                key.cidx,
+                |d| d.is(&key),
+                |d, more| {
+                    debug_assert!(
+                        runs.path == d.run_path(),
+                        "a direct's runs are along its read's compute"
+                    );
+                    let read = d.read_node();
+                    d.runs = 0;
+                    *more = Few::None;
+                    for &(n, g, k) in runs.counts.as_slice() {
+                        if (n, g) == read {
+                            d.runs = k;
+                        } else {
+                            more.push((n, g, k));
+                        }
+                    }
+                    d.owner = (d.owner & (HAS_EPISODE | MORE_RUNS)) | runs.owner;
+                    true
+                },
+            ),
+            Some(_) => {
+                if let Some(i) = self.position(key.cidx) {
+                    self.remove_at(i, true, |d| d.is(&key));
+                }
+                self.push(key, maker, runs);
+            }
+            None => self.push(key, maker, runs),
+        }
+    }
+
+    /// Takes the untaken direct for read `key`, returning the runs its
+    /// retry reads from.
+    pub(crate) fn take(&mut self, key: &ReadKey) -> Option<RunSlot> {
+        let i = self.position(key.cidx)?;
+        let mut found = None;
+        self.find_mut(
+            key.cidx,
+            |d| d.is(key) && !d.taken(),
+            |d, _| {
+                d.set_taken(true);
+                found = Some(*d);
+                true
+            },
+        );
+        found.map(|d| self.runs_of(i, &d))
+    }
+
+    /// Marks the direct for read `key` taken, if there is one.
+    pub(crate) fn take_keyed(&mut self, key: &ReadKey) {
+        self.find_mut(
+            key.cidx,
+            |d| d.is(key),
+            |d, _| {
+                d.set_taken(true);
+                true
+            },
+        );
+    }
+
+    /// Counts the run of `node` at `generation` along `path` in the
+    /// untaken direct for read `key` whose runs follow that path.
+    pub(crate) fn bump(&mut self, key: &ReadKey, path: u64, node: u32, generation: u32) {
+        self.find_mut(
+            key.cidx,
+            |d| d.is(key),
+            |d, more| {
+                if !d.taken() && d.run_path() == path {
+                    if (node, generation) == d.read_node() {
+                        d.runs += 1;
+                    } else {
+                        match (more.as_mut_slice().iter_mut())
+                            .find(|(n, g, _)| (*n, *g) == (node, generation))
+                        {
+                            Some((_, _, k)) => *k += 1,
+                            None => more.push((node, generation, 1)),
+                        }
+                    }
+                }
+                true
+            },
+        );
+    }
+
+    /// The positions listed for the run at `level`, each once, lowest
+    /// first.
+    fn of_maker(&self, level: u32) -> Vec<usize> {
+        let mut at: Vec<usize> = self
+            .by_maker
+            .get(&level)
+            .map_or_else(Vec::new, |m| m.list.as_slice().to_vec());
+        note_work(at.len());
+        at.sort_unstable();
+        at.dedup();
+        at
+    }
+
+    fn rearm_at(&mut self, i: usize, pick: impl Fn(&Direct) -> bool) {
+        if let Some(d) = self.slot_mut(i).filter(|d| d.node != EMPTY && pick(d)) {
+            d.set_taken(false);
+        }
+        if let Some(more) = (!self.more_at.is_empty())
+            .then(|| self.more_at.get_mut(&(i as u32)))
+            .flatten()
+        {
+            for d in more.iter_mut().filter(|d| pick(d)) {
+                d.set_taken(false);
+            }
+        }
+    }
+
+    /// The run at `level` was doomed: its directs are read again.
+    pub(crate) fn rearm_maker(&mut self, level: u32) {
+        for i in self.of_maker(level) {
+            self.rearm_at(i, |d| d.maker == level);
+        }
+    }
+
+    /// The frame at `frame`, as `(node, generation, cidx)`, runs again:
+    /// its directs are read again.
+    pub(crate) fn rearm_frame(&mut self, (node, generation, cidx): (u32, u32, u32)) {
+        if let Some(i) = self.position(cidx) {
+            self.rearm_at(i, |d| d.of(node, generation));
+        }
+    }
+
+    /// The run at `level` ended: its directs go.
+    pub(crate) fn remove_maker(&mut self, level: u32) {
+        let at = self.of_maker(level);
+        self.by_maker.remove(&level);
+        for i in at {
+            self.remove_at(i, false, |d| d.maker == level);
+        }
+    }
+
+    /// The directs for reads by the frame at `frame` go.
+    pub(crate) fn remove_frame(&mut self, (node, generation, cidx): (u32, u32, u32)) {
+        if let Some(i) = self.position(cidx) {
+            self.remove_at(i, true, |d| d.of(node, generation));
+        }
+    }
+
+    /// The directs for reads by the frames of `node` at `generation`, at
+    /// any position, go: lazily, as their removals by maker or frame take
+    /// them out, since a release is cold and the directs keep no index by
+    /// node.
+    pub(crate) fn remove_node(&mut self, node: u32, generation: u32) {
+        if self.live != 0 {
+            self.released.insert((node, generation), self.next_stamp);
+        }
+    }
+
+    /// As [`Pending::frame_awaits`].
+    pub(crate) fn frame_awaits(&self, (node, generation, cidx): (u32, u32, u32)) -> bool {
+        (self.find_at(cidx, |d| !d.taken() && d.of(node, generation))).is_some()
+    }
+
+    /// As [`Pending::read_awaits`].
+    pub(crate) fn read_awaits(
+        &self,
+        (node, generation, cidx): (u32, u32, u32),
+        reading: u64,
+        ordinal: Option<u32>,
+        parts: Option<(u64, Option<u64>, u32)>,
+    ) -> bool {
+        let found = self.find_at(cidx, |d| {
+            !d.taken()
+                && d.of(node, generation)
+                && d.reading == reading
+                && ordinal.is_none_or(|o| d.ordinal == o)
+                && parts.is_none_or(|p| (d.path, d.episode(), d.seq) == p)
+        });
+        found.is_some()
+    }
+}
+
+fn holds_maker(
+    at: &[Vec<Direct>],
+    more_at: &HashMap<u32, Vec<Direct>, FxBuildHasher>,
+    j: usize,
+    maker: u32,
+) -> bool {
+    let Some(first) = at.get(j / CHUNK).and_then(|c| c.get(j % CHUNK)) else {
+        return false;
+    };
+    first.node != EMPTY
+        && (first.maker == maker
+            || (more_at.get(&(j as u32))).is_some_and(|m| m.iter().any(|d| d.maker == maker)))
+}
+
+/// One of `k`'s entries went (see [`Made::shed`]).
+fn unmade<K: std::hash::Hash + Eq>(
+    index: &mut HashMap<K, Made, FxBuildHasher>,
+    k: K,
+    keep: impl FnMut(&usize) -> bool,
+) {
+    let MapEntry::Occupied(mut e) = index.entry(k) else {
+        debug_assert!(false, "a maker's live count went below zero");
+        return;
+    };
+    if e.get_mut().shed(keep) {
+        e.remove();
+    }
+}
+
 impl Delivery {
     /// An untaken, unblocked delivery of `what` for the read `key`.
     pub(crate) fn new(key: ReadKey, maker: u32, what: Delivered) -> Self {
@@ -856,10 +1818,6 @@ impl Delivery {
         self.taken
     }
 
-    fn is_deep(&self) -> bool {
-        matches!(&self.what, Delivered::Unwind { nodes, .. } if nodes.is_deep())
-    }
-
     fn is_untaken_panic(&self) -> bool {
         !self.taken && matches!(self.what, Delivered::Unwind { cycle: false, .. })
     }
@@ -869,6 +1827,8 @@ impl Delivery {
 /// live while some delivery holds it.
 pub(crate) trait Provenance {
     fn record(&self) -> u64;
+    /// The read the record names was answered by taking its delivery.
+    fn spend(&self);
 }
 
 /// This thread's Failed read that a provenance record names: the
@@ -913,10 +1873,6 @@ pub(crate) enum Delivered {
     /// compute pops: a doomed entry is not pushed back, so a pending entry
     /// of its node on top is a repeat the walk still owes.
     Walk(Box<crate::runtime::Walk>, Option<u32>),
-    /// The read ran its node's compute, a virtual frame above the frame's,
-    /// which the retry runs again as that compute: a walk would first
-    /// visit deps the replay of that frame's run has left Failed or Dirty.
-    Direct,
 }
 
 pub(crate) struct Context {
@@ -925,6 +1881,11 @@ pub(crate) struct Context {
     /// The position of level 0.
     pub(crate) boundary: u32,
     pub(crate) levels: Vec<VecDeque<Entry>>,
+    /// How many entries of each node and generation `levels` holds, built
+    /// when [`Self::queues`] first asks and kept in step from then on. Only
+    /// a `Shared` reservation's end asks, so other contexts count nothing,
+    /// and a scan per ask instead is quadratic on a long budget-1 chain.
+    queued: Option<HashMap<(u32, u32), u32, FxBuildHasher>>,
     pub(crate) vstack: Vec<VFrame>,
     /// Each node's `vstack` positions, lowest first, with the generation
     /// its virtual frame recorded.
@@ -933,7 +1894,11 @@ pub(crate) struct Context {
     /// loop starts.
     pub(crate) running: Option<u32>,
     pub(crate) pending: Pending,
+    pub(crate) directs: Directs,
     pub(crate) running_entry: Option<Entry>,
+    /// The running entry still fronts its level: the driver has neither
+    /// popped nor truncated it.
+    running_fronts: bool,
     /// Every entry of this context is speculative: the context was opened
     /// inside a speculative entry's run.
     pub(crate) spec_base: bool,
@@ -951,7 +1916,7 @@ pub(crate) struct Context {
     /// The walk a `Walk` delivery just taken resumes, with the read it is
     /// for and the reading frame's position, until that read's walk takes
     /// it or the read ends.
-    pub(crate) resume: Option<(u64, u32, crate::runtime::Walk)>,
+    pub(crate) resume: Option<(u64, u32, Box<crate::runtime::Walk>)>,
     /// The node, generation and reading frame's position of the read a
     /// `Direct` delivery just taken sends to its compute, until that
     /// read's walk does or the read ends.
@@ -1024,11 +1989,14 @@ impl Context {
             rt,
             boundary,
             levels: vec![VecDeque::from([target])],
+            queued: None,
             vstack: Vec::new(),
             vindex: HashMap::default(),
             running: None,
             running_entry: None,
+            running_fronts: false,
             pending: Pending::default(),
+            directs: Directs::new(boundary),
             spec_base: target.spec,
             claims: Vec::new(),
             episodes: Vec::new(),
@@ -1056,18 +2024,108 @@ impl Context {
             .find_map(|(level, q)| q.front().map(|e| (level as u32, *e)))
     }
 
+    /// Marks `entry`, the front of `level`, as the one the driver runs.
+    pub(crate) fn run_entry(&mut self, level: u32, entry: Entry) {
+        self.running = Some(level);
+        self.running_entry = Some(entry);
+        self.running_fronts = true;
+    }
+
+    /// Whether an entry of `node` at `generation` has yet to run: the
+    /// running entry is not one until the driver pops it.
+    pub(crate) fn queues(&mut self, node: u32, generation: u32) -> bool {
+        let running = self.running_fronts
+            && self
+                .running_entry
+                .is_some_and(|e| e.node == node && e.generation == generation);
+        let queued = self
+            .queued
+            .get_or_insert_with(|| Self::count_levels(&self.levels));
+        queued.get(&(node, generation)).copied().unwrap_or(0) > u32::from(running)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_levels(levels: &[VecDeque<Entry>]) -> HashMap<(u32, u32), u32, FxBuildHasher> {
+        let mut queued = HashMap::default();
+        for e in levels.iter().flatten() {
+            *queued.entry((e.node, e.generation)).or_default() += 1;
+        }
+        queued
+    }
+
+    /// Whether `node`'s virtual frame at `generation` stands for a frame
+    /// on the unbounded run's stack ([`Self::stacked`]).
+    pub(crate) fn stacks(&self, node: u32, generation: u32) -> bool {
+        self.position(node, generation)
+            .is_some_and(|p| (p as usize) < self.stacked().len())
+    }
+
     pub(crate) fn push_entry(&mut self, level: u32, entry: Entry) {
         let level = level as usize;
         if self.levels.len() <= level {
             self.levels.resize_with(level + 1, VecDeque::new);
         }
         self.levels[level].push_back(entry);
+        if self.queued.is_some() {
+            self.count_in(entry);
+        }
     }
 
     /// Removes the oldest entry at `level`, the one the driver ran.
     pub(crate) fn pop_entry(&mut self, level: u32) {
-        self.levels[level as usize].pop_front();
+        self.drop_oldest(level);
         self.trim_levels();
+    }
+
+    /// Removes the oldest entry at `level`, leaving empty levels in place.
+    pub(crate) fn drop_oldest(&mut self, level: u32) {
+        if let Some(e) = self.levels[level as usize].pop_front() {
+            if self.queued.is_some() {
+                self.count_out(e);
+            }
+            if self.running == Some(level) {
+                self.running_fronts = false;
+            }
+        }
+    }
+
+    /// Drops every level from `len` up with its entries.
+    pub(crate) fn truncate_levels(&mut self, len: usize) {
+        if self.queued.is_some() {
+            for q in self.levels.split_off(len.min(self.levels.len())) {
+                for e in q {
+                    self.count_out(e);
+                }
+            }
+        } else {
+            self.levels.truncate(len);
+        }
+        if self.running.is_some_and(|level| level as usize >= len) {
+            self.running_fronts = false;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_in(&mut self, e: Entry) {
+        if let Some(q) = &mut self.queued {
+            *q.entry((e.node, e.generation)).or_default() += 1;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_out(&mut self, e: Entry) {
+        let Some(q) = &mut self.queued else {
+            return;
+        };
+        if let MapEntry::Occupied(mut n) = q.entry((e.node, e.generation)) {
+            *n.get_mut() -= 1;
+            if *n.get() == 0 {
+                n.remove();
+            }
+        }
     }
 
     /// Drops the empty levels on top, so `next_entry` finds the highest
@@ -1093,6 +2151,8 @@ impl Context {
         }
         stack.push((pos, frame.generation));
         self.vstack.push(frame);
+        #[cfg(all(test, not(loom)))]
+        PEAK_VSTACK.with(|p| p.set(p.get().max(self.vstack.len())));
     }
 
     /// The highest virtual frame below position `cidx`.
@@ -1254,7 +2314,11 @@ impl Context {
     /// over once, its delivery keeping a [`Regen`] marker in its place.
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
         let key = self.pending.get(i).key;
+        if let Some(p) = &self.pending.get(i).provenance {
+            p.spend();
+        }
         self.pending.take_keyed(&key);
+        self.directs.take_keyed(&key);
         self.pending.pass(i);
         let Delivered::Unwind {
             cycle,
@@ -1282,14 +2346,16 @@ impl Context {
                 unreachable!("incr-core: taken as an unwind");
             };
             let payload = std::mem::replace(payload, regen);
-            d.resumed = Some(payload_key(&*payload));
-            return Delivered::Unwind {
+            let key = payload_key(&*payload);
+            let what = Delivered::Unwind {
                 cycle: *cycle,
                 poison: *poison,
                 attributed: *attributed,
                 payload,
                 nodes: nodes.clone(),
             };
+            self.pending.resume(i, key);
+            return what;
         };
         let what = Delivered::Unwind {
             cycle: *cycle,
@@ -1299,7 +2365,7 @@ impl Context {
             nodes: nodes.clone(),
         };
         if let Delivered::Unwind { payload, .. } = &what {
-            self.pending.get_mut(i).resumed = Some(payload_key(&**payload));
+            self.pending.resume(i, payload_key(&**payload));
         }
         what
     }
@@ -1327,16 +2393,19 @@ impl Context {
     /// the delivery before the frame's retry reads it. A kept one keeps its
     /// `runs`: the retry that took it ran none of the read's walk.
     pub(crate) fn deliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
+        self.directs
+            .deliver(ReadKey::blocked(below), below.maker, runs);
+    }
+
+    /// As [`Self::deliver_direct`], for a frame whose compute ran in the
+    /// retry that took an earlier walk or direct delivery for the read:
+    /// the walk goes and the direct one is read again with `runs`, since
+    /// the runs it kept no longer cover the ended ones. A direct one from
+    /// the same maker is updated in place, sparing a removal and a push.
+    pub(crate) fn redeliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
         let key = ReadKey::blocked(below);
-        if self
-            .pending
-            .find_keyed(&key, |d| matches!(d.what, Delivered::Direct))
-            .is_none()
-        {
-            let mut d = Delivery::new(key, below.maker, Delivered::Direct);
-            d.runs = runs;
-            self.pending.push(d);
-        }
+        self.pending.remove_walks(&key);
+        self.directs.redeliver(key, below.maker, runs);
     }
 
     /// The run of the frame at `frame` along `path` is over, and a later
@@ -1361,6 +2430,7 @@ impl Context {
     pub(crate) fn end_maker(&mut self, level: u32) -> Vec<Delivery> {
         self.claim_revs.end_maker(level);
         self.run_failures.end_maker(level);
+        self.directs.remove_maker(level);
         self.pending.extract_maker(level)
     }
 
@@ -1435,14 +2505,24 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
+    static SPEC_READS: RefCell<SpecReads> = const { RefCell::new(HashMap::with_hasher(FxBuildHasher)) };
+    static SPEC_PENDING: Cell<Option<SpecPending>> = const { Cell::new(None) };
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
+    static KEPT_HELD: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
+    static KEPT_GEN: Cell<u64> = const { Cell::new(0) };
+    // A kept copy holds landings `KEPT_HELD` does not mark: every landing
+    // counts as one a kept copy may hold.
+    static KEPT_ALL: Cell<bool> = const { Cell::new(false) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static THREAD_TAG: Cell<u64> = const { Cell::new(0) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
+    static SPECULATING_IN: RefCell<Vec<RuntimeId>> = const { RefCell::new(Vec::new()) };
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
@@ -1456,14 +2536,22 @@ thread_local! {
 #[cfg(loom)]
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = RefCell::new(Vec::new());
+    static SPEC_READS: RefCell<SpecReads> = RefCell::new(HashMap::default());
+    static SPEC_PENDING: Cell<Option<SpecPending>> = Cell::new(None);
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = Cell::new(0);
+    static KEPT_HELD: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
+    static KEPT_GEN: Cell<u64> = Cell::new(0);
+    static KEPT_ALL: Cell<bool> = Cell::new(false);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
+    static THREAD_TAG: Cell<u64> = Cell::new(0);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
+    static SPECULATING_IN: RefCell<Vec<RuntimeId>> = RefCell::new(Vec::new());
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
@@ -1478,11 +2566,16 @@ loom::thread_local! {
 thread_local! {
     static VINDEX_REPUSHES: Cell<u64> = const { Cell::new(0) };
     static NOTE_WORK: Cell<u64> = const { Cell::new(0) };
+    static PEAK_LIVE: Cell<usize> = const { Cell::new(0) };
+    static PEAK_DIRECTS: Cell<usize> = const { Cell::new(0) };
+    static PEAK_VSTACK: Cell<usize> = const { Cell::new(0) };
+    static PATH_STEPS: Cell<u64> = const { Cell::new(0) };
+    static TICKET_CHECKS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Counts `units` elements a pass over this thread's notes, their copies,
-/// its kept reads, a context's traced deliveries or the provenance records
-/// looked at.
+/// its kept reads, a context's traced deliveries, the provenance records
+/// or a delivery index's list looked at.
 #[inline(always)]
 pub(crate) fn note_work(units: usize) {
     #[cfg(all(test, not(loom)))]
@@ -1491,10 +2584,59 @@ pub(crate) fn note_work(units: usize) {
     let _ = units;
 }
 
+/// Runs `f` without counting the note work it does.
+#[cfg(all(test, not(loom)))]
+fn without_note_work(f: impl FnOnce()) {
+    let counted = NOTE_WORK.with(Cell::get);
+    f();
+    NOTE_WORK.with(|n| n.set(counted));
+}
+
 /// The units [`note_work`] counted on this thread since the last call.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_note_work() -> u64 {
     NOTE_WORK.with(|n| n.replace(0))
+}
+
+/// The most deliveries, direct ones and virtual frames one context on
+/// this thread held at once since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_peak_live() -> (usize, usize, usize) {
+    (
+        PEAK_LIVE.with(|p| p.replace(0)),
+        PEAK_DIRECTS.with(|p| p.replace(0)),
+        PEAK_VSTACK.with(|p| p.replace(0)),
+    )
+}
+
+/// Counts `frames` stack frames a frame's path was folded over.
+#[inline(always)]
+pub(crate) fn path_steps(frames: usize) {
+    #[cfg(all(test, not(loom)))]
+    PATH_STEPS.with(|n| n.set(n.get() + frames as u64));
+    #[cfg(not(all(test, not(loom))))]
+    let _ = frames;
+}
+
+/// The frames [`path_steps`] counted on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_path_steps() -> u64 {
+    PATH_STEPS.with(|n| n.replace(0))
+}
+
+/// Counts `members` ticket members a test build's ticket check looked at.
+#[inline(always)]
+pub(crate) fn ticket_checks(members: usize) {
+    #[cfg(all(test, not(loom)))]
+    TICKET_CHECKS.with(|n| n.set(n.get() + members as u64));
+    #[cfg(not(all(test, not(loom))))]
+    let _ = members;
+}
+
+/// The members [`ticket_checks`] counted on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_ticket_checks() -> u64 {
+    TICKET_CHECKS.with(|n| n.replace(0))
 }
 
 /// Virtual frames pushed on this thread for a node that already had one
@@ -1520,17 +2662,21 @@ struct Logged {
     all: bool,
     /// The event may retire landings by position, short of the node.
     wide: bool,
+    /// The landing's node may be in a kept read's copy.
+    kept: bool,
 }
 
 /// The events logged while reads are kept, with the indexes of those that
-/// may retire landings by position and of each node's landings, so that
-/// a kept read's catch-up skips the landings of nodes its copy does not
-/// hold.
+/// may retire landings by position and of the landings of nodes a kept
+/// copy held, by node and in log order, so that a kept read's catch-up
+/// skips the landings of nodes its copy does not hold, and with none since
+/// it was kept, looks at no node of its copy.
 #[derive(Default)]
 struct Events {
     log: Vec<Logged>,
     wide: Vec<usize>,
     landed: HashMap<(RuntimeId, (u32, u32)), Vec<usize>, FxBuildHasher>,
+    kept: Vec<usize>,
 }
 
 impl Events {
@@ -1539,8 +2685,9 @@ impl Events {
         if l.wide {
             self.wide.push(i);
         }
-        if let Some(n) = l.ev.node() {
+        if let Some(n) = l.ev.node().filter(|_| l.kept) {
             self.landed.entry((l.rt, n)).or_default().push(i);
+            self.kept.push(i);
         }
         self.log.push(l);
     }
@@ -1548,6 +2695,7 @@ impl Events {
     fn clear(&mut self) {
         self.log.clear();
         self.wide.clear();
+        self.kept.clear();
         // As for the copied set, a clear costs the capacity.
         if self.landed.capacity() > COPIED_KEEP {
             self.landed = HashMap::default();
@@ -1571,10 +2719,234 @@ pub(crate) fn keep_foreign_read(read: KeptRead, fresh: bool) {
     keep(read, fresh, true);
 }
 
+/// A speculative frame's Clean read of another runtime, with that
+/// runtime's count of changes as the read found it, which the frame's
+/// stash is adopted only while it still holds.
+struct CheckedRead {
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+}
+
+/// Keeps `seen` for the speculative frame of `ctl` at `cidx` of `rt`, as
+/// [`keep_read`] keeps the read: the checked reads of frames at or above its
+/// position, which have popped, go, and so do the frame's own ones on its
+/// first kept read (`fresh`), which an earlier frame there left.
+pub(crate) fn check_read(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+    fresh: bool,
+) {
+    CHECKED_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        d.retain(|e| e.rt != rt || e.cidx < cidx || !fresh && e.cidx == cidx && e.ctl == ctl);
+        let ours = |e: &CheckedRead| e.rt == rt && e.cidx == cidx && e.ctl == ctl;
+        if !d
+            .iter_mut()
+            .rev()
+            .take_while(|e| ours(e))
+            .any(|e| e.seen.absorb(&seen))
+        {
+            d.push(CheckedRead {
+                rt,
+                cidx,
+                ctl,
+                seen,
+            });
+        }
+    });
+}
+
+/// Where a speculative frame's read of a node took its value. Only a
+/// listed source leaves the frame's stash adoptable; every other read,
+/// including one through a path no site lists, leaves it `Unchecked`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpecSource {
+    Unchecked,
+    /// The node's published state was Clean or Cyclic when its value was
+    /// read, so it stays so for the revision.
+    Settled,
+    /// The node's stash with this serial, which the frame's adoption needs
+    /// the node to land from.
+    Stash(u64),
+}
+
+/// The open speculative read of node `slot` at `generation` of `rt`.
+#[derive(Clone, Copy)]
+pub(crate) struct SpecPending {
+    rt: RuntimeId,
+    slot: u32,
+    generation: u32,
+    source: SpecSource,
+}
+
+/// Speculative frames' reads of other stashes, by frame (runtime,
+/// position and control block) and then by node, to each stash's serial.
+/// A frame that pops without taking its reads leaves them until the
+/// thread's replay context ends; a frame its control block's address
+/// reuses clears them on its first read.
+type SpecReads =
+    HashMap<(RuntimeId, u32, usize), HashMap<(u32, u32), u64, FxBuildHasher>, FxBuildHasher>;
+
+/// Opens a speculative frame's read of node `slot` at `generation` of
+/// `rt`, `Unchecked` until a listed source names its own; returns the
+/// read it nests in, for [`close_spec_read`].
+pub(crate) fn open_spec_read(rt: RuntimeId, slot: u32, generation: u32) -> Option<SpecPending> {
+    SPEC_PENDING.with(|p| {
+        p.replace(Some(SpecPending {
+            rt,
+            slot,
+            generation,
+            source: SpecSource::Unchecked,
+        }))
+    })
+}
+
+/// A listed source of the open read, if it is of node `slot` at
+/// `generation` of `rt`.
+pub(crate) fn spec_source(rt: RuntimeId, slot: u32, generation: u32, source: SpecSource) {
+    SPEC_PENDING.with(|p| {
+        if let Some(mut q) = p.get() {
+            if q.rt == rt && q.slot == slot && q.generation == generation {
+                q.source = source;
+                p.set(Some(q));
+            }
+        }
+    });
+}
+
+/// Closes the open read, back to `outer`, and returns its source.
+pub(crate) fn close_spec_read(outer: Option<SpecPending>) -> SpecSource {
+    SPEC_PENDING
+        .with(|p| p.replace(outer))
+        .map_or(SpecSource::Unchecked, |q| q.source)
+}
+
+/// Keeps the frame of `ctl` at `cidx` of `rt`'s read of node `slot` at
+/// `generation` from its stash `serial`; an earlier frame's reads under the
+/// same control block at the position go on the frame's first one
+/// (`fresh`). False if the frame read another stash of the node, whose
+/// adoption both reads cannot share.
+pub(crate) fn keep_spec_read(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    node: (u32, u32),
+    serial: u64,
+    fresh: bool,
+) -> bool {
+    SPEC_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        let reads = d.entry((rt, cidx, ctl as usize)).or_default();
+        if fresh {
+            reads.clear();
+        }
+        *reads.entry(node).or_insert(serial) == serial
+    })
+}
+
+/// Whether the frame of `ctl` at `cidx` of `rt` read node `slot` at
+/// `generation` from a stash.
+pub(crate) fn spec_read_of(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    slot: u32,
+    generation: u32,
+) -> bool {
+    SPEC_READS.with(|d| {
+        d.borrow()
+            .get(&(rt, cidx, ctl as usize))
+            .is_some_and(|reads| reads.contains_key(&(slot, generation)))
+    })
+}
+
+/// The stash reads of the frame of `ctl` at `cidx` of `rt`, which is
+/// popping, as `(slot, generation, serial)`.
+pub(crate) fn take_spec_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<(u32, u32, u64)> {
+    SPEC_READS.with(|d| {
+        d.borrow_mut()
+            .remove(&(rt, cidx, ctl as usize))
+            .map_or_else(Vec::new, |reads| {
+                reads
+                    .into_iter()
+                    .map(|((slot, generation), serial)| (slot, generation, serial))
+                    .collect()
+            })
+    })
+}
+
+/// How many frames' stash reads this thread still keeps.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn spec_read_frames() -> usize {
+    SPEC_READS.with(|d| d.borrow().len())
+}
+
+/// A context named so that no context of another thread, now or later, has
+/// the same name: context ids count per thread.
+pub(crate) type ContextName = (u64, u64);
+
+fn thread_tag() -> u64 {
+    static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    THREAD_TAG.with(|t| {
+        if t.get() == 0 {
+            t.set(NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        t.get()
+    })
+}
+
+/// This thread's outermost context, of any runtime: contexts nest, so some
+/// context open now is still open later exactly when this one is.
+pub(crate) fn outermost_context() -> Option<ContextName> {
+    let thread = thread_tag();
+    peek(|c| c.first().map(|x| (thread, x.id)))
+}
+
+/// Whether context `name` is open on this thread, at any depth.
+pub(crate) fn context_open(name: ContextName) -> bool {
+    name.0 == thread_tag() && peek(|c| c.iter().any(|x| x.id == name.1))
+}
+
+/// The checked reads of the frame of `ctl` at `cidx` of `rt`, which is
+/// popping, taken with those of frames above it.
+pub(crate) fn take_checked_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<Count> {
+    CHECKED_READS.with(|d| {
+        let mut counts = Vec::new();
+        for e in d
+            .borrow_mut()
+            .extract_if(.., |e| e.rt == rt && e.cidx >= cidx)
+            .filter(|e| e.cidx == cidx && e.ctl == ctl)
+        {
+            crate::changes::fold(&mut counts, &e.seen);
+        }
+        counts
+    })
+}
+
 fn keep(mut read: KeptRead, fresh: bool, number: bool) {
     if let Delivered::Unwind { nodes, .. } = &read.what {
         let top = read.cidx + 1 + nodes.depth();
         KEPT_TOP.with(|k| k.set(k.get().max(top)));
+        // A shared copy marks only the notes no earlier copy of its log
+        // did; marking one taken apart would cost its size at every keep,
+        // so every landing counts as kept instead.
+        if nodes.as_shared().is_some() {
+            mark_in(Marks::Kept, read.rt, nodes);
+        } else if !matches!(&nodes.nodes, Nodes::Owned(n) if n.is_empty()) {
+            KEPT_ALL.with(|k| k.set(true));
+        }
     }
     let seen = KEPT_EVENTS.with(|v| v.borrow().log.len());
     let gone: Vec<(KeptRead, usize)> = KEPT_READS.with(|d| {
@@ -1616,6 +2988,7 @@ fn keep(mut read: KeptRead, fresh: bool, number: bool) {
         gone
     });
     value_code::set_kept_bit(true);
+    let _drops = crate::attempt::Outside::enter(true);
     drop(gone);
 }
 
@@ -1645,10 +3018,32 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
     }
 }
 
-/// A shared copy marks only the notes its log's earlier copies did not.
 fn mark(rt: RuntimeId, nodes: &Landings) {
-    let generation = copied_generation();
-    COPIED.with(|c| {
+    mark_in(Marks::Copied, rt, nodes);
+}
+
+/// Which set of landings copies may hold: the contexts' deliveries'
+/// (`COPIED`) or the kept reads' (`KEPT_HELD`).
+#[derive(Clone, Copy)]
+enum Marks {
+    Copied,
+    Kept,
+}
+
+fn log_marks(log: &mut Log, marks: Marks) -> &mut Marked {
+    match marks {
+        Marks::Copied => &mut log.marked,
+        Marks::Kept => &mut log.kept_marked,
+    }
+}
+
+/// A shared copy marks only the notes its log's earlier copies did not.
+fn mark_in(marks: Marks, rt: RuntimeId, nodes: &Landings) {
+    let (generation, set) = match marks {
+        Marks::Copied => (copied_generation(), &COPIED),
+        Marks::Kept => (kept_generation(), &KEPT_HELD),
+    };
+    set.with(|c| {
         let mut c = c.borrow_mut();
         let mut mark = |n| {
             c.insert((rt, n));
@@ -1656,7 +3051,21 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
         match &nodes.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
-                for &(n, _) in nodes {
+                for &(n, _, _) in nodes {
+                    mark(n);
+                }
+            }
+            // A cut copy holds less than its log up to `len`, so it marks
+            // only what it holds and leaves the watermark to uncut copies.
+            Nodes::Shared {
+                log,
+                len,
+                epoch,
+                base,
+                cut: Some(cut),
+                ..
+            } => {
+                for (n, _, _) in log.borrow().landings(*len, *epoch, *base, Some(cut)) {
                     mark(n);
                 }
             }
@@ -1664,23 +3073,23 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
                 log, len, epoch, ..
             } => {
                 let mut log = log.borrow_mut();
-                let from = match log.marked {
-                    (g, upto) if g == generation => upto.min(*len),
-                    _ => 0,
-                };
+                let from = log_marks(&mut log, marks).advance(generation, *len, *epoch);
                 note_work(len - from);
                 for e in log.entries[from..*len].iter().filter(|e| e.gone >= *epoch) {
                     match &e.lent {
                         None => mark(e.node),
+                        // A ticket's members outlive the kept set, so
+                        // marks on them would restart with every set: the
+                        // copy counts every landing instead.
+                        Some(_) if matches!(marks, Marks::Kept) => {
+                            KEPT_ALL.with(|k| k.set(true));
+                        }
                         // A ticket's members went into earlier copies of
                         // the notes that stood for it, so only its later
                         // members are new.
                         Some((members, len)) => {
                             let mut joined = members.lock();
-                            let from = match joined.marked {
-                                (g, upto) if g == generation => upto.min(*len),
-                                _ => 0,
-                            };
+                            let from = joined.marked.advance(generation, *len, *epoch);
                             note_work(len - from);
                             for m in joined.members[from..*len]
                                 .iter()
@@ -1688,11 +3097,9 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
                             {
                                 mark(m.node);
                             }
-                            joined.marked = (generation, (*len).max(from));
                         }
                     }
                 }
-                log.marked = (generation, (*len).max(from));
             }
         }
     });
@@ -1701,13 +3108,27 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
 /// This thread's copied set's generation, unique among every thread's, as
 /// a ticket's members are marked from any thread.
 fn copied_generation() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     COPIED_GEN.with(|g| {
         if g.get() == 0 {
-            g.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            g.set(new_generation());
         }
         g.get()
     })
+}
+
+/// As [`copied_generation`], for the kept reads' set.
+fn kept_generation() -> u64 {
+    KEPT_GEN.with(|g| {
+        if g.get() == 0 {
+            g.set(new_generation());
+        }
+        g.get()
+    })
+}
+
+fn new_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a kept read or a context's delivery may hold copied landings.
@@ -1725,21 +3146,25 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
         .is_some_and(|n| COPIED.with(|c| c.borrow().contains(&(rt, n))));
     // Short of a copied node, an event retires only landings above its
     // position, or at it for a contained payload; a landing also retires
-    // its node from the kept copies that hold it, which the copied set
-    // does not mark.
+    // its node from the kept copies that hold it, which the kept set
+    // marks and the copied set does not.
     let reach = match *ev {
         Retire::Contained { cidx, .. } => cidx,
         _ => ev.cidx() + 1,
     };
     if value_code::thread_word() & value_code::KEPT_BIT != 0 {
         let wide = all || KEPT_TOP.with(Cell::get) >= reach;
-        if wide || ev.node().is_some() {
+        let kept = ev.node().is_some_and(|n| {
+            KEPT_ALL.with(Cell::get) || KEPT_HELD.with(|k| k.borrow().contains(&(rt, n)))
+        });
+        if wide || kept {
             KEPT_EVENTS.with(|v| {
                 v.borrow_mut().push(Logged {
                     rt,
                     ev: *ev,
                     all,
                     wide,
+                    kept,
                 })
             });
         }
@@ -1764,10 +3189,10 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     let from = events.wide.partition_point(|&i| i < seen);
     // `(index, whether the copy held its node)`
     let mut todo: Vec<(usize, bool)> = events.wide[from..].iter().map(|&i| (i, false)).collect();
-    if events.log.len() > seen && !events.landed.is_empty() {
+    if events.kept.last().is_some_and(|&i| i >= seen) {
         let copy = nodes.owned_nodes();
         note_work(copy.len());
-        for &(n, _) in copy.iter() {
+        for &(n, _, _) in copy.iter() {
             if let Some(at) = events.landed.get(&(rt, n)) {
                 todo.extend(
                     at[at.partition_point(|&i| i < seen)..]
@@ -1795,6 +3220,168 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     }
 }
 
+/// Catches up the kept reads of `rt`'s frame at `cidx`, each `(read,
+/// seen)`, on the events logged since it was kept. Every event only takes
+/// landings away, and the events a copy missed take the same in any order:
+/// the landings deeper than the shallowest position one of them takes, and
+/// the nodes landed since. So a copy that shares its log keeps sharing it,
+/// with those cut ([`Cut`]), and one backward pass over the events gives
+/// every copy its cut. A copy taken apart, or one a held landing below the
+/// frame may empty, takes the events one at a time ([`catch_up`]).
+fn catch_up_frame(rt: RuntimeId, cidx: u32, reads: &mut [(KeptRead, usize)], events: &Events) {
+    let shared = |e: &KeptRead| {
+        matches!(&e.what, Delivered::Unwind { nodes, .. }
+            if matches!(&nodes.nodes, Nodes::Shared { cut: None, .. }))
+    };
+    let Some(first) = reads
+        .iter()
+        .filter(|(e, _)| shared(e))
+        .map(|(_, s)| *s)
+        .min()
+    else {
+        for (e, seen) in reads.iter_mut() {
+            catch_up(e, *seen, events);
+        }
+        return;
+    };
+    let (landed, below) = landed_since(rt, cidx, first, events);
+    let landed = Rc::new(landed);
+    let mut order: Vec<usize> = (0..reads.len()).collect();
+    order.sort_unstable_by_key(|&k| std::cmp::Reverse(reads[k].1));
+    let wide = &events.wide[events.wide.partition_point(|&i| i < first)..];
+    note_work(wide.len());
+    let mut cuts = CutPositions::default();
+    let mut next = wide.len();
+    for k in order {
+        let (e, seen) = &mut reads[k];
+        if !shared(e) || below.is_some_and(|b| b >= *seen) {
+            catch_up(e, *seen, events);
+            continue;
+        }
+        while next > 0 && wide[next - 1] >= *seen {
+            next -= 1;
+            let l = &events.log[wide[next]];
+            if l.rt == rt && (cidx < l.ev.cidx() || l.all) {
+                cuts.add(&l.ev);
+            }
+        }
+        let Delivered::Unwind { nodes, .. } = &mut e.what else {
+            unreachable!()
+        };
+        let at = cuts.position(nodes.source);
+        if at <= i64::from(cidx) {
+            nodes.nodes = Nodes::Owned(Vec::new());
+            continue;
+        }
+        let Nodes::Shared { depth, cut, .. } = &mut nodes.nodes else {
+            unreachable!()
+        };
+        let keep = u32::try_from(at - i64::from(cidx) - 1).unwrap_or(u32::MAX);
+        if keep < *depth || landed.order.last().is_some_and(|&i| i >= *seen) {
+            *depth = (*depth).min(keep);
+            *cut = Some(Cut {
+                depth: keep,
+                seen: *seen,
+                landed: Rc::clone(&landed),
+            });
+        }
+    }
+}
+
+/// The landings of `rt`'s nodes kept copies held, logged from index
+/// `first` on, and the latest of them at or below the frame at `cidx`: a
+/// copy holding that node loses every landing of another payload.
+fn landed_since(
+    rt: RuntimeId,
+    cidx: u32,
+    first: usize,
+    events: &Events,
+) -> (CutLandings, Option<usize>) {
+    let mut landed = CutLandings::default();
+    let mut below = None;
+    let kept = &events.kept[events.kept.partition_point(|&i| i < first)..];
+    note_work(kept.len());
+    for &i in kept {
+        let l = &events.log[i];
+        if l.rt != rt {
+            continue;
+        }
+        if let Retire::Landing { cidx: at, node, .. } = l.ev {
+            landed.latest.insert(node, i);
+            landed.order.push(i);
+            if at <= cidx {
+                below = Some(i);
+            }
+        }
+    }
+    (landed, below)
+}
+
+/// The positions the events a backward pass has met take landings above,
+/// for a copy of the notes of a payload: an event takes those above its
+/// position, a containment of the copy's own payload also those at it, and
+/// a landing of another payload's those above it.
+#[derive(Default)]
+struct CutPositions {
+    any: Option<i64>,
+    /// Per payload, what its events take from a copy of another payload's
+    /// notes and from a copy of its own.
+    keyed: HashMap<PayloadKey, (i64, i64), FxBuildHasher>,
+    /// The two payloads with the lowest positions for others' copies.
+    best: [Option<(i64, PayloadKey)>; 2],
+}
+
+impl CutPositions {
+    fn add(&mut self, ev: &Retire) {
+        match *ev {
+            Retire::Above(at) => self.any = Some(self.any.map_or(at.into(), |a| a.min(at.into()))),
+            Retire::Contained { cidx: at, payload } => {
+                self.keyed_add(payload, i64::from(at), i64::from(at) - 1);
+            }
+            Retire::Landing {
+                cidx: at,
+                payload: Some(payload),
+                ..
+            } => self.keyed_add(payload, i64::from(at), i64::MAX),
+            Retire::Landing { payload: None, .. } => {}
+        }
+    }
+
+    fn keyed_add(&mut self, key: PayloadKey, others: i64, own: i64) {
+        let e = self.keyed.entry(key).or_insert((i64::MAX, i64::MAX));
+        e.0 = e.0.min(others);
+        e.1 = e.1.min(own);
+        let v = e.0;
+        if let Some(i) = self
+            .best
+            .iter()
+            .position(|b| b.is_some_and(|(_, k)| k == key))
+        {
+            self.best[i] = Some((v, key));
+        } else if self.best[1].is_none_or(|(b, _)| v < b) {
+            self.best[1] = Some((v, key));
+        }
+        if self.best[1].is_some_and(|(b1, _)| self.best[0].is_none_or(|(b0, _)| b1 < b0)) {
+            self.best.swap(0, 1);
+        }
+    }
+
+    /// The lowest position the events take landings above in a copy of
+    /// `source`'s notes; `i64::MAX` if none.
+    fn position(&self, source: Option<PayloadKey>) -> i64 {
+        let own = source
+            .and_then(|s| self.keyed.get(&s))
+            .map_or(i64::MAX, |e| e.1);
+        let others = self
+            .best
+            .iter()
+            .flatten()
+            .find(|(_, k)| Some(*k) != source)
+            .map_or(i64::MAX, |(v, _)| *v);
+        self.any.unwrap_or(i64::MAX).min(own).min(others)
+    }
+}
+
 /// Marks the kept reads' copies for a context that opens.
 fn mark_kept() {
     KEPT_READS.with(|d| {
@@ -1813,12 +3400,7 @@ pub(crate) fn take_kept_reads(
     ctl: *const crate::cycle::ComputeCtl,
 ) -> Vec<KeptRead> {
     let mut out = extract_kept(cidx, |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl);
-    KEPT_EVENTS.with(|v| {
-        let v = v.borrow();
-        for (e, seen) in &mut out {
-            catch_up(e, *seen, &v);
-        }
-    });
+    KEPT_EVENTS.with(|v| catch_up_frame(rt, cidx, &mut out, &v.borrow()));
     if value_code::thread_word() & value_code::KEPT_BIT == 0 {
         forget_events();
     }
@@ -1835,6 +3417,7 @@ pub(crate) fn drop_kept_from(rt: RuntimeId, cidx: u32) {
     if value_code::thread_word() & value_code::KEPT_BIT == 0 {
         forget_events();
     }
+    let _drops = crate::attempt::Outside::enter(true);
     drop(gone);
 }
 
@@ -1852,21 +3435,41 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
             "incr-core: a foreign read's count outlived its kept read"
         );
         value_code::set_kept_bit(!d.is_empty());
-        if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
-            COPIED.with(|c| {
-                let mut c = c.borrow_mut();
-                // A clear costs the capacity, which one big replay leaves
-                // behind for every later kept episode.
-                if c.capacity() > COPIED_KEEP {
-                    *c = CopiedSet::default();
-                } else {
-                    c.clear();
-                }
-            });
+        let word = value_code::thread_word();
+        if d.is_empty() && word & value_code::REPLAY_BIT == 0 {
+            COPIED.with(clear_set);
             COPIED_GEN.with(|g| g.set(0));
+            if !speculative() {
+                CHECKED_READS.with(|c| c.borrow_mut().clear());
+                SPEC_READS.with(|c| c.borrow_mut().clear());
+            }
+            if word & value_code::NOTES_BIT == 0 {
+                end_kept_marks();
+            }
         }
         out
     })
+}
+
+/// Clears the kept set once no read is kept, no context is open and the
+/// thread holds no notes. While notes stay, a later read may keep a longer
+/// copy of a log whose earlier entries are marked, and clearing then
+/// would mark them again for every read up a chain.
+pub(crate) fn end_kept_marks() {
+    KEPT_HELD.with(clear_set);
+    KEPT_GEN.with(|g| g.set(0));
+    KEPT_ALL.with(|k| k.set(false));
+}
+
+fn clear_set(set: &RefCell<CopiedSet>) {
+    let mut set = set.borrow_mut();
+    // A clear costs the capacity, which one big replay leaves behind for
+    // every later kept episode.
+    if set.capacity() > COPIED_KEEP {
+        *set = CopiedSet::default();
+    } else {
+        set.clear();
+    }
 }
 
 /// No read is kept, so no copy takes the logged events.
@@ -2218,21 +3821,51 @@ pub(crate) fn frame_records(rt: RuntimeId, slot: u32, generation: u32) -> bool {
     })
 }
 
-/// Counts a speculative entry's run while it lives; dropping it, by an
-/// unwind included, gives the count back.
+/// Counts a speculative run while it lives, with the runtime whose chain
+/// speculates; dropping it, by an unwind included, gives both back.
 pub(crate) struct Speculating(());
 
 impl Speculating {
-    pub(crate) fn enter() -> Self {
+    pub(crate) fn enter(chain: RuntimeId) -> Self {
         SPECULATIVE.with(|s| s.set(s.get() + 1));
+        SPECULATING_IN.with(|c| c.borrow_mut().push(chain));
+        value_code::set_bits(value_code::SPECULATING_BIT, true);
         Self(())
     }
 }
 
 impl Drop for Speculating {
     fn drop(&mut self) {
-        SPECULATIVE.with(|s| s.set(s.get() - 1));
+        SPECULATING_IN.with(|c| c.borrow_mut().pop());
+        let left = SPECULATIVE.with(|s| {
+            s.set(s.get() - 1);
+            s.get()
+        });
+        value_code::set_bits(value_code::SPECULATING_BIT, left != 0);
     }
+}
+
+/// Whether a speculative run on this thread speculates in a chain of `rt`.
+pub(crate) fn speculating_in(rt: RuntimeId) -> bool {
+    speculative() && SPECULATING_IN.with(|c| c.borrow().contains(&rt))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SPECULATIVE_WAIT_DROPS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Counts, on this thread, a speculative run dropped where it would
+/// register a claim wait.
+#[cfg(test)]
+pub(crate) fn count_speculative_wait_drop() {
+    SPECULATIVE_WAIT_DROPS.with(|d| d.set(d.get() + 1));
+}
+
+/// The speculative wait drops this thread counted since the last take.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_speculative_wait_drops() -> u32 {
+    SPECULATIVE_WAIT_DROPS.with(|d| d.replace(0))
 }
 
 /// Runs `f` on the thread's contexts without changing them, so the replay
@@ -2384,10 +4017,16 @@ pub(crate) fn note_took(rt: RuntimeId, reader: RunKey, reading: u64, payload: &(
     });
 }
 
+/// Whether this thread noted a take in this engine call (`clear` resets
+/// it).
+#[inline(always)]
+pub(crate) fn takes_held() -> bool {
+    value_code::thread_word() & value_code::TOOK_BIT != 0
+}
+
 /// Whether this thread has noted reads of runtime `rt` no landing took.
 pub(crate) fn takes_noted(rt: RuntimeId) -> bool {
-    value_code::thread_word() & value_code::TOOK_BIT != 0
-        && TOOK.with(|t| t.borrow().keys().any(|k| k.0 == rt))
+    takes_held() && TOOK.with(|t| t.borrow().keys().any(|k| k.0 == rt))
 }
 
 /// What run `run`'s reads took, as it lands.
@@ -2480,7 +4119,7 @@ pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + S
 /// which stays put while the box unwinds. A closure can catch a box and
 /// raise a fresh one at the freed address with no engine call between, so
 /// the key also holds the type and the text of a `&str` or `String`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PayloadKey {
     /// Every zero-sized payload's box has its type's dangling address, so
     /// only the type tells two of them apart, the engine's own unwinds
@@ -2538,18 +4177,19 @@ pub(crate) fn take_pending(
 ) -> Option<Delivered> {
     with(|c| {
         c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
-            let at = x.pending.find_keyed(key, |d| {
-                !d.taken && !matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
-            })?;
+            let at = x
+                .pending
+                .find_keyed(key, |d| !d.taken && !matches!(d.what, Delivered::Walk(..)))?;
             // The read has its outcome, which ended the walk it was
             // blocked in, so a later read under the same key in this
             // run must not resume that walk or recompute its node.
             x.pending.take_keyed(key);
+            x.directs.take_keyed(key);
             Some(match &x.pending.get(at).what {
                 Delivered::Landed(value, poison) => {
                     Delivered::Landed(Unbuilt::new(clone(value.value())), *poison)
                 }
-                Delivered::Walk(..) | Delivered::Direct => {
+                Delivered::Walk(..) => {
                     unreachable!("incr-core: a walk's direction is not a value")
                 }
                 Delivered::Unwind { .. } => x.take_unwind(at),
@@ -2566,11 +4206,11 @@ pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
     with(|c| {
         for x in c.iter_mut().filter(|x| x.rt == rt) {
             for i in x.pending.keyed(key).to_vec() {
-                let d = x.pending.get_mut(i);
+                let d = x.pending.get(i);
                 if d.taken
                     && matches!(&d.what, Delivered::Unwind { payload, .. } if payload.is::<Regen>())
                 {
-                    d.resumed = Some(raised);
+                    x.pending.resume(i, raised);
                 }
             }
         }
@@ -2581,7 +4221,7 @@ pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
 pub(crate) fn regenerated_at(id: u64, i: usize, raised: PayloadKey) {
     with(|c| {
         if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-            x.pending.get_mut(i).resumed = Some(raised);
+            x.pending.resume(i, raised);
         }
     });
 }
@@ -2827,39 +4467,60 @@ pub(crate) fn run_at(
     })
 }
 
-/// The seq of the latest run of `rt`'s `frame`, live or ended, and the
-/// path it started along, which no frame or virtual frame below it changes
-/// while it runs or before its episode's end lands it: for a run that may
-/// have left the stack, as a member's that lands at its episode's end. A
-/// frame on the stack has them from [`run_at`]. No run gives seq 0 and no
-/// path.
-pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
+/// The seq of the latest run of `rt`'s `frame`, live or ended, the path
+/// it started along, and whether a later run at its depth replaced it: for
+/// a run that may have left the stack, as a member's that lands at its
+/// episode's end. No frame or virtual frame below a run changes its path
+/// while it runs, but once a later run replaced it the frames below may
+/// have run again, so only its recorded path is its own. A frame on the
+/// stack has them from [`run_at`]. No run gives seq 0 and no path.
+pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>, bool) {
     RUNS.with(|r| {
         let r = r.borrow();
         let live = (r.live.iter().rev().flatten()).find(|x| x.rt == rt && x.frame == frame);
         let ended = r.ended.get(&(rt, frame));
         match (live, ended) {
-            (Some(l), Some(e)) => Some(if l.order > e.order { l } else { e }),
-            (Some(x), None) | (None, Some(x)) => Some(x),
+            (Some(l), Some(e)) if l.order > e.order => Some((l, false)),
+            (Some(_), Some(e)) | (None, Some(e)) => Some((e, true)),
+            (Some(l), None) => Some((l, false)),
             (None, None) => None,
         }
-        .map_or((0, None), |x| (x.seq, Some(x.path)))
+        .map_or((0, None, false), |(x, replaced)| {
+            (x.seq, Some(x.path), replaced)
+        })
     })
 }
 
-/// Drops the runs of each runtime in `gone` that has no context left in
-/// `c`: a frame that starts before its next context opens has no run, and
-/// must not find one of an earlier frame at its stack address.
+/// Drops the runs, and outside speculation the stash reads, of each
+/// runtime in `gone` that has no context left in `c`: a frame that starts
+/// before its next context opens has no run, and must not find one of an
+/// earlier frame at its stack address.
 fn end_sessions(c: &[Context], gone: impl IntoIterator<Item = RuntimeId>) {
+    let reads = !speculative() && SPEC_READS.with(|d| !d.borrow().is_empty());
+    let end_reads = |rt: Option<RuntimeId>| {
+        SPEC_READS.with(|d| {
+            let d = &mut *d.borrow_mut();
+            match rt {
+                Some(rt) => d.retain(|&(of, _, _), _| of != rt),
+                None => d.clear(),
+            }
+        });
+    };
     RUNS.with(|r| {
         let r = &mut *r.borrow_mut();
         if c.is_empty() {
             *r = Runs::default();
+            if reads {
+                end_reads(None);
+            }
             return;
         }
         for rt in gone {
             if innermost(c, rt).is_none() {
                 r.forget(rt);
+                if reads {
+                    end_reads(Some(rt));
+                }
             }
         }
     });
@@ -2927,13 +4588,11 @@ pub(crate) fn end_run(rt: RuntimeId, frame: Frame, path: u64) {
                 };
                 for j in 0..x.pending.keyed(&key).len() {
                     let d = x.pending.get_mut(x.pending.keyed(&key)[j]);
-                    if !d.taken
-                        && d.runs.path == path
-                        && matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
-                    {
+                    if !d.taken && d.runs.path == path && matches!(d.what, Delivered::Walk(..)) {
                         d.runs.bump(node, generation);
                     }
                 }
+                x.directs.bump(&key, path, node, generation);
             }
         }
         if let Some(slot) = run_slot_mut(c, rt, cidx, path) {
@@ -2958,6 +4617,7 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
             for i in x.pending.of_maker(level) {
                 x.pending.set_taken(i, false);
             }
+            x.directs.rearm_maker(level);
             return Vec::new();
         }
         x.end_maker(level)
@@ -2979,7 +4639,7 @@ pub(crate) struct EarliestByFrame {
     /// notes a record again: a record taken for one meanwhile would be one
     /// of the ended runs'.
     #[cfg(debug_assertions)]
-    ended: std::collections::HashSet<(u32, u32), FxBuildHasher>,
+    ended: HashSet<(u32, u32), FxBuildHasher>,
 }
 
 /// A frame's node, generation and position.
@@ -3114,4 +4774,473 @@ fn note_earliest(
 /// The innermost context of `rt`, as an index into the stack.
 pub(crate) fn innermost(c: &[Context], rt: RuntimeId) -> Option<usize> {
     c.iter().rposition(|x| x.rt == rt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notes::Notes;
+
+    fn keyed_run_slot(key: &ReadKey) -> RunSlot {
+        let step = Step {
+            node: key.node,
+            episode: key.episode,
+            reading: key.reading,
+            ordinal: key.ordinal,
+            seq: key.seq,
+        };
+        RunSlot {
+            path: extend_path(key.path, step),
+            ..RunSlot::default()
+        }
+    }
+
+    fn direct_key(node: u32, reading: u64) -> ReadKey {
+        ReadKey {
+            node,
+            generation: 0,
+            cidx: 5,
+            reading,
+            ordinal: 1,
+            path: 3,
+            seq: 0,
+            episode: Some(9),
+            foreign: None,
+        }
+    }
+
+    /// A released node's directs are gone at once though they leave
+    /// their positions only with their maker, and a direct delivered
+    /// again after the release counts afresh.
+    #[test]
+    fn a_released_nodes_directs_are_gone_and_come_back_fresh() {
+        let (x, y) = (direct_key(1, 7), direct_key(2, 7 | 1 << 32));
+        let mut directs = Directs::new(0);
+        directs.deliver(x, 0, keyed_run_slot(&x));
+        directs.deliver(y, 0, keyed_run_slot(&y));
+        let (px, py) = (keyed_run_slot(&x).path, keyed_run_slot(&y).path);
+        directs.bump(&x, px, 7, 0);
+        directs.bump(&x, px, 8, 0);
+        directs.bump(&y, py, 7, 1);
+        directs.remove_node(1, 0);
+        assert!(!directs.frame_awaits((1, 0, 5)));
+        assert!(directs.frame_awaits((2, 0, 5)));
+        assert!(directs.take(&x).is_none());
+        directs.deliver(x, 0, keyed_run_slot(&x));
+        directs.bump(&x, px, 8, 0);
+        let fresh = directs.take(&x).expect("delivered again");
+        assert_eq!(
+            (fresh.path, fresh.count(7, 0), fresh.count(8, 0)),
+            (px, 0, 1)
+        );
+        let y_runs = directs.take(&y).expect("not released");
+        assert_eq!((y_runs.count(7, 1), y_runs.count(7, 0)), (1, 0));
+        directs.remove_maker(0);
+        assert!(directs.released.is_empty() && directs.more_runs.is_empty());
+    }
+
+    /// A shallow context's directs make only the positions it uses.
+    #[test]
+    #[cfg(not(loom))]
+    fn a_shallow_direct_makes_few_positions() {
+        let key = direct_key(1, 7);
+        let mut directs = Directs::new(0);
+        take_note_work();
+        directs.deliver(key, 0, keyed_run_slot(&key));
+        let units = take_note_work();
+        assert!(
+            units <= 8,
+            "{units} units of note work for a direct at position 5"
+        );
+    }
+
+    /// Running out of stamps drops the released directs and keeps the
+    /// others' counts.
+    #[test]
+    fn running_out_of_stamps_keeps_the_live_directs_runs() {
+        let (x, y, z) = (direct_key(1, 7), direct_key(2, 7), direct_key(3, 7));
+        let mut directs = Directs::new(0);
+        directs.deliver(x, 0, keyed_run_slot(&x));
+        directs.deliver(y, 1, keyed_run_slot(&y));
+        directs.bump(&y, keyed_run_slot(&y).path, 8, 0);
+        directs.remove_node(1, 0);
+        directs.next_stamp = u32::MAX;
+        directs.deliver(z, 1, keyed_run_slot(&z));
+        assert_eq!(directs.live, 2);
+        assert!(directs.released.is_empty());
+        assert_eq!(directs.take(&y).expect("kept").count(8, 0), 1);
+        assert!(directs.take(&z).is_some() && directs.take(&x).is_none());
+        directs.remove_maker(0);
+        directs.remove_maker(1);
+        assert_eq!(directs.live, 0);
+    }
+
+    /// A deep direct that goes with its maker's run and comes back with the
+    /// next doom is held at its position again without making the
+    /// positions below it again.
+    #[test]
+    #[cfg(not(loom))]
+    fn a_deep_direct_held_again_makes_no_positions_again() {
+        let depth = 100_000;
+        let key = ReadKey {
+            node: 1,
+            generation: 0,
+            cidx: depth,
+            reading: 2,
+            ordinal: 1,
+            path: 3,
+            seq: 0,
+            episode: None,
+            foreign: None,
+        };
+        let mut directs = Directs::new(0);
+        take_note_work();
+        for _ in 0..10 {
+            directs.deliver(key, 0, keyed_run_slot(&key));
+            directs.remove_maker(0);
+        }
+        let units = take_note_work();
+        assert!(
+            units < 2 * u64::from(depth),
+            "{units} units of note work for 10 holds of a direct at position {depth}"
+        );
+    }
+
+    /// A cut that takes a node's newer, deeper note and keeps its older one
+    /// leaves the older stamp: the frame's containment names only the
+    /// landing its kept notes name.
+    #[test]
+    fn a_cut_newer_note_leaves_the_older_stamp() {
+        let rt = RuntimeId::for_test(7);
+        let payload: Box<dyn Any + Send> = Box::new("p");
+        let key = payload_key(&*payload);
+        let mut notes = Notes::new();
+        notes.push(rt, key, 1, ((5, 0), 10), false);
+        notes.push(rt, key, 3, ((5, 0), 20), false);
+        let whole = notes.copy(rt, key, 0).into_nodes();
+        assert_eq!(whole, vec![((5, 0), 1, 10), ((5, 0), 3, 20)]);
+        let mut cut = notes.copy(rt, key, 0);
+        let Nodes::Shared { cut: c, .. } = &mut cut.nodes else {
+            panic!("a copy of a log shares it");
+        };
+        *c = Some(Cut {
+            depth: 2,
+            seen: 0,
+            landed: Rc::new(CutLandings::default()),
+        });
+        assert_eq!(cut.into_nodes(), vec![((5, 0), 1, 10)]);
+    }
+
+    /// Copy `a` of a log is taken before a removal and copy `b` after it,
+    /// and `b` is marked first: `a` still holds the removed note, so its
+    /// mark must not stop at the watermark `b` left.
+    #[test]
+    fn an_earlier_copy_marks_the_notes_a_later_copy_left_out() {
+        for marks in [Marks::Kept, Marks::Copied] {
+            let rt = RuntimeId::for_test(7);
+            let payload: Box<dyn Any + Send> = Box::new("p");
+            let key = payload_key(&*payload);
+            let mut notes = Notes::new();
+            notes.push(rt, key, 1, ((1, 0), 0), false);
+            notes.push(rt, key, 2, ((2, 0), 0), false);
+            let a = notes.copy(rt, key, 0);
+            notes.forget_node(rt, (2, 0));
+            notes.push(rt, key, 3, ((3, 0), 0), false);
+            let b = notes.copy(rt, key, 0);
+            mark_in(marks, rt, &b);
+            mark_in(marks, rt, &a);
+            let set = match marks {
+                Marks::Kept => &KEPT_HELD,
+                Marks::Copied => &COPIED,
+            };
+            assert!(set.with(|s| s.borrow().contains(&(rt, (2, 0)))));
+        }
+    }
+
+    /// A pending list holding one passed delivery of the frame at 3 whose
+    /// payload is keyed `source`, with landings `nodes`.
+    fn passed_at_3(source: PayloadKey, nodes: Vec<((u32, u32), u32)>) -> Pending {
+        let read = ReadKey {
+            node: 1,
+            generation: 0,
+            cidx: 3,
+            reading: 2,
+            ordinal: 1,
+            path: 0,
+            seq: 0,
+            episode: None,
+            foreign: None,
+        };
+        let what = Delivered::Unwind {
+            cycle: false,
+            poison: crate::cycle::POISONED,
+            attributed: false,
+            payload: Box::new("p"),
+            nodes: Landings::owned(
+                Some(source),
+                nodes.into_iter().map(|(n, d)| (n, d, 0)).collect(),
+            ),
+        };
+        let mut pending = Pending::default();
+        pending.push(Delivery::new(read, 0, what));
+        pending.pass(0);
+        pending
+    }
+
+    fn holds(pending: &mut Pending, node: (u32, u32)) -> bool {
+        let Delivered::Unwind { nodes, .. } = &mut pending.get_mut(0).what else {
+            unreachable!()
+        };
+        nodes.holds(node)
+    }
+
+    static P: &str = "p";
+    static Q: &str = "q";
+
+    fn key(payload: &'static &'static str) -> PayloadKey {
+        payload_key(payload)
+    }
+
+    /// A passed delivery's landing just above its frame is a note at the
+    /// position of the frame's next read, which a walk's entry there
+    /// containing the same payload retires.
+    #[test]
+    fn a_containment_just_above_a_frame_retires_its_passed_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        let contained = |payload| Retire::Contained { cidx: 4, payload };
+        pending.retire(&contained(key(&Q)), false);
+        assert!(holds(&mut pending, (2, 0)));
+        pending.retire(&contained(key(&P)), false);
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// The copy a take raises stands for the delivery's payload as its
+    /// source does, so a containment of the copy retires the landing too.
+    #[test]
+    fn a_containment_of_a_resumed_copy_retires_its_passed_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&Q));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&Q),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A copy renoted in two parts, the second reusing the first, notes
+    /// what the whole copy renoted at once does: once the deeper frame's
+    /// notes go, both keep the shallower note's own stamp, as the frames
+    /// that made the notes would.
+    #[cfg(not(loom))]
+    #[test]
+    fn a_renote_reused_across_a_stamp_change_notes_what_a_whole_one_does() {
+        let rt = RuntimeId::for_test(7);
+        let source: Box<dyn Any + Send> = Box::new("s");
+        let s = payload_key(&*source);
+        // Each Notes renotes its own source log, as each thread's does.
+        let copies = || {
+            let mut from = Notes::new();
+            from.push(rt, s, 1, ((5, 0), 10), false);
+            let early = from.copy(rt, s, 0);
+            from.push(rt, s, 3, ((5, 0), 20), false);
+            (early, from.copy(rt, s, 0))
+        };
+        let (early, late) = copies();
+        let mut reused = Notes::new();
+        reused.note_copy(rt, key(&P), 0, early.as_shared().unwrap());
+        take_note_work();
+        reused.note_copy(rt, key(&P), 0, late.as_shared().unwrap());
+        let reusing = take_note_work();
+        let (_, late) = copies();
+        take_note_work();
+        let mut whole = Notes::new();
+        whole.note_copy(rt, key(&Q), 0, late.as_shared().unwrap());
+        assert!(
+            reusing < take_note_work(),
+            "the second renote reused the first"
+        );
+        reused.forget_from(2, None);
+        whole.forget_from(2, None);
+        let reused = reused.copy(rt, key(&P), 0).into_nodes();
+        let whole = whole.copy(rt, key(&Q), 0).into_nodes();
+        assert_eq!(reused, whole);
+        assert_eq!(whole, vec![((5, 0), 1, 10)]);
+    }
+
+    /// A passed delivery's payload regenerated as `Q` counts as its source,
+    /// so a containment of `Q` just above its frame reaches its landings.
+    #[test]
+    fn a_containment_of_a_regenerated_payload_retires_its_passed_landing() {
+        unsafe fn parts(_: *const (), _: u32, _: u32, _: bool) -> KeyParts {
+            (0, 0, None, 0)
+        }
+        let target = Entry {
+            node: 0,
+            generation: 0,
+            suspect: false,
+            spec: false,
+            retry: Retry::Walk,
+            walked: false,
+            r5: false,
+        };
+        let keys = FrameKeys {
+            owner: std::ptr::null(),
+            parts,
+        };
+        let id = open(RuntimeId::for_test(7), 0, target, keys);
+        let context = |c: &mut Vec<Context>| c.iter_mut().position(|x| x.id == id).unwrap();
+        with(|c| {
+            let at = context(c);
+            c[at].pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        });
+        regenerated_at(id, 0, key(&Q));
+        let held = with(|c| {
+            let at = context(c);
+            let pending = &mut c[at].pending;
+            pending.retire(
+                &Retire::Contained {
+                    cidx: 4,
+                    payload: key(&Q),
+                },
+                false,
+            );
+            holds(pending, (2, 0))
+        });
+        drop(close(id));
+        assert!(!held);
+    }
+
+    /// A delivery that loses its deeper landings is filed again as one
+    /// whose landings sit just above its frame, which a containment there
+    /// of its payload still reaches.
+    #[test]
+    fn a_delivery_left_just_above_its_frame_is_reached_there() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
+        pending.retire(&Retire::Above(4), false);
+        assert!(!holds(&mut pending, (5, 0)));
+        assert!(pending.by_top.is_empty());
+        assert!(matches!(pending.filed.get(&0), Some(Filed::Shallow(4, _))));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&P),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A later take's copy replaces the earlier one's as the payload a
+    /// containment must name.
+    #[test]
+    fn a_later_take_replaces_the_copy_a_containment_retires() {
+        static R: &str = "r";
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&Q));
+        pending.resume(0, key(&R));
+        assert!(!pending.by_payload.contains(&(4, key(&Q), 0)));
+        let contained = |payload| Retire::Contained { cidx: 4, payload };
+        pending.retire(&contained(key(&Q)), false);
+        assert!(holds(&mut pending, (2, 0)));
+        pending.retire(&contained(key(&R)), false);
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A copy keyed as the source shares its entry, which a later take's
+    /// copy leaves to the source.
+    #[test]
+    fn a_take_after_a_copy_keyed_as_the_source_keeps_the_source_listed() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&P));
+        pending.resume(0, key(&Q));
+        assert!(pending.by_payload.contains(&(4, key(&P), 0)));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&P),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// Opens a context holding `pending`, runs `f` on it and closes it.
+    fn in_context(pending: Pending, f: impl FnOnce(u64)) {
+        unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> KeyParts {
+            unreachable!()
+        }
+        let entry = Entry {
+            node: 1,
+            generation: 0,
+            suspect: false,
+            spec: false,
+            retry: Retry::Compute,
+            walked: false,
+            r5: false,
+        };
+        let keys = FrameKeys {
+            owner: std::ptr::null(),
+            parts: no_parts,
+        };
+        let id = open(RuntimeId::SENTINEL, 1, entry, keys);
+        with(|c| c.iter_mut().find(|x| x.id == id).unwrap().pending = pending);
+        f(id);
+        drop(close(id));
+    }
+
+    fn retires_contained_at_4(id: u64, payload: PayloadKey) -> bool {
+        with(|c| {
+            let x = c.iter_mut().find(|x| x.id == id).unwrap();
+            x.pending
+                .retire(&Retire::Contained { cidx: 4, payload }, false);
+            !holds(&mut x.pending, (2, 0))
+        })
+    }
+
+    /// A regenerated payload stands for a delivery's source as a take's
+    /// copy does, so a containment of it retires a landing just above the
+    /// frame.
+    #[test]
+    fn a_containment_of_a_payload_regenerated_at_its_delivery_retires_its_landing() {
+        in_context(passed_at_3(key(&P), vec![((2, 0), 0)]), |id| {
+            regenerated_at(id, 0, key(&Q));
+            assert!(retires_contained_at_4(id, key(&Q)));
+        });
+    }
+
+    #[test]
+    fn a_containment_of_a_payload_regenerated_for_its_read_retires_its_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        let d = pending.get_mut(0);
+        d.taken = true;
+        let Delivered::Unwind { payload, .. } = &mut d.what else {
+            unreachable!()
+        };
+        *payload = Box::new(Regen(std::any::TypeId::of::<&str>()));
+        let read = d.key;
+        in_context(pending, |id| {
+            regenerated(RuntimeId::SENTINEL, &read, key(&Q));
+            assert!(retires_contained_at_4(id, key(&Q)));
+        });
+    }
+
+    /// Short of a node a copy holds, a landing of another payload retires
+    /// only the landings above its position.
+    #[test]
+    fn a_landing_retires_passed_landings_only_above_it() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
+        pending.retire(
+            &Retire::Landing {
+                cidx: 4,
+                payload: Some(key(&Q)),
+                node: (9, 0),
+            },
+            false,
+        );
+        assert!(holds(&mut pending, (2, 0)));
+        assert!(!holds(&mut pending, (5, 0)));
+    }
 }

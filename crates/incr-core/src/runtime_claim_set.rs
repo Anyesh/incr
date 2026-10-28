@@ -135,6 +135,7 @@ impl<C: Cells> Runtime<C> {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::Deleting)
                             .is_ok()
                         {
+                            C::u64_fetch_add(&self.reshapes, 1);
                             taken.push((m, cur));
                             break;
                         }
@@ -186,6 +187,7 @@ impl<C: Cells> Runtime<C> {
     /// the caller to wait out with no guard held.
     pub(super) fn claim_set(&self, roots: &[ErasedIncr], root: NodeId) -> SetEnd<'_, C> {
         let mut inner = self.inner.write();
+        let _change = self.counted_change();
         let mut members = Members::default();
         self.gather(&inner, roots, &mut members);
         if members.order.is_empty() {
@@ -298,6 +300,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> HashSet<ErasedIncr> {
         let mut inner = self.inner.write();
+        let _change = self.counted_change();
         let mut done: HashSet<ErasedIncr> = HashSet::new();
         let mut units: Vec<(ErasedIncr, Members)> = Vec::with_capacity(candidates.len());
         for &c in candidates {
@@ -424,18 +427,20 @@ impl<C: Cells> Runtime<C> {
                 },
                 // One delete per entry, so a wound retries only the
                 // delete it interrupted and the count stays exact.
-                Step::DeleteSingle => match self.enter(|| self.delete_erased(top)) {
-                    DeleteOutcome::Deleted => {
-                        deleted += 1;
-                        stack.pop_segment(base);
+                Step::DeleteSingle => {
+                    match self.nested_entry(|| self.enter(|| self.delete_erased(top))) {
+                        DeleteOutcome::Deleted => {
+                            deleted += 1;
+                            stack.pop_segment(base);
+                        }
+                        DeleteOutcome::AlreadyGone => stack.pop_segment(base),
+                        // A dependent attached after the step; walk to it next.
+                        DeleteOutcome::HasDependents => {}
                     }
-                    DeleteOutcome::AlreadyGone => stack.pop_segment(base),
-                    // A dependent attached after the step; walk to it next.
-                    DeleteOutcome::HasDependents => {}
-                },
+                }
                 Step::DeleteSet => {
                     let seg = &stack.entries[base..];
-                    if let Some(n) = self.enter(|| self.delete_segment(seg)) {
+                    if let Some(n) = self.nested_entry(|| self.enter(|| self.delete_segment(seg))) {
                         deleted += n;
                         stack.pop_segment(base);
                     }

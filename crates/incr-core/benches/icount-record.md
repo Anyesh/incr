@@ -2543,16 +2543,6 @@ each segment, which put Local and Shared over the memory ceiling at
 owner writes both and its release publishes both. Base `ca94bbad`, tip
 `52987c56`, same box, `icount.sh` defaults.
 
-## Doom reservations
-
-`f98fc424` (on `ac199763`) keeps a node a doom released for its
-context's retry from other threads until that context ends. Each Shared
-claim reads one global count after its CAS, an unrun landing notes the
-node when a reservation scope is open, and every outermost Shared entry
-checks on exit that its thread holds none. Base `78d070d4` (`ac199763`
-adds only a comment), tip `12f67a7d` (the later commits change only the
-wound path and loom builds), same box, `icount.sh` defaults.
-
 | workload | base | tip | delta |
 |---|---|---|---|
 | `get_clean_shared` | 196 | 196 | 0 |
@@ -2671,6 +2661,18 @@ on every read that takes nothing; T8-divert-per-read-undivert-cost ends
 it only after a take, a removal or a doom instead. The release replay
 scale tests finish in 24.94 s at the tip against 28.39 s at the base.
 
+## Doom reservations
+
+`f98fc424` (on `ac199763`) keeps a node a doom released for its
+context's retry from other threads until that context ends. Each Shared
+claim reads one global count after its CAS, an unrun landing notes the
+node when a reservation scope is open, and every outermost Shared entry
+checks on exit that its thread holds none. Base `78d070d4` (`ac199763`
+adds only a comment), tip `12f67a7d` (the later commits change only the
+wound path and loom builds), same box, `icount.sh` defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
 | `delete_single_shared` | 1533.25 | 1563.36 | +30.11 |
 | `early_cutoff_shared` | 3683.85 | 3739.84 | +55.99 |
 | `fanout_shared_4` | 23724.09 | 24031.99 | +307.90 |
@@ -2893,3 +2895,365 @@ Gate: the hard gates are exact (102, 196, 218.14, 87). Replay scale by
 - Engine: `w/T11-sync-562ebeed` (merge `f52e82e4`) against t11 `7dbc7dd9`, this box through buildlock, `icount.sh` defaults.
 - Exact: `get_clean_local` 95, `get_clean_shared` 190, `table_hit_local` 150.14, `table_hit_shared` 216.14, `value_slot_read_local` 5, `value_slot_read_shared` 87.
 - Propagation rises are train B's own: the same workloads measured on t10 `c3b8e377` -> `562ebeed` rise within 1.7 points of the sync's. t10 vs t11: `chain_local/propagate/100` +20.97% vs +22.33%, `diamond_local` +16.33% vs +18.06%, `early_cutoff_local` +13.00% vs +14.09%, `simple_count/local/1000` +11.52% vs +11.57%, `collection_insert_then_read/local_incremental/1000` +10.45% vs +10.75%, `delete_cascade_local` +7.50% vs +7.35%, `fanout_local_1000` +6.95% vs +6.76%, `foreign_dirty_read_unbudgeted_u64` +19.81% vs +21.18%, `children_churn_local` +1.61% vs +1.53%. `chain_shared/propagate/100` rises less on t11 (+9.93%) than on t10 (+27.09%).
+
+## Held landings under Shared (Widened H)
+
+`w/T8-two-40k-195f` holds an attempt's exposed landings under `Shared`
+until the read that made them returns (Variant V): the owner sees its
+held landings through a view, a rerun of a held node keeps what its
+write displaces, and a runtime's holds publish or retract at its first
+entry's exit. Base `164cbf2f`, tip `d3dec85b`, same box, `icount.sh`
+defaults; PT line diffs at 2 iterations (`chain_shared` traces lose AUX
+data at 4).
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 101 | 101 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_shared` | 218.14 | 218.14 | 0 |
+| `chain_local/propagate/100` | 98030.01 | 97439.01 | -591.00 |
+| `chain_shared/propagate/100` | 199512.33 | 202636.59 | +3124.26 |
+| `simple_count/local/1000` | 2221.56 | 2224.60 | +3.04 |
+| `simple_count/shared/1000` | 4285.93 | 4340.75 | +54.82 |
+| `fanout_local_4` | 17711 | 17702 | -9 |
+| `fanout_shared_4` | 24746.06 | 25378.05 | +631.99 |
+
+- `chain_shared` +29 per compute up to `faab661e` (the tree before the
+  first-entry fix), of which the named checks are: `seen`'s Computing
+  test at the three walk loads per compute (+14, the owner's view of its
+  held landings), `rerun_hold`'s `hold::active()` (+6), the landing's
+  `hold::active()` (+5), the view's held-bit test (+3) and `KeptGuard`'s
+  `KEPT` test (+2); the rest is spills around them.
+- The first-entry fix (`2f19ddd3..d3dec85b`) adds +2.1 per compute in
+  `chain_shared`. With the read wrapped in `first_entry` inline it also
+  cost `get_clean_shared` +4 (register allocation in `get`, frame 0x38
+  to 0x48) and `chain_shared` +3.7 per compute; `d3dec85b` moves that
+  entry into a cold `first_read`, which removed both.
+- `rerun_hold` and the kept value started inline in `compute_attempts`
+  and cost every compute in spills even when no hold was active (Local
+  +17, Shared +38 per compute against `276dafb2`); moving the
+  `holds`/`take_kept` calls into cold helpers that take the control
+  block (`7eedc225`, `46fa3232`) removed that.
+- Local pays nothing: `chain_local` is 6 per compute below base, from
+  layout.
+
+## A walk rechecks a dep list a held run may have installed
+
+`w/T10-walk-held-deps` marks a held run's node in `dep_count` while its
+dep list may be unpublished, and counts retractions per runtime; under
+`Shared` a walk rereads a node's deps when the mark is set or the count
+moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
+`icount.sh` defaults; PT line diffs at 10 iterations.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 100 | 100 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_shared` | 218.14 | 218.14 | 0 |
+| `chain_local/propagate/100` | 114565.03 | 114483.02 | -82.01 |
+| `chain_shared/propagate/100` | 252950.60 | 254652.62 | +1702.02 |
+| `collection_insert_then_read/shared_incremental/1000` | 8356.17 | 8405.85 | +49.68 |
+| `early_cutoff_shared` | 4228.28 | 4261.28 | +33.00 |
+| `diamond_shared` | 8890.94 | 8945.93 | +54.99 |
+
+- The check after each expanded node's dep read costs about 17 per
+  walked node under `Shared` (`chain_shared` +1702 over 100 nodes).
+- `shared_incremental/1000` +49.68 (+0.59 %), by PT lines with tip lines
+  mapped to base (+48.8 traced): 26 is the check's own code, the check
+  line +12, the retraction counter's acquire load +7 and compare
+  (`retracted_since`) +3, the `held_mark` acquire load +3 and the walk's
+  starting counter load +1; the block the check wraps moved, +11 at its
+  new closing line against -11 at the old one; the other 22.8 is layout
+  over unchanged lines, none more than 6 per op (node lookup in
+  `segmented_nodes.rs` +6 and -4, `take` -6).
+- `Walk::visit_pending` first compiled as an outlined call, about 13 per
+  walked node under both cells (`chain_local/propagate/10` +130 of +140)
+  and over the 1 % bar on `shared_incremental`; `285b26d31` inlines it.
+- Local runs no new code: the checks are compiled out, `chain_local` is
+  82 per op below base, from layout. The Local scale rows that panic
+  (increment 2 scale icount, gh-cmd `0fc77156-d51efe`:
+  `local_custom_payload_chain_100k_at_budget_1` 1.0125,
+  `local_nested_caught_chain_stays_linear` 1.0088) rise in glibc's
+  `_dl_find_object`, which the unwinder calls per frame. Cachegrind on
+  `local_nested_caught_chain_stays_linear` (4000 caught panics), with the
+  walk's cfg(test) park calls and `NO_RESTART_HERE` check removed so that
+  only engine code differs: `096fb59d6` 1635.52M, `9a6be2014` 1647.65M
+  (+12.13M, +0.74 %). The step is `619c9e167` (`815b25be3` 1632.04M,
+  `619c9e167` 1647.72M), where `_dl_find_object`, both its parts, goes
+  from 13.38M to 28.88M over the same 321,960 calls (callgrind), 41.5 to
+  89.7 instructions per call: the lookup's cost moved with the test
+  binary's layout, not its count. Over `096fb59d6` to `9a6be2014` everything
+  outside `_dl_find_object` nets -3.3M (+12.13M against its +15.41M:
+  B-tree and `Notes` code moving between symbols, `_Unwind_Find_FDE`
+  -3.0M); across the `619c9e167` step alone it is about +2.6M. With
+  the cfg(test) code in, the same step lands at `61d37ff85` instead.
+  Same family as `B7-clean-walk-fde-growth`, unwind cost through the
+  walk that moves with codegen.
+
+## The replay context counts queued entries only once a reservation asks
+
+`w/T10-queued-scan` (tip `90bb837e`, on `c87e7bd4`) stops counting every
+entry a replay context queues: the count map is built when a `Shared`
+reservation's end first asks `Context::queues`, and kept in step only from
+then on, by cold out-of-line updates. Local contexts never build it. Hard
+gates by `icount.sh` on this box, `65ce8fa5` against `c87e7bd4`:
+`get_clean_local` 100, `get_clean_shared` 193, `table_hit_local` 155.14,
+`table_hit_shared` 218.14 and `value_slot_read_shared` 87 on both, exact.
+Scale icount by `gh-scale-icount.sh c87e7bd4b 90bb837e6` (gh-cmd
+`90bb837e-d51efe`, all 58 rows ran), ratios tip over base:
+
+| workload | ratio |
+|---|---|
+| `local_taint_100k_at_budget_1_on_a_1_mib_thread` | 0.9884 |
+| `local_doom_under_stabilize` | 0.9911 |
+| `local_fallback_cycle_100k_at_budget_1` | 0.9949 |
+| `local_panicking_chain_paths_stay_linear_at_budget_1` | 1.0037 |
+| `local_taint_100k_at_budget_256_on_a_1_mib_thread` | 1.0008 |
+| `shared_doom_under_stabilize` | 1.0029 |
+| `shared_taint_100k_at_budget_1_on_a_1_mib_thread` | 1.0032 |
+| `shared_wide_frame_deliveries_stay_linear` | 1.0040 |
+
+- The two `Local` rows above base are glibc heap state, not engine work
+  (callgrind, gh-cmds `90bb837e-0f9bfa`, `90bb837e-07cd0c`,
+  `90bb837e-3b644f`): `incr_core` self cost falls on both
+  (`panicking_chain` 10,084.2M against 10,085.0M). Over the whole
+  program, malloc rises (`_int_malloc` +168M, `malloc_consolidate` +15M)
+  and frees fall (`_int_free_maybe_consolidate` -101M, all of `free`
+  -106M). With `GLIBC_TUNABLES=glibc.malloc.tcache_count=0` the tip is
+  below base on both rows; with fastbins off as well it is 0.06% and 0.03%
+  above.
+- The other `Local` rows above 1.0, at most 1.0003, are not the change
+  either (callgrind, gh-cmds `65ce8fa5-8a39ee` and `65ce8fa5-c6a900`,
+  against `c87e7bd4`).
+  `local_contained_chain_stays_linear_at_budget_1` runs below base under
+  callgrind in every allocator setting (default 36,301.6M against
+  36,360.6M), with `incr_core` self cost 1.4M lower. The three foreign-read
+  rows have identical `incr_core` self cost, so the `Local` push, drop and
+  truncate `Option` checks cost them nothing; each is a constant ~1.1k
+  instructions up in every allocator setting, all of it in the dynamic
+  loader's relocations and libtest's handling of a test list four tests
+  longer (`TestDesc::clone`, `filter_tests`, the list's collect and drop).
+  `local_fixpoint_cycle_100k_at_budget_256` (+53,754, 1.0000) was not
+  measured further.
+- `Shared` rows that end reservations pay for the built map's cold
+  updates, up to 0.4%.
+
+## A replan restarts only on another thread's episodes
+
+`w/T10-34ec3-trial` (tip `32822615`, on `8b7f853e`) logs each episode's
+and release's slots under the episode-log lock, prunes a replanned walk
+only under other threads' episodes since its first plan, and restarts a
+released read only when the release reached the plan. Counts under
+cachegrind on GitHub runners (bench driver per iteration, n up to
+100000; scale tests as `gh-scale-icount.sh`).
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 100 / 193 | 100 / 193 | 0 |
+| `table_hit_local` / `_shared` | 155.12 / 218.12 | 155.12 / 218.12 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/100` | 113,771 | 114,574 | +803 |
+| `chain_shared/propagate/100` | 248,102.45 | 245,816.45 | -2,286 |
+| `shared_nested_caught_chain_stays_linear` (scale) | 1,862,612,212 | 2,061,676,980 | +10.7% |
+| `shared_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread` (scale) | 36,365,919,446 | 39,125,761,965 | +7.6% |
+
+Gate: every hard gate counts the same as the base. Every other bench row
+is within 1% (Local compute rows +0.2% to +0.7%, Shared compute rows
+-0.2% to -1.0%), and scale timing totals 1.003.
+
+- Both rises begin at `0029ca96`, which only deletes code (the walk's
+  `waited` field, `Computed::Replan`'s `waited`, the waits' flags);
+  `6eb0208e` before it counts as the base (113,771; 1,865,653,679).
+- Local, +8 per walk entry, all in `clean_walk` (per-instruction
+  callgrind joined to the disassembly, `6eb0208e` 549 hot instructions
+  per entry, `0029ca96` 557): after `walk.push` (`Walk::push`'s capacity
+  test) LLVM now duplicates the loop head's `work.pop()` length test
+  (`vec/mod.rs:2817`: two stack reloads, a test and a branch, 4) and
+  keeps a constant on the stack instead of in `r15` (+1); the other 3
+  are stack loads and stores reshuffled as `r12` and `r15` swap roles.
+  No field or inlining choice moves: it is block layout and register
+  allocation after the deletion, with no attribute that undoes it.
+- Shared `nested_caught` and `custom_payload`: the added instructions
+  are in the unwinder (unnamed code, +524M in `nested_caught`'s query
+  form, +2.7G in `custom_payload`), while `rust_eh_personality` and
+  `_Unwind_Find_FDE` stay flat, so a caught panic crosses the same
+  frames and does more work in each. `clean_walk`'s unwind tables grew
+  at `0029ca96`: two of its four instances from 80-byte FDEs to 920 and
+  912 bytes, the others from 1,156 to 1,256 and 888 to 1,156, so each
+  unwind through a walk frame runs a longer CFA program. The two
+  budget-1 `nested_caught` rows fall (0.98, 0.97).
+
+## A user panic's landings held to the attempt's end
+
+`w/T10-held-unwind-landings` holds every landing a user panic makes in a
+`Shared` attempt until the outermost entry exits, and the owner's own
+set flips its held landings through the view (`341b3ddc1`). Base
+`44e67aeee`, tip `61a24aa8b`, same box, `icount.sh` defaults; PT line
+diffs at 10 iterations (`chain_shared/propagate/10`,
+`foreign_dirty_read_unbudgeted_u64`) and 1 (`delete_owned_tree_shared`,
+which loses AUX data at 3).
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 99 | 99 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_shared` | 218.1 | 218.1 | 0 |
+| `chain_local/propagate/100` | 105523.0 | 105523.0 | 0 |
+| `chain_shared/propagate/4` | 10731.2 | 10767.2 | +36.0 |
+| `chain_shared/propagate/10` | 23312.4 | 23390.5 | +78.0 |
+| `chain_shared/propagate/100` | 249190.1 | 249898.7 | +708.6 |
+| `simple_count/shared/1000` | 4660.2 | 4675.3 | +15.1 |
+| `collection_insert_then_read/shared_incremental/1000` | 8415.4 | 8444.1 | +28.7 |
+| `diamond_shared` | 8908.9 | 8943.9 | +35.0 |
+| `foreign_dirty_read_unbudgeted_u64` | 62078.1 | 62212.4 | +134.3 |
+| `delete_owned_tree_shared` | 998246.7 | 1001161.2 | +2914.5 |
+
+- Every `Shared` rise is the set walk: per node walked, the
+  `is_computing` test inside `seen_quietly` on the loaded word (+5,
+  `runtime.rs:1070` inlined) and `push_pending`'s empty test (+2,
+  `runtime.rs:6605`); per walk, `hold::active()` and the empty
+  `pending` list (+8, `runtime.rs:3512`). `chain_shared` fits 7 per
+  node plus 8 at 4, 10 and 100 nodes; `delete_owned_tree_shared` is
+  200 walks at about 9 each in the PT diff.
+- The largest ratio is 1.0051 (`early_cutoff_shared`). Scale icount
+  (GitHub, `61a24aa8-1d4a1c`) tops out at 1.020 on caught-panic chains;
+  scale timing at 9 rounds totals 1.001.
+- Local pays nothing: every `Local` row is within 0.2 % of base, and
+  the walk's checks sit behind `C::SINGLE_THREADED`.
+- The tip measured predates `05816c989`, which changes only
+  `moved_since_read`; that runs at the publication of a held Failed
+  landing, or of a held Clean one being lowered there, which no
+  workload here makes, so the rows stand.
+
+## Exact take-over and the walk listing of held landings (increment 17)
+
+Increment 17 `33c30fd66` is `w/T10-held-unwind-landings` (`a09b77e81`:
+held panic landings, and a take-over only while the owner is outside
+the engine, through the attempt's `outside` flag) with the walk listing
+of held landings and its take-over refusal (`854fdfd5d`), merged onto
+increment 16 `6bfc3b196`. Cachegrind on GitHub runners, bench driver
+per iteration with a 0-iteration run subtracted: the port against 16
+(gh-cmd `33c30fd6-cafc79`, one codegen unit `33c30fd6-2327e7`), and
+the branch alone against its base increment 9 `95436e778`
+(`686405c7-65d6e8`). These are the first measurements of the hold's
+cost on compute rows; the earlier held-landing sections measured walks.
+
+| workload | 16 | 17 | delta | 9 | branch | delta |
+|---|---|---|---|---|---|---|
+| `get_clean_local` | 99 | 99 | 0 | 99 | 99 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 | 193 | 193 | 0 |
+| `table_hit_local` | 155.12 | 155.12 | 0 | 155.12 | 155.12 | 0 |
+| `table_hit_shared` | 218.12 | 218.12 | 0 | 218.12 | 218.12 | 0 |
+| `value_slot_read_shared` | 87 | 87 | 0 | 87 | 87 | 0 |
+| `chain_shared/propagate/100` | 242988.1 | 246842.4 | +3854.3 | 242588.1 | 246442.4 | +3854.3 |
+| `delete_single_shared` | 1613.8 | 1663.8 | +50.0 | 1612.8 | 1662.8 | +50.0 |
+| `fanout_shared_4` | 26842.1 | 27292.3 | +450.3 | 26816.1 | 27267.3 | +451.3 |
+| `delete_single_local` | 750 | 762 | +12 | 749 | 761 | +12 |
+| `fanout_local_4` | 18761 | 18779 | +18 | 18750 | 18768 | +18 |
+
+- `chain_shared/propagate/100`, per symbol: `write_if_changed` +15 per
+  write (+1500), the `ComputeFn` wrapper +13 per compute (+1300, the
+  `outside` flag's store and restore around the closure),
+  `mark_dependents_dirty` +7 per node (+708), `FnOnce::call_once` +3
+  per compute (+303).
+- `delete_single_shared`: `wait_out_set` +39, the arena's `release`
+  +12, `delete_strict` +8. `fanout_shared_4`: `wait_out_set` +234,
+  `get_slow` +79, `release` +72, the `ComputeFn` wrapper +71,
+  `delete_erased` +48.
+- Local pays nothing. At one codegen unit (`33c30fd6-2327e7`)
+  `fanout_local_4` is 18772 on both and `delete_single_local` 800 on 17
+  against 799 on 16. Per source line of that build's
+  `delete_single_local` (`33c30fd6-28b694`, line tables), each file's
+  lines cost the same on both once moved line numbers are matched, and
+  the one instruction is code with no source line (`runtime.rs:0` +1,
+  `alloc.rs:0` +1, `icount.rs:0` -1). Every guard is behind
+  `C::SINGLE_THREADED` or a no-op on a thread with no attempt word.
+- Contained panics, Shared only. Scale icount on the port
+  (`33c30fd6-e8670d`): `shared_contained_chain_stays_linear_at_budget_16`
+  1.0784 (+432.6M instructions), 1.0402 at budget 2, the Local
+  contained chains at most 1.0049; the branch alone against 9
+  (`686405c7-c43a94`) is 1.0771 (+424.3M) at budget 16. Callgrind on
+  that test (`8efe5cb8-df2203`, the
+  branch on increment 15 against 15): raises (14455) and
+  `resume_unwind`s (14449) equal base, and over its 14003 failed
+  landings `_Unwind_Resume` rises by 14003 (49028 to 63031) and
+  `rust_eh_personality` by 42009 (246066 to 288075), one more resume and
+  three more personality calls per failed landing, raised from the same
+  frames (gdb backtraces, `8efe5cb8-2e6d92`): about 31k instructions per
+  failed landing. The `ComputeFn` wrapper's guard is one cleanup pad:
+  without it (`854fdfd5-6301ba`) `_Unwind_Resume` is back to 49028,
+  `rust_eh_personality` falls by 14009 and the test by 79.5M
+  instructions. `read_walk`'s guard adds no unwind call
+  (`854fdfd5-7279b7`). Growth class is unchanged.
+- Scale timing totals 0.994 (`33c30fd6-9b2bbf`). Its largest rows are
+  Shared: `shared_contained_chain_stays_linear_at_budget_16` 1.085 (wall
+  1.076), `shared_nested_caught_chain_stays_linear_at_budget_1` 1.080
+  (wall 1.059), `shared_same_text_fan_through_a_frame_over_chain_stays_linear`
+  1.064 (wall 1.069), `shared_failed_entry_fan_in` 1.059 (wall 1.028)
+  and the contained chain at budget 2 1.048 (wall 1.041).
+
+## A read revisits a node another read published or released since its plan
+
+`w/T10-wide-two-b0939-w7` (tip `56b5744f`, increment 15 `0dde1d8c` merged
+into `df341666`) publishes a held release without the unrun mark, and
+after the root's claim restarts the walk when another thread's
+publication logged the root in the episode log since the plan. Bench
+rows with `icount.sh` on this box; scale tests as `gh-scale-icount.sh`
+against increment 15.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 99 / 193 | 99 / 193 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `simple_count/shared/1000` | 4,695.22 | 4,715.42 | +20.20 |
+| `chain_shared/propagate/4` | 10,793.21 | 10,837.21 | +44 |
+| `shared_failed_entry_fan_in` (scale) | 1,784,641,129 | 1,793,604,164 | +0.50% |
+| `shared_nested_caught_chain_through_a_query_stays_linear` (scale) | 4,887,484,994 | 4,959,152,493 | +1.47% |
+
+Gate: every hard gate counts the same as the base, every Local row is
+within 0.14% (`table_hit_sip_local` +0.14%), and Shared compute rows
+rise at most 0.61% (`early_cutoff_shared`). Scale icount totals 1.0010
+over 75 tests (Local rows within 0.03%), scale timing 1.012.
+
+- Shared, +44 per iteration on `chain_shared/propagate/4` (Intel PT per
+  line, 20 iterations): the root now carries its plan into its claim
+  (`ensure_clean`'s `then_some(planned)` drops the `!is_root` test, -32
+  at the old line, +4 at the new one, +26 in `bool::then_some`, +9 in
+  `Option`), the claim compares it (`others_landed`, +10) and runs the
+  root check (`!node.unrun()`, +2); `Vec` length reads +20 and
+  `takes_held` +4, atomics +1, while `complete_walk`'s inlining moves
+  cancel (+13, -13). The episode log is read under its lock
+  (`root_reached`) only when another thread landed since the plan, which
+  a single-threaded bench never does; Local skips the check
+  (`C::SINGLE_THREADED`).
+- The check reads only entries a publication logged (`Logged::ended`):
+  a landing or release published at a read's end, never an interim
+  landing of an attempt still running, so a restart reacts only to
+  finished history. A node released unrun is skipped, its read still
+  running elsewhere; `shared_reader_that_waited_out_a_discarded_claim_keeps_its_plan`
+  (0x59bd) pins that a discarded claim's waiter keeps its plan.
+- The root check's restart has no cap (the release replan keeps its
+  `ROOT_RESTARTS`). Each restart replans, moving `since` past every
+  number logged so far, so a second restart needs a new ended entry for
+  the root numbered after the new plan, that is another read finished on
+  the root. Eviction cannot loop: an evicted entry counts only if it was
+  ended (`evicted_ended`, not `evicted`) and its number follows the new
+  plan, so a restart taken on eviction alone needs 1,024 per-slot
+  entries logged after an ended one that is itself after the plan. Own
+  ended entries count there too, but only once `others_since` saw
+  another thread's landing, and each such restart still needs new log
+  traffic past the plan.
+  `a_root_check_reads_only_another_threads_ended_entries` covers ended
+  against interim, own against foreign, landed against released numbers,
+  wrap and eviction.
+- Panicking Shared scale rows (`nested_caught` up to 1.0147,
+  `many_caught_unwinds` 1.0093, `failed_entry_chain` 1.0080): callgrind
+  on `shared_failed_entry_fan_in` at `70ca13f9` counted the engine's own
+  functions within 0.1M of the base and `_Unwind_RaiseException` and
+  `_Unwind_Resume` exactly as often, so the change adds no
+  `resume_unwind` or second unwind of a panic; the rise is the
+  unwinder's per-frame work (libgcc CFA interpretation +35.2M,
+  `rust_eh_personality` +12.1M, `_dl_find_object` -11.8M).
+- Loom: `env -u CARGO_ENCODED_RUSTFLAGS RUSTFLAGS="--cfg loom -D warnings"
+  cargo test -p incr-core --release --lib --no-run` rc 0 on `56b5744f`.

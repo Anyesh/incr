@@ -1,9 +1,11 @@
 //! A walk's containment of what its cleaning raises. The dirty walk
 //! cleans every recorded dep of a node before rerunning it, so it can
 //! compute a dep the rerun no longer reads. A non-root walk entry whose
-//! compute panics or closes a cycle therefore lands as a changed dep and
-//! the walk goes on; a panic's payload stays with the Failed landings it
-//! made, as a ticket, for the first read of any of them.
+//! compute panics therefore lands as a changed dep and the walk goes on,
+//! while a cycle goes on to the reader. A panic's payload stays with the
+//! Failed landings it made, as a ticket, for the first read of any of
+//! them; a closure that panics after catching a cycle lands unwound,
+//! keeps no payload, and runs again for the next read.
 //!
 //! The entry's frame decides where it ends in the unwind, before its
 //! claims are released: the closure's panic arm, or the abort of the
@@ -22,14 +24,14 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
-use crate::notes::{removal, Members, Notes};
+use crate::notes::{removal, Landed, Members, Notes, Stamped};
 use crate::replay::{note_work, payload_key, Landings, Retire};
 
 /// A Failed read's node left Failed before the read could tell which
@@ -58,6 +60,26 @@ pub(crate) struct Tickets {
     /// dropped once the delete, sweep or walk that released them holds no
     /// lock and has finished.
     buried: Vec<Ticket>,
+    /// By the slot of a dep a set's walk stops at, the Failed landings over
+    /// it (slot, generation) that no walk flagged; see `note_past_sets`.
+    past: BTreeMap<u32, Vec<(u32, u32)>>,
+    /// By the slot of a Dirty node below a noted dep, the slots of the
+    /// nodes that read it, up which a take goes to the noted deps.
+    above: BTreeMap<u32, Vec<u32>>,
+    /// The nodes whose Dirty deps `above` holds, each scanned once.
+    scanned: BTreeSet<u32>,
+    /// By slot, the generation and stamp of the node's latest Failed
+    /// landing under `Shared`. A note names the landing it was made for by
+    /// its stamp, so a containment that comes after the node was flipped
+    /// and landed Failed again, on another thread, holds nothing for it.
+    landed: BTreeMap<u32, (u32, u64)>,
+}
+
+/// `slot`'s bit in `Runtime::failed_past`: a walk takes the tickets' lock
+/// only at a dep whose bit is set; notes under other residues never set it.
+#[inline(always)]
+pub(super) fn past_bit(slot: u32) -> u64 {
+    1 << (slot & 63)
 }
 
 #[derive(Clone, Copy)]
@@ -122,6 +144,9 @@ impl Tickets {
     }
 }
 
+/// The most members a test build's ticket check walks in full.
+const FULL_CHECK_MEMBERS: usize = 64;
+
 pub(crate) fn tickets<C: Cells>() -> C::Lock<Tickets> {
     <C::Lock<Tickets> as Lock<Tickets>>::new(Tickets::default())
 }
@@ -178,6 +203,11 @@ fn with_notes<R>(f: impl FnOnce(&mut Notes) -> R) -> R {
         let holds = !n.is_empty();
         if held != holds {
             value_code::set_notes_bit(holds);
+            if !holds
+                && value_code::thread_word() & (value_code::KEPT_BIT | value_code::REPLAY_BIT) == 0
+            {
+                replay::end_kept_marks();
+            }
         }
         r
     })
@@ -265,7 +295,7 @@ impl<C: Cells> Runtime<C> {
         // Every Failed landing removes the node from the tickets before its
         // store, so under the lock a node still Failed at this generation
         // is in the latest landing's ticket, if any.
-        if state::load::<C>(node.state_cell()) != NodeState::Failed {
+        if self.seen(node.state_cell(), state::load::<C>(node.state_cell())) != NodeState::Failed {
             return Err(Left);
         }
         // After the state, as a recycle bumps it before its new node lands.
@@ -289,16 +319,16 @@ impl<C: Cells> Runtime<C> {
         // With no frame on the thread, no walk's entry can hold the ticket
         // again, so it goes as its members are noted, rather than lent.
         let alone = (base == 0).then(|| {
-            let live: Vec<(u32, u32)> = c
+            let live: Vec<Stamped> = c
                 .members
                 .lock()
                 .members
                 .iter()
                 .filter(|m| m.gone == u64::MAX)
-                .map(|m| m.node)
+                .map(|m| (m.node, m.at))
                 .collect();
             note_work(live.len());
-            for n in &live {
+            for (n, _) in &live {
                 t.landings.remove(n);
             }
             live
@@ -311,7 +341,9 @@ impl<C: Cells> Runtime<C> {
         drop(t);
         let payload = payload.into_inner().unwrap_or_else(PoisonError::into_inner);
         match alone {
-            Some(nodes) => self.note_above(nodes.into_iter().map(|n| (n, 0)), &*payload, true),
+            Some(nodes) => {
+                self.note_above(nodes.into_iter().map(|(n, at)| (n, 0, at)), &*payload, true)
+            }
             None => {
                 let (rt, at) = (self.runtime_id, payload_key(&*payload));
                 with_notes(|n| n.push_lent(rt, at, base, members));
@@ -339,6 +371,15 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
         self.note_failed_run(id, generation, cidx, regenerable);
+        let stamp = if C::SINGLE_THREADED {
+            0
+        } else {
+            let mut t = self.tickets.write();
+            let stamp = t.next;
+            t.next += 1;
+            t.landed.insert(id.0, (generation, stamp));
+            stamp
+        };
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
@@ -349,7 +390,7 @@ impl<C: Cells> Runtime<C> {
                 // This landing replaces the node's earlier Failed landings,
                 // so no payload noted for them may hold the node again.
                 n.forget_node(rt, landing);
-                n.push(rt, at, cidx, landing, false);
+                n.push(rt, at, cidx, (landing, stamp), false);
             });
         } else if notes_held() {
             with_notes(|n| n.forget_node(rt, landing));
@@ -402,6 +443,7 @@ impl<C: Cells> Runtime<C> {
     /// landings `payload` made there hold it for their first read. Another
     /// payload's notes at `cidx` are the reading frame's, as at a landing.
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
+        self.park(ParkPoint::BeforeContain);
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
         self.retire_copies(&Retire::Contained { cidx, payload: at });
         let (nodes, lent) = if notes_held() {
@@ -420,7 +462,7 @@ impl<C: Cells> Runtime<C> {
     /// read took leaves that ticket.
     fn hold(
         &self,
-        mut nodes: Vec<(u32, u32)>,
+        mut nodes: Vec<Stamped>,
         lent: Vec<Arc<Members>>,
         payload: Box<dyn Any + Send>,
     ) -> Option<Box<dyn Any + Send>> {
@@ -434,10 +476,14 @@ impl<C: Cells> Runtime<C> {
             .filter_map(|m| t.lent.remove(&m.id).map(|c| (m.id, c)))
             .collect();
         note_work(nodes.len() + taken.len());
-        nodes.retain(|&(slot, generation)| {
+        nodes.retain(|&((slot, generation), stamp)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
-                && self.in_failed_landing(slot)
+                && (C::SINGLE_THREADED || t.landed.get(&slot) == Some(&(generation, stamp)))
+                && self.in_failed_landing(
+                    slot,
+                    self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
+                )
                 && t.of((slot, generation))
                     .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
         });
@@ -461,11 +507,16 @@ impl<C: Cells> Runtime<C> {
             for m in members.members.iter().filter(|m| m.gone == u64::MAX) {
                 let j = t.landings[&m.node];
                 debug_assert_eq!(j.ticket, other);
-                nodes.push(m.node);
+                nodes.push((m.node, m.at));
                 t.landings.remove(&m.node);
             }
         }
-        for n in nodes {
+        let pushed_from = if cfg!(test) {
+            ticket.members.lock().members.len()
+        } else {
+            0
+        };
+        for (n, stamp) in nodes {
             if let Some((j, _)) = t.of(n) {
                 t.leave(j, at);
             }
@@ -473,6 +524,7 @@ impl<C: Cells> Runtime<C> {
                 let mut joined = ticket.members.lock();
                 joined.members.push(crate::notes::Member {
                     node: n,
+                    at: stamp,
                     gone: u64::MAX,
                 });
                 joined.members.len() as u32 - 1
@@ -488,7 +540,7 @@ impl<C: Cells> Runtime<C> {
             ticket.live += 1;
         }
         if cfg!(test) {
-            self.check_members(&t, id, &ticket);
+            self.check_members(&t, id, &ticket, pushed_from);
         }
         if ticket.live == 0 {
             self.sync_held(&t);
@@ -500,11 +552,12 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Whether `slot`'s node is in its Failed landing: Failed, or Computing
-    /// under a regenerating run, which lands nothing and puts it back. Exact
-    /// under the tickets lock, under which a rerun moves it and marks it.
-    fn in_failed_landing(&self, slot: u32) -> bool {
-        match state::load::<C>(self.nodes.get(slot).state_cell()) {
+    /// Whether `slot`'s node, in `state` as this thread sees it, is in its
+    /// Failed landing: Failed, or Computing under a regenerating run, which
+    /// lands nothing and puts it back. Exact under the tickets lock, under
+    /// which a rerun moves it and marks it.
+    fn in_failed_landing(&self, slot: u32, state: NodeState) -> bool {
+        match state {
             NodeState::Failed => true,
             NodeState::Computing | NodeState::ComputingDirty => {
                 crate::replay::is_regen_running(self.runtime_id, slot)
@@ -513,28 +566,65 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// [`Self::in_failed_landing`] for `slot`'s node of `generation`. The
+    /// write hold excludes a rerun, which moves the node and marks it under a
+    /// read hold.
+    pub(super) fn failed_landing_of(&self, slot: u32, generation: u32) -> bool {
+        let _t = self.tickets.write();
+        let node = self.nodes.get(slot);
+        node.generation() == generation
+            && self.in_failed_landing(
+                slot,
+                self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
+            )
+    }
+
     /// Every landing a ticket keeps is in its Failed landing and indexed to
-    /// it: every change from that landing releases it.
-    fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {
+    /// it: every change from that landing releases it. A ticket of more
+    /// than [`FULL_CHECK_MEMBERS`] is walked whole, count included, only
+    /// when this hold took it past a power of two, and otherwise has only
+    /// the members from `pushed_from` on checked: a ticket that grows by a
+    /// landing per hold costs a test build linear work, as it does a
+    /// user's, and a member gone stale is seen within one doubling.
+    fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket, pushed_from: usize) {
         let members = ticket.members.lock();
-        let live = members.members.iter().filter(|m| m.gone == u64::MAX);
+        let len = members.members.len();
+        let full =
+            len <= FULL_CHECK_MEMBERS || pushed_from == 0 || pushed_from.ilog2() != len.ilog2();
+        let from = if full { 0 } else { pushed_from };
+        crate::replay::ticket_checks(len - from);
+        let live = members.members[from..]
+            .iter()
+            .filter(|m| m.gone == u64::MAX);
         let mut n = 0;
         for m in live {
             n += 1;
             let node = self.nodes.get(m.node.0);
+            // Another thread's held landing shows Computing here until its
+            // publication, which releases what it does not land Failed.
             assert!(
                 node.generation() == m.node.1
-                    && self.in_failed_landing(m.node.0)
+                    && (node.held_mark()
+                        || self.in_failed_landing(
+                            m.node.0,
+                            self.seen_quietly(
+                                node.state_cell(),
+                                state::load::<C>(node.state_cell()),
+                            ),
+                        ))
                     && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
         }
-        assert_eq!(n, ticket.live, "incr-core: a ticket counts its landings");
+        if full {
+            assert_eq!(n, ticket.live, "incr-core: a ticket counts its landings");
+        }
     }
 
     /// A set's walk flips `id` from Failed to Dirty, under the tickets'
     /// lock: a `hold` of the landing either precedes the flip, which then
-    /// releases its ticket, or sees the node Dirty and holds nothing. The
+    /// releases its ticket, or sees the node Dirty, or Failed in a later
+    /// landing with another stamp (`Tickets::landed`), and holds nothing. The
     /// payloads it alone kept wait with the buried ones until the walk has
     /// flagged every dependent. False if the state moved first.
     #[cold]
@@ -573,6 +663,244 @@ impl<C: Cells> Runtime<C> {
         true
     }
 
+    /// A retraction lands the held Failed landings of `slots` unrun: their
+    /// tickets let go of them as a flip's do.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn release_retracted(&self, slots: &[u32], bag: &mut Deferred<C>) {
+        if slots.is_empty() || !self.tickets_held() {
+            return;
+        }
+        let mut t = self.tickets.write();
+        let mut stale = Vec::new();
+        for &slot in slots {
+            stale.extend(release(&mut t, u64::MAX, slot_landings(slot)));
+        }
+        self.sync_held(&t);
+        drop(t);
+        defer(stale, bag);
+    }
+
+    /// Before `id` lands Failed over `deps`. A set's walk stops at a Dirty
+    /// dep, whose dependents the walk that made it Dirty flagged; a dep a
+    /// caught panic left Dirty had no such walk. The landing is noted under
+    /// each such dep for the next walk that reaches it or a Dirty node below
+    /// it, where a walk from further down stops first (0x5c05), so it lasts
+    /// its revision and not past the dep's next change, except under
+    /// `Shared` for a set whose walk passed the dep before the note was
+    /// made. A dep is judged as this thread sees it, so a landing it holds
+    /// toward Dirty is noted, and so is one a set flagged while held, which
+    /// publishes as flagged, not as its target. A dep still Computing is
+    /// not noted: on
+    /// this thread it is an open cycle head the landing belongs to, and a
+    /// flip there reruns the caught cycle on every read (0x1daa).
+    /// Speculative landings are noted too: the take checks the node.
+    #[inline(always)]
+    pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
+        let past = |dep: NodeId| self.left_past(dep);
+        if deps.iter().any(|&(d, _)| past(d)) {
+            self.note_past(id, generation, deps, past);
+        }
+    }
+
+    /// A held Failed landing's new deps published Failed: their reverse
+    /// edges wait for its publication, so a set's flip of one reaches the
+    /// landing only through a note. Taken before the publish reads whether
+    /// they are settled: a flip before the note leaves the dep Dirty for
+    /// that read, and one after finds the note. A dep this thread holds
+    /// needs none, as no other thread reruns it before it publishes with
+    /// the landing, after every held edge is in.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_held_failed_deps(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        deps: &[(NodeId, u32)],
+    ) {
+        let failed: Vec<&(NodeId, u32)> = deps
+            .iter()
+            .filter(|&&(d, _)| self.nodes.get(d.0).state() == NodeState::Failed)
+            .collect();
+        if failed.is_empty() {
+            return;
+        }
+        let mut published: Vec<NodeId> = Vec::new();
+        node.for_each_dep(|d| published.push(d));
+        fn unpublished<'a, S: DepLookup + ?Sized>(
+            failed: Vec<&'a (NodeId, u32)>,
+            published: &S,
+        ) -> Vec<&'a (NodeId, u32)> {
+            failed
+                .into_iter()
+                .filter(|(d, _)| !published.has(*d))
+                .collect()
+        }
+        let new = if dep_set::needs_hashing(published.len(), failed.len()) {
+            unpublished(failed, &DepHashSet::new(&published))
+        } else {
+            unpublished(failed, published.as_slice())
+        };
+        if !new.is_empty() {
+            self.note_held(id, node.generation(), new.into_iter());
+        }
+    }
+
+    /// Notes `id` under `deps` as the reverse edges its publication installs
+    /// would reach it: only a walk that flips a dep takes it, and a walk
+    /// stopping below a dep reaches it through the dep's own notes, so no
+    /// scan below, which would flip it where the published landing stays.
+    #[cold]
+    #[inline(never)]
+    fn note_held<'a>(
+        &self,
+        id: NodeId,
+        generation: u32,
+        deps: impl Iterator<Item = &'a (NodeId, u32)>,
+    ) {
+        let mut t = self.tickets.write();
+        for &(dep, _) in deps {
+            let notes = t.past.entry(dep.0).or_default();
+            if !notes.contains(&(id.0, generation)) {
+                notes.push((id.0, generation));
+            }
+            self.failed_past.fetch_or(past_bit(dep.0), Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    fn left_past(&self, dep: NodeId) -> bool {
+        let cell = self.nodes.get(dep.0).state_cell();
+        let raw = state::load::<C>(cell);
+        raw == NodeState::ComputingDirty
+            || matches!(
+                self.seen_quietly(cell, raw),
+                NodeState::Dirty | NodeState::ComputingDirty
+            )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_past(
+        &self,
+        id: NodeId,
+        generation: u32,
+        deps: &[(NodeId, u32)],
+        past: impl Fn(NodeId) -> bool,
+    ) {
+        let mut t = self.tickets.write();
+        for &(dep, _) in deps.iter().filter(|&&(d, _)| past(d)) {
+            #[cfg(test)]
+            self.past_note_work.fetch_add(1, Relaxed);
+            let notes = t.past.entry(dep.0).or_default();
+            if !notes.contains(&(id.0, generation)) {
+                notes.push((id.0, generation));
+            }
+            self.failed_past.fetch_or(past_bit(dep.0), Relaxed);
+            self.scan_below(&mut t, dep);
+        }
+    }
+
+    /// Records, once per node until a take passes it, the deps below `dep`
+    /// a walk may stop at with the nodes that read them. A node scanned
+    /// before keeps the deps it had: its deps change only by a run, after a
+    /// set below it that a take on its way up ended.
+    fn scan_below(&self, t: &mut Tickets, dep: NodeId) {
+        let mut stack = vec![dep];
+        while let Some(node) = stack.pop() {
+            if !t.scanned.insert(node.0) {
+                continue;
+            }
+            self.nodes.get(node.0).for_each_dep(|below| {
+                if self.stops_walks(below) {
+                    #[cfg(test)]
+                    self.past_note_work.fetch_add(1, Relaxed);
+                    let above = t.above.entry(below.0).or_default();
+                    if !above.contains(&node.0) {
+                        above.push(node.0);
+                    }
+                    self.failed_past.fetch_or(past_bit(below.0), Relaxed);
+                    stack.push(below);
+                }
+            });
+        }
+    }
+
+    /// `id` installed a new dep list: if it was scanned, its Dirty deps are
+    /// scanned again, as `above` may lack its new ones and the notes above
+    /// it stand (a closure that reads by run count reruns a memo with no
+    /// set and no take).
+    #[inline(always)]
+    pub(super) fn deps_installed(&self, id: u32) {
+        if self.failed_past.load(Relaxed) & past_bit(id) != 0 {
+            self.unscan(id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unscan(&self, id: u32) {
+        let mut t = self.tickets.write();
+        if t.scanned.remove(&id) {
+            self.scan_below(&mut t, NodeId(id));
+        }
+    }
+
+    /// A node below a noted dep that a later walk may stop at: Dirty, or
+    /// still Computing, which a budget's unwind lands Dirty before the
+    /// unbounded run's landing does, so the scans of both agree (0x9593).
+    fn stops_walks(&self, dep: NodeId) -> bool {
+        state::load::<C>(self.nodes.get(dep.0).state_cell()) == NodeState::Computing
+            || self.left_past(dep)
+    }
+
+    /// Recounts the bits only while few slots are noted, so a take stays
+    /// within the entries it removes; past that the bits stay a superset.
+    fn sync_past(&self, t: &Tickets) {
+        if t.past.len() + t.above.len() > 64 {
+            return;
+        }
+        let bits =
+            (t.past.keys().chain(t.above.keys())).fold(0, |bits, &slot| bits | past_bit(slot));
+        self.failed_past.store(bits, Relaxed);
+    }
+
+    /// A set's walk reached `dep`: queues the landings noted over it that
+    /// are still Failed, or still Computing toward a Failed landing, which
+    /// the walk then flags so that it lands Dirty.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn take_past_sets(&self, dep: NodeId, queue: &mut Vec<NodeId>) {
+        let noted = |t: &Tickets| t.past.contains_key(&dep.0) || t.above.contains_key(&dep.0);
+        if !noted(&self.tickets.read()) {
+            return;
+        }
+        let mut t = self.tickets.write();
+        if !noted(&t) {
+            return;
+        }
+        let mut notes = Vec::new();
+        let mut up = vec![dep.0];
+        while let Some(slot) = up.pop() {
+            t.scanned.remove(&slot);
+            notes.extend(t.past.remove(&slot).into_iter().flatten());
+            up.extend(t.above.remove(&slot).into_iter().flatten());
+        }
+        self.sync_past(&t);
+        drop(t);
+        for (id, generation) in notes {
+            let node = self.nodes.get(id);
+            if node.generation() == generation
+                && matches!(
+                    state::load::<C>(node.state_cell()),
+                    NodeState::Failed | NodeState::Computing | NodeState::ComputingDirty
+                )
+            {
+                queue.push(NodeId(id));
+            }
+        }
+    }
+
     /// After a set's walk: drops the tickets its flips released.
     #[inline(always)]
     pub(super) fn drop_released_tickets(&self) {
@@ -598,6 +926,15 @@ impl<C: Cells> Runtime<C> {
         defer(self.release_left(id, mark), bag);
     }
 
+    /// A mark for [`Self::left_failed_landing`] that leaves the tickets
+    /// joined from here on, which a later landing's readers took.
+    pub(super) fn ticket_mark(&self) -> u64 {
+        if !self.tickets_held() {
+            return 0;
+        }
+        self.tickets.read().next
+    }
+
     fn release_left(&self, id: NodeId, mark: u64) -> Vec<Ticket> {
         let mut t = self.tickets.write();
         let stale = release(&mut t, mark, slot_landings(id.0));
@@ -612,6 +949,9 @@ impl<C: Cells> Runtime<C> {
         if self.tickets_held() {
             self.bury(slot, generation);
         }
+        if self.failed_past.load(Relaxed) & past_bit(slot) != 0 {
+            self.bury_past(slot);
+        }
         if self.regens_held.load(Relaxed) {
             self.forget_failed_run(slot, generation);
         }
@@ -623,6 +963,16 @@ impl<C: Cells> Runtime<C> {
         let mut t = self.tickets.write();
         let stale = release(&mut t, u64::MAX, (slot, generation)..=(slot, generation));
         t.buried.extend(stale);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bury_past(&self, slot: u32) {
+        let mut t = self.tickets.write();
+        t.scanned.remove(&slot);
+        if t.past.remove(&slot).is_some() | t.above.remove(&slot).is_some() {
+            self.sync_past(&t);
+        }
     }
 
     /// A delete's bag drains: drops the tickets its deletes buried, and
@@ -646,6 +996,7 @@ impl<C: Cells> Runtime<C> {
             self.sync_held(&t);
             buried
         };
+        let _drops = (!C::SINGLE_THREADED).then(|| crate::attempt::Outside::enter(true));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(buried))).err()
     }
 
@@ -673,7 +1024,7 @@ impl<C: Cells> Runtime<C> {
     /// Notes each of `nodes` at its depth above the reading frame.
     fn note_above(
         &self,
-        nodes: impl IntoIterator<Item = ((u32, u32), u32)>,
+        nodes: impl IntoIterator<Item = Landed>,
         payload: &(dyn Any + Send),
         restorable: bool,
     ) {
@@ -687,8 +1038,8 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         with_notes(|n| {
-            for (node, depth) in nodes {
-                n.push(rt, at, base + depth, node, restorable);
+            for (node, depth, stamp) in nodes {
+                n.push(rt, at, base + depth, (node, stamp), restorable);
             }
         });
     }
@@ -698,7 +1049,16 @@ impl<C: Cells> Runtime<C> {
     /// the retry's later pops retire the deeper ones as the unbounded
     /// run's do.
     pub(super) fn note_delivered(&self, nodes: Landings, payload: &(dyn Any + Send)) {
-        self.note_above(nodes.into_nodes(), payload, false);
+        let Some(copy) = nodes.as_shared() else {
+            self.note_above(nodes.into_nodes(), payload, false);
+            return;
+        };
+        let (rt, base, at) = (
+            self.runtime_id,
+            self.dep_stack.next_cidx(),
+            payload_key(payload),
+        );
+        with_notes(|n| n.note_copy(rt, at, base, copy));
     }
 
     /// A delivery keeps a copy of `payload` for a frame's retry while

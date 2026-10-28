@@ -851,9 +851,10 @@ local_and_shared!(
     shared_unwind_out_of_an_entry
 );
 
-/// T reads F, F reads w and U, and once c is 1 U reads F: with `u_panics`
-/// F takes a fallback and U panics after reading it, otherwise the cycle
-/// panics at depth 0. Below budget 2 U's virtual hit claims F, Dirty from
+/// T reads F, F reads w and U, and once c is 1 U reads F. With `u_panics`
+/// F takes a fallback and U panics after reading it; otherwise F has no
+/// fallback. T's walk runs U as F's dep, before F's closure, so either way
+/// the cycle reaches the read. Below budget 2 U's virtual hit claims F, Dirty from
 /// its first revision, and U's entry's unwind releases that claim with
 /// the discard landing. What every read and later set lands is the
 /// unbounded run's.
@@ -909,14 +910,7 @@ fn a_user_panic_releases_a_virtual_hit_claim<C: Cells>() {
         let Out::Panic(text) = &unbounded[1].0 else {
             panic!("{unbounded:?}")
         };
-        assert!(
-            text.contains(if u_panics {
-                "u boom"
-            } else {
-                "dependency cycle"
-            }),
-            "{text}"
-        );
+        assert!(text.ends_with("dependency cycle: 2, 3"), "{text}");
         assert_eq!(unbounded[3].0, Out::Value(8));
         for frames in [1, 2, 3] {
             assert_eq!(
@@ -2023,4 +2017,150 @@ local_and_shared!(
     member_try_get_in_caught_cycle_stays_new,
     local_member_try_get_in_caught_cycle_stays_new,
     shared_member_try_get_in_caught_cycle_stays_new
+);
+
+thread_local! {
+    static FAN_LAST: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(None) };
+    static FAN_FIRST: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A fan of one-text panics, each raising again the box the reader caught
+/// last, read by a frame over a chain deeper than the budget, so each
+/// retry delivers copies of one note log under different keys. The reader
+/// then raises again its last box, or its first one after the later
+/// retries, and an outer query catches it, before and after a `set` under
+/// the chain: every read and state is the unbounded run's. `dep` has the
+/// fan read the input, so the walk after the `set` raises the stashed
+/// boxes again, and `deep` puts the outer query over its own chain, so its
+/// frame's retry delivers the reader's box. Under Miri the grid shrinks to
+/// one width, budgets 1 and 3 and chains of 4, still deeper than the
+/// budget; at budget 1 each run must still deliver some box twice and the
+/// reader's box to the outer frame.
+fn reraised_fan_box_lands_as_unbounded<C: Cells>() {
+    let (widths, budgets, chain): (&[usize], &[u32], usize) = if cfg!(miri) {
+        (&[2], &[1, 3], 4)
+    } else {
+        (&[2, 3, 5], &[1, 2, 3, 8], 12)
+    };
+    let run = |frames: Option<u32>, n: usize, through: bool, first: bool, dep: bool, deep: bool| {
+        FAN_LAST.with(|b| b.borrow_mut().take());
+        FAN_FIRST.with(|b| b.borrow_mut().take());
+        let rt = runtime::<C>(frames);
+        let p = rt.create_input(0_u64);
+        let mut nodes = Vec::new();
+        let failing: Vec<Incr<u64>> = (0..n)
+            .map(|_| {
+                let f = rt.create_query_with(
+                    move |rt| -> u64 {
+                        if dep {
+                            rt.get(p);
+                        }
+                        let b = FAN_LAST.with(|b| b.borrow_mut().take());
+                        std::panic::resume_unwind(b.unwrap_or_else(|| Box::new("fan")))
+                    },
+                    replayable(),
+                );
+                nodes.push(f);
+                if through {
+                    let g = rt.create_query_with(move |rt| rt.get(f) + 1, replayable());
+                    nodes.push(g);
+                    g
+                } else {
+                    f
+                }
+            })
+            .collect();
+        let mut top = rt.create_query_with(move |rt| rt.get(p), replayable());
+        nodes.push(top);
+        for _ in 0..chain {
+            let below = top;
+            top = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+            nodes.push(top);
+        }
+        let reader = rt.create_query_with(
+            move |rt| {
+                for (i, &f) in failing.iter().enumerate() {
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                        if payload.is::<&'static str>() {
+                            let slot = if first && i == 0 {
+                                &FAN_FIRST
+                            } else {
+                                &FAN_LAST
+                            };
+                            slot.with(|b| *b.borrow_mut() = Some(payload));
+                        }
+                    }
+                }
+                let v = rt.get(top);
+                let slot = if first { &FAN_FIRST } else { &FAN_LAST };
+                if let Some(b) = slot.with(|b| b.borrow_mut().take()) {
+                    std::panic::resume_unwind(b);
+                }
+                v
+            },
+            replayable(),
+        );
+        nodes.push(reader);
+        let mut above = rt.create_query_with(move |rt| rt.get(p), replayable());
+        nodes.push(above);
+        for _ in 0..chain {
+            let below = above;
+            above = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+            nodes.push(above);
+        }
+        let outer = rt.create_query_with(
+            move |rt| {
+                let v = if deep { rt.get(above) } else { 0 };
+                v + catch_unwind(AssertUnwindSafe(|| rt.get(reader))).unwrap_or(1000)
+            },
+            replayable(),
+        );
+        nodes.push(outer);
+        let mut outs = vec![get(&rt, outer)];
+        let before = std::mem::take(&mut *rt.deliveries.lock().unwrap());
+        rt.set(p, 1);
+        outs.push(get(&rt, outer));
+        outs.push(get(&rt, nodes[0]));
+        outs.push(get(&rt, reader));
+        let states: Vec<NodeState> = nodes.iter().map(|&h| rt.state_of(h)).collect();
+        ((outs, states), before, [reader.slot(), outer.slot()])
+    };
+    let mut differ = Vec::new();
+    for &n in widths {
+        for through in [false, true] {
+            for (first, dep, deep) in (0..8).map(|i| (i & 1 != 0, i & 2 != 0, i & 4 != 0)) {
+                let (unbounded, ..) = run(None, n, through, first, dep, deep);
+                for &frames in budgets {
+                    let (bounded, delivered, [reader, outer]) =
+                        run(Some(frames), n, through, first, dep, deep);
+                    if frames == 1 {
+                        let fan: Vec<_> = delivered.iter().filter(|d| !d.cycle).collect();
+                        let keys: std::collections::BTreeSet<_> =
+                            fan.iter().map(|d| (d.frame, d.read)).collect();
+                        assert!(
+                            fan.len() > keys.len()
+                                && fan.iter().any(|d| d.frame == outer && d.read == reader),
+                            "n {n} through {through} first {first} dep {dep} deep {deep}: \
+                             no box delivered twice or none to the outer frame: {delivered:?}"
+                        );
+                    }
+                    if bounded != unbounded {
+                        differ.push(format!(
+                            "n {n} through {through} first {first} dep {dep} deep {deep} \
+                             frames {frames}: \
+                             want {unbounded:?} got {bounded:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+local_and_shared!(
+    reraised_fan_box_lands_as_unbounded,
+    local_reraised_fan_box_lands_as_unbounded,
+    shared_reraised_fan_box_lands_as_unbounded
 );

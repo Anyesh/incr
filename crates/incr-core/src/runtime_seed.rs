@@ -55,6 +55,17 @@ impl<C: Cells> Runtime<C> {
                 return Err((err, value));
             }
         };
+        // A speculative run may have landed the node back New with a stash,
+        // which stands for the run the seed replaces. A stash that read it
+        // holds a value the seed replaces with no new revision, so the
+        // reshape count ends it.
+        if C::u32_load_relaxed(&self.stash_count) != 0 {
+            let mut bag = Deferred::new();
+            if self.drop_stash(id, q.generation(), &mut bag) {
+                C::u64_fetch_add(&self.reshapes, 1);
+            }
+            bag.drain_isolated();
+        }
         let arena = self
             .arenas
             .tagged_arena::<T>(node.type_tag())
@@ -129,9 +140,12 @@ impl<C: Cells> Runtime<C> {
         let id = NodeId(d.dep.slot());
         let dep = self.nodes.get(id.0);
         self.park(ParkPoint::SeedBeforeTrust(id));
-        let cur = state::load::<C>(dep.state_cell());
+        let raw = state::load::<C>(dep.state_cell());
+        let cur = self.seen(dep.state_cell(), raw);
+        // A landing this thread holds is its own, so it needs no RMW to
+        // read from.
         let held = matches!(cur, NodeState::Clean | NodeState::Dirty)
-            && state::try_transition::<C>(dep.state_cell(), cur, cur).is_ok()
+            && (cur != raw || state::try_transition::<C>(dep.state_cell(), cur, cur).is_ok())
             && dep.changed_at() == stamp;
         self.park(ParkPoint::SeedAfterTrust(id));
         held

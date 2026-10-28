@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -135,6 +139,7 @@ jobs:
           - { model: "loom_models::loom_cross_thread_cycle", bound: 2 }
           - { model: "loom_models::loom_wound_retry", bound: 2 }
           - { model: "loom_models::loom_wait_deregister", bound: 2 }
+          - { model: "loom_models::rested_reservation_owner_waits_in_the_engine", bound: 2 }
           - { model: "loom_models::table_miss_race_under_set", bound: 2 }
           - { model: "loom_models::table_hit_vs_publish", bound: 2 }
           - { model: "loom_models::table_hit_vs_remove_rehash", bound: 2 }
@@ -147,11 +152,54 @@ jobs:
           - { model: "loom_models::virtual_hit_claim_race", bound: 2 }
           - { model: "loom_models::doom_reservations_cross_direct", bound: 2 }
           - { model: "loom_models::doom_reservations_cross_held", bound: 2 }
+          - { model: "loom_models::walk_listing_passes_a_reader_its_read_joins", bound: 2 }
+          - { model: "loom_models::walk_listing_holds_an_earlier_reader_until_its_read_ends", bound: 2 }
+          - { model: "loom_models::doom_caught_joins_reader", bound: 2 }
+          - { model: "loom_models::doom_in_flight_race", bound: 2 }
+          - { model: "loom_models::doom_lazy_joins_reader", bound: 2 }
+          - { model: "loom_models::doom_lazy_reads_again", bound: 2 }
+          - { model: "loom_models::doom_lazy_end_races_take_over", bound: 2 }
+          - { model: "loom_models::doom_lazy_wound_before_raise", bound: 2 }
+          - { model: "loom_models::doom_lazy_take_over_during_user_panic", bound: 2 }
+          - { model: "loom_models::give_back_wait_ends_on_a_give_back", bound: 2 }
+          - { model: "loom_models::give_back_wait_ends_on_a_landing", bound: 2 }
+          - { model: "loom_models::give_back_wait_ends_when_a_take_over_keeps_the_claim", bound: 2 }
+          - { model: "loom_models::walk_listing_ends_where_its_read_enters_user_code", bound: 2 }
+          - { model: "loom_models::walk_listing_ends_at_its_nodes_settled_landing", bound: 2 }
           - { model: "loom_models::discard_under_set", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance", bound: 2 }
-          - { model: "loom_models::vframe_failed_provenance_relanded", bound: 2 }
+          # Bound 2 does not finish in 90 min. Bound 1 misses the race 77addc034
+          # fixed, whose owed-payload raise doom reservations make unreachable.
+          - { model: "loom_models::vframe_failed_provenance_relanded", bound: 1 }
           - { model: "loom_models::drain_vs_set", bound: 2 }
           - { model: "loom_models::flip_racing_a_contained_hold_releases_the_ticket", bound: 2 }
+          - { model: "loom_models::loom_held_landing_publishes_under_set", bound: 2 }
+          - { model: "loom_models::loom_held_group_record_precedes_state", bound: 2 }
+          - { model: "loom_models::loom_cross_runtime_held_wait", bound: 2 }
+          - { model: "loom_models::loom_held_episode_wound_retracts_values", bound: 2 }
+          - { model: "loom_models::loom_wound_overtakes_held_panic_landings", bound: 2 }
+          - { model: "loom_models::loom_own_landed_reread_matches_local", bound: 1 }
+          - { model: "loom_models::loom_released_group_members_stay_grouped_until_the_read_ends", bound: 2 }
+          - { model: "loom_models::loom_checked_read_vs_change", bound: 3 }
+          - { model: "loom_models::loom_speculative_changes_vs_check", bound: 3 }
+          - { model: "loom_models::loom_speculative_change_passes_check", bound: 3 }
+          - { model: "loom_models::loom_memo_ends_before_a_later_landings_changed_at", bound: 3 }
+          - { model: "loom_models::loom_memo_ends_before_another_threads_landings_changed_at", bound: 3 }
+          - { model: "loom_models::hand_over_races_publication", bound: 2 }
+          - { model: "loom_models::hand_over_races_reclaim", bound: 2 }
+          - { model: "loom_models::hand_over_waits_out_a_holder_that_progresses", bound: 2 }
+          - { model: "loom_models::a_read_joining_a_reader_of_a_cycle_below_it_finishes", bound: 2 }
+          - { model: "loom_models::hand_over_wounds_a_holder_that_joins_a_reader", bound: 2 }
+          - { model: "loom_models::hand_over_restarts_a_holder_boundedly", bound: 2 }
+          - { model: "loom_models::hand_over_races_publication_at_the_outermost_exit", bound: 2 }
+          - { model: "loom_models::hand_over_races_publication_at_a_first_entry_exit", bound: 2 }
+          - { model: "loom_models::hand_over_at_a_cycle_closed_on_the_stack", bound: 2 }
+          - { model: "loom_models::hand_over_at_a_cycle_caught_across_runtimes", bound: 2 }
+          - { model: "loom_models::hand_over_at_a_cycle_closed_under_another_runtimes_frame", bound: 2 }
+          - { model: "loom_models::hand_over_races_publication_of_a_ring_of_three_at_the_outermost_exit", bound: 2 }
+          - { model: "loom_models::hand_over_races_publication_of_a_ring_of_three_at_a_first_entry_exit", bound: 2 }
+          - { model: "loom_models::hand_over_races_a_failed_publication_at_the_outermost_exit", bound: 1 }
+          - { model: "loom_models::hand_over_races_a_failed_publication_at_a_first_entry_exit", bound: 1 }
           - { model: "loom_seed_models::seed_vs_set", bound: 2 }
           - { model: "loom_seed_models::seed_vs_dep_recompute", bound: 2 }
           - { model: "loom_seed_models::seed_vs_reader", bound: 2 }

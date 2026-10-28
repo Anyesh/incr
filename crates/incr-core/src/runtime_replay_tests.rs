@@ -2,13 +2,13 @@
 //! the bounds on runs and walks the plan's T8 tests set.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Runtime, DEFAULT_MAX_FRAMES};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_alone;
-use crate::cycle::{ComputeCtl, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
+use crate::cycle::{ComputeCtl, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
 use crate::cycle_state::{set_unwind_kind, unwind_kind, with_held, Held, UnwindKind};
 use crate::deferred::Deferred;
 use crate::dep_stack::DepStack;
@@ -462,6 +462,29 @@ fn the_unbudgeted_list_follows_the_budgets() {
     rt.set_max_frames(u32::MAX);
     drop(rt);
     assert!(!super::replay_impl::unbudgeted(id));
+}
+
+thread_local! {
+    static EXIT_DROPPED: Runtime<Local> = Runtime::new();
+}
+
+/// A runtime its thread's exit drops after `NOTE_DECIDED` is destroyed,
+/// which it is when the runtime's first budget change comes after its
+/// creation, still leaves the unbudgeted list.
+#[test]
+fn a_runtime_dropped_after_the_note_hook_leaves_the_list() {
+    let other = Runtime::<Local>::new();
+    other.set_max_frames(u32::MAX);
+    let id = std::thread::spawn(|| {
+        EXIT_DROPPED.with(|rt| {
+            rt.set_max_frames(u32::MAX);
+            rt.runtime_id
+        })
+    })
+    .join()
+    .unwrap();
+    assert!(!super::replay_impl::unbudgeted(id));
+    drop(other);
 }
 
 /// Races `set_max_frames(u32::MAX)` with a byte budget: another thread
@@ -976,14 +999,19 @@ fn native_graph_never_speculates<C: Cells>(rt: &Runtime<C>) {
     assert!(rt.dooms.lock().unwrap().is_empty());
 }
 
+// Its 51 native levels outgrow libtest's 2 MiB thread under TSan.
 #[test]
 fn local_native_graph_never_speculates() {
-    native_graph_never_speculates(&native_runtime::<Local>());
+    on_stack(16 << 20, || {
+        native_graph_never_speculates(&native_runtime::<Local>())
+    });
 }
 
 #[test]
 fn shared_native_graph_never_speculates() {
-    native_graph_never_speculates(&native_runtime::<Shared>());
+    on_stack(16 << 20, || {
+        native_graph_never_speculates(&native_runtime::<Shared>())
+    });
 }
 
 /// `c` and `e` are a cycle with no strategy, reached only by the
@@ -1061,6 +1089,61 @@ fn shared_speculative_cycle_is_recomputed() {
     speculative_cycle_is_recomputed::<Shared>(false);
     speculative_cycle_is_recomputed::<Shared>(true);
 }
+
+/// `c`, reached only by `r`'s speculative run, catches the cycle of `d`,
+/// which landed Cyclic alone before. The real claim of `c` runs its
+/// closure, as the unbounded run does, and does not adopt a stash of the
+/// speculative run: the attempt that catches a cycle notes it
+/// (`cycle_caught`).
+fn speculative_caught_cycle_is_rerun<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let d_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let d_of_d = d_cell.clone();
+    let d = rt.create_query_with(
+        move |rt| rt.try_get(*d_of_d.get().unwrap()).map_or(0, |v| v + 1),
+        replayable(),
+    );
+    d_cell.set(d).unwrap();
+    assert!(rt.try_get(d).is_err());
+    assert_eq!(rt.state_of(d), NodeState::Cyclic);
+    let runs = Arc::new([AtomicU32::new(0), AtomicU32::new(0)]);
+    let counted = runs.clone();
+    let c = rt.create_query_with(
+        move |rt| {
+            counted[usize::from(!rt.computing_speculative())].fetch_add(1, SeqCst);
+            rt.try_get(d).unwrap_or(7) + 1
+        },
+        replayable(),
+    );
+    let b = rt.create_query(|_| 5_u64);
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(runs[0].load(SeqCst), 1, "c ran speculatively");
+    assert_eq!(runs[1].load(SeqCst), 0);
+    assert_eq!(rt.get(c), 8);
+    assert_eq!(
+        runs[1].load(SeqCst),
+        1,
+        "the real claim of c adopted a stash over a caught cycle"
+    );
+}
+
+local_and_shared!(
+    speculative_caught_cycle_is_rerun,
+    local_speculative_caught_cycle_is_rerun,
+    shared_speculative_caught_cycle_is_rerun
+);
 
 /// `r`'s speculative run computes the replayable `p` over the Native `n`,
 /// which reads input `d`, and stashes both. `d` is deleted, so the real
@@ -1230,7 +1313,11 @@ fn adopted_write_panic_lands_failed<C: Cells>(replay: bool) {
     assert_eq!(rt.get(x).v, 1);
     rt.set(input, 2);
     assert_eq!(rt.get(r), 5);
-    assert_eq!(runs.load(SeqCst), 2);
+    // A Shared doomed frame raises its discard at a read that would
+    // compute, so no speculative run recomputes `x` and the real claim
+    // runs it.
+    let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
+    assert_eq!(runs.load(SeqCst), 1 + speculative);
     boom.store(true, SeqCst);
     let payload = catch_unwind(AssertUnwindSafe(|| rt.get(x))).expect_err("x panics");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"eq boom"));
@@ -1450,6 +1537,10 @@ fn doomed_value_drops<C: Cells>(frames: u32) -> (u32, u32, bool) {
 /// isolated or happens in a run that is discarded, so a panicking `Drop`
 /// reaches no read.
 fn replay_builds_and_drops<C: Cells>() {
+    // A Shared doomed frame runs on past its placeholder and builds its
+    // value, but raises its discard at a read that would compute, so no
+    // speculative run follows it.
+    let speculative = |n: u32| if C::SINGLE_THREADED { n } else { 0 };
     assert_eq!(doomed_value_drops::<C>(u32::MAX), (2, 0, false));
     assert_eq!(doomed_value_drops::<C>(1), (3, 1, false));
     for adopt in [false, true] {
@@ -1459,8 +1550,8 @@ fn replay_builds_and_drops<C: Cells>() {
             assert_eq!(
                 speculative_value_drops::<C>(1, adopt, keep),
                 (
-                    built + 1 + u32::from(!adopt),
-                    dropped + u32::from(!keep) + u32::from(!adopt),
+                    built + speculative(1 + u32::from(!adopt)),
+                    dropped + speculative(u32::from(!keep) + u32::from(!adopt)),
                     false
                 ),
                 "adopt {adopt}, keep {keep}"
@@ -1881,6 +1972,133 @@ local_and_shared!(
     shared_a_replaced_blocked_landing_drops_outside_the_contexts
 );
 
+/// Runs `f` on a context whose target, at level 0, is an entry of a
+/// query, with that entry.
+fn with_a_context<R>(f: impl FnOnce(&mut crate::replay::Context, crate::replay::Entry) -> R) -> R {
+    let rt = Runtime::<Shared>::new();
+    let q = rt.create_query(|_| 0_u64);
+    unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> crate::replay::KeyParts {
+        unreachable!()
+    }
+    let entry = crate::replay::Entry {
+        node: q.slot(),
+        generation: q.generation(),
+        suspect: false,
+        spec: false,
+        retry: crate::replay::Retry::Compute,
+        walked: false,
+        r5: false,
+    };
+    let id = crate::replay::open(
+        rt.runtime_id,
+        1,
+        entry,
+        crate::replay::FrameKeys {
+            owner: std::ptr::null(),
+            parts: no_parts,
+        },
+    );
+    let r = crate::replay::with(|c| f(c.iter_mut().find(|x| x.id == id).unwrap(), entry));
+    drop(crate::replay::close(id));
+    r
+}
+
+/// Whether the context queues an entry of a node before and after it pops
+/// the running entry of that node at `running`, with the target at level 0
+/// and one more entry of the node pushed at each of `pushed`.
+fn queues_around_the_running_entrys_pop(pushed: &[u32], running: u32) -> (bool, bool) {
+    with_a_context(|x, entry| {
+        for &level in pushed {
+            x.push_entry(level, entry);
+        }
+        x.run_entry(running, entry);
+        let before = x.queues(entry.node, entry.generation);
+        x.pop_entry(running);
+        (before, x.queues(entry.node, entry.generation))
+    })
+}
+
+/// The running entry is not one its node still owes, before or after its
+/// pop.
+#[test]
+fn the_running_entry_alone_leaves_its_node_unqueued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[], 0), (false, false));
+}
+
+/// The running entry of a node, once popped, does not hide another entry
+/// of the node queued below it: that entry still owes the node's run.
+#[test]
+fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[1], 1), (true, true));
+}
+
+/// Nor one queued behind it at its own level, now at that level's front.
+#[test]
+fn a_popped_running_entry_leaves_the_next_entry_of_its_node_queued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[0], 0), (true, true));
+}
+
+/// Truncating the levels above the running entry drops their entries of
+/// its node, and an entry at a level the truncation keeps stays queued.
+#[test]
+fn truncated_levels_leave_only_the_kept_entries_of_a_node_queued() {
+    let queued = with_a_context(|x, entry| {
+        x.push_entry(1, entry);
+        x.push_entry(3, entry);
+        x.run_entry(0, entry);
+        x.truncate_levels(2);
+        let kept = x.queues(entry.node, entry.generation);
+        x.truncate_levels(1);
+        (kept, x.queues(entry.node, entry.generation))
+    });
+    assert_eq!(queued, (true, false));
+}
+
+/// Pushes, pops and truncations after the first ask keep the answer in step
+/// with the levels.
+#[test]
+fn queued_entries_follow_the_levels_after_the_first_ask() {
+    let queued = with_a_context(|x, entry| {
+        x.push_entry(1, entry);
+        x.run_entry(0, entry);
+        let first = x.queues(entry.node, entry.generation);
+        x.push_entry(2, entry);
+        x.truncate_levels(2);
+        x.drop_oldest(0);
+        let popped = x.queues(entry.node, entry.generation);
+        x.truncate_levels(1);
+        (first, popped, x.queues(entry.node, entry.generation))
+    });
+    assert_eq!(queued, (true, true, false));
+}
+
+/// The count keys on node and generation: an entry of another node, or of
+/// the node at another generation, is not one of the running entry's.
+#[test]
+fn queued_entries_are_told_apart_by_node_and_generation() {
+    let queued = with_a_context(|x, entry| {
+        let other = crate::replay::Entry {
+            node: entry.node + 1,
+            ..entry
+        };
+        let later = crate::replay::Entry {
+            generation: entry.generation + 1,
+            ..entry
+        };
+        x.push_entry(1, other);
+        x.push_entry(1, later);
+        x.run_entry(0, entry);
+        let asked = (
+            x.queues(entry.node, entry.generation),
+            x.queues(other.node, other.generation),
+            x.queues(later.node, later.generation),
+        );
+        x.truncate_levels(1);
+        (asked, x.queues(other.node, other.generation))
+    });
+    assert_eq!(queued, ((false, true, true), false));
+}
+
 #[derive(Debug)]
 struct CustomPayload(u64);
 
@@ -1941,11 +2159,25 @@ fn custom_payload_shape<C: Cells>(
     rt.try_get(top_r).unwrap_or(7777)
 }
 
+/// The budgets a sweep tries for its next shape, counted in `case`: 1 to 8,
+/// or under Miri one of them, rotating with `case`, so a sweep of eight or
+/// more shapes still tries every budget.
+fn sweep_frames(case: &mut usize) -> std::ops::Range<u32> {
+    *case += 1;
+    if cfg!(miri) {
+        let frames = 1 + (*case % 8) as u32;
+        frames..frames + 1
+    } else {
+        1..9
+    }
+}
+
 /// A reader that catches a dep's custom panic payload, which the engine
 /// cannot copy for a retry, branches on it as the unbounded run does under
 /// every budget, the reader at the budget itself included.
 #[test]
 fn a_caught_custom_payload_survives_the_readers_retries() {
+    let mut case = 0;
     for d_replayable in [true, false] {
         for outer in [0, 1, 4] {
             for mid in [0, 1, 3] {
@@ -1960,7 +2192,7 @@ fn a_caught_custom_payload_survives_the_readers_retries() {
                     for local in [true, false] {
                         let want = shape(u32::MAX, local);
                         assert_eq!(want, 42_000 + 1 + u64::from(chain));
-                        for frames in 1..9 {
+                        for frames in sweep_frames(&mut case) {
                             assert_eq!(
                                 shape(frames, local),
                                 want,
@@ -2071,6 +2303,7 @@ fn failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32, fails: CFails
 /// cycle.
 #[test]
 fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
+    let mut case = 0;
     let counts = || {
         (
             super::replay_impl::THREAD_REGENERATIONS.with(std::cell::Cell::get),
@@ -2102,7 +2335,7 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
                         CFails::Before | CFails::ViaClean => 100,
                     };
                     assert_eq!(want, b * 1000 + 1 + u64::from(chain), "{fails:?}");
-                    for frames in 1..9 {
+                    for frames in sweep_frames(&mut case) {
                         assert_eq!(
                             shape(frames),
                             want,
@@ -2119,6 +2352,130 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
         if matches!(fails, CFails::Before | CFails::InB) {
             assert!(regens_after > regens, "{fails:?} regenerated nothing");
             assert_eq!(holds_after, holds, "{fails:?} held a reader");
+        }
+    }
+}
+
+/// Under `Shared`, after the root reads the fallback cycle y, whose
+/// episode holds every landing to the read's exit: c deletes x, a node
+/// the thread holds, and panics with a custom payload; b catches it and
+/// panics with its own, which r catches as in [`failed_dep_shape`]. The
+/// delete reads x's held landing, so c's Failed landing is held though
+/// its run read no held value. Returns the root's value, the states a
+/// second thread saw for c at each regeneration's rerun of c, and c's
+/// state after the read.
+fn held_failed_after_a_delete(
+    frames: u32,
+    outer: u32,
+    chain: u32,
+) -> (u64, Vec<NodeState>, NodeState) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    rt.set_placeholder(0_u64);
+    let i = rt.create_input(1_u64);
+    let z_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let z_read = Arc::clone(&z_cell);
+    let y = rt.create_query_with(
+        move |rt: &Runtime<Shared>| rt.get(*z_read.get().unwrap()) + 1,
+        QueryOpts {
+            cycle: CycleStrategy::fallback(|_: &Cycle| 100),
+            replay: Replay::Allowed,
+        },
+    );
+    let z = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(y) * 2, replayable());
+    z_cell.set(z).unwrap();
+    let x = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(y) + 1, replayable());
+    let gone = Arc::new(AtomicBool::new(false));
+    let deleted = Arc::clone(&gone);
+    let was_deleted = Arc::clone(&gone);
+    let c = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> u64 {
+            if !deleted.load(SeqCst) && rt.try_delete_node(x).is_ok() {
+                deleted.store(true, SeqCst);
+            }
+            std::panic::panic_any(CustomPayload(rt.get(i)))
+        },
+        replayable(),
+    );
+    rt.set_max_frames(frames);
+    let b = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> u64 {
+            let got = match catch_unwind(AssertUnwindSafe(|| rt.get(c))) {
+                Err(p) => p.downcast::<CustomPayload>().map_or(100, |x| x.0 + 10),
+                Ok(v) => v,
+            };
+            std::panic::panic_any(CustomPayload(got))
+        },
+        replayable(),
+    );
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let v = deep;
+        deep = rt.create_query_with(move |rt| rt.get(v) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut below = r;
+    for _ in 0..outer {
+        let v = below;
+        below = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    let top = rt.create_query_with(
+        move |rt| {
+            let _ = rt.get(y);
+            if !gone.load(SeqCst) {
+                let _ = rt.try_get(x);
+            }
+            rt.get(below)
+        },
+        replayable(),
+    );
+    let seen: Arc<Mutex<Vec<NodeState>>> = Arc::default();
+    // Weak, so the hook the runtime owns does not keep the runtime alive.
+    let (watch, watcher) = (Arc::downgrade(&rt), Arc::clone(&seen));
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == super::ParkPoint::RerunBack(NodeId(c.slot())) {
+            let rt = watch.upgrade().expect("the runtime parks its own hook");
+            let state = std::thread::spawn(move || rt.nodes.get(c.slot()).state())
+                .join()
+                .unwrap();
+            watcher.lock().unwrap().push(state);
+        }
+    }));
+    assert!(installed.is_ok());
+    let got = rt.try_get(top).unwrap_or(7777);
+    assert!(was_deleted.load(SeqCst), "c never deleted x");
+    let seen = seen.lock().unwrap().clone();
+    (got, seen, rt.state_of(c))
+}
+
+/// A held Failed landing is no regeneration's to rerun: no other thread
+/// sees c Failed before the read's exit publishes it, and the read ends
+/// with c Failed and the unbounded run's value under every budget.
+#[test]
+fn shared_held_failed_landing_is_never_rerun_before_its_publication() {
+    let mut case = 0;
+    for outer in [0, 1, 3] {
+        for chain in [0, 2, 6] {
+            let (want, _, state) = held_failed_after_a_delete(u32::MAX, outer, chain);
+            assert_eq!(state, NodeState::Failed);
+            for frames in sweep_frames(&mut case) {
+                let (got, seen, state) = held_failed_after_a_delete(frames, outer, chain);
+                let at = format!("outer={outer} chain={chain} frames={frames}");
+                assert_eq!(got, want, "{at}");
+                assert!(
+                    !seen.contains(&NodeState::Failed),
+                    "c Failed before the exit: {at} {seen:?}"
+                );
+                assert_eq!(state, NodeState::Failed, "{at}");
+            }
         }
     }
 }
@@ -2174,6 +2531,7 @@ fn cyclic_failed_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u64 {
 /// did.
 #[test]
 fn a_payload_after_a_virtual_cycle_read_reads_as_unbounded() {
+    let mut case = 0;
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
             for local in [true, false] {
@@ -2186,7 +2544,7 @@ fn a_payload_after_a_virtual_cycle_read_reads_as_unbounded() {
                 };
                 let want = shape(u32::MAX);
                 assert_eq!(want, 5001 + u64::from(chain));
-                for frames in 1..9 {
+                for frames in sweep_frames(&mut case) {
                     assert_eq!(
                         shape(frames),
                         want,
@@ -2263,12 +2621,13 @@ fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32, k0: u64
     (before, rt.try_get(top).unwrap_or(7777))
 }
 
-/// r sees b's payload after b's own run walked a cycle as the unbounded run's
-/// r did, at every budget. The unbounded r sees `CustomPayload(5)`, b's
-/// payload for the cycle, at every depth, as a fresh runtime with k set
-/// gives.
+/// r sees after the set what the unbounded run's r did, at every budget.
+/// The walk of b recomputes its stale dep y, whose cycle reaches the read
+/// (`Err`, 7777), as on main, where a fresh runtime with k set gives b's
+/// `CustomPayload(5)`: the stale-dep known limitation.
 #[test]
 fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
+    let mut case = 0;
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
             for local in [true, false] {
@@ -2280,14 +2639,10 @@ fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
                     }
                 };
                 let want = shape(u32::MAX, 0);
-                assert_eq!(
-                    want.1,
-                    shape(u32::MAX, 1).0,
-                    "the unbounded read is not the fresh one"
-                );
                 let chain = u64::from(chain);
-                assert_eq!(want, (6001 + chain, 5001 + chain));
-                for frames in 1..9 {
+                assert_eq!(shape(u32::MAX, 1).0, 5001 + chain, "fresh");
+                assert_eq!(want, (6001 + chain, 7777));
+                for frames in sweep_frames(&mut case) {
                     assert_eq!(
                         shape(frames, 0),
                         want,
@@ -2376,6 +2731,7 @@ fn recomputed_virtual_shape<C: Cells>(
 /// payload instead of given a regenerated one.
 #[test]
 fn a_payload_after_a_virtual_cycle_read_holds_its_reader() {
+    let mut case = 0;
     let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
     let before = holds();
     for fallback in [false, true] {
@@ -2390,7 +2746,7 @@ fn a_payload_after_a_virtual_cycle_read_holds_its_reader() {
                         }
                     };
                     let want = shape(u32::MAX);
-                    for frames in 1..9 {
+                    for frames in sweep_frames(&mut case) {
                         assert_eq!(
                             shape(frames),
                             want,
@@ -2545,6 +2901,7 @@ fn member_b<C: Cells>(rt: &Runtime<C>, i: Incr<u64>) -> Incr<u64> {
 /// member.
 #[test]
 fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
+    let mut case = 0;
     let counts = || {
         (
             super::replay_impl::THREAD_REGENERATIONS.with(std::cell::Cell::get),
@@ -2572,7 +2929,7 @@ fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
             for local in [true, false] {
                 assert_eq!(creating(u32::MAX, local), 11_001 + u64::from(chain));
                 assert_eq!(member(u32::MAX, local), 11_001 + u64::from(chain));
-                for frames in 1..9 {
+                for frames in sweep_frames(&mut case) {
                     let at = format!("local={local} outer={outer} chain={chain} frames={frames}");
                     let before = counts().1;
                     assert_eq!(
@@ -2606,6 +2963,7 @@ fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
 /// read a rerun of b makes as a read of a node of another runtime.
 #[test]
 fn a_payload_from_another_runtimes_node_holds_its_reader_past_the_budget() {
+    let mut case = 0;
     let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
     let before = holds();
     for outer in [0, 1, 3] {
@@ -2634,7 +2992,7 @@ fn a_payload_from_another_runtimes_node_holds_its_reader_past_the_budget() {
                 })
             };
             assert_eq!(shape(u32::MAX), 11_001 + u64::from(chain));
-            for frames in 1..9 {
+            for frames in sweep_frames(&mut case) {
                 assert_eq!(
                     shape(frames),
                     11_001 + u64::from(chain),
@@ -2710,6 +3068,7 @@ fn foreign_ticket_shape<C: Cells>(frames: u32, outer: u32, mid: u32, chain: u32)
 /// (201): b's run read another runtime, so its payload is not rebuilt by a
 /// rerun and r is held past the budget instead.
 fn a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded<C: Cells>() {
+    let mut case = 0;
     let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
     let before = holds();
     let mut differ = Vec::new();
@@ -2723,7 +3082,7 @@ fn a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded<C: Cells>()
                     "the unbounded run did not take the walk's payload: \
                      outer={outer} mid={mid} chain={chain}"
                 );
-                for frames in 1..9 {
+                for frames in sweep_frames(&mut case) {
                     let got = foreign_ticket_shape::<C>(frames, outer, mid, chain);
                     if got != want {
                         differ.push(format!(
@@ -2754,6 +3113,234 @@ fn shared_a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded() {
     a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded::<Shared>();
 }
 
+/// A lookup b makes that records no dependency.
+#[derive(Clone, Copy, Debug)]
+enum Lookup {
+    ForeignTable,
+    ForeignAlive,
+    OwnAlive,
+    ForeignCount,
+    OwnLabel,
+    ForeignForEach,
+    ForeignSnapshot,
+    OwnGraph,
+    ForeignCycle,
+    OwnTrace,
+    GroupCount,
+    GroupKeys,
+    GroupGet,
+    SortedSnapshot,
+    SortedLen,
+}
+
+/// `foreign_ticket_shape` with b's read of j replaced by `lookup`, one of
+/// the lookups that record no dependency, on b's own runtime or another.
+/// After the walk holds b's payload, the test thread flips the lookup's
+/// answer (an insert, a delete, a label or a cycle landing), which
+/// dirties nothing b reads; a rerun of b sees the new answer.
+fn lookup_ticket_shape<C: Cells>(
+    lookup: Lookup,
+    frames: u32,
+    outer: u32,
+    mid: u32,
+    chain: u32,
+) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let table = Arc::new(other.create_table::<u64, u64>());
+    let gone = other.create_input(0_u64);
+    let own_gone = rt.create_input(0_u64);
+    let coll = other.create_collection::<u64>();
+    let groups = Arc::new(coll.group_by(&other, |v| *v % 2));
+    let sorted = Arc::new(coll.sort_by_key(&other, |v| *v));
+    let closes = other.create_input(0_u64);
+    let loop_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let looped = {
+        let loop_cell = Arc::clone(&loop_cell);
+        other.create_query_with_fallback(
+            move |o| {
+                if o.get(closes) == 1 {
+                    o.get(*loop_cell.get().unwrap()) + 1
+                } else {
+                    0
+                }
+            },
+            |_: &Cycle| 100_u64,
+        )
+    };
+    assert!(loop_cell.set(looped).is_ok());
+    assert_eq!(other.get(looped), 0);
+    let other_nodes = other.node_count();
+    let i = rt.create_input(1_u64);
+    let k = rt.create_input(0_u64);
+    let (b_other, b_table, b_coll) = (Arc::clone(&other), Arc::clone(&table), coll.clone());
+    let (b_groups, b_sorted) = (Arc::clone(&groups), Arc::clone(&sorted));
+    let own_nodes = Arc::new(AtomicUsize::new(0));
+    let b_own_nodes = Arc::clone(&own_nodes);
+    let b = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let seen = match lookup {
+                Lookup::ForeignTable => b_table.get(&b_other, &3).is_some(),
+                Lookup::ForeignAlive => b_other.is_alive(gone),
+                Lookup::OwnAlive => rt.is_alive(own_gone),
+                Lookup::ForeignCount => b_other.node_count() == other_nodes,
+                Lookup::OwnLabel => rt.label(own_gone.slot()).is_none(),
+                Lookup::ForeignForEach => {
+                    let mut entries = 0;
+                    b_table.for_each(&b_other, |_, _| entries += 1);
+                    entries == 0
+                }
+                Lookup::ForeignSnapshot => b_coll.snapshot_len() == 0,
+                Lookup::OwnGraph => rt.graph_snapshot().iter().all(|n| n.label.is_none()),
+                Lookup::ForeignCycle => b_other.cycle_of(looped).is_none(),
+                Lookup::OwnTrace => rt.get_traced(i).1.total_nodes == b_own_nodes.load(Relaxed),
+                Lookup::GroupCount => b_groups.group_count() == 0,
+                Lookup::GroupKeys => b_groups.keys().is_empty(),
+                Lookup::GroupGet => b_groups.get_group(&1).is_none(),
+                Lookup::SortedSnapshot => b_sorted.snapshot().is_empty(),
+                Lookup::SortedLen => b_sorted.snapshot_len() == 0,
+            };
+            std::panic::panic_any(CustomPayload(100 * rt.get(i) + if seen { 1 } else { 5 }))
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt| if rt.get(k) == 0 { rt.get(b) } else { 7 },
+        replayable(),
+    );
+    own_nodes.store(rt.node_count(), Relaxed);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    rt.set(i, 2);
+    rt.set(k, 1);
+    assert_eq!(rt.get(x), 7);
+    match lookup {
+        Lookup::ForeignTable | Lookup::ForeignForEach => {
+            table.get_or_insert_input(&other, 3, || 0);
+        }
+        Lookup::ForeignAlive | Lookup::ForeignCount => other.delete_node(gone),
+        Lookup::OwnAlive | Lookup::OwnTrace => rt.delete_node(own_gone),
+        Lookup::OwnLabel | Lookup::OwnGraph => rt.set_label(own_gone.slot(), "seen".into()),
+        Lookup::ForeignCycle => {
+            other.set(closes, 1);
+            assert_eq!(other.get(looped), 100);
+        }
+        Lookup::ForeignSnapshot
+        | Lookup::GroupCount
+        | Lookup::GroupKeys
+        | Lookup::GroupGet
+        | Lookup::SortedSnapshot
+        | Lookup::SortedLen => {
+            coll.insert(&other, 1);
+            other.get(groups.version_node());
+            other.get(sorted.version_node());
+        }
+    }
+    let mut top_b = b;
+    for _ in 0..mid {
+        let v = top_b;
+        top_b = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let v = deep;
+        deep = rt.create_query_with(move |rt| rt.get(v) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(top_b))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut top = r;
+    for _ in 0..outer {
+        let v = top;
+        top = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    rt.try_get(top).unwrap_or(7777)
+}
+
+/// Every budget gives what the unbounded run gives for
+/// `lookup_ticket_shape`, which takes the walk's payload: 205 for the
+/// table miss, and 201 for the other lookups, made before their flip.
+/// Under Miri a slice of the shapes, in which each lookup still holds a
+/// reader of b past the budget.
+fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
+    let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
+    let (outers, mids, chains, budgets): (&[u32], &[u32], &[u32], _) = if cfg!(miri) {
+        (&[0, 3], &[1], &[2], 1..3)
+    } else {
+        (&[0, 1, 3, 8], &[0, 1, 3], &[0, 2, 6], 1..9)
+    };
+    let mut differ = Vec::new();
+    for (lookup, payload) in [
+        (Lookup::ForeignTable, 205_u64),
+        (Lookup::ForeignAlive, 201),
+        (Lookup::OwnAlive, 201),
+        (Lookup::ForeignCount, 201),
+        (Lookup::OwnLabel, 201),
+        (Lookup::ForeignForEach, 201),
+        (Lookup::ForeignSnapshot, 201),
+        (Lookup::OwnGraph, 201),
+        (Lookup::ForeignCycle, 201),
+        (Lookup::OwnTrace, 201),
+        (Lookup::GroupCount, 201),
+        (Lookup::GroupKeys, 201),
+        (Lookup::GroupGet, 201),
+        (Lookup::SortedSnapshot, 201),
+        (Lookup::SortedLen, 201),
+    ] {
+        let before = holds();
+        for &outer in outers {
+            for &mid in mids {
+                for &chain in chains {
+                    let want = lookup_ticket_shape::<C>(lookup, u32::MAX, outer, mid, chain);
+                    assert_eq!(
+                        want,
+                        payload * 1000 + 2 + u64::from(chain),
+                        "the unbounded run did not take the walk's payload: \
+                         {lookup:?} outer={outer} mid={mid} chain={chain}"
+                    );
+                    for frames in budgets.clone() {
+                        let got = lookup_ticket_shape::<C>(lookup, frames, outer, mid, chain);
+                        if got != want {
+                            differ.push(format!(
+                                "{lookup:?} outer={outer} mid={mid} chain={chain} \
+                                 frames={frames}: {got} != {want}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            holds() > before,
+            "{lookup:?}: no reader of b was held past the budget"
+        );
+    }
+    assert!(
+        differ.is_empty(),
+        "{} budgets differ from the unbounded run:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
+#[test]
+fn local_a_payload_after_an_unrecorded_lookup_reads_as_unbounded() {
+    a_payload_after_an_unrecorded_lookup_reads_as_unbounded::<Local>();
+}
+
+#[test]
+fn shared_a_payload_after_an_unrecorded_lookup_reads_as_unbounded() {
+    a_payload_after_an_unrecorded_lookup_reads_as_unbounded::<Shared>();
+}
+
 /// A value whose `Clone` reads node `j` of another runtime, a read that is
 /// no dependency of the node that clones it.
 struct ReadsOther {
@@ -2776,6 +3363,115 @@ impl PartialEq for ReadsOther {
     fn eq(&self, other: &Self) -> bool {
         self.seen == other.seen
     }
+}
+
+/// [`side_read`]'s shape with a replayable `c` that reads `v`, whose
+/// `Clone` reads j of another runtime (1), a held read no stash adoption
+/// checks. Once j moves to 2, `c` computes 12, as the unbounded run does,
+/// rather than adopt the speculative 11.
+fn speculative_value_code_foreign_read<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let jin = other.create_input(1_u64);
+    let j = other.create_query(move |o: &Runtime<Shared>| o.get(jin));
+    assert_eq!(other.get(j), 1);
+    let v = rt.create_input(ReadsOther {
+        other: Arc::clone(&other),
+        j,
+        seen: 0,
+    });
+    let b = rt.create_query(|_| 5_u64);
+    let c = rt.create_query_with(move |rt| rt.get(v).seen + 10, replayable());
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    other.set(jin, 2);
+    assert_eq!(other.get(j), 2);
+    assert_eq!(rt.get(c), 12);
+}
+
+local_and_shared!(
+    speculative_value_code_foreign_read,
+    local_speculative_value_code_foreign_read,
+    shared_speculative_value_code_foreign_read
+);
+
+/// [`side_read`]'s shape with `c` in an unbudgeted runtime `a`, read from
+/// `rt`'s doomed run, so `c`'s run there is speculative. `c` reads j of a
+/// third runtime, Dirty at that read when `dirty` is set (the framed
+/// foreign read), else Clean (settled by `c`'s keep resolver).
+/// Once j moves to 3, `c` computes 13, as the unbounded run does, rather
+/// than adopt its speculative run's value. That holds for the `Local`
+/// forms only: a `Shared` `rt`'s doomed run raises its discard at its read
+/// of `a`, so `c` runs no speculative run there and the last read is plain.
+fn unbudgeted_speculative_foreign_read<C: Cells>(dirty: bool) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let jin = other.create_input(1_u64);
+    let j = other.create_query(move |o: &Runtime<Shared>| o.get(jin));
+    assert_eq!(other.get(j), 1);
+    if dirty {
+        other.set(jin, 2);
+    }
+    let a = Arc::new(Runtime::<Shared>::new());
+    let o = Arc::clone(&other);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let c = a.create_query(move |_: &Runtime<Shared>| {
+        counted.fetch_add(1, SeqCst);
+        o.get(j) + 10
+    });
+    let b = rt.create_query(|_| 5_u64);
+    let reader = Arc::clone(&a);
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                reader.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
+    assert_eq!(runs.load(SeqCst), speculative, "c's speculative run");
+    other.set(jin, 3);
+    assert_eq!(other.get(j), 3);
+    assert_eq!(a.get(c), 13);
+}
+
+#[test]
+fn local_unbudgeted_speculative_clean_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Local>(false);
+}
+
+#[test]
+fn shared_unbudgeted_speculative_clean_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Shared>(false);
+}
+
+#[test]
+fn local_unbudgeted_speculative_dirty_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Local>(true);
+}
+
+#[test]
+fn shared_unbudgeted_speculative_dirty_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Shared>(true);
 }
 
 /// `foreign_ticket_shape` with b's read of j moved into value code: b
@@ -2812,12 +3508,13 @@ fn value_code_foreign_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u6
     );
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
     let armed = Arc::new(AtomicBool::new(false));
-    let (hook_armed, hook_other) = (Arc::clone(&armed), Arc::clone(&other));
+    // Weak: the hook lives in `other`, so a strong count would keep it alive.
+    let (hook_armed, hook_other) = (Arc::clone(&armed), Arc::downgrade(&other));
     let j_id = NodeId(j.slot());
     let installed = other.park_hook.set(Box::new(move |point| {
         if point == super::ParkPoint::ValueCodeBeforeReload(j_id) && hook_armed.swap(false, SeqCst)
         {
-            let o = Arc::clone(&hook_other);
+            let o = hook_other.upgrade().expect("the hook runs inside other");
             assert_eq!(std::thread::spawn(move || o.get(j)).join().unwrap(), 5);
         }
     }));
@@ -2857,6 +3554,7 @@ fn value_code_foreign_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u6
 /// `value_code_foreign_shape`: b's run read the other runtime from value
 /// code, so its payload is not rebuilt by a rerun.
 fn a_payload_after_a_value_code_foreign_read_reads_as_unbounded<C: Cells>() {
+    let mut case = 0;
     let mut differ = Vec::new();
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
@@ -2866,7 +3564,7 @@ fn a_payload_after_a_value_code_foreign_read_reads_as_unbounded<C: Cells>() {
                 205_002 + u64::from(chain),
                 "the unbounded run did not take the walk's payload: outer={outer} chain={chain}"
             );
-            for frames in 1..9 {
+            for frames in sweep_frames(&mut case) {
                 let got = value_code_foreign_shape::<C>(frames, outer, chain);
                 if got != want {
                     differ.push(format!(
@@ -2892,4 +3590,212 @@ fn local_a_payload_after_a_value_code_foreign_read_reads_as_unbounded() {
 #[test]
 fn shared_a_payload_after_a_value_code_foreign_read_reads_as_unbounded() {
     a_payload_after_a_value_code_foreign_read_reads_as_unbounded::<Shared>();
+}
+
+/// A top query at budget 1 reading New query c and, on c's placeholder,
+/// a chain of `n` replayable hops, each reading input j of another
+/// runtime Clean and then having a second thread set j before its next
+/// hop: the doomed top's speculative run of the chain stashes each hop
+/// over the stash of the hop it read, so every stash inherits reads of j
+/// at counts of their own. The longest foreign count list any stash kept,
+/// and the counts the stashes inherited.
+fn foreign_counts_under_interleaved_sets<C: Cells>(n: u64) -> (usize, usize) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let j = other.create_input(0_u64);
+    let sets = Arc::new(AtomicU32::new(0));
+    let mut head = rt.create_query_with(
+        {
+            let other = Arc::clone(&other);
+            move |_: &Runtime<C>| other.get(j)
+        },
+        replayable(),
+    );
+    for _ in 1..n {
+        let below = head;
+        let other = Arc::clone(&other);
+        let sets = Arc::clone(&sets);
+        head = rt.create_query_with(
+            move |rt| {
+                let seen = other.get(j);
+                let o = Arc::clone(&other);
+                let v = u64::from(sets.fetch_add(1, SeqCst)) + 1;
+                std::thread::spawn(move || o.set(j, v)).join().unwrap();
+                rt.get(below) + seen
+            },
+            replayable(),
+        );
+    }
+    let c = rt.create_query_with(|_| 1_u64, replayable());
+    let top = rt.create_query_with(
+        move |rt| if rt.get(c) % 2 == 0 { rt.get(head) } else { 0 },
+        replayable(),
+    );
+    let most = &super::replay_impl::THREAD_MOST_FOREIGN_COUNTS;
+    let inherited = &super::replay_impl::THREAD_INHERITED_FOREIGN_COUNTS;
+    most.with(|m| m.set(0));
+    inherited.with(|m| m.set(0));
+    assert_eq!(rt.get(top), 0);
+    (
+        most.with(std::cell::Cell::get),
+        inherited.with(std::cell::Cell::get),
+    )
+}
+
+/// A stash keeps one count per foreign runtime, however often that runtime
+/// changed between the reads it and its stashed deps made.
+fn a_stash_keeps_one_count_per_foreign_runtime<C: Cells>() {
+    for n in [4, 16, 64] {
+        let (most, inherited) = foreign_counts_under_interleaved_sets::<C>(n);
+        assert!(
+            inherited >= n as usize - 2,
+            "n={n}: the stashes inherited {inherited} counts"
+        );
+        assert_eq!(
+            most, 1,
+            "n={n}: a stash kept more counts than foreign runtimes"
+        );
+    }
+}
+
+#[test]
+fn local_a_stash_keeps_one_count_per_foreign_runtime() {
+    a_stash_keeps_one_count_per_foreign_runtime::<Local>();
+}
+
+#[test]
+fn shared_a_stash_keeps_one_count_per_foreign_runtime() {
+    a_stash_keeps_one_count_per_foreign_runtime::<Shared>();
+}
+
+/// A speculative frame that read a stash and then panics on a deleted
+/// handle pops with no stash, so nothing takes its stash reads; they end
+/// with the replay context, and none outlives the read.
+fn stash_reads_end_with_their_context<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let q = rt.create_query_with(|_: &Runtime<C>| 7_u64, replayable());
+    let gone = rt.create_input(1_u64);
+    rt.delete_node(gone);
+    let p = rt.create_query_with(
+        move |rt: &Runtime<C>| rt.get(q) + rt.get(gone),
+        replayable(),
+    );
+    let b = rt.create_query(|_: &Runtime<C>| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(p)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(reader), 5);
+    assert_eq!(rt.get(q), 7);
+    assert_eq!(crate::replay::spec_read_frames(), 0);
+}
+
+#[test]
+fn local_stash_reads_end_with_their_context() {
+    stash_reads_end_with_their_context::<Local>();
+}
+
+#[test]
+fn shared_stash_reads_end_with_their_context() {
+    stash_reads_end_with_their_context::<Shared>();
+}
+
+/// A speculative run's dead read counts as one reshape at the next creation
+/// made with no frame of the runtime active, a table miss included, and at
+/// none made inside a compute, where a run's own miss would end its stash.
+fn dead_reads_count_at_a_creation_outside_a_compute<C: Cells>(rt: &Runtime<C>)
+where
+    crate::table::NodeTable<u64, u64, C>: Send + Sync,
+{
+    let table = Arc::new(rt.create_table::<u64, u64>());
+    let inside = {
+        let table = table.clone();
+        rt.create_query(move |rt: &Runtime<C>| rt.get(table.get_or_insert_input(rt, 1, || 2)))
+    };
+    C::u64_fetch_add(&rt.dead_reads, 1);
+    let before = C::u64_load_relaxed(&rt.reshapes);
+    assert_eq!(rt.get(inside), 2);
+    assert_eq!(
+        C::u64_load_relaxed(&rt.reshapes),
+        before,
+        "a miss inside a compute"
+    );
+    let _ = table.get_or_insert_input(rt, 2, || 3);
+    assert_eq!(
+        C::u64_load_relaxed(&rt.reshapes),
+        before + 1,
+        "a miss outside"
+    );
+    let _ = rt.create_input(4_u64);
+    assert_eq!(
+        C::u64_load_relaxed(&rt.reshapes),
+        before + 1,
+        "counted once"
+    );
+}
+
+local_and_shared!(
+    dead_reads_count_at_a_creation_outside_a_compute,
+    local_dead_reads_count_at_a_creation_outside_a_compute,
+    shared_dead_reads_count_at_a_creation_outside_a_compute
+);
+
+/// A chain of `k` plain queries above a query with a cycle strategy, read
+/// once from the top, the shape of a deep spreadsheet column.
+fn deep_chain_read<C: Cells>(k: usize) -> i64 {
+    let rt = Runtime::<C>::new();
+    let on = rt.create_input(0_i64);
+    let root: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let m = {
+        let root = root.clone();
+        rt.create_query_with_fallback(
+            move |rt| match rt.get(on) {
+                0 => 0,
+                _ => rt.get(*root.get().unwrap()) + 1,
+            },
+            |_c: &Cycle| 100,
+        )
+    };
+    let mut top = rt.create_query(move |rt| rt.get(m) + rt.get(on));
+    for _ in 1..k {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below) + 1);
+    }
+    let r = rt.create_query(move |rt| rt.get(top));
+    root.set(r).unwrap();
+    rt.get(r)
+}
+
+/// 1,100 levels, a tenth over 1,000, fit a 2 MiB thread in a release
+/// build; a debug build's frames are many times larger, so it gets 128 MiB.
+fn deep_chain_fits_a_small_thread<C: Cells>() {
+    let stack = if cfg!(debug_assertions) {
+        128 << 20
+    } else {
+        2 << 20
+    };
+    on_stack(stack, || assert_eq!(deep_chain_read::<C>(1_100), 1_099));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_deep_chain_fits_a_small_thread() {
+    deep_chain_fits_a_small_thread::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_deep_chain_fits_a_small_thread() {
+    deep_chain_fits_a_small_thread::<Shared>();
 }

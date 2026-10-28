@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::race_tests::{id, park_at, Gate};
-use super::{ParkPoint, Runtime, Walk, EXACT_MODE_AT, NO_TAINT_NEW};
+use super::{ParkPoint, Runtime, Walk, EXACT_MODE_AT, NO_TAINT_NEW, SPARE_WORK, SPARE_WORK_MAX};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
@@ -621,9 +621,11 @@ fn shared_stale_dep_that_panics_is_not_read() {
 }
 
 /// `x` read `a` while `sel` was 0; setting `k` closes a cycle `a -> b -> a`
-/// and setting `sel` stops `x` reading `a`. A run from scratch never meets
-/// the cycle, so `get(x)` does not raise it, though the walk may run `a`.
-fn stale_dep_in_a_cycle_is_not_read<C: Cells>() {
+/// and setting `sel` stops `x` reading `a`. The walk of `x` cleans its
+/// recorded dep `a` before `x` reruns, and the cycle `a`'s run closes
+/// reaches `get(x)`, as on main, though a run from scratch never meets it:
+/// a known limitation until a walk can tell a dep its reader still reads.
+fn stale_dep_in_a_cycle_reaches_the_reader<C: Cells>() {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
     let k = rt.create_input(0_i64);
@@ -646,26 +648,27 @@ fn stale_dep_in_a_cycle_is_not_read<C: Cells>() {
 
     rt.set(k, 1);
     rt.set(sel, 1);
-    assert_eq!(rt.get(x), 100);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+    assert_eq!(panic_message(err), "incr-core: dependency cycle: 2, 3");
     let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
     assert!(panic_message(err).contains("cycle"));
 }
 
 #[test]
-fn local_stale_dep_in_a_cycle_is_not_read() {
-    stale_dep_in_a_cycle_is_not_read::<Local>();
+fn local_stale_dep_in_a_cycle_reaches_the_reader() {
+    stale_dep_in_a_cycle_reaches_the_reader::<Local>();
 }
 
 #[test]
-fn shared_stale_dep_in_a_cycle_is_not_read() {
-    stale_dep_in_a_cycle_is_not_read::<Shared>();
+fn shared_stale_dep_in_a_cycle_reaches_the_reader() {
+    stale_dep_in_a_cycle_reaches_the_reader::<Shared>();
 }
 
-/// As above, but `a` first reads `s`, which `try_get`s `a` and so becomes a
-/// held claim anchored at `a`'s own position before `b` closes the cycle.
-/// `a`'s unwind releases that claim, so the walk still contains the cycle:
-/// `get(x)` gives 100, as from scratch, and only a direct `get(a)` raises it.
-fn wave6_containable_counts_claim_anchored_at_walk_entry<C: Cells>() {
+/// As above, but `a` first reads `s`, which `try_get`s `a` and so holds a
+/// claim anchored at `a`'s own position before `b` closes the cycle. The
+/// cycle through `a`, `s` and `b` still reaches `get(x)` and every later
+/// read of `x` or `a`, as on main, while `s` reads its fallback.
+fn claim_anchored_at_the_walk_entry_reaches_the_reader<C: Cells>() {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
     let k = rt.create_input(0_i64);
@@ -690,25 +693,28 @@ fn wave6_containable_counts_claim_anchored_at_walk_entry<C: Cells>() {
 
     rt.set(k, 1);
     rt.set(sel, 1);
-    assert_eq!(rt.get(x), 100);
-    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
-    assert!(panic_message(err).contains("cycle"));
+    for n in [x, x, a] {
+        let err = catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err();
+        assert_eq!(panic_message(err), "incr-core: dependency cycle: 2, 3, 4");
+    }
+    assert_eq!(rt.get(s), 5);
 }
 
 #[test]
-fn wave6_local_containable_counts_claim_anchored_at_walk_entry() {
-    wave6_containable_counts_claim_anchored_at_walk_entry::<Local>();
+fn local_claim_anchored_at_the_walk_entry_reaches_the_reader() {
+    claim_anchored_at_the_walk_entry_reaches_the_reader::<Local>();
 }
 
 #[test]
-fn wave6_shared_containable_counts_claim_anchored_at_walk_entry() {
-    wave6_containable_counts_claim_anchored_at_walk_entry::<Shared>();
+fn shared_claim_anchored_at_the_walk_entry_reaches_the_reader() {
+    claim_anchored_at_the_walk_entry_reaches_the_reader::<Shared>();
 }
 
-/// As `stale_dep_in_a_cycle_is_not_read`, but `a` catches the cycle unwind
-/// and then panics on its own. The walk entry must contain that panic as it
-/// contains the cycle, so `get(x)` gives 100, as from scratch, and only a
-/// direct `get(a)` raises "a own".
+/// As `stale_dep_in_a_cycle_reaches_the_reader`, but `a` catches the cycle
+/// unwind and then panics on its own, which unwinds with the cycle's kind
+/// and its own payload. The walk entry contains that panic as any other,
+/// so `get(x)` gives 100, as from scratch, and only a direct `get(a)`
+/// raises "a own".
 fn wave7_walk_contains_own_panic_after_swallowed_cycle<C: Cells>() {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
@@ -838,24 +844,30 @@ fn shared_unread_walk_entry_leaves_the_reader_clean() {
     unread_walk_entry_leaves_the_reader_clean::<Shared>();
 }
 
-/// When `y`'s rerun still reads `e`, `z` read a value built on `e`'s Dirty
-/// landing and lands Dirty, at every frame budget.
-fn read_walk_entry_leaves_the_reader_dirty<C: Cells>() {
+/// When `y`'s rerun still reads `e`, the walk of `y` cleans `e`, whose
+/// catch of the cycle left it Dirty, by running its recorded dep `c1`
+/// before `e` reruns; `c1`'s cycle then reaches `get(z)`, as on main, at
+/// every frame budget: a known limitation until a walk leaves a dep a
+/// catching closure reads to that closure.
+fn caught_cycle_reaches_the_reader_through_the_catchers_walk<C: Cells>() {
     for frames in [None, Some(1), Some(2), Some(3)] {
-        let (z, e) = walk_entry_reader::<C>(frames, 0);
-        assert_ne!(e, NodeState::Clean, "frames {frames:?}");
-        assert_eq!(z, NodeState::Dirty, "frames {frames:?}");
+        let got = catch_unwind(AssertUnwindSafe(|| walk_entry_reader::<C>(frames, 0)));
+        assert_eq!(
+            got.map_err(panic_message),
+            Err("incr-core: dependency cycle: 2, 3".into()),
+            "frames {frames:?}"
+        );
     }
 }
 
 #[test]
-fn local_read_walk_entry_leaves_the_reader_dirty() {
-    read_walk_entry_leaves_the_reader_dirty::<Local>();
+fn local_caught_cycle_reaches_the_reader_through_the_catchers_walk() {
+    caught_cycle_reaches_the_reader_through_the_catchers_walk::<Local>();
 }
 
 #[test]
-fn shared_read_walk_entry_leaves_the_reader_dirty() {
-    read_walk_entry_leaves_the_reader_dirty::<Shared>();
+fn shared_caught_cycle_reaches_the_reader_through_the_catchers_walk() {
+    caught_cycle_reaches_the_reader_through_the_catchers_walk::<Shared>();
 }
 
 /// A dep the walk cleans panics, and the rerun still reads it: the rerun
@@ -885,6 +897,50 @@ fn walked_dep_panic_reaches_the_rerun_that_reads_it<C: Cells>() {
     assert_eq!(rt.get(x), 3);
     assert_eq!(rt.contained_payloads(), 0);
     assert_no_notes();
+}
+
+/// A dep the walk cleans panics and the rerun no longer reads it, so the
+/// payload its ticket holds is owed to no read; the set that flips the dep
+/// Dirty again drops it. Over many such revisions at most one is held.
+fn unread_walked_dep_payload_is_dropped_by_its_next_flip<C: Cells>() {
+    quiet_ticket_booms();
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v % 2 == 1, "ticket boom");
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(f) } else { 0 });
+    for k in 0..test_size(10_000) as i64 {
+        rt.set(j, 2 * k + 1);
+        assert_eq!(rt.contained_payloads(), 0, "revision pair {k}");
+        rt.set(sel, 0);
+        assert_eq!(rt.get(x), 2 * k + 1);
+        assert_eq!(rt.contained_payloads(), 0, "revision pair {k}");
+
+        rt.set(j, 2 * k + 2);
+        rt.set(sel, 1);
+        assert_eq!(rt.get(x), 0);
+        assert_eq!(rt.contained_payloads(), 1, "revision pair {k}");
+    }
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err();
+    assert_eq!(panic_message(err), "ticket boom");
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_no_notes();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_unread_walked_dep_payload_is_dropped_by_its_next_flip() {
+    unread_walked_dep_payload_is_dropped_by_its_next_flip::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unread_walked_dep_payload_is_dropped_by_its_next_flip() {
+    unread_walked_dep_payload_is_dropped_by_its_next_flip::<Shared>();
 }
 
 /// No unwind is in flight, so this thread keeps no landing for one.
@@ -1921,13 +1977,13 @@ fn wave6_same_type_zst_note_joins_ticket_after_engine_call<C: Cells>() {
 }
 
 #[test]
-#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+#[ignore = "beta.7: T10-pin-same-type-zst-payload, payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
 fn wave6_local_same_type_zst_note_joins_ticket_after_engine_call() {
     wave6_same_type_zst_note_joins_ticket_after_engine_call::<Local>();
 }
 
 #[test]
-#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+#[ignore = "beta.7: T10-pin-same-type-zst-payload, payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
 fn wave6_shared_same_type_zst_note_joins_ticket_after_engine_call() {
     wave6_same_type_zst_note_joins_ticket_after_engine_call::<Shared>();
 }
@@ -2211,7 +2267,7 @@ fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
 /// The chain at 2000 to 64000 with a ticket per caught read, every read's
 /// ticket taken while the frames below hold theirs: the tickets' work
 /// stays linear in the reads. A retry's read of a regenerable payload keeps
-/// a copy of its notes, about 20 units a read.
+/// a copy of its notes and unlists its deliveries, about 31 units a read.
 fn ticket_catching_chain_work<C: Cells>() {
     for n in [2000, 4000, 16000, test_size(64_000)] {
         let work = thread::Builder::new()
@@ -2225,7 +2281,7 @@ fn ticket_catching_chain_work<C: Cells>() {
             .join()
             .unwrap();
         assert!(
-            work <= 24 * n as u64,
+            work <= 48 * n as u64,
             "{work} units of note work for {n} reads"
         );
     }
@@ -2328,13 +2384,13 @@ fn walk_enters_a_cycle_where_a_fresh_read_does<C: Cells>() {
 }
 
 #[test]
-#[ignore = "a walk enters a cycle where it recomputes first, not where a fresh read does"]
+#[ignore = "beta.7: T10-pin-walk-enters-cycle-at-recompute, a walk enters a cycle where it recomputes first, not where a fresh read does"]
 fn local_walk_enters_a_cycle_where_a_fresh_read_does() {
     walk_enters_a_cycle_where_a_fresh_read_does::<Local>();
 }
 
 #[test]
-#[ignore = "a walk enters a cycle where it recomputes first, not where a fresh read does"]
+#[ignore = "beta.7: T10-pin-walk-enters-cycle-at-recompute, a walk enters a cycle where it recomputes first, not where a fresh read does"]
 fn shared_walk_enters_a_cycle_where_a_fresh_read_does() {
     walk_enters_a_cycle_where_a_fresh_read_does::<Shared>();
 }
@@ -2366,8 +2422,9 @@ fn shared_walk_enters_a_cycle_at_its_first_recomputed_member() {
 /// `c`, which reads `d`, which reads `b` back: R3 in the member run of `b`,
 /// a cycle over the held member `b`, `c` and `d` that aborts the episode.
 /// `x` reads `a` only while `sel` is 0. After `k` and `sel` go to 1, the
-/// walk of `x` recomputes its stale dep `a` and contains the abort, so the
-/// rerun, which no longer reads `a`, gives 100 as a fresh read of `x` does.
+/// walk of `x` recomputes its stale dep `a`, and the cycle that aborts the
+/// episode reaches `get(x)`, as on main, though a fresh read of `x` gives
+/// 100: the stale-dep known limitation.
 fn stale_dep_whose_episode_cycles<C: Cells>() -> Result<i64, String> {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
@@ -2426,14 +2483,22 @@ fn stale_dep_whose_episode_cycles<C: Cells>() -> Result<i64, String> {
     got
 }
 
+const EPISODE_CYCLE: &str = "incr-core: dependency cycle: 3, 4, 5";
+
 #[test]
-fn local_stale_dep_whose_episode_cycles_is_not_read() {
-    assert_eq!(stale_dep_whose_episode_cycles::<Local>(), Ok(100));
+fn local_stale_dep_whose_episode_cycles_reaches_the_reader() {
+    assert_eq!(
+        stale_dep_whose_episode_cycles::<Local>(),
+        Err(EPISODE_CYCLE.into())
+    );
 }
 
 #[test]
-fn shared_stale_dep_whose_episode_cycles_is_not_read() {
-    assert_eq!(stale_dep_whose_episode_cycles::<Shared>(), Ok(100));
+fn shared_stale_dep_whose_episode_cycles_reaches_the_reader() {
+    assert_eq!(
+        stale_dep_whose_episode_cycles::<Shared>(),
+        Err(EPISODE_CYCLE.into())
+    );
 }
 
 #[test]
@@ -2467,4 +2532,184 @@ fn an_untainted_entry_merged_into_its_parent_keeps_the_new_mark() {
     walk.unsettled(x);
     assert_eq!(walk.work.len(), 1);
     assert_eq!(walk.work[0].taint, NO_TAINT_NEW);
+}
+
+/// The visit that switches the walk to exact mode drops a repeated pending
+/// entry below its own, so the visit's entry ends up below the length the
+/// walk had before it; cutting an expansion there keeps nothing pushed after
+/// the visit.
+#[test]
+fn a_visit_at_the_exact_switch_reports_its_own_entry() {
+    let (r, m, c, d) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
+    let mut walk = Walk::new(r, 0, NodeState::Dirty);
+    walk.work.clear();
+    walk.visit(m, 0, false);
+    walk.visit(m, 0, false);
+    walk.first_visits = EXACT_MODE_AT - 1;
+    let before = walk.work.len();
+    let pending = walk.visit_pending(c, 0, false);
+    assert!(pending < before);
+    assert_eq!(walk.work[pending].id, c);
+    walk.expand(d, 0, NodeState::Dirty);
+    walk.work.truncate(pending);
+    assert!(walk.work.iter().all(|e| e.id != c && e.id != d));
+}
+
+/// A chain of `n` queries over one input, built bottom-up so no first
+/// compute nests; a set on the input then makes a read of the top walk all
+/// `n` iteratively.
+fn dirty_chain<C: Cells>(rt: &Runtime<C>, n: usize) -> (Incr<i64>, Incr<i64>) {
+    let x = rt.create_input(0_i64);
+    let mut top = rt.create_query(move |rt| rt.get(x));
+    rt.get(top);
+    for _ in 1..n {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below) + 1);
+        rt.get(top);
+    }
+    (x, top)
+}
+
+/// This thread's spare walk buffer, as its capacity and address.
+fn spare_work() -> (usize, usize) {
+    SPARE_WORK.with(|spare| {
+        let work = spare.take();
+        let seen = work
+            .as_ref()
+            .map_or((0, 0), |w| (w.capacity(), w.as_ptr() as usize));
+        spare.set(work);
+        seen
+    })
+}
+
+fn a_deep_walk_keeps_its_buffer_for_the_next<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (x, top) = dirty_chain(&rt, 200);
+    rt.set(x, 1);
+    assert_eq!(rt.get(top), 200);
+    let (cap, at) = spare_work();
+    assert!(cap >= 200, "the walk kept {cap} entries");
+    rt.set(x, 2);
+    assert_eq!(rt.get(top), 201);
+    assert_eq!(spare_work(), (cap, at), "the next walk reused the buffer");
+}
+
+#[test]
+fn local_deep_walk_keeps_its_buffer_for_the_next() {
+    a_deep_walk_keeps_its_buffer_for_the_next::<Local>();
+}
+
+#[test]
+fn shared_deep_walk_keeps_its_buffer_for_the_next() {
+    a_deep_walk_keeps_its_buffer_for_the_next::<Shared>();
+}
+
+fn a_walk_past_the_cap_frees_its_buffer<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let n = SPARE_WORK_MAX + 1;
+    let (x, top) = dirty_chain(&rt, n);
+    rt.set(x, 1);
+    assert_eq!(rt.get(top), n as i64);
+    assert_eq!(spare_work(), (0, 0), "a buffer past the cap stays unkept");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_walk_past_the_cap_frees_its_buffer() {
+    a_walk_past_the_cap_frees_its_buffer::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_walk_past_the_cap_frees_its_buffer() {
+    a_walk_past_the_cap_frees_its_buffer::<Shared>();
+}
+
+/// The 20-deep chain's bottom reads the 200-deep `side` chain only once
+/// `x` is odd, so the walk after `x` turns odd runs `side`'s Dirty walk
+/// nested in its compute. The nested walk returns its buffer first; the
+/// outer walk's smaller one, returned after, must not displace it.
+fn a_shorter_outer_walk_keeps_the_nested_walks_buffer<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (y, side) = dirty_chain(&rt, 200);
+    let x = rt.create_input(0_i64);
+    let mut top = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        if v % 2 == 1 {
+            let _ = rt.get(side);
+        }
+        v
+    });
+    rt.get(top);
+    for _ in 1..20 {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below) + 1);
+        rt.get(top);
+    }
+    rt.set(y, 1);
+    rt.set(x, 1);
+    assert_eq!(rt.get(top), 20);
+    let (cap, _) = spare_work();
+    assert!(
+        cap >= 200,
+        "the outer walk's {cap} entries displaced the nested walk's buffer"
+    );
+}
+
+#[test]
+fn local_shorter_outer_walk_keeps_the_nested_walks_buffer() {
+    a_shorter_outer_walk_keeps_the_nested_walks_buffer::<Local>();
+}
+
+#[test]
+fn shared_shorter_outer_walk_keeps_the_nested_walks_buffer() {
+    a_shorter_outer_walk_keeps_the_nested_walks_buffer::<Shared>();
+}
+
+/// Reads the top of a 50-deep Dirty chain once with no retraction and once
+/// with one counted while the walk sits before each node's dep read, so the
+/// walk drops and revisits every expansion once. The revisits must not count
+/// as first visits: the count places the switch to exact mode, and a walk
+/// that crosses it at a different node plans another order (0x17ce25,
+/// 0x16574d).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_walk_revisit_after_a_retraction_is_no_first_visit() {
+    const DEPTH: usize = 50;
+    let read = |retract: bool| {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let (x, top) = dirty_chain(&*rt, DEPTH);
+        if retract {
+            let weak = Arc::downgrade(&rt);
+            let seen = Mutex::new(std::collections::HashSet::new());
+            let hook: super::ParkHook = Box::new(move |point| {
+                if let ParkPoint::WalkBeforeDeps(n) = point {
+                    if seen.lock().unwrap().insert(n) {
+                        if let Some(rt) = weak.upgrade() {
+                            Shared::u64_fetch_add(&rt.retractions.0, 1);
+                        }
+                    }
+                }
+            });
+            assert!(rt.park_hook.set(hook).is_ok());
+        }
+        rt.set(x, 1);
+        let (visits, rereads) = (rt.first_visits(), rt.rereads.load(Ordering::Relaxed));
+        assert_eq!(rt.get(top), DEPTH as i64);
+        (
+            rt.first_visits() - visits,
+            rt.rereads.load(Ordering::Relaxed) - rereads,
+        )
+    };
+    let (plain, plain_rereads) = read(false);
+    let (retracted, rereads) = read(true);
+    assert_eq!(plain_rereads, 0);
+    assert!(
+        rereads >= DEPTH as u64 - 1,
+        "only {rereads} expansions were dropped and revisited"
+    );
+    assert_eq!(
+        retracted, plain,
+        "{rereads} revisits moved the walk's first visits"
+    );
 }

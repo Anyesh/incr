@@ -48,6 +48,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use crate::handle::{ErasedIncr, Incr};
@@ -468,6 +469,33 @@ pub(crate) const HANDLED: u16 = 2048;
 /// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
+/// `ComputeCtl::flags`: the frame made a read its stash adoption can't
+/// check, so a speculative run of it is not stashed:
+/// - a kept read (`KEPT_READ`) of its own runtime, or of another runtime's
+///   node that was not Clean or was read while that runtime was changing;
+/// - on a `SPECULATIVE` frame, a read of another runtime it neither keeps
+///   nor records, or holds instead of keeping (`FOREIGN_HOLD`), and a
+///   lookup that records nothing;
+/// - a read of a deleted node's handle.
+pub(crate) const KEPT_UNCHECKED: u16 = 8192;
+
+/// `ComputeCtl::flags`: the frame read a landing this thread's attempt
+/// holds (`crate::hold`), so its own landing is held too, and so is its
+/// reader's.
+pub(crate) const HOLD: u16 = 16384;
+/// A `HOLD` frame's write kept what it displaced in `crate::hold`, keyed
+/// by this control block, until the landing's entry takes it or the frame
+/// ends (`crate::hold::KeptGuard`).
+pub(crate) const KEPT: u16 = 32768;
+pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
+/// A speculative frame whose outcome no stash keeps: a doomed run is
+/// discarded, and an open cycle's provisional read may settle otherwise.
+pub(crate) const UNSTASHED: u16 = DOOMED | LOW;
+/// A frame that read some node other than as its real state: a
+/// placeholder, a kept or held landing, another runtime's node unchecked,
+/// or a dep that did not land Clean.
+pub(crate) const UNREAL_READS: u16 =
+    DOOMED | POISONED | PH_SEEN | KEPT_READ | FOREIGN_HOLD | KEPT_UNCHECKED | HOLD;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
@@ -483,7 +511,21 @@ const _: () = assert!(crate::bits::disjoint(&[
     SPECULATIVE as u64,
     HANDLED as u64,
     UNREGENERABLE as u64,
+    KEPT_UNCHECKED as u64,
+    HOLD as u64,
+    KEPT as u64,
 ]));
+
+/// [`ComputeCtl::marks`]: `path` holds the frame's path.
+const PATH_KEPT: u8 = 1;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::reads_counted`].
+const READS_COUNTED: u8 = 2;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::looked_up_unrecorded`].
+const LOOKED_UP_UNRECORDED: u8 = 4;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::read_stashes`].
+const STASH_READ: u8 = 8;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::spec_unchecked`].
+const SPEC_UNCHECKED: u8 = 16;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -497,19 +539,33 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
+    /// `PATH_KEPT`, `READS_COUNTED`, `LOOKED_UP_UNRECORDED`, `STASH_READ`
+    /// and `SPEC_UNCHECKED`, which only get set.
+    marks: Cell<u8>,
+    /// The frame's dep count at its last read that could unwind into it:
+    /// a dep past it was read after.
+    pub(crate) read_at: Cell<u32>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
-    /// The frame's runtime's [`KeepResolver`], or null for a frame that
-    /// settles its keeping when it is pushed or keeps nothing.
+    /// The frame's runtime's [`KeepResolver`], a speculative frame's own,
+    /// or null for a frame that settles its keeping when it is pushed or
+    /// keeps nothing.
     keep: *const KeepResolver,
+    /// The frame's path once found (`kept_path`), left unwritten until
+    /// then so a push pays nothing for it.
+    path: Cell<MaybeUninit<u64>>,
+    /// `Runtime::reshapes` as a speculative run of the frame began, which
+    /// its stash holds at.
+    pub(crate) reshapes: Cell<u64>,
 }
 
-/// Lives inside its runtime and answers whether a frame of node `slot` of
-/// that runtime keeps other runtimes' Clean reads for its retry. The
-/// runtime's `keep_resolver_ptr` is good while one of its computes runs,
-/// since the compute borrows the runtime; a pointer taken from the field
-/// itself may not reach the rest of the runtime.
+/// Lives inside its runtime (a speculative frame's, beside its run) and
+/// answers whether a frame of node `slot` of that runtime keeps other
+/// runtimes' Clean reads for its retry. The runtime's `keep_resolver_ptr`
+/// is good while one of its computes runs, since the compute borrows the
+/// runtime; a pointer taken from the field itself may not reach the rest
+/// of the runtime.
 pub(crate) struct KeepResolver {
     pub(crate) keeps: unsafe fn(*const KeepResolver, u32) -> bool,
 }
@@ -527,21 +583,84 @@ impl ComputeCtl {
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
+            marks: Cell::new(0),
+            read_at: Cell::new(0),
             children: Cell::new(std::ptr::null()),
             keep,
+            path: Cell::new(MaybeUninit::uninit()),
+            reshapes: Cell::new(0),
         }
     }
 
     /// Whether this frame, of node `slot`, keeps other runtimes' Clean
-    /// reads.
+    /// reads. A speculative frame's resolver marks it `KEPT_UNCHECKED`
+    /// when it does not.
     ///
     /// # Safety
     ///
-    /// The frame must be running, so that its runtime is borrowed.
+    /// The frame must be running and on top of the stack, so that its
+    /// runtime is borrowed.
     pub(crate) unsafe fn keeps_foreign(&self, slot: u32) -> bool {
         // SAFETY: the caller's frame is running, so the runtime holding
-        // the resolver is borrowed and in place.
+        // the resolver is borrowed and in place, as is a speculative
+        // frame's resolver beside its run.
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
+    }
+
+    /// Whether the dep stack counts this frame's reads in its side table.
+    /// A control block serves one frame, so a fresh one at a popped
+    /// frame's address says no.
+    pub(crate) fn reads_counted(&self) -> bool {
+        self.marks.get() & READS_COUNTED != 0
+    }
+
+    pub(crate) fn count_reads(&self) {
+        self.marks.set(self.marks.get() | READS_COUNTED);
+    }
+
+    /// Whether this speculative frame read a stash, kept in
+    /// `replay::keep_spec_read` under this control block. A fresh one at a
+    /// popped frame's address says no.
+    pub(crate) fn read_stashes(&self) -> bool {
+        self.marks.get() & STASH_READ != 0
+    }
+
+    pub(crate) fn mark_stash_read(&self) {
+        self.marks.set(self.marks.get() | STASH_READ);
+    }
+
+    /// Whether this speculative frame read something no stash of it can
+    /// stand over: a read that named no checked source. Unlike
+    /// `KEPT_UNCHECKED`, it leaves a member run's basis to its own checks.
+    pub(crate) fn spec_unchecked(&self) -> bool {
+        self.marks.get() & SPEC_UNCHECKED != 0
+    }
+
+    pub(crate) fn mark_spec_unchecked(&self) {
+        self.marks.set(self.marks.get() | SPEC_UNCHECKED);
+    }
+
+    /// Whether a `BUFFERED` frame made a lookup that records no dep, which
+    /// a speculative member run's basis cannot check.
+    pub(crate) fn looked_up_unrecorded(&self) -> bool {
+        self.marks.get() & LOOKED_UP_UNRECORDED != 0
+    }
+
+    pub(crate) fn look_up_unrecorded(&self) {
+        self.marks.set(self.marks.get() | LOOKED_UP_UNRECORDED);
+    }
+
+    /// The frame's path, if [`Self::keep_path`] kept it.
+    pub(crate) fn kept_path(&self) -> Option<u64> {
+        // SAFETY: `keep_path` writes `path` before it marks it kept.
+        (self.marks.get() & PATH_KEPT != 0).then(|| unsafe { self.path.get().assume_init() })
+    }
+
+    /// Keeps `path` as the frame's path, which the frames below it fix
+    /// while it is on the stack.
+    pub(crate) fn keep_path(&self, path: u64) {
+        self.path.set(MaybeUninit::new(path));
+        self.marks.set(self.marks.get() | PATH_KEPT);
     }
 
     #[inline(always)]
@@ -557,6 +676,10 @@ impl ComputeCtl {
     #[inline(always)]
     pub(crate) fn raise(&self, flag: u16) {
         self.flags.set(self.flags.get() | flag);
+    }
+
+    pub(crate) fn clear(&self, flag: u16) {
+        self.flags.set(self.flags.get() & !flag);
     }
 
     /// Marks the frame part of an open cycle reaching down to `p`.
@@ -596,3 +719,10 @@ pub(crate) struct WoundUnwind;
 /// The payload a speculative entry's discard unwind carries on from a
 /// closure that swallowed it.
 pub(crate) struct DiscardUnwind;
+
+/// The payload a `Shared` doomed frame raises at its placeholder read in
+/// place of running on past it. It carries the discard kind, and every
+/// frame it passes is doomed and lands the discard, so it never leaves the
+/// doomed frames: user code there could join a thread that reads a node
+/// the doom reserved for this thread's retry.
+pub(crate) struct DoomUnwind;
