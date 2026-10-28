@@ -8804,13 +8804,13 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "cross-runtime reads record no edge, so a speculative entry's early read keeps a value a later set changed"]
+    #[ignore = "T10-cross-diff-0x1684812d06f040c3-native-runs"]
     fn replay_differential_cross_runtime_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, true, false), seed));
     }
 
     #[test]
-    #[ignore = "cross-runtime reads record no edge, so a speculative entry's early read keeps a value a later set changed"]
+    #[ignore = "T10-cross-diff-0xeb8a5eb5f0cdc317-deps, T10-cross-diff-0xa122ae288d458244-failed-for-new"]
     fn replay_differential_cross_runtime_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, true, false), seed));
     }
