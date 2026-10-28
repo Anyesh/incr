@@ -1291,7 +1291,9 @@ impl<C: Cells> Runtime<C> {
 
     /// The basis of a speculative member run at `cidx` that read `deps`, if
     /// it ended well and read only real state, each other node unchanged
-    /// since revision `started`; drops its notes either way.
+    /// since revision `started`; drops its notes either way. A kept read is
+    /// real only as another runtime's checked Clean read (no
+    /// `KEPT_UNCHECKED`), which the basis carries.
     #[cold]
     #[inline(never)]
     fn spec_basis(
@@ -1303,13 +1305,19 @@ impl<C: Cells> Runtime<C> {
         ctl: &ComputeCtl,
         started: Option<u64>,
     ) -> Option<Basis> {
+        let foreign = if ctl.has(cycle::KEPT_READ) {
+            replay::take_checked_reads(self.runtime_id, cidx, ctl)
+        } else {
+            Vec::new()
+        };
         if let (true, Some(started)) = (
-            ok && !ctl.has(cycle::UNREAL_READS) && !ctl.looked_up_unrecorded(),
+            ok && !ctl.has(cycle::UNREAL_READS & !cycle::KEPT_READ) && !ctl.looked_up_unrecorded(),
             started,
         ) {
             h.take_basis(self.runtime_id, cidx, deps, &|d| {
                 self.clean_stamp(d).filter(|&(_, at)| at <= started)
             })
+            .map(|basis| Basis { foreign, ..basis })
         } else {
             h.drop_spec_reads(self.runtime_id, cidx);
             None

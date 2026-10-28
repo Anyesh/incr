@@ -2873,7 +2873,8 @@ fn run_counted<C: Cells>(
 
 /// Native runs by side, made order, revision and node: unbounded, bounded,
 /// and bounded speculative.
-type NativeCounts = HashMap<(usize, usize, u64, usize), (u32, u32, u32)>;
+type NativeKey = (usize, usize, u64, usize);
+type NativeCounts = HashMap<NativeKey, (u32, u32, u32)>;
 
 fn native_counts(want: &[NativeRun], got: &[NativeRun]) -> NativeCounts {
     let mut counts: NativeCounts = HashMap::new();
@@ -2894,14 +2895,20 @@ fn native_counts(want: &[NativeRun], got: &[NativeRun]) -> NativeCounts {
 /// the unbounded run runs more than once is a cycle member, which a retry
 /// may run more or less often (the README's cycle exception).
 fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
-    let mut off: Vec<_> = (native_counts(want, got).into_iter())
-        .filter(|&(_, (u, b, s))| s > 1 || u <= 1 && (b < u || b > u + u32::from(s > 0)))
-        .collect();
-    off.sort_unstable();
+    let off = native_off(want, got);
     assert!(
         off.is_empty(),
         "{label}: Native runs (side, made, revision, node): (unbounded, bounded, speculative) {off:?}"
     );
+}
+
+/// The Native run counts that differ from the unbounded run's, sorted.
+fn native_off(want: &[NativeRun], got: &[NativeRun]) -> Vec<(NativeKey, (u32, u32, u32))> {
+    let mut off: Vec<_> = (native_counts(want, got).into_iter())
+        .filter(|&(_, (u, b, s))| s > 1 || u <= 1 && (b < u || b > u + u32::from(s > 0)))
+        .collect();
+    off.sort_unstable();
+    off
 }
 
 /// The two-thread form: every phase schedule at every budget, unbounded
@@ -4417,12 +4424,19 @@ fn cross_seed_reading_back_under_virtual_frames() {
 /// 0x1684812d06f040c3 at budget 1: Native node 8 runs under 6 as a member
 /// of their cycle, recorded under speculation, and reads the other
 /// runtime's Clean node 0. The real read after it must keep that run, as
-/// the unbounded run does, not run 8 again.
+/// the unbounded run does, not run 8 again. In revision 6 the other
+/// runtime's node is Dirty at the read and stashed, unlanded at the look,
+/// so 8 still runs twice there (T10-cross-diff-0x1684812d06f040c3-native-runs).
 #[test]
 #[cfg_attr(miri, ignore)]
 fn cross_seed_native_member_run_over_a_foreign_clean_read() {
     let case = gen_case(0x1684812d06f040c3, true, false);
-    quiet(|| differential::<Local>(&case, 0x1684812d06f040c3));
+    quiet(|| {
+        let (unbounded, native) = run_counted::<Local>(&case, None, 0);
+        let (bounded, runs) = run_counted::<Local>(&case, Some(1), 0);
+        compare(&case, &unbounded, &bounded, "0x1684812d06f040c3, budget 1");
+        assert_eq!(native_off(&native, &runs), [((0, 15, 6, 8), (1, 2, 0))]);
+    });
 }
 
 /// Two-thread seeds, with a second runtime when `.1`, whose reads pushed a

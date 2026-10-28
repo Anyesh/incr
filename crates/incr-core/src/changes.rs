@@ -104,6 +104,16 @@ pub(crate) struct Count {
     mixed: bool,
 }
 
+impl std::fmt::Debug for Count {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Count")
+            .field("at", &self.at)
+            .field("speculative", &self.speculative)
+            .field("mixed", &self.mixed)
+            .finish()
+    }
+}
+
 impl Count {
     /// Whether the runtime has not changed since the read.
     pub(crate) fn holds(&self) -> bool {

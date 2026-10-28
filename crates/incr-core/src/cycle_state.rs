@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::changes::Count;
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
 use crate::deferred::Unbuilt;
 use crate::fx::FxBuildHasher;
@@ -248,6 +249,7 @@ impl Held {
             Some(Some(mut kept)) => {
                 kept.held.extend(basis.held);
                 kept.clean.extend(basis.clean);
+                kept.foreign.extend(basis.foreign);
                 Some(kept)
             }
             Some(None) => None,
@@ -522,12 +524,15 @@ pub(crate) struct Discarded {
 }
 
 /// What a speculative run read, for [`HeldMap::look`] to check: the held
-/// members it read, each with what it read, and the other nodes, each
-/// Clean when the run recorded, with its generation and `changed_at`.
+/// members it read, each with what it read, the other nodes, each Clean
+/// when the run recorded, with its generation and `changed_at`, and the
+/// other runtimes it read Clean, with their changes as the reads found
+/// them.
 #[derive(Debug, Default)]
 pub(crate) struct Basis {
     pub(crate) held: Vec<(u32, MemberRead)>,
     pub(crate) clean: Vec<(NodeId, u32, u64)>,
+    pub(crate) foreign: Vec<Count>,
 }
 
 /// A speculative run's read of a held member.
@@ -896,6 +901,7 @@ impl HeldMap {
             .clean
             .iter()
             .all(|&(d, generation, at)| clean(d) == Some((generation, at)))
+            && basis.foreign.iter().all(Count::holds)
             && basis.held.iter().all(|(m, read)| match read {
                 MemberRead::Buffer(stamp) => {
                     self.claims
@@ -996,7 +1002,7 @@ impl HeldMap {
         self.mark_spec_reads();
         let mut basis = Basis {
             held,
-            clean: Vec::new(),
+            ..Basis::default()
         };
         if basis
             .held
