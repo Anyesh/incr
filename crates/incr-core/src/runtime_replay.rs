@@ -5887,13 +5887,15 @@ impl<C: Cells> Runtime<C> {
     /// The path and seq of the frame of `node` at `cidx`: its run's, when
     /// one started, and [`Self::path_at`] otherwise.
     pub(super) fn run_path(&self, node: u32, generation: u32, cidx: u32) -> (u64, u32) {
-        let (seq, path) = replay::run_seq(self.runtime_id, (node, generation, cidx));
+        let (seq, path, replaced) = replay::run_seq(self.runtime_id, (node, generation, cidx));
         let path = path.unwrap_or_else(|| self.path_at(cidx));
-        debug_assert_eq!(
-            path,
-            self.reference_path_at(cidx),
-            "the run's path at {cidx}"
-        );
+        if !replaced {
+            debug_assert_eq!(
+                path,
+                self.reference_path_at(cidx),
+                "the run's path at {cidx}"
+            );
+        }
         (path, seq)
     }
 

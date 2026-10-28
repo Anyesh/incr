@@ -3100,6 +3100,20 @@ fn seed_36b61_case() -> Case {
     }
 }
 
+/// A cycle episode's abort lands a held member Failed after a later run
+/// at its depth replaced its run, when the frames below no longer give
+/// the path it ran along; the landing keeps the recorded path, and the
+/// read after it finds no claim left behind.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_be15b_lands_a_replaced_members_run_on_its_recorded_path() {
+    let case = gen_case(0xbe1_5b51_f74f_d48a, false, false);
+    quiet(|| {
+        differential::<Local>(&case, 0xbe1_5b51_f74f_d48a);
+        differential::<Shared>(&case, 0xbe1_5b51_f74f_d48a);
+    });
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn seed_36b61_keeps_a_doomed_frames_claims_past_another_discard() {
@@ -9347,13 +9361,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
-    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant, T10-diff-local-release-uncaught-cycle"]
+    #[cfg_attr(miri, ignore)]
     fn replay_differential_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
-    #[ignore = "blocking: T10-diff-0xbe15b51f74fd48a-computing-invariant, T10-diff-local-release-uncaught-cycle"]
+    #[cfg_attr(miri, ignore)]
     fn replay_differential_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, false, false), seed));
     }

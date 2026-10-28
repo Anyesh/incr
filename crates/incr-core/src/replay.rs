@@ -4467,23 +4467,27 @@ pub(crate) fn run_at(
     })
 }
 
-/// The seq of the latest run of `rt`'s `frame`, live or ended, and the
-/// path it started along, which no frame or virtual frame below it changes
-/// while it runs or before its episode's end lands it: for a run that may
-/// have left the stack, as a member's that lands at its episode's end. A
-/// frame on the stack has them from [`run_at`]. No run gives seq 0 and no
-/// path.
-pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
+/// The seq of the latest run of `rt`'s `frame`, live or ended, the path
+/// it started along, and whether a later run at its depth replaced it: for
+/// a run that may have left the stack, as a member's that lands at its
+/// episode's end. No frame or virtual frame below a run changes its path
+/// while it runs, but once a later run replaced it the frames below may
+/// have run again, so only its recorded path is its own. A frame on the
+/// stack has them from [`run_at`]. No run gives seq 0 and no path.
+pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>, bool) {
     RUNS.with(|r| {
         let r = r.borrow();
         let live = (r.live.iter().rev().flatten()).find(|x| x.rt == rt && x.frame == frame);
         let ended = r.ended.get(&(rt, frame));
         match (live, ended) {
-            (Some(l), Some(e)) => Some(if l.order > e.order { l } else { e }),
-            (Some(x), None) | (None, Some(x)) => Some(x),
+            (Some(l), Some(e)) if l.order > e.order => Some((l, false)),
+            (Some(_), Some(e)) | (None, Some(e)) => Some((e, true)),
+            (Some(l), None) => Some((l, false)),
             (None, None) => None,
         }
-        .map_or((0, None), |x| (x.seq, Some(x.path)))
+        .map_or((0, None, false), |(x, replaced)| {
+            (x.seq, Some(x.path), replaced)
+        })
     })
 }
 
