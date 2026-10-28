@@ -5676,13 +5676,6 @@ impl<'a> Woken<'a> {
     /// waiter's walk waits on it; whether the walk waited, and a try where
     /// it did is checked.
     fn try_at(&self, k: usize) -> bool {
-        self.run_at(k, true).is_some()
-    }
-
-    /// [`Self::try_at`]'s try, and if the walk waited, whether the holder
-    /// gave the node back New or Dirty to the waiter and whether the waiter
-    /// claimed it again; checked only if `check`.
-    fn run_at(&self, k: usize, check: bool) -> Option<(bool, bool)> {
         let Woken {
             case,
             phases,
@@ -5737,10 +5730,11 @@ impl<'a> Woken<'a> {
                         waited.store(true, SeqCst);
                     }
                 } else if on_waiter && p == ParkPoint::BeforeClaim(held_node) {
+                    if waited.load(SeqCst) && unrun() {
+                        given_back.store(true, SeqCst);
+                    }
+                } else if on_waiter && p == ParkPoint::BeforeReservationCheck(held_node) {
                     if waited.load(SeqCst) {
-                        if unrun() {
-                            given_back.store(true, SeqCst);
-                        }
                         reclaimed.store(true, SeqCst);
                     }
                 } else if !on_waiter && p == ParkPoint::BeforeClaim(held_node) {
@@ -5754,7 +5748,7 @@ impl<'a> Woken<'a> {
             });
             assert!(live.world.rt(0).park_hook.set(hook).is_ok());
         };
-        let mut met = None;
+        let mut met = false;
         quiet(|| {
             let serial = Serial::new(case, phases);
             let verdict = Mutex::new(None);
@@ -5768,10 +5762,7 @@ impl<'a> Woken<'a> {
             if !waited.load(SeqCst) {
                 return;
             }
-            met = Some((given_back.load(SeqCst), reclaimed.load(SeqCst)));
-            if !check {
-                return;
-            }
+            met = true;
             if owes_run {
                 assert!(
                     given_back.load(SeqCst),
