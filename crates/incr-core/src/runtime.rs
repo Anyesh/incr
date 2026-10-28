@@ -4159,7 +4159,7 @@ impl<C: Cells> Runtime<C> {
                     !is_root,
                     (!C::SINGLE_THREADED && (is_root || unchecked.take() != Some(cur))).then_some(
                         Planned {
-                            root: (!is_root && !walk.root_failed_here).then_some(id),
+                            root: (!is_root && cur != id && !walk.root_failed_here).then_some(id),
                             ..planned
                         },
                     ),
