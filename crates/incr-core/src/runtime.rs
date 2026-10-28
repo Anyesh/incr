@@ -1026,7 +1026,11 @@ impl Walk {
                 work.push(root);
                 work
             }
-            None => vec![root],
+            None => {
+                let mut work = Vec::with_capacity(16);
+                work.push(root);
+                work
+            }
         };
         Self {
             work,
@@ -1086,8 +1090,7 @@ impl Walk {
 
     /// Grows through a fresh allocation, not `realloc`, because glibc's
     /// `realloc` bypasses its thread cache and costs several times a
-    /// cached `malloc` and `free`. The first growth goes straight to 16
-    /// entries, so a short walk grows once.
+    /// cached `malloc` and `free`.
     #[cold]
     #[inline(never)]
     fn grow(&mut self) {
