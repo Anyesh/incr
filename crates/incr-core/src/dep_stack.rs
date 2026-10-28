@@ -157,6 +157,30 @@ pub struct Frames {
     /// the deps their nodes keep. Dropping them at a pop or a context's
     /// close would cost every compute, or every replayed level's stack.
     read_counts: Vec<(u32, ReadCounts)>,
+    /// The index of a frame found below the top `NEAR_FRAMES`, by runtime
+    /// and node: each group expansion nested in a deep chain of member runs
+    /// asks for the same frame at the stack's bottom. A push of a frame for
+    /// the node drops its entry, so an entry whose frame still computes the
+    /// node is the innermost one that does.
+    deep: HashMap<(RuntimeId, NodeId), usize, FxBuildHasher>,
+}
+
+/// Frames from the top that [`DepStack::frame_cidx`] scans before it looks
+/// up a deeper frame.
+const NEAR_FRAMES: usize = 16;
+
+/// Deeper frames remembered before the table starts afresh.
+const DEEP_FRAMES_MAX: usize = 64;
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static FRAMES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Frames this thread's [`DepStack::frame_cidx`] calls have compared.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn frames_scanned() -> u64 {
+    FRAMES_SCANNED.with(std::cell::Cell::get)
 }
 
 /// A placement [`DepStack::place_next_at`] replaced, to restore.
@@ -278,6 +302,7 @@ impl Frames {
             placed: u32::MAX,
             holds: Vec::new(),
             read_counts: Vec::new(),
+            deep: HashMap::with_hasher(FxBuildHasher),
         }
     }
 
@@ -361,7 +386,16 @@ impl Frames {
         if self.frames.capacity() == 0 {
             first_push();
         }
+        if !self.deep.is_empty() {
+            self.forget_deep(frame.rt(), frame.node);
+        }
         self.frames.push(frame);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn forget_deep(&mut self, rt: RuntimeId, node: NodeId) {
+        self.deep.remove(&(rt, node));
     }
 
     #[inline(always)]
@@ -921,15 +955,45 @@ pub trait DepStack: sealed::Sealed + 'static {
         })
     }
 
+    /// Whether the frame at `depth` computes `node` of runtime `rt`.
+    fn frame_at_is(&self, depth: usize, rt: RuntimeId, node: NodeId) -> bool {
+        self.with(|s| {
+            s.frames
+                .get(depth)
+                .is_some_and(|f| f.node == node && f.rt() == rt)
+        })
+    }
+
     /// The position of the innermost frame on this stack computing
     /// `node` of runtime `rt`, if one is.
     fn frame_cidx(&self, rt: RuntimeId, node: NodeId) -> Option<u32> {
         self.with(|s| {
-            s.frames
-                .iter()
-                .rev()
-                .find(|f| f.node == node && f.rt() == rt)
-                .map(|f| f.cidx)
+            let is = |f: &Frame| {
+                #[cfg(all(test, not(loom)))]
+                FRAMES_SCANNED.with(|n| n.set(n.get() + 1));
+                f.node == node && f.rt() == rt
+            };
+            let near = s.frames.len().saturating_sub(NEAR_FRAMES);
+            if let Some(f) = s.frames[near..].iter().rev().find(|f| is(f)) {
+                return Some(f.cidx);
+            }
+            if near == 0 {
+                return None;
+            }
+            if let Some(&i) = s.deep.get(&(rt, node)) {
+                if i < near && s.frames.get(i).is_some_and(is) {
+                    debug_assert!(!s.frames[i + 1..near]
+                        .iter()
+                        .any(|f| f.node == node && f.rt() == rt));
+                    return Some(s.frames[i].cidx);
+                }
+            }
+            let i = s.frames[..near].iter().rposition(is)?;
+            if s.deep.len() >= DEEP_FRAMES_MAX {
+                s.deep.clear();
+            }
+            s.deep.insert((rt, node), i);
+            Some(s.frames[i].cidx)
         })
     }
 
@@ -1242,6 +1306,29 @@ mod tests {
         assert!(s.is_computing(rt(1), NodeId(7)));
         s.pop_frame();
         assert!(!s.is_computing(rt(1), NodeId(7)));
+    }
+
+    /// A frame for a node pushed above a deep frame for it that a lookup
+    /// remembered is the one found.
+    #[test]
+    fn a_node_pushed_again_above_a_remembered_deep_frame_is_found() {
+        let s = SharedDepStack::new();
+        let ctls: Vec<ComputeCtl> = (0..40).map(|_| ComputeCtl::new(0)).collect();
+        for (i, ctl) in ctls.iter().enumerate() {
+            let node = if i == 0 || i == 20 {
+                5
+            } else {
+                1000 + i as u32
+            };
+            s.push_frame_at(rt(1), NodeId(node), ctl, 100 + i as u32);
+            if i == 19 {
+                assert_eq!(s.frame_cidx(rt(1), NodeId(5)), Some(100));
+            }
+        }
+        assert_eq!(s.frame_cidx(rt(1), NodeId(5)), Some(120));
+        for _ in 0..40 {
+            s.pop_frame();
+        }
     }
 
     #[test]

@@ -2056,3 +2056,293 @@ fn local_speculative_fan_100k_adopts_its_stashes() {
 fn shared_speculative_fan_100k_adopts_its_stashes() {
     speculative_fan_100k::<Shared>();
 }
+
+/// A `k`-member landed group on a chain under `m`, which reads the chain's
+/// top once `on` is set. The read of `m` after that computes the chain
+/// member by member inside `m`'s run, and each member's read of the one
+/// below verifies the group, which fails on the member computing above it.
+struct ChainedGroup {
+    on: Incr<i64>,
+    m: Incr<i64>,
+    r: Incr<i64>,
+    xs: Vec<Incr<i64>>,
+}
+
+fn chained_group<C: Cells>(rt: &Runtime<C>, k: usize) -> ChainedGroup {
+    chained_group_with(rt, k, None, false).0
+}
+
+/// [`chained_group`] where each member also reads an input of its own if
+/// `inputs`, and where `xs[at]`'s run, once armed (1), first claims the
+/// bottom member and lands it New unrun, as a doom's discard of its claim
+/// would, and then reads 2.
+fn chained_group_with<C: Cells>(
+    rt: &Runtime<C>,
+    k: usize,
+    at: Option<usize>,
+    inputs: bool,
+) -> (ChainedGroup, Arc<AtomicU32>) {
+    let armed = Arc::new(AtomicU32::new(0));
+    let on = rt.create_input(0_i64);
+    let root: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let m = {
+        let root = root.clone();
+        rt.create_query_with_fallback(
+            move |rt| match rt.get(on) {
+                0 => 0,
+                _ => rt.get(*root.get().unwrap()) + 1,
+            },
+            |_c: &crate::cycle::Cycle| 100,
+        )
+    };
+    let own = || inputs.then(|| rt.create_input(0_i64));
+    let y = own();
+    let mut xs =
+        vec![rt.create_query(move |rt| rt.get(m) + rt.get(on) + y.map_or(0, |y| rt.get(y)))];
+    for i in 1..k {
+        let below = *xs.last().unwrap();
+        let (bottom, here, armed, y) = (xs[0], at == Some(k - 1 - i), armed.clone(), own());
+        xs.push(rt.create_query(move |rt| {
+            if here && armed.compare_exchange(1, 0, SeqCst, SeqCst).is_ok() {
+                let node = rt.nodes.get(bottom.slot());
+                if crate::state::try_claim_compute::<C>(node.state_cell()).is_ok() {
+                    rt.land_unrun(crate::NodeId(bottom.slot()), node, NodeState::New);
+                    armed.store(2, SeqCst);
+                }
+            }
+            rt.get(below) + y.map_or(0, |y| rt.get(y)) + 1
+        }));
+    }
+    xs.reverse();
+    let r = {
+        let top = xs[0];
+        rt.create_query(move |rt| rt.get(top))
+    };
+    root.set(r).unwrap();
+    assert_eq!(rt.get(r), k as i64 - 1);
+    rt.force_group_for_test(&xs.iter().map(|x| x.erase()).collect::<Vec<_>>());
+    rt.set(on, 1);
+    (ChainedGroup { on, m, r, xs }, armed)
+}
+
+/// The read claims each member a bounded number of times, not once per
+/// member below it.
+fn chained_group_reads_claim_once<C: Cells>() {
+    let k = if cfg!(miri) {
+        8
+    } else if cfg!(debug_assertions) {
+        scaled(500)
+    } else {
+        scaled(2000)
+    };
+    let rt = Runtime::<C>::new();
+    let shape = chained_group(&rt, k);
+    let before = rt.group_claims.load(SeqCst);
+    let listed = rt.group_listings.load(SeqCst);
+    let loaded = rt.group_external_loads.load(SeqCst);
+    let scanned = crate::dep_stack::frames_scanned();
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let scans = crate::dep_stack::frames_scanned() - scanned;
+    let claims = rt.group_claims.load(SeqCst) - before;
+    let listings = rt.group_listings.load(SeqCst) - listed;
+    let loads = rt.group_external_loads.load(SeqCst) - loaded;
+    assert!(got.is_ok(), "the read of m panicked");
+    assert!(
+        (k as u64 - 1..=2 * k as u64).contains(&claims),
+        "{claims} member claims for a {k}-member group in one read"
+    );
+    assert!(
+        listings <= 4,
+        "{listings} listings of a {k}-member group's deps in one read"
+    );
+    assert!(
+        loads <= 4 * k as u64,
+        "{loads} loads of a {k}-member group's deps in one read"
+    );
+    assert!(
+        scans <= 64 * k as u64,
+        "{scans} frames compared finding frames in a {k}-deep chain in one read"
+    );
+}
+
+/// A group whose members each read an input of their own has k deps
+/// outside it; the read loads each a bounded number of times, not once
+/// per nested expansion.
+fn input_chained_group_loads_each_dep_once<C: Cells>() {
+    let k = if cfg!(miri) {
+        8
+    } else if cfg!(debug_assertions) {
+        scaled(500)
+    } else {
+        scaled(2000)
+    };
+    let rt = Runtime::<C>::new();
+    let (shape, _) = chained_group_with(&rt, k, None, true);
+    let loaded = rt.group_external_loads.load(SeqCst);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(shape.m)));
+    let loads = rt.group_external_loads.load(SeqCst) - loaded;
+    assert!(got.is_ok(), "the read of m panicked");
+    assert!(
+        loads <= 4 * k as u64,
+        "{loads} loads of a {k}-member group's {k} outside deps in one read"
+    );
+}
+
+#[test]
+fn local_input_chained_group_loads_each_dep_once() {
+    on_stack(64 << 20, input_chained_group_loads_each_dep_once::<Local>);
+}
+
+#[test]
+fn shared_input_chained_group_loads_each_dep_once() {
+    on_stack(64 << 20, input_chained_group_loads_each_dep_once::<Shared>);
+}
+
+#[test]
+fn local_chained_group_reads_claim_once() {
+    on_stack(64 << 20, chained_group_reads_claim_once::<Local>);
+}
+
+#[test]
+fn shared_chained_group_reads_claim_once() {
+    on_stack(64 << 20, chained_group_reads_claim_once::<Shared>);
+}
+
+/// The read's answer, every node's state and value, then every slot's
+/// deps and group record.
+type GroupOutcome = (
+    Result<i64, String>,
+    Vec<NodeState>,
+    Vec<Result<i64, String>>,
+    Vec<Vec<u32>>,
+    Vec<Vec<(u32, u32)>>,
+);
+
+/// The read of `m` with the blocked-record skip and the listed-externals
+/// reuse as given, `xs[unrun_at]` landing the bottom member New if set and
+/// each member reading its own input if `inputs`, how many skips and reuses
+/// it took, and whether the bottom landed.
+fn chained_group_outcome<C: Cells>(
+    k: usize,
+    (skip, reuse): (bool, bool),
+    unrun_at: Option<usize>,
+    inputs: bool,
+) -> (GroupOutcome, u64, u64, bool) {
+    crate::cycle_state::set_group_blocker_skip(skip);
+    crate::cycle_state::set_group_externals_reuse(reuse);
+    let skips = crate::cycle_state::group_blocker_skips();
+    let reuses = crate::cycle_state::group_externals_reuses();
+    let rt = Runtime::<C>::new();
+    let (shape, armed) = chained_group_with(&rt, k, unrun_at, inputs);
+    armed.store(1, SeqCst);
+    let read = |h: Incr<i64>| {
+        catch_unwind(AssertUnwindSafe(|| rt.get(h))).map_err(super::race_tests::panic_message)
+    };
+    let got = read(shape.m);
+    let nodes: Vec<Incr<i64>> = [shape.on, shape.m, shape.r]
+        .into_iter()
+        .chain(shape.xs.iter().copied())
+        .collect();
+    let states = nodes.iter().map(|&h| rt.state_of(h)).collect();
+    let values = nodes.iter().map(|&h| read(h)).collect();
+    let slots = 0..rt.nodes.len();
+    let deps = slots
+        .clone()
+        .map(|x| {
+            let mut d = Vec::new();
+            rt.nodes.get(x).for_each_dep(|n| d.push(n.0));
+            d
+        })
+        .collect();
+    let groups = {
+        let inner = rt.inner.read();
+        slots
+            .map(|x| {
+                inner
+                    .member_recs
+                    .get(&x)
+                    .map_or(Vec::new(), |g| g.members.clone())
+            })
+            .collect()
+    };
+    crate::cycle_state::set_group_blocker_skip(true);
+    crate::cycle_state::set_group_externals_reuse(true);
+    rt.assert_invariant_i();
+    (
+        (got, states, values, deps, groups),
+        crate::cycle_state::group_blocker_skips() - skips,
+        crate::cycle_state::group_externals_reuses() - reuses,
+        armed.load(SeqCst) == 2,
+    )
+}
+
+/// Ending a verify early on a record blocked by a member this thread
+/// computes moves no node: the read, every node's state and value, and
+/// every slot's deps and group record match the read that claims the
+/// group at each member.
+fn chained_group_skip_moves_no_node<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    let (with, skipped, ..) = chained_group_outcome::<C>(k, (true, true), None, false);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), None, false);
+    assert!(skipped > 0, "no group verify took the skip");
+    assert_eq!(with, without);
+}
+
+#[test]
+fn local_chained_group_skip_moves_no_node() {
+    on_stack(16 << 20, chained_group_skip_moves_no_node::<Local>);
+}
+
+#[test]
+fn shared_chained_group_skip_moves_no_node() {
+    on_stack(16 << 20, chained_group_skip_moves_no_node::<Shared>);
+}
+
+/// A member landing New unrun under the blocker's frame, as a doom's
+/// discard lands one, keeps its record but ends the skip: the read that
+/// skips matches the one that claims the group at each member.
+fn chained_group_unrun_landing_ends_skip<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    let at = Some(k / 2);
+    let (with, skipped, _, landed) = chained_group_outcome::<C>(k, (true, true), at, false);
+    let (without, ..) = chained_group_outcome::<C>(k, (false, true), at, false);
+    assert!(landed, "the bottom member was not claimed to land");
+    assert!(skipped > 0, "no group verify took the skip");
+    assert_eq!(with, without);
+}
+
+#[test]
+fn local_chained_group_unrun_landing_ends_skip() {
+    on_stack(16 << 20, chained_group_unrun_landing_ends_skip::<Local>);
+}
+
+#[test]
+fn shared_chained_group_unrun_landing_ends_skip() {
+    on_stack(16 << 20, chained_group_unrun_landing_ends_skip::<Shared>);
+}
+
+/// Reusing a group's externals listed earlier in the entry moves no node:
+/// the read, every node's state and value, and every slot's deps and
+/// group record match the read that lists them at each expansion.
+fn chained_group_reuse_moves_no_node<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 64 };
+    for (at, inputs) in [(None, false), (Some(k / 2), false), (None, true)] {
+        let (with, _, reused, _) = chained_group_outcome::<C>(k, (true, true), at, inputs);
+        let (without, ..) = chained_group_outcome::<C>(k, (true, false), at, inputs);
+        assert!(reused > 0, "no group expansion reused a listing");
+        assert_eq!(
+            with, without,
+            "bottom landed New at {at:?}, inputs {inputs}"
+        );
+    }
+}
+
+#[test]
+fn local_chained_group_reuse_moves_no_node() {
+    on_stack(16 << 20, chained_group_reuse_moves_no_node::<Local>);
+}
+
+#[test]
+fn shared_chained_group_reuse_moves_no_node() {
+    on_stack(16 << 20, chained_group_reuse_moves_no_node::<Shared>);
+}

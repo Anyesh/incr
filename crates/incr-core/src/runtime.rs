@@ -95,6 +95,8 @@ pub(crate) struct Inner<C: Cells> {
     /// The group each landed cycle member belongs to, flagged by
     /// `IN_GROUP`.
     pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
+    /// How many times `member_recs` has changed.
+    pub(crate) member_rec_changes: u64,
     /// Each query whose deps a user panic's union replaced as it released
     /// the query New ([`Runtime::land_panic_released`]): that union's
     /// length, and how many of its deps, from the front, it held before
@@ -109,11 +111,36 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
+/// Ends a move counted by [`Runtime::settle_move`].
+pub(crate) struct SettleMove<'a, C: Cells>(&'a C::U64);
+
+impl<C: Cells> Drop for SettleMove<'_, C> {
+    fn drop(&mut self) {
+        C::u64_fetch_add(self.0, 1);
+    }
+}
+
 /// A landed cycle group: its members with the generations they landed
 /// under, sorted by slot, and the cycle readers see.
 pub(crate) struct GroupInfo {
     pub(crate) members: Vec<(u32, u32)>,
     pub(crate) cycle: Cycle,
+}
+
+impl GroupInfo {
+    /// Whether `slot` is a member's. Members are sorted by slot.
+    pub(crate) fn has_slot(&self, slot: u32) -> bool {
+        self.members
+            .binary_search_by_key(&slot, |&(s, _)| s)
+            .is_ok()
+    }
+
+    /// Whether `slot` at `generation` is a member.
+    pub(crate) fn has_member(&self, slot: u32, generation: u32) -> bool {
+        self.members
+            .binary_search_by_key(&slot, |&(s, _)| s)
+            .is_ok_and(|i| self.members[i].1 == generation)
+    }
 }
 
 impl<C: Cells> Inner<C> {
@@ -139,6 +166,7 @@ impl<C: Cells> Inner<C> {
         slot: u32,
         rec: Option<Arc<GroupInfo>>,
     ) -> Option<Arc<GroupInfo>> {
+        self.member_rec_changes += 1;
         match rec {
             Some(r) => self.member_recs.insert(slot, r),
             None => self.member_recs.remove(&slot),
@@ -159,6 +187,7 @@ impl<C: Cells> Inner<C> {
             children: HashMap::default(),
             cycle_strategies: HashMap::new(),
             member_recs: HashMap::new(),
+            member_rec_changes: 0,
             released_deps: HashMap::new(),
         }
     }
@@ -1513,6 +1542,15 @@ pub struct Runtime<C: Cells> {
     /// The node of every group verification, in order.
     #[cfg(test)]
     pub(crate) group_verifies: std::sync::Mutex<Vec<u32>>,
+    /// Members group verifications tried to claim.
+    #[cfg(test)]
+    pub(crate) group_claims: std::sync::atomic::AtomicU64,
+    /// Group expansions that listed the group's deps.
+    #[cfg(test)]
+    pub(crate) group_listings: std::sync::atomic::AtomicU64,
+    /// States of deps outside an expanded group loaded.
+    #[cfg(test)]
+    pub(crate) group_external_loads: std::sync::atomic::AtomicU64,
     /// Every claim a wound or a T8 discard landed as unrun: the node,
     /// whether its episode had dissolved on that thread, whether its group
     /// record then named a member that had left it, and whether it landed
@@ -1569,6 +1607,19 @@ pub struct Runtime<C: Cells> {
     pub(crate) dead_reads: C::U64,
     /// The `dead_reads` a creation has counted as a reshape.
     pub(crate) dead_reads_counted: C::U64,
+    /// Held marks set or cleared so far, each counted after its change: a
+    /// group expansion's scan of its members' marks stands while it is
+    /// unchanged.
+    pub(crate) held_marks: C::U64,
+    /// Unrun landings of a group member in a state other than `Dirty`,
+    /// which keep its record: a group verify's blocker stands only while
+    /// none has happened since.
+    pub(crate) group_unrun_landings: C::U64,
+    /// Twice the moves of a settled node to unsettled with no new revision
+    /// that `reshapes` does not count (a held landing's give-back
+    /// unverifying its readers, a replay rerun of a Failed node), odd while
+    /// one is under way.
+    pub(crate) unsettled: C::U64,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -1686,6 +1737,12 @@ impl<C: Cells> Runtime<C> {
             #[cfg(test)]
             group_verifies: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            group_claims: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            group_listings: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            group_external_loads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             unwound_landings: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             dooms: std::sync::Mutex::new(Vec::new()),
@@ -1709,6 +1766,9 @@ impl<C: Cells> Runtime<C> {
             reshapes: C::new_u64(0),
             dead_reads: C::new_u64(0),
             dead_reads_counted: C::new_u64(0),
+            held_marks: C::new_u64(0),
+            group_unrun_landings: C::new_u64(0),
+            unsettled: C::new_u64(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -4856,15 +4916,19 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn expand_group(&self, cur: NodeId, walk: &mut Walk) -> bool {
-        let group = self.inner.read().member_recs.get(&cur.0).cloned();
+        let unrun = C::u64_load_acquire(&self.group_unrun_landings);
+        let (group, rec_changes) = {
+            let inner = self.inner.read();
+            (
+                inner.member_recs.get(&cur.0).cloned(),
+                inner.member_rec_changes,
+            )
+        };
         let Some(group) = group else {
             return false;
         };
         let generation = self.nodes.get(cur.0).generation();
-        if !group
-            .members
-            .iter()
-            .any(|&(m, g)| m == cur.0 && g == generation)
+        if !group.has_member(cur.0, generation)
             || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
         {
             return false;
@@ -4884,31 +4948,61 @@ impl<C: Cells> Runtime<C> {
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pending = walk.visit_pending_marked(cur, generation, NO_TAINT_GROUP);
-        for &(m, _) in &group.members {
-            self.nodes.get(m).for_each_dep(|dep| {
-                if group
-                    .members
-                    .binary_search_by_key(&dep.0, |&(s, _)| s)
-                    .is_ok()
-                {
-                    return;
+        // Each read in a member's run of a member below it expands the
+        // group again, so the group's deps are listed once per entry.
+        let settle = self.settle_key();
+        let listed = settle.and_then(|settle| {
+            cycle_state::group_externals(self.runtime_id, &group, (rec_changes, unrun, settle))
+        });
+        #[cfg(all(test, not(loom)))]
+        if listed.is_some() {
+            cycle_state::note_group_externals_reuse();
+        }
+        let mut changed = listed.is_none();
+        let mut ext =
+            listed.unwrap_or_else(|| self.list_group_externals(&group, settle.unwrap_or_default()));
+        // A dep found settled stays settled until the settle key moves, so
+        // later expansions in the entry skip it.
+        let mut kept: Option<Vec<cycle_state::GroupExternal>> = None;
+        for (i, &step) in ext.deps.iter().enumerate() {
+            let keep = match step {
+                cycle_state::GroupExternal::Dep(dep) => self.expand_external(walk, NodeId(dep)),
+                cycle_state::GroupExternal::Left(m) => {
+                    self.nodes.get(m).for_each_dep(|dep| {
+                        if !group.has_slot(dep.0) {
+                            self.expand_external(walk, dep);
+                        }
+                    });
+                    true
                 }
-                let dep_node = self.nodes.get(dep.0);
-                let dep_state = state::load::<C>(dep_node.state_cell());
-                if !dep_state.is_settled() {
-                    let dep_state = self.seen(dep_node.state_cell(), dep_state);
-                    if !dep_state.is_settled() {
-                        walk.expand(dep, dep_node.generation(), dep_state);
-                    }
-                }
-            });
+            };
+            match (&mut kept, keep) {
+                (Some(kept), true) => kept.push(step),
+                (None, false) if settle.is_some() => kept = Some(ext.deps[..i].to_vec()),
+                _ => {}
+            }
+        }
+        if let (Some(kept), Some(settle)) = (kept, settle) {
+            ext.deps = kept.into();
+            ext.settle = settle;
+            changed = true;
         }
         if !C::SINGLE_THREADED {
-            let held = group
-                .members
-                .iter()
-                .find(|&&(m, _)| self.nodes.get(m).held_mark())
-                .map(|&(m, g)| (NodeId(m), g));
+            let marks = C::u64_load_acquire(&self.held_marks);
+            let held = match ext.held {
+                Some((at, held)) if at == marks => held,
+                _ => {
+                    let held = group
+                        .members
+                        .iter()
+                        .find(|&&(m, _)| self.nodes.get(m).held_mark())
+                        .copied();
+                    ext.held = Some((marks, held));
+                    changed = true;
+                    held
+                }
+            };
+            let held = held.map(|(m, g)| (NodeId(m), g));
             if held.is_some() || self.retracted_since(walk) {
                 self.drop_held_expansion(
                     walk,
@@ -4918,7 +5012,101 @@ impl<C: Cells> Runtime<C> {
                 );
             }
         }
+        if changed {
+            cycle_state::note_group_externals(self.runtime_id, group, ext);
+        }
         true
+    }
+
+    /// `group`'s deps outside it, in the order an expansion reads them, and
+    /// the record change count they stand at.
+    #[cold]
+    #[inline(never)]
+    fn list_group_externals(
+        &self,
+        group: &Arc<GroupInfo>,
+        settle: (u64, u64),
+    ) -> cycle_state::GroupExternals {
+        #[cfg(test)]
+        self.group_listings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let unrun = C::u64_load_acquire(&self.group_unrun_landings);
+        let (held_here, rec_changes): (Vec<bool>, u64) = {
+            let inner = self.inner.read();
+            (
+                group
+                    .members
+                    .iter()
+                    .map(|(m, _)| {
+                        inner
+                            .member_recs
+                            .get(m)
+                            .is_some_and(|r| Arc::ptr_eq(r, group))
+                    })
+                    .collect(),
+                inner.member_rec_changes,
+            )
+        };
+        let mut deps = Vec::new();
+        for (&(m, _), here) in group.members.iter().zip(held_here) {
+            if !here {
+                deps.push(cycle_state::GroupExternal::Left(m));
+                continue;
+            }
+            self.nodes.get(m).for_each_dep(|dep| {
+                if !group.has_slot(dep.0) {
+                    deps.push(cycle_state::GroupExternal::Dep(dep.0));
+                }
+            });
+        }
+        cycle_state::GroupExternals {
+            rec_changes,
+            unrun,
+            settle,
+            deps: deps.into(),
+            held: None,
+        }
+    }
+
+    /// Pushes `dep`, a dep outside an expanded group, unless it is settled.
+    /// False if its state loaded settled.
+    #[inline]
+    fn expand_external(&self, walk: &mut Walk, dep: NodeId) -> bool {
+        #[cfg(test)]
+        self.group_external_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dep_node = self.nodes.get(dep.0);
+        let dep_state = state::load::<C>(dep_node.state_cell());
+        if dep_state.is_settled() {
+            return false;
+        }
+        let dep_state = self.seen(dep_node.state_cell(), dep_state);
+        if !dep_state.is_settled() {
+            walk.expand(dep, dep_node.generation(), dep_state);
+        }
+        true
+    }
+
+    /// The revision, and the reshapes and other moves of a settled node to
+    /// unsettled within it: a state loaded settled stays so while neither
+    /// moves. None while such a move is under way, a set's dirty walk
+    /// included, since its count moves before it ends.
+    fn settle_key(&self) -> Option<(u64, u64)> {
+        let revision = self.current_revision();
+        let moves = C::u64_load_acquire(&self.unsettled);
+        (moves.is_multiple_of(2) && C::walked(&self.walk, &self.revision) >= revision).then(|| {
+            (
+                revision,
+                C::u64_load_acquire(&self.reshapes).wrapping_add(moves),
+            )
+        })
+    }
+
+    /// Counts a move of settled nodes to unsettled as under way until the
+    /// returned guard drops.
+    pub(crate) fn settle_move(&self) -> SettleMove<'_, C> {
+        C::u64_fetch_add(&self.unsettled, 1);
+        SettleMove(&self.unsettled)
     }
 
     /// Whether another thread changed `id`'s group record since the walk
@@ -6520,6 +6708,18 @@ impl<C: Cells> Runtime<C> {
     /// that a read ordered before its own made.
     pub(crate) fn land_unrun(&self, id: NodeId, node: &NodeData<C>, target: NodeState) {
         self.land_as(id, node, target, target, true);
+        if target != NodeState::Dirty
+            && C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0
+        {
+            C::u64_fetch_add(&self.group_unrun_landings, 1);
+        }
+    }
+
+    /// Sets or clears `node`'s held mark, then counts the change.
+    #[inline]
+    pub(crate) fn set_held_mark(&self, node: &NodeData<C>, held: bool) {
+        node.set_held_mark(held);
+        C::u64_fetch_add(&self.held_marks, 1);
     }
 
     #[inline(always)]

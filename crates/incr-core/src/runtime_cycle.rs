@@ -3158,7 +3158,14 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> GroupEnd {
         let rt = self.runtime_id;
-        let group = self.inner.read().member_recs.get(&x.0).cloned();
+        let unrun = C::u64_load_acquire(&self.group_unrun_landings);
+        let (group, rec_changes) = {
+            let inner = self.inner.read();
+            (
+                inner.member_recs.get(&x.0).cloned(),
+                inner.member_rec_changes,
+            )
+        };
         // The flags byte was loaded under the claim, and a record and its
         // bit change together under the claim, so a missing record is a
         // stale bit.
@@ -3174,7 +3181,7 @@ impl<C: Cells> Runtime<C> {
         let Some(group) = group else {
             return GroupEnd::Ordinary;
         };
-        if !group.members.iter().any(|&(m, gen)| m == x.0 && gen == g) {
+        if !group.has_member(x.0, g) {
             return GroupEnd::Ordinary;
         }
         // A discard keeps the root in the group it dissolved, for other
@@ -3182,6 +3189,25 @@ impl<C: Cells> Runtime<C> {
         // root computes it alone, as the unbounded run's frame does.
         if cycle_state::is_dissolved_group(rt, x.0, &group) {
             return GroupEnd::Ordinary;
+        }
+        // Step 1 failed on a member this thread's frame computes, after
+        // claiming every member below it. While that frame runs, no record
+        // has changed and no member has landed unrun but not Dirty, no
+        // member below it has become unclaimable, so step 1 fails the same
+        // way and keeps the claims in it:
+        // each member read inside a member's run would claim the members
+        // below it again.
+        if let Some(blocker) = cycle_state::group_blocker(rt, &group) {
+            if blocker.rec_changes == rec_changes
+                && blocker.unrun == unrun
+                && self
+                    .dep_stack
+                    .frame_at_is(blocker.depth, rt, NodeId(blocker.member))
+            {
+                #[cfg(all(test, not(loom)))]
+                cycle_state::note_group_blocker_skip();
+                return GroupEnd::Ordinary;
+            }
         }
         // The members' runs sit where `x`'s frame would.
         let cidx = self.dep_stack.next_cidx();
@@ -3196,6 +3222,9 @@ impl<C: Cells> Runtime<C> {
             // this thread's stack, whose claim the unbounded run fails.
             let virtual_member = value_code::thread_word() & value_code::REPLAY_BIT != 0
                 && self.virtual_position(m, generation).is_some();
+            #[cfg(test)]
+            self.group_claims
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let took = !virtual_member && self.claim_member(x, m, &claimed, bag);
             let mut ok = took;
             if ok && node.generation() != generation {
@@ -3210,6 +3239,17 @@ impl<C: Cells> Runtime<C> {
                 // two threads' passes wait on each other.
                 let seen =
                     self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
+                if !took && !virtual_member && is_computing(seen) {
+                    if let Some(depth) = self.dep_stack.frame_depth(rt, NodeId(m)) {
+                        let blocker = cycle_state::GroupBlocker {
+                            member: m,
+                            depth,
+                            rec_changes,
+                            unrun,
+                        };
+                        cycle_state::note_group_blocker(rt, group.clone(), blocker);
+                    }
+                }
                 self.release_group_claims(
                     &claimed,
                     !took && !virtual_member && seen != NodeState::Dirty && !is_computing(seen),

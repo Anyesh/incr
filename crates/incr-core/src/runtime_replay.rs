@@ -2976,6 +2976,7 @@ impl<C: Cells> Runtime<C> {
         // which never waits, so this waits it out. The claim is noted first,
         // so a rerun that finds the node Computing sees it.
         replay::regen_claim(self.runtime_id, id.0, true);
+        let moving = self.settle_move();
         let mut spins = 0;
         loop {
             // A ticket keeps the node while it reruns (`in_failed_landing`).
@@ -3011,6 +3012,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
+        drop(moving);
         let unmark = Unmark(self.runtime_id, id.0);
         // SAFETY: as in `compute_attempts`: the closure is freed only under
         // a Dead claim, which can't succeed while this node is Computing.

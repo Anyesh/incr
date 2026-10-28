@@ -189,7 +189,7 @@ impl<C: Cells> Runtime<C> {
             // entry first, and a release to New is of a claim from New; a
             // cut's claim released unrun takes its origin from the cut.
             let first = target == NodeState::New;
-            node.set_held_mark(true);
+            self.set_held_mark(node, true);
             let own = hold::open(
                 cell,
                 self.runtime_id,
@@ -255,7 +255,7 @@ impl<C: Cells> Runtime<C> {
         );
         debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
         if hold::holds(cell) {
-            node.set_held_mark(true);
+            self.set_held_mark(node, true);
         }
     }
 
@@ -289,7 +289,7 @@ impl<C: Cells> Runtime<C> {
         // Only an entry's publication or retraction clears the mark.
         let held = hold::holds(cell);
         if held {
-            node.set_held_mark(true);
+            self.set_held_mark(node, true);
         }
         held
     }
@@ -411,7 +411,7 @@ impl<C: Cells> Runtime<C> {
             self.counted_change()
         };
         let held = hold::forget(cell).expect("incr-core: a viewed landing has its entry");
-        node.set_held_mark(false);
+        self.set_held_mark(node, false);
         if let Some(old) = &held.undo.deps {
             let mut now: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| now.push(d));
@@ -729,7 +729,7 @@ impl<C: Cells> Runtime<C> {
             if let Some((slot, target)) = stopped {
                 let node = self.nodes.get(slot);
                 node.set_verified_at(0);
-                node.set_held_mark(false);
+                self.set_held_mark(node, false);
                 // While the claim is still this publication's: once the node
                 // lands, a record or ticket there may be a new claim's.
                 if target == NodeState::Failed {
@@ -758,6 +758,7 @@ impl<C: Cells> Runtime<C> {
     /// give-back is unverified, published or not, so one Clean over the
     /// value restored recomputes once after the panic.
     fn unverify_readers(&self, given: &[u32]) {
+        let _moving = self.settle_move();
         let mut readers: Vec<NodeId> = Vec::new();
         {
             let inner = self.inner.read();
@@ -951,7 +952,7 @@ impl<C: Cells> Runtime<C> {
         for action in e.trace {
             self.push_trace_now(id, action);
         }
-        node.set_held_mark(false);
+        self.set_held_mark(node, false);
         self.park(super::ParkPoint::HeldLanding(id));
         let failed = was_failed.then(|| {
             (
@@ -1126,7 +1127,7 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty
             };
             let node = self.nodes.get(e.slot);
-            node.set_held_mark(false);
+            self.set_held_mark(node, false);
             self.land_now(NodeId(e.slot), node, back, back, true);
         }
         if edges_published {

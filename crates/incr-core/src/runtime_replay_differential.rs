@@ -12772,3 +12772,79 @@ fn seed_2efc_kept_children_root_no_unheld_frame() {
         differential::<Shared>(&case, 0x2efc);
     });
 }
+
+fn run_with_group_reuse<C: Cells>(
+    case: &Case,
+    frames: Option<u32>,
+    bytes: usize,
+    (skip, reuse): (bool, bool),
+) -> Result<Trace, String> {
+    crate::cycle_state::set_group_blocker_skip(skip);
+    crate::cycle_state::set_group_externals_reuse(reuse);
+    let got = catch_unwind(AssertUnwindSafe(|| run::<C>(case, frames, bytes)))
+        .map_err(super::race_tests::panic_message);
+    crate::cycle_state::set_group_blocker_skip(true);
+    crate::cycle_state::set_group_externals_reuse(true);
+    got
+}
+
+/// Turning off the group reuses `off` leaves on moves no outcome: every
+/// operation's output and every node's state, deps and group record match
+/// the run with both on, unbounded and at every budget, crossed or not.
+/// Returns how much `taken`, the turned-off reuse's count, grew.
+fn group_reuse_moves_no_trace(
+    seeds: std::ops::Range<u64>,
+    off: (bool, bool),
+    taken: fn() -> u64,
+) -> u64 {
+    let before = taken();
+    quiet(|| {
+        for seed in seeds {
+            for cross in [false, true] {
+                let case = gen_case(seed, cross, false);
+                for (frames, bytes) in std::iter::once((None, 0)).chain(BUDGETS) {
+                    let label = format!("seed {seed:#x} cross {cross} {frames:?}/{bytes}");
+                    assert_eq!(
+                        run_with_group_reuse::<Local>(&case, frames, bytes, (true, true)),
+                        run_with_group_reuse::<Local>(&case, frames, bytes, off),
+                        "Local {label}"
+                    );
+                    assert_eq!(
+                        run_with_group_reuse::<Shared>(&case, frames, bytes, (true, true)),
+                        run_with_group_reuse::<Shared>(&case, frames, bytes, off),
+                        "Shared {label}"
+                    );
+                }
+            }
+        }
+    });
+    taken() - before
+}
+
+/// Ending a verify early on a record blocked by a member this thread
+/// computes moves no outcome.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_blocked_group_skip_moves_no_trace() {
+    let skips = group_reuse_moves_no_trace(
+        0x1a7..0x1a8,
+        (false, true),
+        crate::cycle_state::group_blocker_skips,
+    );
+    eprintln!("group blocker skips: {skips}");
+    assert!(skips > 0, "no seed's verify took the skip");
+}
+
+/// Reusing a group's externals listed earlier in the entry moves no
+/// outcome.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_listed_group_reuse_moves_no_trace() {
+    let reuses = group_reuse_moves_no_trace(
+        0x1a7..0x1a8,
+        (true, false),
+        crate::cycle_state::group_externals_reuses,
+    );
+    eprintln!("group externals reuses: {reuses}");
+    assert!(reuses > 0, "no seed's expansion reused a listing");
+}
