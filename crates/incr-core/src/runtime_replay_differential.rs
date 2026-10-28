@@ -8910,10 +8910,11 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                 if here == 2 {
                     break;
                 }
-                let (held, released, passes, timed_out) = (
+                let (held, released, passes, timed_out, waits) = (
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                 );
                 let rig = |live: &Live<Shared>| {
@@ -8927,7 +8928,24 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                     );
                     let n2 = NodeId(world.handle(0, 2).erased().slot());
                     let rts = [world.rt(0).runtime_id, world.rt(1).runtime_id];
+                    // A walk waiting on another thread's subtree parks at
+                    // WalkWaits whatever it holds; a wait that holds
+                    // nothing never registers.
+                    let waits_on = move |waits: Arc<AtomicBool>| {
+                        move |p: ParkPoint| {
+                            if TWO_PHASE.with(std::cell::Cell::get) == overlap
+                                && TWO_THREAD.with(std::cell::Cell::get) == Some(1 - reader)
+                                && matches!(p, ParkPoint::WalkWaits(_))
+                            {
+                                waits.store(true, SeqCst);
+                            }
+                        }
+                    };
+                    let (waits0, waits) = (waits_on(waits.clone()), waits.clone());
+                    let hook1: crate::runtime::ParkHook = Box::new(waits_on(waits.clone()));
+                    assert!(live.world.rt(1).park_hook.set(hook1).is_ok());
                     let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                        waits0(p);
                         if TWO_PHASE.with(std::cell::Cell::get) != overlap
                             || TWO_THREAD.with(std::cell::Cell::get) != Some(reader)
                             || p != ParkPoint::BeforeComputeOne(n2)
@@ -8945,6 +8963,7 @@ fn two_thread_replan_verifies_an_unrun_ring_member_once() {
                         // order and goes on.
                         let begun = std::time::Instant::now();
                         while !ended.lock().unwrap().contains(&15)
+                            && !waits.load(SeqCst)
                             && rts.iter().all(|&rt| crate::waits::registered_on(rt) == 0)
                         {
                             if begun.elapsed() > std::time::Duration::from_secs(10) {
