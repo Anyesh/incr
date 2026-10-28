@@ -4414,6 +4414,17 @@ fn cross_seed_reading_back_under_virtual_frames() {
     });
 }
 
+/// 0x1684812d06f040c3 at budget 1: Native node 8 runs under 6 as a member
+/// of their cycle, recorded under speculation, and reads the other
+/// runtime's Clean node 0. The real read after it must keep that run, as
+/// the unbounded run does, not run 8 again.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_seed_native_member_run_over_a_foreign_clean_read() {
+    let case = gen_case(0x1684812d06f040c3, true, false);
+    quiet(|| differential::<Local>(&case, 0x1684812d06f040c3));
+}
+
 /// Two-thread seeds, with a second runtime when `.1`, whose reads pushed a
 /// virtual frame onto a node that already had one, a group verify having
 /// claimed a member with a virtual frame on its thread. The threads'
