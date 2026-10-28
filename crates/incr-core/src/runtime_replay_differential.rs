@@ -8955,11 +8955,11 @@ fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
                 );
                 let rig = |live: &Live<Shared>| {
                     let (gated, at14, waits, ready, parked, claimed, seen, world) = (
-                        parked.clone(),
-                        ready.clone(),
                         gated.clone(),
                         at14.clone(),
                         waits.clone(),
+                        ready.clone(),
+                        parked.clone(),
                         claimed.clone(),
                         seen.clone(),
                         live.world.clone(),
@@ -9004,6 +9004,7 @@ fn two_thread_walk_entry_claimed_after_its_root_was_claimed_seed() {
                             if waits.load(SeqCst)
                                 && computing(n2)
                                 && !computing(n14)
+                                && !parked.load(SeqCst)
                                 && !reserved(n14)
                                 && !parked.swap(true, SeqCst)
                             {
