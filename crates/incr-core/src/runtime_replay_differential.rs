@@ -721,6 +721,10 @@ thread_local! {
     static OPEN: std::cell::RefCell<Vec<Eval>> = const { std::cell::RefCell::new(Vec::new()) };
     /// While set, the runs of Native closures that start on this thread.
     static NATIVE: std::cell::RefCell<Option<Vec<NativeRun>>> = const { std::cell::RefCell::new(None) };
+    /// While set, the runtimes a run builds on this thread keep their
+    /// Native queries native under `INCR_TEST_ALL_REPLAYABLE`
+    /// ([`keeping_native`]).
+    static KEEP_NATIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While set, how many closure runs start on this thread, by side and
     /// node index, for [`replay_run_counts`].
     static RUNS: std::cell::RefCell<Option<HashMap<(usize, usize), u32>>> = const { std::cell::RefCell::new(None) };
@@ -1508,7 +1512,10 @@ type Trace = Vec<(Out, Snapshot)>;
 
 fn runtimes<C: Cells>(frames: Option<u32>, bytes: usize) -> [Box<Runtime<C>>; 2] {
     [(); 2].map(|()| {
-        let rt = Box::new(Runtime::<C>::new());
+        let mut rt = Box::new(Runtime::<C>::new());
+        if KEEP_NATIVE.with(std::cell::Cell::get) {
+            rt.all_replayable = false;
+        }
         rt.set_placeholder(0_u64);
         if BARE_PLACEHOLDER.load(SeqCst) {
             rt.set_placeholder(Bare(0, false));
@@ -2863,6 +2870,21 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
 }
 
 /// [`run`], with the Native closure runs it started.
+/// Runs `f` with [`KEEP_NATIVE`] set, for a pin of how often Native
+/// closures run: `INCR_TEST_ALL_REPLAYABLE` would make the case's Native
+/// queries replayable, leaving no Native runs to count.
+fn keeping_native<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            KEEP_NATIVE.with(|k| k.set(false));
+        }
+    }
+    KEEP_NATIVE.with(|k| k.set(true));
+    let _reset = Reset;
+    f()
+}
+
 fn run_counted<C: Cells>(
     case: &Case,
     frames: Option<u32>,
@@ -4473,9 +4495,11 @@ fn cross_seed_reading_back_under_virtual_frames() {
 fn cross_seeds_native_member_run_over_a_checked_foreign_read() {
     for seed in [0x16a03, 0x3ce9] {
         let case = gen_case(seed, true, false);
-        quiet(|| {
-            differential::<Local>(&case, seed);
-            differential::<Shared>(&case, seed);
+        keeping_native(|| {
+            quiet(|| {
+                differential::<Local>(&case, seed);
+                differential::<Shared>(&case, seed);
+            })
         });
     }
 }
@@ -4490,11 +4514,13 @@ fn cross_seeds_native_member_run_over_a_checked_foreign_read() {
 #[cfg_attr(miri, ignore)]
 fn cross_seed_native_member_run_over_a_foreign_clean_read() {
     let case = gen_case(0x1684812d06f040c3, true, false);
-    quiet(|| {
-        let (unbounded, native) = run_counted::<Local>(&case, None, 0);
-        let (bounded, runs) = run_counted::<Local>(&case, Some(1), 0);
-        compare(&case, &unbounded, &bounded, "0x1684812d06f040c3, budget 1");
-        assert_eq!(native_off(&native, &runs), [((0, 15, 6, 8), (1, 2, 0))]);
+    keeping_native(|| {
+        quiet(|| {
+            let (unbounded, native) = run_counted::<Local>(&case, None, 0);
+            let (bounded, runs) = run_counted::<Local>(&case, Some(1), 0);
+            compare(&case, &unbounded, &bounded, "0x1684812d06f040c3, budget 1");
+            assert_eq!(native_off(&native, &runs), [((0, 15, 6, 8), (1, 2, 0))]);
+        })
     });
 }
 
