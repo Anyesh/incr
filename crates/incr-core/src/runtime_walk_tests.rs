@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::race_tests::{id, park_at, Gate};
-use super::{ParkPoint, Runtime, Walk, EXACT_MODE_AT, NO_TAINT_NEW};
+use super::{ParkPoint, Runtime, Walk, EXACT_MODE_AT, NO_TAINT_NEW, SPARE_WORK, SPARE_WORK_MAX};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
@@ -2553,4 +2553,115 @@ fn a_visit_at_the_exact_switch_reports_its_own_entry() {
     walk.expand(d, 0, NodeState::Dirty);
     walk.work.truncate(pending);
     assert!(walk.work.iter().all(|e| e.id != c && e.id != d));
+}
+
+/// A chain of `n` queries over one input, built bottom-up so no first
+/// compute nests; a set on the input then makes a read of the top walk all
+/// `n` iteratively.
+fn dirty_chain<C: Cells>(rt: &Runtime<C>, n: usize) -> (Incr<i64>, Incr<i64>) {
+    let x = rt.create_input(0_i64);
+    let mut top = rt.create_query(move |rt| rt.get(x));
+    rt.get(top);
+    for _ in 1..n {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below) + 1);
+        rt.get(top);
+    }
+    (x, top)
+}
+
+/// This thread's spare walk buffer, as its capacity and address.
+fn spare_work() -> (usize, usize) {
+    SPARE_WORK.with(|spare| {
+        let work = spare.take();
+        let seen = work
+            .as_ref()
+            .map_or((0, 0), |w| (w.capacity(), w.as_ptr() as usize));
+        spare.set(work);
+        seen
+    })
+}
+
+fn a_deep_walk_keeps_its_buffer_for_the_next<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (x, top) = dirty_chain(&rt, 200);
+    rt.set(x, 1);
+    assert_eq!(rt.get(top), 200);
+    let (cap, at) = spare_work();
+    assert!(cap >= 200, "the walk kept {cap} entries");
+    rt.set(x, 2);
+    assert_eq!(rt.get(top), 201);
+    assert_eq!(spare_work(), (cap, at), "the next walk reused the buffer");
+}
+
+#[test]
+fn local_deep_walk_keeps_its_buffer_for_the_next() {
+    a_deep_walk_keeps_its_buffer_for_the_next::<Local>();
+}
+
+#[test]
+fn shared_deep_walk_keeps_its_buffer_for_the_next() {
+    a_deep_walk_keeps_its_buffer_for_the_next::<Shared>();
+}
+
+fn a_walk_past_the_cap_frees_its_buffer<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let n = SPARE_WORK_MAX + 1;
+    let (x, top) = dirty_chain(&rt, n);
+    rt.set(x, 1);
+    assert_eq!(rt.get(top), n as i64);
+    assert_eq!(spare_work(), (0, 0), "a buffer past the cap stays unkept");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_walk_past_the_cap_frees_its_buffer() {
+    a_walk_past_the_cap_frees_its_buffer::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_walk_past_the_cap_frees_its_buffer() {
+    a_walk_past_the_cap_frees_its_buffer::<Shared>();
+}
+
+/// The 20-deep chain's bottom reads the 200-deep `side` chain only once
+/// `x` is odd, so the walk after `x` turns odd runs `side`'s Dirty walk
+/// nested in its compute. The nested walk returns its buffer first; the
+/// outer walk's smaller one, returned after, must not displace it.
+fn a_shorter_outer_walk_keeps_the_nested_walks_buffer<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (y, side) = dirty_chain(&rt, 200);
+    let x = rt.create_input(0_i64);
+    let mut top = rt.create_query(move |rt| {
+        let v = rt.get(x);
+        if v % 2 == 1 {
+            let _ = rt.get(side);
+        }
+        v
+    });
+    rt.get(top);
+    for _ in 1..20 {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below) + 1);
+        rt.get(top);
+    }
+    rt.set(y, 1);
+    rt.set(x, 1);
+    assert_eq!(rt.get(top), 20);
+    let (cap, _) = spare_work();
+    assert!(
+        cap >= 200,
+        "the outer walk's {cap} entries displaced the nested walk's buffer"
+    );
+}
+
+#[test]
+fn local_shorter_outer_walk_keeps_the_nested_walks_buffer() {
+    a_shorter_outer_walk_keeps_the_nested_walks_buffer::<Local>();
+}
+
+#[test]
+fn shared_shorter_outer_walk_keeps_the_nested_walks_buffer() {
+    a_shorter_outer_walk_keeps_the_nested_walks_buffer::<Shared>();
 }

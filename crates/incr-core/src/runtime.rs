@@ -953,6 +953,38 @@ struct Expanded {
     groups: Vec<(NodeId, Arc<GroupInfo>, usize)>,
 }
 
+/// Walk work buffers above this many entries are freed, not kept.
+const SPARE_WORK_MAX: usize = 4096;
+
+#[cfg(not(loom))]
+thread_local! {
+    /// A finished walk's work buffer, kept for this thread's next walk: a
+    /// deep walk's buffer is past glibc's thread cache, and allocating it
+    /// afresh consolidates the fast bins Shared's reclaimed values fill.
+    static SPARE_WORK: std::cell::Cell<Option<Vec<Entry>>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(loom)]
+loom::thread_local! {
+    static SPARE_WORK: std::cell::Cell<Option<Vec<Entry>>> = std::cell::Cell::new(None);
+}
+
+impl Drop for Walk {
+    fn drop(&mut self) {
+        let cap = self.work.capacity();
+        if !(16..=SPARE_WORK_MAX).contains(&cap) {
+            return;
+        }
+        let mut work = std::mem::take(&mut self.work);
+        work.clear();
+        // Past the thread's locals' teardown the buffer is freed instead.
+        let _ = SPARE_WORK.try_with(|spare| match spare.take() {
+            Some(kept) if kept.capacity() >= cap => spare.set(Some(kept)),
+            _ => spare.set(Some(work)),
+        });
+    }
+}
+
 impl Walk {
     #[cold]
     #[inline(never)]
@@ -982,12 +1014,20 @@ impl Walk {
     }
     #[inline]
     fn new(root: NodeId, generation: u32, root_state: NodeState) -> Self {
+        let root = Entry {
+            id: root,
+            taint: Self::visit_kind(root_state),
+            generation,
+        };
+        let work = match SPARE_WORK.try_with(std::cell::Cell::take).ok().flatten() {
+            Some(mut work) => {
+                work.push(root);
+                work
+            }
+            None => vec![root],
+        };
         Self {
-            work: vec![Entry {
-                id: root,
-                taint: Self::visit_kind(root_state),
-                generation,
-            }],
+            work,
             first_visits: 0,
             visited: None,
             expanded: None,
