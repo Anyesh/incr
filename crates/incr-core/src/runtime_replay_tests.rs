@@ -3715,3 +3715,52 @@ local_and_shared!(
     local_dead_reads_count_at_a_creation_outside_a_compute,
     shared_dead_reads_count_at_a_creation_outside_a_compute
 );
+
+/// A chain of `k` plain queries above a query with a cycle strategy, read
+/// once from the top, the shape of a deep spreadsheet column.
+fn deep_chain_read<C: Cells>(k: usize) -> i64 {
+    let rt = Runtime::<C>::new();
+    let on = rt.create_input(0_i64);
+    let root: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let m = {
+        let root = root.clone();
+        rt.create_query_with_fallback(
+            move |rt| match rt.get(on) {
+                0 => 0,
+                _ => rt.get(*root.get().unwrap()) + 1,
+            },
+            |_c: &Cycle| 100,
+        )
+    };
+    let mut top = rt.create_query(move |rt| rt.get(m) + rt.get(on));
+    for _ in 1..k {
+        let below = top;
+        top = rt.create_query(move |rt| rt.get(below) + 1);
+    }
+    let r = rt.create_query(move |rt| rt.get(top));
+    root.set(r).unwrap();
+    rt.get(r)
+}
+
+/// 1,100 levels, a tenth over 1,000, fit a 2 MiB thread in a release
+/// build; a debug build's frames are many times larger, so it gets 128 MiB.
+fn deep_chain_fits_a_small_thread<C: Cells>() {
+    let stack = if cfg!(debug_assertions) {
+        128 << 20
+    } else {
+        2 << 20
+    };
+    on_stack(stack, || assert_eq!(deep_chain_read::<C>(1_100), 1_099));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_deep_chain_fits_a_small_thread() {
+    deep_chain_fits_a_small_thread::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_deep_chain_fits_a_small_thread() {
+    deep_chain_fits_a_small_thread::<Shared>();
+}
