@@ -23,4 +23,19 @@ for p in crates/incr-python/pyproject.toml crates/incr-concurrent-python/pyproje
         status=1
     fi
 done
+
+# A caret requirement between workspace crates lets a published crate resolve
+# a later release of its sibling, which runs another engine's semantics.
+inexact=$(cargo metadata --no-deps --format-version 1 | jq -r --arg want "=$workspace" '
+    (.packages | map(.name)) as $ws
+    | .packages[] | . as $p
+    | .dependencies[]
+    | select(.name as $n | $ws | index($n))
+    | select(.req != "*" or ($p.publish == null and .kind != "dev"))
+    | select(.req != $want)
+    | "\($p.name) requires \(.name) \(.req), not \($want)"')
+if [[ -n "$inexact" ]]; then
+    echo "$inexact"
+    status=1
+fi
 exit $status

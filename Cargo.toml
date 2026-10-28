@@ -7,4 +7,4 @@ version = "0.2.0-beta.6"
 
 [workspace.dependencies]
 incr-core = { version = "=0.2.0-beta.6", path = "crates/incr-core" }
-incr-concurrent = { version = "0.2.0-beta.6", path = "crates/incr-concurrent" }
+incr-concurrent = { version = "=0.2.0-beta.6", path = "crates/incr-concurrent" }
