@@ -87,21 +87,46 @@ jobs:
       - run: cargo +1.88 check -p incr-wasm-tests --all-targets --target wasm32-unknown-unknown
 
   miri:
-    name: Miri
+    name: Miri (${{ matrix.crate }} ${{ matrix.part }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        crate: [incr-core, incr-kube]
+        include:
+          - { crate: incr-core, part: lib-0 }
+          - { crate: incr-core, part: lib-1 }
+          - { crate: incr-core, part: lib-2 }
+          - { crate: incr-core, part: lib-3 }
+          - { crate: incr-core, part: lib-4 }
+          - { crate: incr-core, part: lib-5 }
+          - { crate: incr-core, part: stress }
+          - { crate: incr-kube, part: all }
     env:
       CRATE: ${{ matrix.crate }}
+      PART: ${{ matrix.part }}
+      LIB_SHARDS: 6
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly miri test -p "$CRATE" --lib --test stress -- --test-threads=1
+      # incr-core's lib tests take close to a job's 6 h limit under Miri,
+      # so they run in shards packed by scripts/miri-times.tsv.
+      - shell: bash
+        run: |
+          case "$PART" in
+            all) cargo +nightly miri test -p "$CRATE" --lib --test stress -- --test-threads=1 ;;
+            stress) cargo +nightly miri test -p "$CRATE" --test stress -- --test-threads=1 ;;
+            lib-*)
+              cargo +nightly miri test -p "$CRATE" --lib -- --list | sed -n 's/: test$//p' > "$RUNNER_TEMP/tests"
+              cargo +nightly miri test -p "$CRATE" --lib -- --list --ignored | sed -n 's/: test$//p' > "$RUNNER_TEMP/ignored"
+              python3 scripts/miri-shard.py scripts/miri-times.tsv "$LIB_SHARDS" "${PART#lib-}" \
+                "$RUNNER_TEMP/tests" "$RUNNER_TEMP/ignored" > "$RUNNER_TEMP/shard"
+              cargo +nightly miri test -p "$CRATE" --lib -- --test-threads=1 --exact $(cat "$RUNNER_TEMP/shard")
+              ;;
+            *) echo "unknown part $PART"; exit 1 ;;
+          esac
 
   loom:
     name: Loom (${{ matrix.model }}, bound ${{ matrix.bound }})
