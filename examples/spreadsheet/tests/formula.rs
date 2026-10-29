@@ -65,6 +65,8 @@ fn unknown_functions_and_bad_if_arity_fail_to_parse() {
     assert_eq!(parse_formula("FOO"), Err(ParseError));
     assert_eq!(parse_formula("SUM(1+2:A3)"), Err(ParseError));
     assert_eq!(parse_formula("SUM(A1:A2000000)"), Err(ParseError));
+    assert_eq!(parse_formula("IF(A1:A3)"), Err(ParseError));
+    assert_eq!(parse_formula("IF(A1, B1:B2)"), Err(ParseError));
 }
 
 #[test]
@@ -72,6 +74,10 @@ fn contents_classify_as_empty_number_text_formula_or_invalid() {
     assert_eq!(parse_content(""), Content::Empty);
     assert_eq!(parse_content("29.99"), Content::Number(29.99));
     assert_eq!(parse_content("Price"), Content::Text("Price".into()));
+    for word in ["NaN", "inf", "Infinity", "-inf", "1e999"] {
+        assert_eq!(parse_content(word), Content::Text(word.into()), "{word}");
+    }
+    assert_eq!(parse_content("-2.5e3"), Content::Number(-2500.0));
     assert_eq!(
         parse_content("=A1"),
         Content::Formula(Expr::CellRef(c("A1")))

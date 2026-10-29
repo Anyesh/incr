@@ -259,7 +259,7 @@ impl Parser {
                     if !FUNCTIONS.contains(&name.as_str()) {
                         return Err(());
                     }
-                    let args = self.parse_fn_args()?;
+                    let args = self.parse_fn_args(name != "IF")?;
                     self.expect(&Token::RParen)?;
                     if name == "IF" && args.len() != 3 {
                         return Err(());
@@ -279,8 +279,9 @@ impl Parser {
         }
     }
 
-    /// Parse function arguments, expanding range expressions like A1:B5.
-    fn parse_fn_args(&mut self) -> Result<Vec<Expr>, ()> {
+    /// Parse function arguments, expanding range expressions like A1:B5
+    /// where `ranges` allows them.
+    fn parse_fn_args(&mut self, ranges: bool) -> Result<Vec<Expr>, ()> {
         let mut args = Vec::new();
         if self.peek() == Some(&Token::RParen) {
             return Ok(args);
@@ -291,6 +292,9 @@ impl Parser {
             let first = self.parse_expr()?;
 
             if self.peek() == Some(&Token::Colon) {
+                if !ranges {
+                    return Err(());
+                }
                 self.advance();
                 let second = self.parse_expr()?;
                 // Both must be cell refs for a range
@@ -355,7 +359,7 @@ pub fn parse_content(raw: &str) -> Content {
         Content::Empty
     } else if let Some(formula) = raw.strip_prefix('=') {
         parse_formula(formula).map_or(Content::Invalid, Content::Formula)
-    } else if let Ok(n) = raw.trim().parse::<f64>() {
+    } else if let Some(n) = raw.trim().parse::<f64>().ok().filter(|n| n.is_finite()) {
         Content::Number(n)
     } else {
         Content::Text(raw.to_string())
@@ -363,7 +367,6 @@ pub fn parse_content(raw: &str) -> Content {
 }
 
 impl Content {
-    /// The cell's value, reading other cells through `lookup`.
     pub fn evaluate(&self, lookup: &mut impl FnMut(Coord) -> CellValue) -> CellValue {
         match self {
             Content::Empty => CellValue::Empty,
