@@ -43,12 +43,23 @@ struct SetCellMsg {
     content: String,
 }
 
-/// One lock around each set and its recalc: the runtime keeps one queue
-/// of dirtied cells, so two edits recalculating at once would each take
-/// part of the other's report.
 struct AppState {
     engine: Mutex<Engine>,
     tx: broadcast::Sender<String>,
+}
+
+impl AppState {
+    /// Applies and broadcasts the edit under one hold of the lock: the
+    /// runtime keeps one queue of dirtied cells, so two edits
+    /// recalculating at once would each take part of the other's report,
+    /// and two broadcasts racing could leave clients on the older value.
+    fn edit(&self, at: Coord, content: String) {
+        let mut engine = self.engine.lock().expect("engine lock");
+        let update = apply(&mut engine, at, content);
+        if let Ok(json) = serde_json::to_string(&update) {
+            let _ = self.tx.send(json);
+        }
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -58,13 +69,12 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
+    // Subscribed before the snapshot, so an edit after it is not missed.
+    let mut rx = state.tx.subscribe();
     let msg = full_state(&state.engine.lock().expect("engine lock"));
     if let Ok(json) = serde_json::to_string(&msg) {
         let _ = sender.send(Message::Text(json.into())).await;
     }
-
-    // Subscribe to broadcast for updates from other clients.
-    let mut rx = state.tx.subscribe();
 
     // Spawn a task to forward broadcasts to this client.
     let mut send_task = tokio::spawn(async move {
@@ -84,9 +94,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             let Some(at) = Coord::parse(&set_msg.cell) else {
                 continue;
             };
-            let update = apply(&state.engine, at, set_msg.content);
-            if let Ok(json) = serde_json::to_string(&update) {
-                let _ = state.tx.send(json);
+            let state = Arc::clone(&state);
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || state.edit(at, set_msg.content)).await
+            {
+                eprintln!("edit failed: {e}");
             }
         }
     });
@@ -100,8 +112,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
 /// Sets the cell and recalculates. The edited cell is always sent, with
 /// its content, since a new content can leave the value unchanged.
-fn apply(engine: &Mutex<Engine>, at: Coord, content: String) -> UpdateMsg {
-    let mut engine = engine.lock().expect("engine lock");
+fn apply(engine: &mut Engine, at: Coord, content: String) -> UpdateMsg {
     engine.set(at, &content);
     let mut changed: Vec<CellState> = engine
         .recalc()
@@ -204,16 +215,16 @@ async fn serve_static() -> impl IntoResponse {
 mod tests {
     use super::*;
 
-    fn send(engine: &Mutex<Engine>, cell: &str, content: &str) -> serde_json::Value {
+    fn send(engine: &mut Engine, cell: &str, content: &str) -> serde_json::Value {
         let at = Coord::parse(cell).unwrap();
         serde_json::to_value(apply(engine, at, content.to_string())).unwrap()
     }
 
     #[test]
     fn updates_carry_the_edited_cell_last_with_its_content() {
-        let engine = Mutex::new(Engine::new());
-        send(&engine, "A1", "=B1");
-        let update = send(&engine, "B1", "=A1");
+        let engine = &mut Engine::new();
+        send(engine, "A1", "=B1");
+        let update = send(engine, "B1", "=A1");
         assert_eq!(
             update["changed"],
             serde_json::json!([
@@ -221,7 +232,7 @@ mod tests {
                 {"cell": "B1", "content": "=A1", "error": "#CIRC!"},
             ])
         );
-        let update = send(&engine, "B1", "5");
+        let update = send(engine, "B1", "5");
         assert_eq!(
             update["changed"],
             serde_json::json!([
@@ -229,7 +240,7 @@ mod tests {
                 {"cell": "B1", "content": "5", "value": 5.0},
             ])
         );
-        let update = send(&engine, "B1", "5.0");
+        let update = send(engine, "B1", "5.0");
         assert_eq!(
             update["changed"],
             serde_json::json!([{"cell": "B1", "content": "5.0", "value": 5.0}])
