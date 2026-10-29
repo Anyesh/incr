@@ -283,13 +283,13 @@ function cellName(col, row) {
   return COL_LETTERS[col] + row;
 }
 
-function formatValue(val, content) {
-  if (content && !content.startsWith('=') && isNaN(parseFloat(content))) {
-    return { text: content, cls: 'text' };
-  }
-  if (val === null || val === undefined) return { text: '', cls: '' };
-  if (isNaN(val)) return { text: '#ERR', cls: 'error' };
-  if (!isFinite(val)) return { text: '#DIV/0', cls: 'error' };
+function formatValue(v) {
+  if (!v) return { text: '', cls: '' };
+  if (v.error !== undefined) return { text: v.error, cls: 'error' };
+  if (v.text !== undefined) return { text: v.text, cls: 'text' };
+  if (v.value === undefined) return { text: '', cls: '' };
+  if (v.value === null) return { text: '#NUM!', cls: 'error' };
+  const val = v.value;
   if (val === Math.floor(val) && Math.abs(val) < 1e15) {
     return { text: val.toString(), cls: 'number' };
   }
@@ -300,9 +300,7 @@ function renderCell(name) {
   const td = document.getElementById('cell-' + name);
   if (!td) return;
   const display = td.querySelector('.cell-display');
-  const content = cellContents[name] || '';
-  const value = cellValues[name];
-  const fmt = formatValue(value, content);
+  const fmt = formatValue(cellValues[name]);
   display.textContent = fmt.text;
   display.className = 'cell-display ' + fmt.cls;
 }
@@ -377,7 +375,7 @@ function connect() {
     if (msg.type === 'full_state') {
       for (const cell of msg.cells) {
         cellContents[cell.cell] = cell.content;
-        cellValues[cell.cell] = cell.value;
+        cellValues[cell.cell] = cell;
         renderCell(cell.cell);
       }
       if (msg.node_count) {
@@ -388,8 +386,8 @@ function connect() {
 
     if (msg.type === 'update') {
       for (const cell of msg.changed) {
-        if (cell.content) cellContents[cell.cell] = cell.content;
-        cellValues[cell.cell] = cell.value;
+        if (cell.content !== undefined) cellContents[cell.cell] = cell.content;
+        cellValues[cell.cell] = cell;
         renderCell(cell.cell);
         flashCell(cell.cell);
       }

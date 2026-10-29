@@ -1,22 +1,27 @@
-mod server_engine;
-
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
+use incr_spreadsheet::coord::Coord;
+use incr_spreadsheet::engine::Engine;
+use incr_spreadsheet::value::CellValue;
+use incr_spreadsheet::Sheet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::server_engine::{seed_data, SpreadsheetEngine};
+const COLS: u32 = 10;
+const ROWS: u32 = 20;
 
 #[derive(Clone, Serialize)]
 struct CellState {
     cell: String,
-    content: String,
-    value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(flatten)]
+    value: CellValue,
 }
 
 #[derive(Serialize)]
@@ -38,8 +43,11 @@ struct SetCellMsg {
     content: String,
 }
 
+/// One lock around each set and its recalc: the runtime keeps one queue
+/// of dirtied cells, so two edits recalculating at once would each take
+/// part of the other's report.
 struct AppState {
-    engine: Arc<SpreadsheetEngine>,
+    engine: Mutex<Engine>,
     tx: broadcast::Sender<String>,
 }
 
@@ -50,21 +58,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Send full state on connect.
-    let full = state.engine.full_state();
-    let cells: Vec<CellState> = full
-        .into_iter()
-        .map(|(cell, content, value)| CellState {
-            cell,
-            content,
-            value,
-        })
-        .collect();
-    let msg = FullStateMsg {
-        r#type: "full_state",
-        cells,
-        node_count: state.engine.node_count(),
-    };
+    let msg = full_state(&state.engine.lock().expect("engine lock"));
     if let Ok(json) = serde_json::to_string(&msg) {
         let _ = sender.send(Message::Text(json.into())).await;
     }
@@ -81,59 +75,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    // Process incoming messages from this client.
-    let engine = state.engine.clone();
-    let tx = state.tx.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
-            if let Message::Text(text) = msg {
-                if let Ok(set_msg) = serde_json::from_str::<SetCellMsg>(&text) {
-                    let changed_values = engine.set_cell(&set_msg.cell, &set_msg.content);
-
-                    // Build update with content for the edited cell and values for all changed.
-                    let mut changed: Vec<CellState> = changed_values
-                        .into_iter()
-                        .map(|(cell, value)| {
-                            let content = if cell.eq_ignore_ascii_case(&set_msg.cell) {
-                                set_msg.content.clone()
-                            } else {
-                                String::new()
-                            };
-                            CellState {
-                                cell,
-                                content,
-                                value,
-                            }
-                        })
-                        .collect();
-
-                    // Always include the edited cell even if its value didn't "change"
-                    // (e.g., setting text content).
-                    if !changed
-                        .iter()
-                        .any(|c| c.cell.eq_ignore_ascii_case(&set_msg.cell))
-                    {
-                        let full = engine.full_state();
-                        if let Some((_, content, value)) = full
-                            .iter()
-                            .find(|(name, _, _)| name.eq_ignore_ascii_case(&set_msg.cell))
-                        {
-                            changed.push(CellState {
-                                cell: set_msg.cell.to_uppercase(),
-                                content: content.clone(),
-                                value: *value,
-                            });
-                        }
-                    }
-
-                    let update = UpdateMsg {
-                        r#type: "update",
-                        changed,
-                    };
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = tx.send(json);
-                    }
-                }
+            let Message::Text(text) = msg else { continue };
+            let Ok(set_msg) = serde_json::from_str::<SetCellMsg>(&text) else {
+                continue;
+            };
+            let Some(at) = Coord::parse(&set_msg.cell) else {
+                continue;
+            };
+            let update = apply(&state.engine, at, set_msg.content);
+            if let Ok(json) = serde_json::to_string(&update) {
+                let _ = state.tx.send(json);
             }
         }
     });
@@ -145,17 +98,89 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
+/// Sets the cell and recalculates. The edited cell is always sent, with
+/// its content, since a new content can leave the value unchanged.
+fn apply(engine: &Mutex<Engine>, at: Coord, content: String) -> UpdateMsg {
+    let mut engine = engine.lock().expect("engine lock");
+    engine.set(at, &content);
+    let mut changed: Vec<CellState> = engine
+        .recalc()
+        .into_iter()
+        .filter(|&(cell, _)| cell != at)
+        .map(|(cell, value)| CellState {
+            cell: cell.to_string(),
+            content: None,
+            value,
+        })
+        .collect();
+    changed.push(CellState {
+        cell: at.to_string(),
+        content: Some(content),
+        value: engine.value(at),
+    });
+    UpdateMsg {
+        r#type: "update",
+        changed,
+    }
+}
+
+fn full_state(engine: &Engine) -> FullStateMsg {
+    let cells = (1..=ROWS)
+        .flat_map(|row| (0..COLS).map(move |col| Coord::new(col, row)))
+        .map(|at| CellState {
+            cell: at.to_string(),
+            content: Some(engine.content(at)),
+            value: engine.value(at),
+        })
+        .collect();
+    FullStateMsg {
+        r#type: "full_state",
+        cells,
+        node_count: engine.node_count(),
+    }
+}
+
+fn seed_data(engine: &mut Engine) {
+    let seeds: &[(&str, &str)] = &[
+        ("A1", "Price"),
+        ("B1", "Qty"),
+        ("C1", "Total"),
+        ("A2", "29.99"),
+        ("B2", "5"),
+        ("C2", "=A2*B2"),
+        ("A3", "49.99"),
+        ("B3", "3"),
+        ("C3", "=A3*B3"),
+        ("A4", "9.99"),
+        ("B4", "12"),
+        ("C4", "=A4*B4"),
+        ("A6", "Subtotal"),
+        ("C6", "=SUM(C2:C4)"),
+        ("A7", "Tax (8%)"),
+        ("C7", "=C6*0.08"),
+        ("A8", "Total"),
+        ("C8", "=C6+C7"),
+    ];
+    for (cell, content) in seeds {
+        engine.set(Coord::parse(cell).expect("seed cell"), content);
+    }
+    engine.recalc();
+}
+
 #[tokio::main]
 async fn main() {
-    let engine = SpreadsheetEngine::new();
-    seed_data(&engine);
+    let mut engine = Engine::new();
+    seed_data(&mut engine);
 
     println!("incr spreadsheet demo");
     println!("nodes: {}", engine.node_count());
 
     let (tx, _) = broadcast::channel::<String>(256);
 
-    let state = Arc::new(AppState { engine, tx });
+    let state = Arc::new(AppState {
+        engine: Mutex::new(engine),
+        tx,
+    });
 
     let app = axum::Router::new()
         .route("/ws", get(ws_handler))
@@ -173,4 +198,56 @@ async fn main() {
 async fn serve_static() -> impl IntoResponse {
     let html = include_str!("../static/index.html");
     axum::response::Html(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn send(engine: &Mutex<Engine>, cell: &str, content: &str) -> serde_json::Value {
+        let at = Coord::parse(cell).unwrap();
+        serde_json::to_value(apply(engine, at, content.to_string())).unwrap()
+    }
+
+    #[test]
+    fn updates_carry_the_edited_cell_last_with_its_content() {
+        let engine = Mutex::new(Engine::new());
+        send(&engine, "A1", "=B1");
+        let update = send(&engine, "B1", "=A1");
+        assert_eq!(
+            update["changed"],
+            serde_json::json!([
+                {"cell": "A1", "error": "#CIRC!"},
+                {"cell": "B1", "content": "=A1", "error": "#CIRC!"},
+            ])
+        );
+        let update = send(&engine, "B1", "5");
+        assert_eq!(
+            update["changed"],
+            serde_json::json!([
+                {"cell": "A1", "value": 5.0},
+                {"cell": "B1", "content": "5", "value": 5.0},
+            ])
+        );
+        let update = send(&engine, "B1", "5.0");
+        assert_eq!(
+            update["changed"],
+            serde_json::json!([{"cell": "B1", "content": "5.0", "value": 5.0}])
+        );
+    }
+
+    #[test]
+    fn full_state_covers_the_page_grid_with_seed_totals() {
+        let mut engine = Engine::new();
+        seed_data(&mut engine);
+        let msg = serde_json::to_value(full_state(&engine)).unwrap();
+        let cells = msg["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), (COLS * ROWS) as usize);
+        let c8 = cells.iter().find(|c| c["cell"] == "C8").unwrap();
+        assert_eq!(c8["content"], "=C6+C7");
+        let subtotal = 29.99 * 5.0 + 49.99 * 3.0 + 9.99 * 12.0;
+        assert_eq!(c8["value"], subtotal + subtotal * 0.08);
+        let a1 = cells.iter().find(|c| c["cell"] == "A1").unwrap();
+        assert_eq!(a1["text"], "Price");
+    }
 }
