@@ -148,10 +148,25 @@ Loom model checking is not wired up because the value slots and dep lists build 
 ## Demos
 
 - [`examples/concurrent-server/`](examples/concurrent-server/) — multi-threaded HTTP server (Rust) where one writer thread feeds live market data into the graph while many HTTP handler threads read derived portfolio values concurrently without blocking.
-- [`examples/spreadsheet/`](examples/spreadsheet/) — live spreadsheet engine driving formula cells through the incremental graph with WebSocket sync.
+- [`examples/spreadsheet/`](examples/spreadsheet/): a spreadsheet whose cells live in `GridTable`s and come into being when first referenced, so the sheet has no fixed size. A circular reference shows `#CIRC!` through a cycle fallback and recovers when the loop is broken, chains deeper than the frame budget replay instead of overflowing the stack, and the live page gets only the cells each edit changed, from watched cells. The same formulas also run in a full-recalc baseline for comparison.
 - [`examples/persist-config/`](examples/persist-config/): a pricing config and an order log kept in an incr-persist file log, with a revenue query over both and a test that kills the writer with SIGKILL mid-write and checks every acknowledged write survives the restart.
 
 A Python `travel-premium` demo and a `dashboard` demo with real per-node tracing live on the v0.1 line; porting them to v0.2 is open.
+
+### Recalc demo
+
+`cargo run --release -p incr-spreadsheet --bin recalc` builds a 100,000-row running sum and 1,000 chains of 100 cells in both the incr engine and the full-recalc baseline, then times edits at different depths and checks that both engines give the same value in every cell. Incr wins when an edit reaches few cells and loses when it reaches most of the sheet, since each recomputed cell costs more than one evaluation in a plain loop. One run on an i7-9750H:
+
+```
+edit                               full       incr    speedup  answer
+load and first recalc         388.64 ms  793.54 ms       0.5x  same
+A100000 (last row)             76.31 ms    16.3 us    4690.5x  same
+A50000 (middle row)            77.75 ms   54.08 ms       1.4x  same
+A1 (first row)                 77.30 ms  108.37 ms       0.7x  same
+D500 (one chain head)          84.25 ms   197.3 us     427.0x  same
+```
+
+The baseline finds cycles from the formulas as written, while incr finds them from the reads a recalc makes, so a loop that only an untaken `IF` branch would close shows `#CIRC!` in the baseline and a value in incr.
 
 ## Integrations
 
