@@ -1,19 +1,22 @@
-use std::collections::HashMap;
+use crate::coord::Coord;
+use crate::value::{CellValue, DIV0, PARSE, VALUE};
 
-use incr_concurrent::{Incr, Runtime};
+/// The most cells one range may name, so a typo such as `A1:A9999999`
+/// fails to parse instead of allocating millions of refs.
+const MAX_RANGE_CELLS: u64 = 1 << 20;
 
-// AST
+const FUNCTIONS: [&str; 5] = ["SUM", "AVG", "MIN", "MAX", "IF"];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(f64),
-    CellRef(String),
+    CellRef(Coord),
     BinOp(Box<Expr>, Op, Box<Expr>),
     UnaryNeg(Box<Expr>),
     FnCall(String, Vec<Expr>),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Op {
     Add,
     Sub,
@@ -251,13 +254,19 @@ impl Parser {
             Some(Token::Ident(name)) => {
                 self.advance();
                 if self.peek() == Some(&Token::LParen) {
-                    self.advance(); // consume '('
-                    let args = self.parse_fn_args(&name)?;
+                    self.advance();
+                    let name = name.to_uppercase();
+                    if !FUNCTIONS.contains(&name.as_str()) {
+                        return Err(());
+                    }
+                    let args = self.parse_fn_args()?;
                     self.expect(&Token::RParen)?;
-                    Ok(Expr::FnCall(name.to_uppercase(), args))
+                    if name == "IF" && args.len() != 3 {
+                        return Err(());
+                    }
+                    Ok(Expr::FnCall(name, args))
                 } else {
-                    // Cell reference
-                    Ok(Expr::CellRef(name.to_uppercase()))
+                    Coord::parse(&name).map(Expr::CellRef).ok_or(())
                 }
             }
             Some(Token::LParen) => {
@@ -271,7 +280,7 @@ impl Parser {
     }
 
     /// Parse function arguments, expanding range expressions like A1:B5.
-    fn parse_fn_args(&mut self, _fn_name: &str) -> Result<Vec<Expr>, ()> {
+    fn parse_fn_args(&mut self) -> Result<Vec<Expr>, ()> {
         let mut args = Vec::new();
         if self.peek() == Some(&Token::RParen) {
             return Ok(args);
@@ -285,11 +294,8 @@ impl Parser {
                 self.advance();
                 let second = self.parse_expr()?;
                 // Both must be cell refs for a range
-                if let (Expr::CellRef(start), Expr::CellRef(end)) = (&first, &second) {
-                    let expanded = expand_range(start, end)?;
-                    for cell in expanded {
-                        args.push(Expr::CellRef(cell));
-                    }
+                if let (Expr::CellRef(start), Expr::CellRef(end)) = (first, second) {
+                    args.extend(expand_range(start, end)?.into_iter().map(Expr::CellRef));
                 } else {
                     return Err(());
                 }
@@ -308,147 +314,184 @@ impl Parser {
     }
 }
 
-// Range expansion
-
-fn parse_cell_ref(s: &str) -> Result<(u8, u32), ()> {
-    let s = s.to_uppercase();
-    let col_char = s.chars().next().ok_or(())?;
-    if !col_char.is_ascii_alphabetic() {
+fn expand_range(start: Coord, end: Coord) -> Result<Vec<Coord>, ()> {
+    let (c_lo, c_hi) = (start.col.min(end.col), start.col.max(end.col));
+    let (r_lo, r_hi) = (start.row.min(end.row), start.row.max(end.row));
+    let count = u64::from(c_hi - c_lo + 1) * u64::from(r_hi - r_lo + 1);
+    if count > MAX_RANGE_CELLS {
         return Err(());
     }
-    let col = col_char as u8 - b'A';
-    let row: u32 = s[1..].parse().map_err(|_| ())?;
-    Ok((col, row))
+    Ok((r_lo..=r_hi)
+        .flat_map(|r| (c_lo..=c_hi).map(move |c| Coord::new(c, r)))
+        .collect())
 }
 
-fn cell_name(col: u8, row: u32) -> String {
-    format!("{}{}", (b'A' + col) as char, row)
-}
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParseError;
 
-fn expand_range(start: &str, end: &str) -> Result<Vec<String>, ()> {
-    let (sc, sr) = parse_cell_ref(start)?;
-    let (ec, er) = parse_cell_ref(end)?;
-    let c_lo = sc.min(ec);
-    let c_hi = sc.max(ec);
-    let r_lo = sr.min(er);
-    let r_hi = sr.max(er);
-
-    let mut cells = Vec::new();
-    for r in r_lo..=r_hi {
-        for c in c_lo..=c_hi {
-            cells.push(cell_name(c, r));
-        }
-    }
-    Ok(cells)
-}
-
-// Public API
-
-pub fn parse_formula(input: &str) -> Result<Expr, ()> {
-    let tokens = tokenize(input)?;
+pub fn parse_formula(input: &str) -> Result<Expr, ParseError> {
+    let tokens = tokenize(input).map_err(|()| ParseError)?;
     let mut parser = Parser::new(tokens);
-    let expr = parser.parse_expr()?;
+    let expr = parser.parse_expr().map_err(|()| ParseError)?;
     if parser.pos != parser.tokens.len() {
-        return Err(()); // unconsumed tokens
+        return Err(ParseError);
     }
     Ok(expr)
 }
 
-/// Evaluate an AST against the incr runtime, calling rt.get() on cell
-/// value nodes to establish dynamic dependencies.
-pub fn eval_expr(expr: &Expr, rt: &Runtime, value_nodes: &HashMap<String, Incr<f64>>) -> f64 {
-    match expr {
-        Expr::Number(n) => *n,
-        Expr::CellRef(name) => {
-            if let Some(&handle) = value_nodes.get(name) {
-                rt.get(handle)
-            } else {
-                f64::NAN
-            }
-        }
-        Expr::UnaryNeg(inner) => -eval_expr(inner, rt, value_nodes),
-        Expr::BinOp(lhs, op, rhs) => {
-            let l = eval_expr(lhs, rt, value_nodes);
-            let r = eval_expr(rhs, rt, value_nodes);
-            match op {
-                Op::Add => l + r,
-                Op::Sub => l - r,
-                Op::Mul => l * r,
-                Op::Div => {
-                    if r == 0.0 {
-                        f64::INFINITY
-                    } else {
-                        l / r
-                    }
-                }
-                Op::Gt => {
-                    if l > r {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                Op::Lt => {
-                    if l < r {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                Op::Gte => {
-                    if l >= r {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                Op::Lte => {
-                    if l <= r {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                Op::Eq => {
-                    if (l - r).abs() < f64::EPSILON {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-            }
-        }
-        Expr::FnCall(name, args) => match name.as_str() {
-            "SUM" => args.iter().map(|a| eval_expr(a, rt, value_nodes)).sum(),
-            "AVG" => {
-                if args.is_empty() {
-                    return f64::NAN;
-                }
-                let sum: f64 = args.iter().map(|a| eval_expr(a, rt, value_nodes)).sum();
-                sum / args.len() as f64
-            }
-            "MIN" => args
-                .iter()
-                .map(|a| eval_expr(a, rt, value_nodes))
-                .fold(f64::INFINITY, f64::min),
-            "MAX" => args
-                .iter()
-                .map(|a| eval_expr(a, rt, value_nodes))
-                .fold(f64::NEG_INFINITY, f64::max),
-            "IF" => {
-                if args.len() != 3 {
-                    return f64::NAN;
-                }
-                let cond = eval_expr(&args[0], rt, value_nodes);
-                if cond != 0.0 && !cond.is_nan() {
-                    eval_expr(&args[1], rt, value_nodes)
-                } else {
-                    eval_expr(&args[2], rt, value_nodes)
-                }
-            }
-            _ => f64::NAN,
-        },
+/// What a cell's raw content means.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Content {
+    Empty,
+    Number(f64),
+    Text(String),
+    Formula(Expr),
+    /// A `=` content that does not parse.
+    Invalid,
+}
+
+pub fn parse_content(raw: &str) -> Content {
+    if raw.is_empty() {
+        Content::Empty
+    } else if let Some(formula) = raw.strip_prefix('=') {
+        parse_formula(formula).map_or(Content::Invalid, Content::Formula)
+    } else if let Ok(n) = raw.trim().parse::<f64>() {
+        Content::Number(n)
+    } else {
+        Content::Text(raw.to_string())
     }
+}
+
+impl Content {
+    /// The cell's value, reading other cells through `lookup`.
+    pub fn evaluate(&self, lookup: &mut impl FnMut(Coord) -> CellValue) -> CellValue {
+        match self {
+            Content::Empty => CellValue::Empty,
+            Content::Number(n) => CellValue::Number(*n),
+            Content::Text(s) => CellValue::Text(s.clone()),
+            Content::Formula(expr) => eval_expr(expr, lookup),
+            Content::Invalid => CellValue::Error(PARSE),
+        }
+    }
+
+    /// Every cell the formula names, both `IF` branches included.
+    pub fn precedents(&self) -> Vec<Coord> {
+        let mut out = Vec::new();
+        if let Content::Formula(expr) = self {
+            expr.collect_refs(&mut out);
+        }
+        out
+    }
+}
+
+impl Expr {
+    fn collect_refs(&self, out: &mut Vec<Coord>) {
+        match self {
+            Expr::Number(_) => {}
+            Expr::CellRef(at) => out.push(*at),
+            Expr::BinOp(lhs, _, rhs) => {
+                lhs.collect_refs(out);
+                rhs.collect_refs(out);
+            }
+            Expr::UnaryNeg(inner) => inner.collect_refs(out),
+            Expr::FnCall(_, args) => args.iter().for_each(|a| a.collect_refs(out)),
+        }
+    }
+}
+
+/// Evaluates `expr`, reading cells through `lookup`. Both operands of an
+/// operator and every argument of an aggregate are read before an error
+/// is returned, so the cells read depend only on `IF` conditions; an
+/// engine that records reads as dependencies then sees the same cycles
+/// as one that reads formulas statically, `IF` aside.
+pub fn eval_expr(expr: &Expr, lookup: &mut impl FnMut(Coord) -> CellValue) -> CellValue {
+    eval(expr, lookup).unwrap_or_else(CellValue::Error)
+}
+
+type Eval = Result<CellValue, &'static str>;
+
+fn eval(expr: &Expr, lookup: &mut impl FnMut(Coord) -> CellValue) -> Eval {
+    match expr {
+        Expr::Number(n) => Ok(CellValue::Number(*n)),
+        Expr::CellRef(at) => match lookup(*at) {
+            CellValue::Empty => Ok(CellValue::Number(0.0)),
+            CellValue::Error(code) => Err(code),
+            v => Ok(v),
+        },
+        Expr::UnaryNeg(inner) => Ok(CellValue::Number(-number(eval(inner, lookup))?)),
+        Expr::BinOp(lhs, op, rhs) => {
+            let l = eval(lhs, lookup);
+            let r = eval(rhs, lookup);
+            let (l, r) = (number(l)?, number(r)?);
+            binop(l, *op, r).map(CellValue::Number)
+        }
+        Expr::FnCall(name, args) if name == "IF" => {
+            let cond = number(eval(&args[0], lookup))?;
+            let taken = if cond != 0.0 && !cond.is_nan() { 1 } else { 2 };
+            eval(&args[taken], lookup)
+        }
+        Expr::FnCall(name, args) => aggregate(name, args, lookup),
+    }
+}
+
+fn number(v: Eval) -> Result<f64, &'static str> {
+    match v? {
+        CellValue::Number(n) => Ok(n),
+        CellValue::Empty => Ok(0.0),
+        CellValue::Text(_) => Err(VALUE),
+        CellValue::Error(code) => Err(code),
+    }
+}
+
+fn binop(l: f64, op: Op, r: f64) -> Result<f64, &'static str> {
+    let truth = |b: bool| if b { 1.0 } else { 0.0 };
+    Ok(match op {
+        Op::Add => l + r,
+        Op::Sub => l - r,
+        Op::Mul => l * r,
+        Op::Div if r == 0.0 => return Err(DIV0),
+        Op::Div => l / r,
+        Op::Gt => truth(l > r),
+        Op::Lt => truth(l < r),
+        Op::Gte => truth(l >= r),
+        Op::Lte => truth(l <= r),
+        Op::Eq => truth((l - r).abs() < f64::EPSILON),
+    })
+}
+
+/// SUM, AVG, MIN and MAX over their arguments' numbers. A referenced
+/// cell holding text or nothing is skipped; a computed argument must be
+/// a number.
+fn aggregate(name: &str, args: &[Expr], lookup: &mut impl FnMut(Coord) -> CellValue) -> Eval {
+    let values: Vec<Eval> = args
+        .iter()
+        .map(|arg| match arg {
+            Expr::CellRef(at) => Ok(lookup(*at)),
+            _ => eval(arg, lookup).and_then(|v| match v {
+                CellValue::Text(_) => Err(VALUE),
+                v => Ok(v),
+            }),
+        })
+        .collect();
+    let mut numbers = Vec::with_capacity(values.len());
+    for v in values {
+        match v? {
+            CellValue::Number(n) => numbers.push(n),
+            CellValue::Error(code) => return Err(code),
+            CellValue::Empty | CellValue::Text(_) => {}
+        }
+    }
+    let result = match name {
+        "SUM" => numbers.iter().sum(),
+        "AVG" if numbers.is_empty() => return Err(DIV0),
+        "AVG" => numbers.iter().sum::<f64>() / numbers.len() as f64,
+        "MIN" if numbers.is_empty() => 0.0,
+        "MIN" => numbers.iter().copied().fold(f64::INFINITY, f64::min),
+        "MAX" if numbers.is_empty() => 0.0,
+        "MAX" => numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        _ => unreachable!("the parser admits only FUNCTIONS"),
+    };
+    Ok(CellValue::Number(result))
 }
 
 #[cfg(test)]
@@ -464,7 +507,7 @@ mod tests {
     #[test]
     fn parse_cell_ref_expr() {
         let expr = parse_formula("A1").unwrap();
-        assert!(matches!(expr, Expr::CellRef(ref s) if s == "A1"));
+        assert_eq!(expr, Expr::CellRef(Coord::new(0, 1)));
     }
 
     #[test]
@@ -499,7 +542,9 @@ mod tests {
 
     #[test]
     fn expand_range_rect() {
-        let cells = expand_range("A1", "B3").unwrap();
-        assert_eq!(cells, vec!["A1", "B1", "A2", "B2", "A3", "B3"]);
+        let at = |name| Coord::parse(name).unwrap();
+        let cells = expand_range(at("B3"), at("A1")).unwrap();
+        let names: Vec<String> = cells.iter().map(Coord::to_string).collect();
+        assert_eq!(names, vec!["A1", "B1", "A2", "B2", "A3", "B3"]);
     }
 }

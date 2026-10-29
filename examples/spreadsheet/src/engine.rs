@@ -3,7 +3,9 @@ use std::sync::{Arc, RwLock};
 
 use incr_concurrent::{Incr, Runtime};
 
-use crate::formula::{eval_expr, parse_formula};
+use incr_spreadsheet::coord::Coord;
+use incr_spreadsheet::formula::{eval_expr, parse_formula};
+use incr_spreadsheet::value::CellValue;
 
 const COLS: u8 = 10; // A-J
 const ROWS: u32 = 20; // 1-20
@@ -40,7 +42,7 @@ pub struct SpreadsheetEngine {
     cells: HashMap<String, CellNodes>,
     /// Shared map of value nodes so query closures can look up references.
     #[allow(dead_code)]
-    value_nodes: Arc<RwLock<HashMap<String, Incr<f64>>>>,
+    value_nodes: Arc<RwLock<HashMap<Coord, Incr<f64>>>>,
     /// Cache of last-known cell values for diffing.
     prev_values: RwLock<HashMap<String, f64>>,
 }
@@ -48,7 +50,7 @@ pub struct SpreadsheetEngine {
 impl SpreadsheetEngine {
     pub fn new() -> Arc<Self> {
         let rt = Runtime::new();
-        let value_nodes: Arc<RwLock<HashMap<String, Incr<f64>>>> =
+        let value_nodes: Arc<RwLock<HashMap<Coord, Incr<f64>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
         let mut cells = HashMap::new();
@@ -71,7 +73,16 @@ impl SpreadsheetEngine {
                         match parse_formula(stripped) {
                             Ok(ast) => {
                                 let nodes = vn.read().expect("value_nodes lock poisoned");
-                                eval_expr(&ast, rt, &nodes)
+                                let value = eval_expr(&ast, &mut |at| {
+                                    nodes
+                                        .get(&at)
+                                        .map_or(CellValue::Empty, |&h| CellValue::Number(rt.get(h)))
+                                });
+                                match value {
+                                    CellValue::Number(n) => n,
+                                    CellValue::Empty => 0.0,
+                                    _ => f64::NAN,
+                                }
                             }
                             Err(_) => f64::NAN,
                         }
@@ -94,7 +105,7 @@ impl SpreadsheetEngine {
         {
             let mut vn = value_nodes.write().expect("value_nodes lock poisoned");
             for (name, cell) in &cells {
-                vn.insert(name.clone(), cell.value);
+                vn.insert(Coord::parse(name).expect("grid name"), cell.value);
             }
         }
 
