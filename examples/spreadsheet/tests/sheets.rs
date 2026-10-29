@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use incr_spreadsheet::coord::Coord;
+use incr_spreadsheet::engine::Engine;
 use incr_spreadsheet::full::FullEngine;
 use incr_spreadsheet::value::{CellValue, CIRC};
 use incr_spreadsheet::Sheet;
@@ -199,3 +200,4 @@ macro_rules! sheet_tests {
 }
 
 sheet_tests!(full, FullEngine::new());
+sheet_tests!(incr, Engine::new());

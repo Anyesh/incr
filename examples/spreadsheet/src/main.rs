@@ -1,4 +1,4 @@
-mod engine;
+mod server_engine;
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::engine::{seed_data, SpreadsheetEngine};
+use crate::server_engine::{seed_data, SpreadsheetEngine};
 
 #[derive(Clone, Serialize)]
 struct CellState {

@@ -1,192 +1,95 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use incr_concurrent::{Incr, Runtime};
+use incr_concurrent::{
+    CycleStrategy, ErasedIncr, GridKey, GridTable, Incr, QueryOpts, Replay, Runtime,
+};
 
-use incr_spreadsheet::coord::Coord;
-use incr_spreadsheet::formula::{eval_expr, parse_formula};
-use incr_spreadsheet::value::CellValue;
+use crate::coord::Coord;
+use crate::formula::{parse_content, Content};
+use crate::value::{CellValue, CIRC};
+use crate::Sheet;
 
-const COLS: u8 = 10; // A-J
-const ROWS: u32 = 20; // 1-20
-
-pub fn cell_name(col: u8, row: u32) -> String {
-    format!("{}{}", (b'A' + col) as char, row)
+/// The incremental engine. Each cell is three nodes: its raw content, the
+/// parse of it, and its value. A value reads the cells its formula
+/// names, creating their nodes on first use, so the grid has no fixed
+/// size and an edit recomputes only the values it reaches; an edit that
+/// leaves a parse or a value equal stops there.
+pub struct Engine {
+    rt: Runtime,
+    tables: Arc<Tables>,
+    watched: HashMap<ErasedIncr, Coord>,
+    shown: HashMap<Coord, CellValue>,
 }
 
-#[allow(dead_code)]
-pub fn parse_cell_name(name: &str) -> Option<(u8, u32)> {
-    let name = name.to_uppercase();
-    let col_char = name.chars().next()?;
-    if !col_char.is_ascii_alphabetic() {
-        return None;
+struct Tables {
+    raw: GridTable<String>,
+    parsed: GridTable<Arc<Content>>,
+    values: GridTable<CellValue>,
+}
+
+fn key(at: Coord) -> GridKey {
+    GridKey::new(0, at.row, at.col)
+}
+
+impl Tables {
+    fn raw(&self, rt: &Runtime, at: Coord) -> Incr<String> {
+        self.raw.get_or_insert_input(rt, key(at), String::new)
     }
-    let col = col_char as u8 - b'A';
-    if col >= COLS {
-        return None;
+
+    fn parsed(self: &Arc<Self>, rt: &Runtime, at: Coord) -> Incr<Arc<Content>> {
+        self.parsed.get_or_insert_query_lazy(rt, key(at), || {
+            let tables = Arc::clone(self);
+            let parse = move |rt: &Runtime| Arc::new(parse_content(&rt.get(tables.raw(rt, at))));
+            (parse, QueryOpts::default())
+        })
     }
-    let row: u32 = name[1..].parse().ok()?;
-    if !(1..=ROWS).contains(&row) {
-        return None;
+
+    /// A cycle lands every member at `#CIRC!`, and a chain deeper than
+    /// the frame budget replays instead of overflowing the stack.
+    fn value(self: &Arc<Self>, rt: &Runtime, at: Coord) -> Incr<CellValue> {
+        self.values.get_or_insert_query_lazy(rt, key(at), || {
+            let tables = Arc::clone(self);
+            let compute = move |rt: &Runtime| {
+                let content = rt.get(tables.parsed(rt, at));
+                content.evaluate(&mut |r| rt.get(tables.value(rt, r)))
+            };
+            let opts = QueryOpts {
+                cycle: CycleStrategy::fallback(|_| CellValue::Error(CIRC)),
+                replay: Replay::Allowed,
+            };
+            (compute, opts)
+        })
     }
-    Some((col, row))
 }
 
-struct CellNodes {
-    content: Incr<String>,
-    value: Incr<f64>,
-}
-
-pub struct SpreadsheetEngine {
-    pub rt: Runtime,
-    cells: HashMap<String, CellNodes>,
-    /// Shared map of value nodes so query closures can look up references.
-    #[allow(dead_code)]
-    value_nodes: Arc<RwLock<HashMap<Coord, Incr<f64>>>>,
-    /// Cache of last-known cell values for diffing.
-    prev_values: RwLock<HashMap<String, f64>>,
-}
-
-impl SpreadsheetEngine {
-    pub fn new() -> Arc<Self> {
+impl Engine {
+    pub fn new() -> Self {
         let rt = Runtime::new();
-        let value_nodes: Arc<RwLock<HashMap<Coord, Incr<f64>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
-        let mut cells = HashMap::new();
-
-        // Create all cells up front so every query closure can reference
-        // any cell, even ones defined later in the grid.
-        for row in 1..=ROWS {
-            for col in 0..COLS {
-                let name = cell_name(col, row);
-                let content = rt.create_input(String::new());
-
-                let vn = value_nodes.clone();
-                let content_handle = content;
-                let value = rt.create_query(move |rt| -> f64 {
-                    let raw = rt.get(content_handle);
-                    if raw.is_empty() {
-                        return 0.0;
-                    }
-                    if let Some(stripped) = raw.strip_prefix('=') {
-                        match parse_formula(stripped) {
-                            Ok(ast) => {
-                                let nodes = vn.read().expect("value_nodes lock poisoned");
-                                let value = eval_expr(&ast, &mut |at| {
-                                    nodes
-                                        .get(&at)
-                                        .map_or(CellValue::Empty, |&h| CellValue::Number(rt.get(h)))
-                                });
-                                match value {
-                                    CellValue::Number(n) => n,
-                                    CellValue::Empty => 0.0,
-                                    _ => f64::NAN,
-                                }
-                            }
-                            Err(_) => f64::NAN,
-                        }
-                    } else {
-                        // Text content: display as NAN (the UI will show
-                        // the raw text instead via the content field).
-                        // Numeric strings parse as their value.
-                        raw.parse::<f64>().unwrap_or(f64::NAN)
-                    }
-                });
-
-                rt.set_label(content.slot(), format!("{}.content", name));
-                rt.set_label(value.slot(), format!("{}.value", name));
-
-                cells.insert(name.clone(), CellNodes { content, value });
-            }
-        }
-
-        // Populate the shared value_nodes map now that all cells exist.
-        {
-            let mut vn = value_nodes.write().expect("value_nodes lock poisoned");
-            for (name, cell) in &cells {
-                vn.insert(Coord::parse(name).expect("grid name"), cell.value);
-            }
-        }
-
-        let engine = Arc::new(Self {
-            rt,
-            cells,
-            value_nodes,
-            prev_values: RwLock::new(HashMap::new()),
+        // A compute cut short for replay reads, and makes table misses
+        // that return, these placeholders until it reruns.
+        rt.set_placeholder(String::new());
+        rt.set_placeholder(Arc::new(Content::Empty));
+        rt.set_placeholder(CellValue::Empty);
+        let tables = Arc::new(Tables {
+            raw: rt.create_grid_table(),
+            parsed: rt.create_grid_table(),
+            values: rt.create_grid_table(),
         });
-
-        // Force initial computation of all value nodes.
-        for row in 1..=ROWS {
-            for col in 0..COLS {
-                let name = cell_name(col, row);
-                if let Some(cell) = engine.cells.get(&name) {
-                    let val = engine.rt.get(cell.value);
-                    engine
-                        .prev_values
-                        .write()
-                        .expect("prev_values lock")
-                        .insert(name, val);
-                }
-            }
+        Self {
+            rt,
+            tables,
+            watched: HashMap::new(),
+            shown: HashMap::new(),
         }
-
-        engine
     }
 
-    /// Set a cell's raw content and return a map of cells whose computed
-    /// value actually changed.
-    pub fn set_cell(&self, name: &str, content: &str) -> HashMap<String, f64> {
-        let name = name.to_uppercase();
-        let cell = match self.cells.get(&name) {
-            Some(c) => c,
-            None => return HashMap::new(),
-        };
-
-        self.rt.set(cell.content, content.to_string());
-
-        // Re-evaluate all cells and diff against previous values.
-        let mut changed = HashMap::new();
-        let mut prev = self.prev_values.write().expect("prev_values lock");
-
-        for row in 1..=ROWS {
-            for col in 0..COLS {
-                let cname = cell_name(col, row);
-                if let Some(c) = self.cells.get(&cname) {
-                    let new_val = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.rt.get(c.value)
-                    }))
-                    .unwrap_or(f64::NAN);
-
-                    let old_val = prev.get(&cname).copied().unwrap_or(0.0);
-                    if !values_equal(old_val, new_val) {
-                        changed.insert(cname.clone(), new_val);
-                    }
-                    prev.insert(cname, new_val);
-                }
-            }
-        }
-
-        changed
-    }
-
-    /// Get the full grid state: (cell_name, raw_content, computed_value).
-    pub fn full_state(&self) -> Vec<(String, String, f64)> {
-        let mut result = Vec::new();
-        for row in 1..=ROWS {
-            for col in 0..COLS {
-                let name = cell_name(col, row);
-                if let Some(cell) = self.cells.get(&name) {
-                    let content = self.rt.get(cell.content);
-                    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.rt.get(cell.value)
-                    }))
-                    .unwrap_or(f64::NAN);
-                    result.push((name, content, value));
-                }
-            }
-        }
-        result
+    /// The cell's raw content as last set.
+    pub fn content(&self, at: Coord) -> String {
+        self.tables
+            .raw
+            .get(&self.rt, key(at))
+            .map_or_else(String::new, |raw| self.rt.get(raw))
     }
 
     pub fn node_count(&self) -> usize {
@@ -194,40 +97,41 @@ impl SpreadsheetEngine {
     }
 }
 
-fn values_equal(a: f64, b: f64) -> bool {
-    if a.is_nan() && b.is_nan() {
-        return true;
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
     }
-    if a.is_infinite() && b.is_infinite() && a.signum() == b.signum() {
-        return true;
-    }
-    (a - b).abs() < f64::EPSILON * a.abs().max(b.abs()).max(1.0)
 }
 
-/// Load the seed data (invoice example).
-pub fn seed_data(engine: &SpreadsheetEngine) {
-    let seeds: &[(&str, &str)] = &[
-        ("A1", "Price"),
-        ("B1", "Qty"),
-        ("C1", "Total"),
-        ("A2", "29.99"),
-        ("B2", "5"),
-        ("C2", "=A2*B2"),
-        ("A3", "49.99"),
-        ("B3", "3"),
-        ("C3", "=A3*B3"),
-        ("A4", "9.99"),
-        ("B4", "12"),
-        ("C4", "=A4*B4"),
-        ("A6", "Subtotal"),
-        ("C6", "=SUM(C2:C4)"),
-        ("A7", "Tax (8%)"),
-        ("C7", "=C6*0.08"),
-        ("A8", "Total"),
-        ("C8", "=C6+C7"),
-    ];
+impl Sheet for Engine {
+    /// Watches the cell's value, so `recalc` hears of every change to it.
+    fn set(&mut self, at: Coord, raw: &str) {
+        let input = self.tables.raw(&self.rt, at);
+        self.rt.set(input, raw.to_string());
+        let value = self.tables.value(&self.rt, at);
+        if self.watched.insert(value.erase(), at).is_none() {
+            self.rt.watch(value);
+        }
+    }
 
-    for (cell, content) in seeds {
-        engine.set_cell(cell, content);
+    /// Reads only the watched cells an edit dirtied since the last
+    /// recalc; a dirtied cell whose value came back equal is not
+    /// returned.
+    fn recalc(&mut self) -> Vec<(Coord, CellValue)> {
+        let mut changed = Vec::new();
+        for node in self.rt.drain_dirtied_watched() {
+            let at = self.watched[&node];
+            let value = self.rt.get(self.tables.value(&self.rt, at));
+            let old = self.shown.get(&at).unwrap_or(&CellValue::Empty);
+            if *old != value {
+                changed.push((at, value.clone()));
+                self.shown.insert(at, value);
+            }
+        }
+        changed
+    }
+
+    fn value(&self, at: Coord) -> CellValue {
+        self.shown.get(&at).cloned().unwrap_or(CellValue::Empty)
     }
 }
