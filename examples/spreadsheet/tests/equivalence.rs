@@ -9,6 +9,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 const SEEDS: u64 = 200;
+/// Half the seeds recalc after every edit, half after batches of up to
+/// three.
 const EDITS: usize = 30;
 const GRID_COLS: u32 = 6;
 const GRID_ROWS: u32 = 40;
@@ -166,7 +168,12 @@ fn run(seed: u64) {
 
     for step in 0..=EDITS {
         if step > 0 {
-            for _ in 0..rng.gen_range(1..=3) {
+            let batch = if seed % 4 < 2 {
+                1
+            } else {
+                rng.gen_range(1..=3)
+            };
+            for _ in 0..batch {
                 let (at, raw) = if rng.gen_bool(0.7) {
                     let i = rng.gen_range(0..GRID_COLS * GRID_ROWS);
                     (grid_coord(i), grid_content(&mut rng, i))

@@ -99,8 +99,51 @@ fn self_reference(mut s: impl Sheet) {
     s.recalc();
     expect(&s, &[("A1", circ()), ("B1", circ())]);
     s.set(c("A1"), "3");
-    s.recalc();
+    let names: Vec<String> = changed(&mut s).into_keys().collect();
+    assert_eq!(names, ["A1", "B1"]);
     expect(&s, &[("A1", num(3.0)), ("B1", num(6.0))]);
+
+    s.set(c("A1"), "=A1+1");
+    assert_eq!(changed(&mut s).len(), 2);
+    expect(&s, &[("A1", circ()), ("B1", circ())]);
+}
+
+/// A 1,000-cell loop with a 1,000-deep chain hanging off it, both past
+/// the frame budget, set bottom first so the first read starts deep.
+fn long_loop_with_a_deep_tail(mut s: impl Sheet) {
+    const N: u32 = 1_000;
+    for row in (1..=N).rev() {
+        let tail = if row == 1 {
+            "=A1".to_string()
+        } else {
+            format!("=B{}+1", row - 1)
+        };
+        s.set(Coord::new(1, row), &tail);
+        if row < N {
+            s.set(Coord::new(0, row), &format!("=A{}", row + 1));
+        }
+    }
+    s.set(Coord::new(0, N), "=A1");
+    s.recalc();
+    for row in [1, N / 2, N] {
+        assert_eq!(s.value(Coord::new(0, row)), circ(), "A{row}");
+        assert_eq!(s.value(Coord::new(1, row)), circ(), "B{row}");
+    }
+
+    s.set(Coord::new(0, N), "7");
+    assert_eq!(s.recalc().len(), 2 * N as usize);
+    for row in [1, N / 2, N] {
+        assert_eq!(s.value(Coord::new(0, row)), num(7.0), "A{row}");
+        assert_eq!(
+            s.value(Coord::new(1, row)),
+            num(f64::from(6 + row)),
+            "B{row}"
+        );
+    }
+
+    s.set(Coord::new(0, N), "=A1");
+    assert_eq!(s.recalc().len(), 2 * N as usize);
+    assert_eq!(s.value(Coord::new(1, N)), circ());
 }
 
 fn downstream_of_a_loop(mut s: impl Sheet) {
@@ -189,6 +232,11 @@ macro_rules! sheet_tests {
             #[test]
             fn downstream_of_a_loop() {
                 super::downstream_of_a_loop($make);
+            }
+
+            #[test]
+            fn long_loop_with_a_deep_tail() {
+                super::long_loop_with_a_deep_tail($make);
             }
 
             #[test]
