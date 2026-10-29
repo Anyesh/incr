@@ -66,8 +66,9 @@ impl Tables {
 impl Engine {
     pub fn new() -> Self {
         let rt = Runtime::new();
-        // A compute cut short for replay reads, and makes table misses
-        // that return, these placeholders until it reruns.
+        // A compute cut short for replay keeps running until it reruns:
+        // its deep read returns a placeholder, and so does every table
+        // miss it makes after, so each table's value type needs one.
         rt.set_placeholder(String::new());
         rt.set_placeholder(Arc::new(Content::Empty));
         rt.set_placeholder(CellValue::Empty);
@@ -84,7 +85,6 @@ impl Engine {
         }
     }
 
-    /// The cell's raw content as last set.
     pub fn content(&self, at: Coord) -> String {
         self.tables
             .raw

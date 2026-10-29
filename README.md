@@ -166,7 +166,7 @@ A1 (first row)                 77.30 ms  108.37 ms       0.7x  same
 D500 (one chain head)          84.25 ms   197.3 us     427.0x  same
 ```
 
-The baseline finds cycles from the formulas as written, while incr finds them from the reads a recalc makes, so a loop that only an untaken `IF` branch would close shows `#CIRC!` in the baseline and a value in incr.
+The baseline finds cycles from the formulas as written, while incr finds them from the reads a recalc makes, so a cell that only an `IF` branch the recalc never takes would put on a loop shows `#CIRC!` in the baseline and its own value or error in incr.
 
 ## Integrations
 
