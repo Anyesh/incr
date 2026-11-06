@@ -27,8 +27,10 @@
 //! into the PyRuntime allocation, which dangled if Python dropped the
 //! runtime first.)
 
+mod keyed;
+
 use pyo3::prelude::*;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -36,6 +38,8 @@ use incr_compute::{
     DeleteError, Incr, IncrCollection, NodeId, NodeKindInfo, NodeTable, PropagationTrace, Runtime,
     SortedCollection, TraceAction,
 };
+use keyed::{KeyCounts, KeyIndex, StagedKeys};
+
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions,
     PyFixpoint, PyValue,
@@ -519,6 +523,130 @@ impl PyCollection {
     }
 }
 
+/// Rows by key: a collection of `(key, row)` pairs holding at most one row
+/// per key, with keys matched as a dict matches them. `collection` is the
+/// rows as a `Collection`, for the operators.
+///
+/// Rows must be hashable. A change hashes each added pair's row in the pair
+/// collection, and each added or removed row again in `collection`'s output
+/// staging, which also runs one row `__eq__` per removed row; before Python
+/// 3.14, which caches a tuple's hash, a removed pair's row is hashed in the
+/// pair collection too. So an upsert that inserts pays two row `__hash__`
+/// calls, one that replaces pays three (four before 3.14) and one row
+/// `__eq__` against the held row, and one with an `==` row changes nothing.
+#[pyclass(name = "KeyedCollection", unsendable)]
+struct PyKeyedCollection {
+    pairs: IncrCollection<PyValue>,
+    rows: IncrCollection<PyValue>,
+    index: RefCell<KeyIndex>,
+    rt: Py<PyRuntime>,
+}
+
+impl OnRuntime for PyKeyedCollection {
+    fn runtime(&self) -> &Py<PyRuntime> {
+        &self.rt
+    }
+}
+
+impl PyKeyedCollection {
+    /// The index, refused to a key or row method that calls back into this
+    /// collection while an operation on it runs.
+    fn index(&self) -> PyResult<RefMut<'_, KeyIndex>> {
+        self.index.try_borrow_mut().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "KeyedCollection used from a key or row method during an operation on it",
+            )
+        })
+    }
+}
+
+#[pymethods]
+impl PyKeyedCollection {
+    #[new]
+    fn new(runtime: Bound<'_, PyRuntime>) -> PyResult<Self> {
+        let (pairs, rows) = runtime.borrow().engine_call(|rt| {
+            let pairs = rt.create_collection::<PyValue>();
+            let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
+                Python::attach(|py| PyValue(or_stash(pair.0.bind(py).get_item(1)).unbind()))
+            });
+            (pairs, rows)
+        })?;
+        Ok(PyKeyedCollection {
+            pairs,
+            rows,
+            index: RefCell::new(KeyIndex::new()),
+            rt: runtime.unbind(),
+        })
+    }
+
+    /// Hold `row` for `key`: nothing happens if the held row is `==` to
+    /// it, otherwise the pair is replaced or inserted.
+    fn upsert(&self, py: Python<'_>, key: Bound<'_, PyAny>, row: Bound<'_, PyAny>) -> PyResult<()> {
+        let mut index = self.index()?;
+        let mut staged = StagedKeys::default();
+        staged.stage(&index, &key, Some(&row))?;
+        index.apply_staged(py, staged, |changes| {
+            self.engine_call(py, |rt| self.pairs.apply(rt, changes))
+        })?;
+        Ok(())
+    }
+
+    /// Remove `key`'s pair. Raises `KeyError` if no row is held for it.
+    fn remove(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<()> {
+        let mut index = self.index()?;
+        let mut staged = StagedKeys::default();
+        if !staged.stage(&index, &key, None)? {
+            return Err(pyo3::exceptions::PyKeyError::new_err(key.unbind()));
+        }
+        index.apply_staged(py, staged, |changes| {
+            self.engine_call(py, |rt| self.pairs.apply(rt, changes))
+        })?;
+        Ok(())
+    }
+
+    /// The row held for `key`, or `None`.
+    fn get<'py>(&self, key: Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.index()?.row(&key)
+    }
+
+    fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self.index()?.row(&key)?.is_some())
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.index()?.len())
+    }
+
+    /// Make the held rows equal `rows`, a mapping or an iterable of
+    /// `(key, row)` pairs (a later pair for a key wins), in one atomic
+    /// change. Returns how many keys were `(inserted, replaced, removed)`.
+    fn reconcile(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<KeyCounts> {
+        let mut index = self.index()?;
+        let mut staged = StagedKeys::default();
+        let pairs = if rows.hasattr("items")? {
+            rows.call_method0("items")?
+        } else {
+            rows.clone()
+        };
+        for pair in pairs.try_iter()? {
+            let (key, row): (Bound<'_, PyAny>, Bound<'_, PyAny>) = pair?.extract()?;
+            staged.stage(&index, &key, Some(&row))?;
+        }
+        staged.stage_removal_of_the_rest(py, &index)?;
+        index.apply_staged(py, staged, |changes| {
+            self.engine_call(py, |rt| self.pairs.apply(rt, changes))
+        })
+    }
+
+    #[getter]
+    fn collection(&self, py: Python<'_>) -> PyCollection {
+        PyCollection {
+            inner: self.rows.clone(),
+            rt: self.rt.clone_ref(py),
+        }
+    }
+}
+
 #[pyclass(name = "SortedCollection", unsendable)]
 struct PySortedCollection {
     inner: SortedCollection<PyValue, PyValue>,
@@ -958,6 +1086,7 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFixpoint>()?;
     m.add_class::<PyNodeTable>()?;
     m.add_class::<PyCollection>()?;
+    m.add_class::<PyKeyedCollection>()?;
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
     Ok(())
