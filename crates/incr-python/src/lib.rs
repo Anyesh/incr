@@ -87,6 +87,22 @@ fn engine_call<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
     pyerr_boundary::<Exc, _>(|| in_runtime(rt, f))
 }
 
+type TracedNode = (Option<String>, Option<Py<PyAny>>);
+
+/// The memoized value of a node a trace just left Clean, so the read
+/// recomputes nothing. `None` for a dead slot, a cycle, or a value type
+/// other than `PyValue` and `u64`.
+fn traced_value(rt: &Runtime, id: NodeId) -> Option<Py<PyAny>> {
+    let handle = rt.erased_handle(id)?;
+    if let Some(node) = rt.typed_handle::<PyValue>(handle) {
+        return rt.try_get(node).ok().map(|v| v.0);
+    }
+    let n = rt.try_get(rt.typed_handle::<u64>(handle)?).ok()?;
+    Some(Python::attach(|py| {
+        n.into_pyobject(py).unwrap().into_any().unbind()
+    }))
+}
+
 fn delete_error(e: DeleteError, key: impl Into<Py<PyAny>>) -> PyErr {
     match e {
         DeleteError::HasDependents => HasDependentsError::new_err(e.to_string()),
@@ -1008,8 +1024,16 @@ impl PyRuntime {
     }
 
     fn get_traced(&self, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        let (val, trace): (PyValue, PropagationTrace) =
-            self.engine_call(|rt| rt.get_traced(node.inner))?;
+        let (val, trace, nodes): (PyValue, PropagationTrace, Vec<TracedNode>) =
+            self.engine_call(|rt| {
+                let (val, trace) = rt.get_traced(node.inner);
+                let nodes = trace
+                    .node_traces
+                    .iter()
+                    .map(|nt| (rt.label(nt.id.0), traced_value(rt, nt.id)))
+                    .collect();
+                (val, trace, nodes)
+            })?;
         Python::attach(|py| {
             let trace_dict = pyo3::types::PyDict::new(py);
             trace_dict.set_item("target", trace.target.0)?;
@@ -1019,9 +1043,11 @@ impl PyRuntime {
             trace_dict.set_item("elapsed_ns", trace.elapsed_ns)?;
 
             let node_traces = pyo3::types::PyList::empty(py);
-            for nt in &trace.node_traces {
+            for (nt, (label, value)) in trace.node_traces.iter().zip(nodes) {
                 let d = pyo3::types::PyDict::new(py);
                 d.set_item("id", nt.id.0)?;
+                d.set_item("label", label)?;
+                d.set_item("value", value)?;
                 d.set_item(
                     "action",
                     match &nt.action {
