@@ -14,7 +14,7 @@ use std::time::Duration;
 use super::*;
 use crate::cells::{Local, Shared};
 use crate::dep_stack::DepStack;
-use crate::runtime::{queued_routers, RoutingFailed};
+use crate::runtime::{owed_to, queued_routers, RoutingFailed};
 
 const SETTLE: Duration = Duration::from_millis(150);
 
@@ -55,6 +55,7 @@ both!(
     a_failing_key_fn_is_stored_and_fails_again_while_its_row_remains,
     a_router_recovers_once_the_row_its_key_fn_refused_is_gone,
     a_stored_failure_is_not_taken_inside_a_compute,
+    a_runtime_owes_its_queued_routers_and_stored_failures_until_cleared,
     routing_runs_after_a_mutator_disposes,
     drain_dirtied_watched_reports_a_total_routing_moved,
     a_drain_inside_another_runtimes_compute_leaves_its_frame_untainted,
@@ -420,6 +421,31 @@ fn a_router_recovers_once_the_row_its_key_fn_refused_is_gone<C: Cells>() {
     assert!(rt.take_routing_failure().is_none());
     assert_eq!(group_values(&rt, &g, 1), vec![1, 3]);
     let _ = rt.get(g.version_node());
+}
+
+fn a_runtime_owes_its_queued_routers_and_stored_failures_until_cleared<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let other = Runtime::<C>::new();
+    let c = rt.create_collection::<i64>();
+    let _g = c.group_by(&rt, bad_key);
+    {
+        let _hold = rt.hold_routing_suppressed();
+        c.insert(&rt, 1);
+        assert_eq!(owed_to(&rt), 1, "a queued router is owed");
+    }
+    assert_eq!(
+        owed_to(&other),
+        0,
+        "another runtime owes what this one queued"
+    );
+    assert!(rt.route_pending().is_none());
+    assert_eq!(owed_to(&rt), 0);
+
+    c.insert(&rt, 13);
+    assert_eq!(owed_to(&rt), 1, "a stored failure is owed");
+    assert!(other.take_routing_failure().is_none());
+    assert!(rt.take_routing_failure().is_some());
+    assert_eq!(owed_to(&rt), 0);
 }
 
 fn a_stored_failure_is_not_taken_inside_a_compute<C: Cells>() {

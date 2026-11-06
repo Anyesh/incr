@@ -77,30 +77,33 @@ fn any_queued() -> bool {
     QUEUED.with(Cell::get) != 0
 }
 
-fn queue(rt: RuntimeId, router: Router) {
-    with_owed(rt, true, |owed| {
+fn queue<C: Cells>(rt: &Runtime<C>, router: Router) {
+    with_owed(rt.runtime_id, true, |owed| {
         if owed.queued.insert(router) {
             owed.pending.push(router);
             QUEUED.with(|q| q.set(q.get() + 1));
+            rt.routing_owing.add(1);
         }
     });
 }
 
 /// Drops `router` from the list, where its own landing put it back.
-fn unqueue(rt: RuntimeId, router: Router) {
-    with_owed(rt, false, |owed| {
+fn unqueue<C: Cells>(rt: &Runtime<C>, router: Router) {
+    with_owed(rt.runtime_id, false, |owed| {
         if owed.queued.remove(&router) {
             owed.pending.retain(|&r| r != router);
             QUEUED.with(|q| q.set(q.get() - 1));
+            rt.routing_owing.sub(1);
         }
     });
 }
 
-fn pop(rt: RuntimeId) -> Option<Router> {
-    with_owed(rt, false, |owed| {
+fn pop<C: Cells>(rt: &Runtime<C>) -> Option<Router> {
+    with_owed(rt.runtime_id, false, |owed| {
         let router = owed.pending.pop()?;
         owed.queued.remove(&router);
         QUEUED.with(|q| q.set(q.get() - 1));
+        rt.routing_owing.sub(1);
         Some(router)
     })
     .flatten()
@@ -112,6 +115,45 @@ pub(crate) fn queued_routers<C: Cells>(rt: &Runtime<C>) -> usize {
     with_owed(rt.runtime_id, false, |owed| owed.pending.len()).unwrap_or(0)
 }
 
+/// The routers queued and failures stored for `rt`, on every thread.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn owed_to<C: Cells>(rt: &Runtime<C>) -> u64 {
+    C::u64_load_relaxed(&rt.routing_owing.owed)
+}
+
+/// What a runtime's calls owe it on every thread: routers queued and
+/// failures stored, so that a call finding none returns with one load of
+/// the runtime it already holds (a thread-local in a shared library is a
+/// call). Also the routing holds of a `Local` runtime, which only one
+/// thread uses; a `Shared` runtime keeps its holds per thread in `Owed`.
+pub(crate) struct Owing<C: Cells> {
+    owed: C::U64,
+    local_holds: C::U32,
+}
+
+impl<C: Cells> Owing<C> {
+    pub(crate) fn new() -> Self {
+        Self {
+            owed: C::new_u64(0),
+            local_holds: C::new_u32(0),
+        }
+    }
+
+    #[inline(always)]
+    fn none(&self) -> bool {
+        C::u64_load_relaxed(&self.owed) == 0
+    }
+
+    fn add(&self, n: u64) {
+        C::u64_fetch_add(&self.owed, n);
+    }
+
+    fn sub(&self, n: u64) {
+        let was = C::u64_fetch_add(&self.owed, n.wrapping_neg());
+        debug_assert!(was >= n, "a runtime's owed count went below zero");
+    }
+}
+
 /// Marks a drain of `rt` running on this thread for its lifetime, an
 /// unwind's included.
 struct Draining(RuntimeId);
@@ -119,7 +161,11 @@ struct Draining(RuntimeId);
 impl Draining {
     /// A drain of `rt`, unless a hold or a drain of it is live on this
     /// thread or nothing is queued for it.
-    fn begin(rt: RuntimeId) -> Option<Self> {
+    fn begin<C: Cells>(rt: &Runtime<C>) -> Option<Self> {
+        if C::u32_load_relaxed(&rt.routing_owing.local_holds) != 0 {
+            return None;
+        }
+        let rt = rt.runtime_id;
         with_owed(rt, false, |owed| {
             if owed.holds != 0 || owed.draining || owed.pending.is_empty() {
                 return None;
@@ -139,9 +185,9 @@ impl Drop for Draining {
 
 /// A router popped for a drain, queued again if an unwind leaves it
 /// unrouted.
-struct Popped(RuntimeId, Router);
+struct Popped<'a, C: Cells>(&'a Runtime<C>, Router);
 
-impl Drop for Popped {
+impl<C: Cells> Drop for Popped<'_, C> {
     fn drop(&mut self) {
         queue(self.0, self.1);
     }
@@ -218,10 +264,17 @@ pub struct RoutingHold<'a, C: Cells> {
 
 impl<C: Cells> Drop for RoutingHold<'_, C> {
     fn drop(&mut self) {
-        let last = with_owed(self.rt.runtime_id, false, |owed| {
-            owed.holds -= 1;
-            owed.holds == 0
-        });
+        let last = if C::SINGLE_THREADED {
+            let holds = &self.rt.routing_owing.local_holds;
+            let left = C::u32_load_relaxed(holds) - 1;
+            C::u32_store_relaxed(holds, left);
+            Some(left == 0)
+        } else {
+            with_owed(self.rt.runtime_id, false, |owed| {
+                owed.holds -= 1;
+                owed.holds == 0
+            })
+        };
         if last == Some(true) && self.routes {
             self.rt.route_queued();
         }
@@ -275,7 +328,12 @@ impl<C: Cells> Runtime<C> {
     }
 
     fn routing_hold(&self, routes: bool) -> RoutingHold<'_, C> {
-        with_owed(self.runtime_id, true, |owed| owed.holds += 1);
+        if C::SINGLE_THREADED {
+            let holds = &self.routing_owing.local_holds;
+            C::u32_store_relaxed(holds, C::u32_load_relaxed(holds) + 1);
+        } else {
+            with_owed(self.runtime_id, true, |owed| owed.holds += 1);
+        }
         RoutingHold {
             rt: self,
             routes,
@@ -288,7 +346,17 @@ impl<C: Cells> Runtime<C> {
     /// drain of it is live on the thread, the thread is in value code, or
     /// it is panicking. Returns the first failure of a routing run this
     /// call started; later ones are dropped.
+    #[inline]
     pub fn route_pending(&self) -> Option<RoutingFailed> {
+        if self.routing_owing.none() {
+            return None;
+        }
+        self.route_pending_owed()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn route_pending_owed(&self) -> Option<RoutingFailed> {
         if cycle_state::open_entry_of(self.runtime_id) {
             return None;
         }
@@ -299,11 +367,25 @@ impl<C: Cells> Runtime<C> {
     /// last take, cleared by the take. `None` while an entry of this
     /// runtime is open on the thread, so a read inside a compute leaves it
     /// for the next top-level call.
+    #[inline]
     pub fn take_routing_failure(&self) -> Option<RoutingFailed> {
+        if self.routing_owing.none() {
+            return None;
+        }
+        self.take_stored_failure()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn take_stored_failure(&self) -> Option<RoutingFailed> {
         if cycle_state::open_entry_of(self.runtime_id) {
             return None;
         }
-        with_owed(self.runtime_id, false, |owed| owed.failure.take()).flatten()
+        let taken = with_owed(self.runtime_id, false, |owed| owed.failure.take()).flatten();
+        if taken.is_some() {
+            self.routing_owing.sub(1);
+        }
+        taken
     }
 
     /// At the exit of a call that may have queued a router: route, keeping
@@ -339,6 +421,7 @@ impl<C: Cells> Runtime<C> {
             let lost = with_owed(self.runtime_id, true, |owed| match owed.failure {
                 None => {
                     owed.failure = Some(failure);
+                    self.routing_owing.add(1);
                     None
                 }
                 Some(_) => Some(failure),
@@ -351,11 +434,11 @@ impl<C: Cells> Runtime<C> {
         if std::thread::panicking() || value_code::thread_word() & value_code::COUNTER_MASK != 0 {
             return None;
         }
-        let _draining = Draining::begin(self.runtime_id)?;
+        let _draining = Draining::begin(self)?;
         crate::lock_order::assert_may_route();
         let mut first = None;
-        while let Some(router) = pop(self.runtime_id) {
-            let popped = Popped(self.runtime_id, router);
+        while let Some(router) = pop(self) {
+            let popped = Popped(self, router);
             let mut visited = HashSet::default();
             self.route_one(router, &mut first, &mut visited);
             std::mem::forget(popped);
@@ -385,7 +468,7 @@ impl<C: Cells> Runtime<C> {
         // write that flagged it during the run queued it on its own thread.
         let node = self.nodes.get(slot);
         if node.generation() == generation && node.state() != NodeState::Clean {
-            unqueue(self.runtime_id, (slot, generation));
+            unqueue(self, (slot, generation));
         }
         if C::SINGLE_THREADED {
             return;
@@ -449,7 +532,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn queue_eager(&self, id: NodeId, node: &NodeData<C>, in_walk: bool) {
         let router = (id.0, node.generation());
-        queue(self.runtime_id, router);
+        queue(self, router);
         if !C::SINGLE_THREADED && in_walk {
             self.note_in_running_router(router);
         }

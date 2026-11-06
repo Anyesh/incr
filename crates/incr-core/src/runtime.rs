@@ -1662,6 +1662,7 @@ pub struct Runtime<C: Cells> {
     /// counts itself only when it is nonzero.
     watching: C::U32,
     router_lists: routing_impl::RouterLists<C>,
+    routing_owing: routing_impl::Owing<C>,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1862,6 +1863,7 @@ impl<C: Cells> Runtime<C> {
             verdict_watch: cycle_impl::verdict_watch::<C>(),
             watching: C::new_u32(0),
             router_lists: routing_impl::RouterLists::new(runtime_id),
+            routing_owing: routing_impl::Owing::new(),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -7820,7 +7822,7 @@ mod seed_impl;
 mod routing_impl;
 
 #[cfg(all(test, not(loom)))]
-pub(crate) use routing_impl::queued_routers;
+pub(crate) use routing_impl::{owed_to, queued_routers};
 pub use routing_impl::{RoutingFailed, RoutingHold};
 
 #[cfg(all(test, not(loom)))]
