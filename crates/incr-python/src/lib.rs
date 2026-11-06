@@ -29,8 +29,10 @@
 
 mod elements;
 mod keyed;
+mod lookups;
 mod memory;
 mod ready;
+mod state;
 
 use pyo3::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -43,10 +45,10 @@ use incr_compute::{
     SortedCollection, TraceAction,
 };
 use keyed::{IndexGuard, KeyCounts, SharedIndex, StagedKeys};
-use memory::{Callables, PyCallable};
+use state::{PyCallable, RtState};
 
 use incr_python_protocol::notready::{
-    PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
+    lookup_failed, PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions,
@@ -137,9 +139,9 @@ trait OnRuntime {
         engine_call(rt, || f(rt))
     }
 
-    /// The runtime's callable count.
-    fn callables(&self, py: Python<'_>) -> Callables {
-        self.runtime().bind(py).borrow().callables.clone()
+    /// The runtime's binding state.
+    fn callables(&self, py: Python<'_>) -> RtState {
+        self.runtime().bind(py).borrow().state.clone()
     }
 }
 
@@ -153,7 +155,7 @@ fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync +
                 py,
                 PyRuntimeRef {
                     ptr: Cell::new(rt as *const _),
-                    callables: py_func.callables(),
+                    state: py_func.state(),
                     missing: &missing,
                 },
             )
@@ -215,9 +217,9 @@ struct PyObserverId {
 #[pyclass(name = "RuntimeRef", unsendable)]
 struct PyRuntimeRef {
     ptr: Cell<*const Runtime>,
-    /// The runtime's callable count, valid while `ptr` is non-null: the
+    /// The runtime's binding state, valid while `ptr` is non-null: the
     /// running query's closure holds it.
-    callables: *const Callables,
+    state: *const RtState,
     /// The missing contributions of the `Incomplete` values the running
     /// query read, valid while `ptr` is non-null.
     missing: *const Cell<u64>,
@@ -254,12 +256,12 @@ impl PyRuntimeRef {
         Ok((rt, unsafe { &*self.missing }))
     }
 
-    /// The runtime and its callable count.
-    fn rt_and_callables(&self) -> PyResult<(&Runtime, &Callables)> {
+    /// The runtime and its binding state.
+    fn rt_and_state(&self) -> PyResult<(&Runtime, &RtState)> {
         let rt = self.rt()?;
         // SAFETY: `rt` succeeded, so the query whose closure owns the
-        // count is still running.
-        Ok((rt, unsafe { &*self.callables }))
+        // state is still running.
+        Ok((rt, unsafe { &*self.state }))
     }
 }
 
@@ -282,6 +284,16 @@ impl PyRuntimeRef {
         let (rt, missing) = self.rt_and_missing()?;
         let val = try_read::<Exc>(engine_call(rt, || rt.try_get(node.inner))?)?;
         ready::read(py, val, missing)
+    }
+
+    /// The value of `key`'s lookup (see `Runtime.create_lookup`), read as
+    /// `get` reads a node: `Pending` makes this query's value `Pending`.
+    fn lookup(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let (rt, state) = self.rt_and_state()?;
+        let (_, missing) = self.rt_and_missing()?;
+        let lookups = state.lookups();
+        let val = engine_call(rt, || rt.get(lookups.node(rt, py, &key)))?;
+        ready::read(py, val.0, missing)
     }
 
     /// `(value, status)` as `Runtime.get_with_status` gives them, with
@@ -314,7 +326,7 @@ impl PyRuntimeRef {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let (rt, callables) = self.rt_and_callables()?;
+        let (rt, callables) = self.rt_and_state()?;
         let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
         let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
         let node = engine_call(rt, || rt.child_query_with(key, f, opts))?;
@@ -889,7 +901,7 @@ struct PyRuntime {
     /// keyed by the collection's internal version node, so repeated
     /// access and every wrapper of one collection share a single node.
     version_bridges: RefCell<HashMap<Incr<u64>, Incr<PyValue>>>,
-    callables: Callables,
+    state: RtState,
 }
 
 #[expect(
@@ -943,7 +955,7 @@ impl PyRuntime {
         PyRuntime {
             holder: Holder::Owned(Runtime::new()),
             version_bridges: RefCell::new(HashMap::new()),
-            callables: Callables::default(),
+            state: RtState::default(),
         }
     }
 
@@ -959,7 +971,8 @@ impl PyRuntime {
             })?;
             let holder = std::mem::replace(&mut this.holder, Holder::Closed);
             let bridges = std::mem::take(this.version_bridges.get_mut());
-            (holder, bridges)
+            let lookups = this.state.lookups().clear();
+            (holder, (bridges, lookups))
         };
         // Dropped after the borrow ends, so a finalizer that calls back into
         // this runtime sees it closed instead of a held borrow.
@@ -1067,7 +1080,7 @@ impl PyRuntime {
     /// Register `callback` to fire on `stabilize()` whenever the node's
     /// value changed since the last firing.
     fn observe(&self, node: PyNodeId, callback: Py<PyAny>) -> PyResult<PyObserverId> {
-        let callback = self.callables.hold(callback);
+        let callback = self.state.hold(callback);
         let id = self.engine_call(|rt| {
             rt.observe(node.inner, move |v: &PyValue| {
                 Python::attach(|py| {
@@ -1100,8 +1113,8 @@ impl PyRuntime {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let opts = query_opts(py, fallback, fixpoint, replay, |f| self.callables.hold(f))?;
-        let f = query_fn(self.callables.hold(py_func));
+        let opts = query_opts(py, fallback, fixpoint, replay, |f| self.state.hold(f))?;
+        let f = query_fn(self.state.hold(py_func));
         let node = self.engine_call(|rt| rt.create_query_with(f, opts))?;
         Ok(PyNodeId { inner: node })
     }
@@ -1235,7 +1248,66 @@ impl PyRuntime {
             .iter()
             .map(|(version, bridge)| (version.slot(), bridge.slot()))
             .collect();
-        memory::stats_dict(py, &stats, self.callables.count(), &bridges)
+        memory::stats_dict(py, &stats, self.state.callables(), &bridges)
+    }
+
+    /// The lookup node for `key`: an input created as `Pending(key)`, and
+    /// queued for `drain_pending_lookups`, the first time `key` is asked
+    /// for here or through `RuntimeRef.lookup`. No query owns it, so it
+    /// keeps its value when the queries reading it stop.
+    fn create_lookup(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<PyNodeId> {
+        let lookups = self.state.lookups();
+        let node = self.engine_call(|rt| lookups.node(rt, py, &key))?;
+        Ok(PyNodeId { inner: node })
+    }
+
+    /// The keys queued since the last drain whose lookup is still
+    /// `Pending`, each once.
+    fn drain_pending_lookups(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let lookups = self.state.lookups();
+        let keys = self.engine_call(|rt| lookups.drain(rt, py))?;
+        Ok(keys.into_iter().map(|key| key.0).collect())
+    }
+
+    /// Set each lookup to its value, from a mapping or an iterable of
+    /// `(key, value)` pairs, creating the ones not asked for yet.
+    fn resolve_lookups(&self, py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<()> {
+        let pairs = if values.hasattr("items")? {
+            values.call_method0("items")?
+        } else {
+            values.clone()
+        };
+        let pairs = pairs
+            .try_iter()?
+            .map(|pair| pair?.extract::<(Py<PyAny>, Py<PyAny>)>())
+            .collect::<PyResult<Vec<_>>>()?;
+        let lookups = self.state.lookups();
+        self.engine_call(|rt| {
+            for (key, value) in pairs {
+                lookups.set(rt, py, &key, value);
+            }
+        })
+    }
+
+    /// Set `key`'s lookup to `LookupFailed(reason, key)`.
+    fn fail_lookup(&self, py: Python<'_>, key: Py<PyAny>, reason: Py<PyAny>) -> PyResult<()> {
+        let failed = lookup_failed(py, reason, key.clone_ref(py))?;
+        let lookups = self.state.lookups();
+        self.engine_call(|rt| lookups.set(rt, py, &key, failed))
+    }
+
+    /// Set each key's lookup back to `Pending(key)` and queue it again.
+    fn retry_lookups(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
+        let keys = keys
+            .try_iter()?
+            .map(|key| key.map(Bound::unbind))
+            .collect::<PyResult<Vec<_>>>()?;
+        let lookups = self.state.lookups();
+        self.engine_call(|rt| {
+            for key in &keys {
+                lookups.retry(rt, py, key);
+            }
+        })
     }
 
     fn node_count(&self) -> PyResult<usize> {

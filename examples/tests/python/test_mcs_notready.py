@@ -1,3 +1,6 @@
+import gc
+import weakref
+
 import pytest
 
 import incr
@@ -382,3 +385,99 @@ def test_sort_by_key_sorts_a_not_ready_element_by_its_row():
         ("bob", 6),
         ("ann", 8),
     ]
+
+
+def test_a_lookup_starts_pending_and_is_drained_once():
+    rt = Runtime()
+    leg = rt.create_lookup(("ann", "bob"))
+    assert rt.get(leg) == Pending(key=("ann", "bob"))
+    assert rt.create_lookup(("ann", "bob")) == leg
+    assert rt.drain_pending_lookups() == [("ann", "bob")]
+    assert rt.drain_pending_lookups() == []
+
+
+def test_a_query_reading_a_lookup_is_pending_until_it_resolves():
+    rt = Runtime()
+    rate = rt.create_input(2)
+    score = rt.create_query(lambda ctx: ctx.lookup("leg") * ctx.get(rate))
+    assert rt.get(score) == Pending(key="leg")
+    assert rt.drain_pending_lookups() == ["leg"]
+
+    rt.resolve_lookups({"leg": 15})
+    assert rt.get_with_status(score) == (30, None)
+    assert rt.drain_pending_lookups() == []
+
+
+def test_a_lookup_resolved_before_the_drain_is_not_drained():
+    rt = Runtime()
+    rt.create_lookup("a")
+    rt.create_lookup("b")
+    rt.resolve_lookups({"a": 1})
+    assert rt.drain_pending_lookups() == ["b"]
+
+
+def test_resolving_an_unknown_key_creates_its_lookup_resolved():
+    rt = Runtime()
+    rt.resolve_lookups({"c": 3})
+    assert rt.get(rt.create_lookup("c")) == 3
+    assert rt.drain_pending_lookups() == []
+
+
+def test_a_failed_lookup_is_a_value_and_retry_makes_it_pending_again():
+    rt = Runtime()
+    score = rt.create_query(lambda ctx: ctx.lookup("leg") + 1)
+    rt.get(score)
+    assert rt.drain_pending_lookups() == ["leg"]
+
+    rt.fail_lookup("leg", "timeout")
+    assert rt.get(score) == LookupFailed("timeout", key="leg")
+
+    rt.retry_lookups(["leg"])
+    assert rt.get(score) == Pending(key="leg")
+    assert rt.drain_pending_lookups() == ["leg"]
+    assert rt.drain_pending_lookups() == []
+
+    rt.resolve_lookups([("leg", 4)])
+    assert rt.get(score) == 5
+
+
+def test_a_lookup_from_a_compute_survives_its_creator_dropping_it():
+    rt = Runtime()
+    use_leg = rt.create_input(True)
+    score = rt.create_query(lambda ctx: ctx.lookup("leg") if ctx.get(use_leg) else 0)
+    rt.get(score)
+    rt.set(use_leg, False)
+    assert rt.get(score) == 0
+    rt.resolve_lookups({"leg": 7})
+    assert rt.get(rt.create_lookup("leg")) == 7
+
+
+def test_lookups_raise_on_a_closed_runtime():
+    rt = Runtime()
+    rt.create_lookup("a")
+    rt.close()
+    for call in (
+        lambda: rt.create_lookup("a"),
+        rt.drain_pending_lookups,
+        lambda: rt.resolve_lookups({"a": 1}),
+        lambda: rt.fail_lookup("a", "x"),
+        lambda: rt.retry_lookups(["a"]),
+    ):
+        with pytest.raises(RuntimeError, match="closed"):
+            call()
+
+
+def test_closing_releases_lookup_keys():
+    class Key:
+        pass
+
+    rt = Runtime()
+    key = Key()
+    rt.create_lookup(key)
+    ref = weakref.ref(key)
+    del key
+    gc.collect()
+    assert ref() is not None
+    rt.close()
+    gc.collect()
+    assert ref() is None

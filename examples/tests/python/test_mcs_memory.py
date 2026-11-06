@@ -207,3 +207,23 @@ def test_stats_from_a_key_method_during_a_keyed_operation_report_the_index():
     keyed.upsert(Key("a", hooks), 2)
 
     assert seen == [baseline]
+
+
+def test_lookups_count_their_keys_values_and_queue():
+    rt = Runtime()
+    before = rt.memory_stats()
+
+    for i in range(1000):
+        rt.create_lookup(("leg", i))
+    queued = rt.memory_stats()
+    # A value, a table key and a queued key per lookup.
+    assert queued["py_refs"] - before["py_refs"] >= 3000
+    assert (
+        queued["by_kind"]["collection"]["bytes"]
+        > before["by_kind"]["collection"]["bytes"]
+    )
+
+    assert len(rt.drain_pending_lookups()) == 1000
+    drained = rt.memory_stats()
+    assert drained["py_refs"] - before["py_refs"] >= 2000
+    assert drained["py_refs"] < queued["py_refs"]

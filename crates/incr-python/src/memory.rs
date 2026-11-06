@@ -1,80 +1,15 @@
 //! `Runtime.memory_stats()`: the engine's figures from
 //! `incr_compute::Runtime::memory_stats`, the Python objects in them
 //! counted by type, and the Python callables the engine holds, which it
-//! cannot see inside its closures.
+//! cannot see inside its closures ([`crate::state::RtState`] counts them).
 
 use std::any::TypeId;
-use std::borrow::Borrow;
-use std::cell::Cell;
 use std::collections::HashMap;
-use std::ops::Deref;
-use std::rc::Rc;
 
 use incr_compute::{MemoryStats, NodeKind};
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
-
-/// How many Python callables one runtime's engine holds: one per live
-/// [`PyCallable`] made from it.
-#[derive(Clone, Default)]
-pub(crate) struct Callables(Rc<Cell<usize>>);
-
-impl Callables {
-    pub(crate) fn hold(&self, f: Py<PyAny>) -> PyCallable {
-        self.0.set(self.0.get() + 1);
-        PyCallable {
-            f,
-            count: self.clone(),
-        }
-    }
-
-    pub(crate) fn count(&self) -> usize {
-        self.0.get()
-    }
-}
-
-/// A Python callable handed to the engine, counted in its runtime's
-/// [`Callables`] from creation until drop.
-pub(crate) struct PyCallable {
-    f: Py<PyAny>,
-    count: Callables,
-}
-
-impl PyCallable {
-    pub(crate) fn callables(&self) -> &Callables {
-        &self.count
-    }
-}
-
-// SAFETY: the engine's closures must be `Send + Sync`, but these live only
-// in a `Runtime<Local>`, which is neither, and in the `unsendable` classes
-// of this module, so they are created, used and dropped on the one thread
-// that runtime lives on and the count's `Rc` is never touched from another.
-// `&PyCallable` reaches only the `Py`, which is `Sync` itself.
-unsafe impl Send for PyCallable {}
-// SAFETY: see `Send`.
-unsafe impl Sync for PyCallable {}
-
-impl Drop for PyCallable {
-    fn drop(&mut self) {
-        self.count.0.set(self.count.0.get() - 1);
-    }
-}
-
-impl Deref for PyCallable {
-    type Target = Py<PyAny>;
-
-    fn deref(&self) -> &Py<PyAny> {
-        &self.f
-    }
-}
-
-impl Borrow<Py<PyAny>> for PyCallable {
-    fn borrow(&self) -> &Py<PyAny> {
-        &self.f
-    }
-}
 
 /// The Python references one value of `type_id` holds, for the types this
 /// binding puts in the engine. A `window`'s `Vec<PyValue>` is not among
