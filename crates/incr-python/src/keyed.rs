@@ -5,11 +5,12 @@
 //! ([`KeyIndex::commit`]) updates the index from what the collection
 //! reports it applied, running no user code, so the two never diverge.
 
+use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 
 use hashbrown::HashTable;
-use incr_compute::Change;
+use incr_compute::{Change, Held, StateKind, StateMemory, StateStats};
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -23,6 +24,44 @@ pub(crate) type KeyCounts = (usize, usize, usize);
 pub(crate) struct KeyIndex {
     table: HashTable<(u64, Py<PyTuple>)>,
     hasher: RandomState,
+}
+
+/// A `KeyedCollection`'s index, which the runtime's state registry also
+/// reaches, through a `Weak`.
+pub(crate) struct SharedIndex(RefCell<KeyIndex>);
+
+// SAFETY: the registry needs `Send + Sync`, but it lives in a
+// `Runtime<Local>`, which is neither, and the index otherwise only in the
+// `unsendable` `KeyedCollection`, so it is only ever reached from the one
+// thread that runtime lives on.
+unsafe impl Send for SharedIndex {}
+// SAFETY: see `Send`.
+unsafe impl Sync for SharedIndex {}
+
+impl SharedIndex {
+    pub(crate) fn new() -> Self {
+        Self(RefCell::new(KeyIndex::new()))
+    }
+
+    pub(crate) fn try_borrow_mut(&self) -> Option<RefMut<'_, KeyIndex>> {
+        self.0.try_borrow_mut().ok()
+    }
+}
+
+impl StateStats for SharedIndex {
+    fn state_stats(&self) -> StateMemory {
+        let index = self
+            .0
+            .try_borrow()
+            .expect("memory_stats called from a key or row method during a keyed operation");
+        let pairs = index.table.len();
+        StateMemory::new(
+            StateKind::Other("keyed_index"),
+            pairs,
+            vec![Held::of::<Py<PyTuple>>(pairs)],
+            index.table.allocation_size(),
+        )
+    }
 }
 
 fn item<'py>(pair: &Bound<'py, PyTuple>, i: usize) -> Bound<'py, PyAny> {

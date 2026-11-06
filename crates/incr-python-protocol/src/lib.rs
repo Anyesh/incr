@@ -12,6 +12,7 @@
 
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
+use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, PoisonError};
@@ -318,23 +319,32 @@ pub fn init_fn(init: Py<PyAny>) -> impl FnOnce() -> PyValue {
 }
 
 /// The options of a query created with `fallback`, `fixpoint` and
-/// `replay` keyword arguments.
-pub fn query_opts(
+/// `replay` keyword arguments. Each Python callable the options keep is
+/// kept as `hold` of it, so a binding can track the callables its engine
+/// holds.
+pub fn query_opts<H>(
     py: Python<'_>,
     fallback: Option<Py<PyAny>>,
     fixpoint: Option<PyRef<'_, PyFixpoint>>,
     replay: bool,
-) -> PyResult<QueryOpts<PyValue>> {
+    hold: impl Fn(Py<PyAny>) -> H,
+) -> PyResult<QueryOpts<PyValue>>
+where
+    H: Borrow<Py<PyAny>> + Send + Sync + 'static,
+{
     let cycle = match (fallback, fixpoint) {
         (Some(_), Some(_)) => {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "a query takes a fallback or a fixpoint, not both",
             ))
         }
-        (Some(g), None) => CycleStrategy::fallback(move |cycle: &Cycle| {
-            Python::attach(|py| PyValue(call_stashing(py, &g, (cycle_ids(cycle),))))
-        }),
-        (None, Some(fixpoint)) => CycleStrategy::Fixpoint(fixpoint.strategy(py)),
+        (Some(g), None) => {
+            let g = hold(g);
+            CycleStrategy::fallback(move |cycle: &Cycle| {
+                Python::attach(|py| PyValue(call_stashing(py, g.borrow(), (cycle_ids(cycle),))))
+            })
+        }
+        (None, Some(fixpoint)) => CycleStrategy::Fixpoint(fixpoint.strategy(py, hold)),
         (None, None) => CycleStrategy::None,
     };
     let replay = if replay {
@@ -387,32 +397,42 @@ impl PyFixpoint {
 }
 
 impl PyFixpoint {
-    fn strategy(&self, py: Python<'_>) -> Fixpoint<PyValue> {
-        let initial = self.initial.clone_ref(py);
-        let mut fixpoint =
-            Fixpoint::new(move || Python::attach(|py| PyValue(call_stashing(py, &initial, ()))))
-                .max_iterations(self.max_iterations);
+    fn strategy<H>(&self, py: Python<'_>, hold: impl Fn(Py<PyAny>) -> H) -> Fixpoint<PyValue>
+    where
+        H: Borrow<Py<PyAny>> + Send + Sync + 'static,
+    {
+        let initial = hold(self.initial.clone_ref(py));
+        let mut fixpoint = Fixpoint::new(move || {
+            Python::attach(|py| PyValue(call_stashing(py, initial.borrow(), ())))
+        })
+        .max_iterations(self.max_iterations);
         if let Some(f) = &self.converged {
-            let f = f.clone_ref(py);
+            let f = hold(f.clone_ref(py));
             fixpoint = fixpoint.converged(move |prev: &PyValue, cur: &PyValue| {
                 Python::attach(|py| {
                     let args = (prev.0.clone_ref(py), cur.0.clone_ref(py));
-                    or_stash(call_stashing(py, &f, args).is_truthy(py))
+                    or_stash(call_stashing(py, f.borrow(), args).is_truthy(py))
                 })
             });
         }
         if let Some(f) = &self.step {
-            let f = f.clone_ref(py);
+            let f = hold(f.clone_ref(py));
             fixpoint = fixpoint.step(move |prev: &PyValue, out: PyValue, k: u32| {
                 Python::attach(|py| {
-                    PyValue(call_stashing(py, &f, (prev.0.clone_ref(py), out.0, k)))
+                    PyValue(call_stashing(
+                        py,
+                        f.borrow(),
+                        (prev.0.clone_ref(py), out.0, k),
+                    ))
                 })
             });
         }
         if let Some(f) = &self.on_limit {
-            let f = f.clone_ref(py);
+            let f = hold(f.clone_ref(py));
             fixpoint = fixpoint.on_limit(move |cycle: &Cycle, cur: PyValue| {
-                Python::attach(|py| PyValue(call_stashing(py, &f, (cycle_ids(cycle), cur.0))))
+                Python::attach(|py| {
+                    PyValue(call_stashing(py, f.borrow(), (cycle_ids(cycle), cur.0)))
+                })
             });
         }
         fixpoint

@@ -36,10 +36,11 @@ pub use incr_core::{
 pub use incr_core::{
     Change, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher,
     FxHasher, GridKey, GridTable as GridTableInner, GroupedCollection as GroupedCollectionInner,
-    Incr, IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
-    NodeTable as NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay,
-    RuntimeId, SortDelta, SortedCollection as SortedCollectionInner, TableKey, TraceAction, Value,
-    DEFAULT_MAX_FRAMES,
+    Held, Incr, IncrCollection as IncrCollectionInner, MemoryStats, NodeId, NodeInfo, NodeKind,
+    NodeKindInfo, NodeMemory, NodeState, NodeTable as NodeTableInner, NodeTrace, ObserverId,
+    PropagationTrace, QueryOpts, Replay, RuntimeId, SortDelta,
+    SortedCollection as SortedCollectionInner, StateKind, StateMemory, StateStats, TableKey,
+    TraceAction, Value, ValueType, DEFAULT_MAX_FRAMES,
 };
 
 /// Single-threaded runtime: `Runtime<Local>`. Not `Send`/`Sync`. Use the
@@ -72,11 +73,12 @@ mod reexports {
             active_frame_doomed, check_value_code, engine_unwind, engine_unwind_in_progress,
             set_aside_cycle_unwind, take_last_cycle, with_value_code, Change, Cycle, CycleStrategy,
             DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher, GridKey, GridTable,
-            GridTableInner, GroupedCollection, GroupedCollectionInner, Incr, IncrCollection,
-            IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable,
-            NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay, Runtime,
-            RuntimeId, SortDelta, SortedCollection, SortedCollectionInner, TableKey, TraceAction,
-            Value, DEFAULT_MAX_FRAMES,
+            GridTableInner, GroupedCollection, GroupedCollectionInner, Held, Incr, IncrCollection,
+            IncrCollectionInner, MemoryStats, NodeId, NodeInfo, NodeKind, NodeKindInfo, NodeMemory,
+            NodeState, NodeTable, NodeTableInner, NodeTrace, ObserverId, PropagationTrace,
+            QueryOpts, Replay, Runtime, RuntimeId, SortDelta, SortedCollection,
+            SortedCollectionInner, StateKind, StateMemory, StateStats, TableKey, TraceAction,
+            Value, ValueType, DEFAULT_MAX_FRAMES,
         };
 
         fn named<T: ?Sized>() {}
@@ -127,6 +129,14 @@ mod reexports {
         named::<SortedCollection<u32, u32>>();
         named::<SortedCollectionInner<u32, u32, incr_core::Local>>();
         named::<TraceAction>();
+        named::<Held>();
+        named::<MemoryStats>();
+        named::<NodeKind>();
+        named::<NodeMemory>();
+        named::<StateKind>();
+        named::<StateMemory>();
+        named::<dyn StateStats>();
+        named::<ValueType>();
         value::<u32>();
         with_value_code(|| ());
         check_value_code();

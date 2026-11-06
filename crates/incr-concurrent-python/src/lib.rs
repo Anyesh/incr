@@ -261,7 +261,7 @@ impl PyRuntimeRef {
         replay: bool,
     ) -> PyResult<PyNodeId> {
         let rt = self.rt()?;
-        let opts = query_opts(py, fallback, fixpoint, replay)?;
+        let opts = query_opts(py, fallback, fixpoint, replay, std::convert::identity)?;
         let (key, f) = (PyValue(key), query_fn(f));
         let node = engine_call(py, rt, || rt.child_query_with(key, f, opts))?;
         Ok(PyNodeId { inner: node })
@@ -303,7 +303,7 @@ impl PyNodeTable {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let opts = query_opts(py, fallback, fixpoint, replay)?;
+        let opts = query_opts(py, fallback, fixpoint, replay, std::convert::identity)?;
         let (key, f) = (PyValue(key), query_fn(f));
         let node = engine_call(py, &self.rt, || {
             self.inner.get_or_insert_query_with(&self.rt, key, f, opts)
@@ -767,7 +767,7 @@ impl PyRuntime {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let opts = query_opts(py, fallback, fixpoint, replay)?;
+        let opts = query_opts(py, fallback, fixpoint, replay, std::convert::identity)?;
         let f = query_fn(py_func);
         let node = engine_call(py, &self.inner, || self.inner.create_query_with(f, opts))?;
         Ok(PyNodeId { inner: node })

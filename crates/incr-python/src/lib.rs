@@ -28,17 +28,20 @@
 //! runtime first.)
 
 mod keyed;
+mod memory;
 
 use pyo3::prelude::*;
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use incr_compute::{
     DeleteError, Incr, IncrCollection, NodeId, NodeKindInfo, NodeTable, PropagationTrace, Runtime,
     SortedCollection, TraceAction,
 };
-use keyed::{KeyCounts, KeyIndex, StagedKeys};
+use keyed::{KeyCounts, KeyIndex, SharedIndex, StagedKeys};
+use memory::{Callables, PyCallable};
 
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions,
@@ -121,17 +124,23 @@ trait OnRuntime {
         let rt = rt.rt()?;
         engine_call(rt, || f(rt))
     }
+
+    /// The runtime's callable count.
+    fn callables(&self, py: Python<'_>) -> Callables {
+        self.runtime().bind(py).borrow().callables.clone()
+    }
 }
 
 /// The closure the engine runs for a Python query: `py_func` called with
 /// a `RuntimeRef` that is invalidated when it returns.
-fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 'static {
+fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 'static {
     move |rt: &Runtime| -> PyValue {
         Python::attach(|py| {
             let rt_ref = Py::new(
                 py,
                 PyRuntimeRef {
                     ptr: Cell::new(rt as *const _),
+                    callables: py_func.callables(),
                 },
             )
             .unwrap();
@@ -187,6 +196,9 @@ struct PyObserverId {
 #[pyclass(name = "RuntimeRef", unsendable)]
 struct PyRuntimeRef {
     ptr: Cell<*const Runtime>,
+    /// The runtime's callable count, valid while `ptr` is non-null: the
+    /// running query's closure holds it.
+    callables: *const Callables,
 }
 
 struct InvalidateRef<'py>(Bound<'py, PyRuntimeRef>);
@@ -210,6 +222,14 @@ impl PyRuntimeRef {
         // the Runtime is borrowed by the runtime's own closure dispatch,
         // so the lifetime is guaranteed to outlive the callback.
         Ok(unsafe { &*ptr })
+    }
+
+    /// The runtime and its callable count.
+    fn rt_and_callables(&self) -> PyResult<(&Runtime, &Callables)> {
+        let rt = self.rt()?;
+        // SAFETY: `rt` succeeded, so the query whose closure owns the
+        // count is still running.
+        Ok((rt, unsafe { &*self.callables }))
     }
 }
 
@@ -252,9 +272,9 @@ impl PyRuntimeRef {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let rt = self.rt()?;
-        let opts = query_opts(py, fallback, fixpoint, replay)?;
-        let (key, f) = (PyValue(key), query_fn(f));
+        let (rt, callables) = self.rt_and_callables()?;
+        let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
+        let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
         let node = engine_call(rt, || rt.child_query_with(key, f, opts))?;
         Ok(PyNodeId { inner: node })
     }
@@ -299,8 +319,9 @@ impl PyNodeTable {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let opts = query_opts(py, fallback, fixpoint, replay)?;
-        let (key, f) = (PyValue(key), query_fn(f));
+        let callables = self.callables(py);
+        let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
+        let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
         let node = self.engine_call(py, |rt| {
             self.inner.get_or_insert_query_with(rt, key, f, opts)
         })?;
@@ -381,6 +402,7 @@ impl PyCollection {
     }
 
     fn filter(&self, py: Python<'_>, predicate: Py<PyAny>) -> PyResult<PyCollection> {
+        let predicate = self.callables(py).hold(predicate);
         let filtered = self.engine_call(py, |rt| {
             self.inner.filter(rt, move |val: &PyValue| -> bool {
                 Python::attach(|py| {
@@ -395,6 +417,7 @@ impl PyCollection {
     }
 
     fn map(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyCollection> {
+        let func = self.callables(py).hold(func);
         let mapped = self.engine_call(py, |rt| {
             self.inner.map(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| PyValue(call_stashing(py, &func, (val.0.clone_ref(py),))))
@@ -420,6 +443,7 @@ impl PyCollection {
     }
 
     fn reduce(&self, py: Python<'_>, fold_fn: Py<PyAny>) -> PyResult<PyNodeId> {
+        let fold_fn = self.callables(py).hold(fold_fn);
         let node = self.engine_call(py, |rt| {
             self.inner.reduce(rt, move |elements| -> PyValue {
                 Python::attach(|py| {
@@ -445,6 +469,8 @@ impl PyCollection {
         lift: Py<PyAny>,
         combine: Py<PyAny>,
     ) -> PyResult<PyNodeId> {
+        let callables = self.callables(py);
+        let (lift, combine) = (callables.hold(lift), callables.hold(combine));
         let node = self.engine_call(py, |rt| {
             self.inner.aggregate(
                 rt,
@@ -467,6 +493,7 @@ impl PyCollection {
     }
 
     fn sort_by_key(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PySortedCollection> {
+        let key_fn = self.callables(py).hold(key_fn);
         let sorted = self.engine_call(py, |rt| {
             self.inner.sort_by_key(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
@@ -479,6 +506,7 @@ impl PyCollection {
     }
 
     fn group_by(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PyGroupedCollection> {
+        let key_fn = self.callables(py).hold(key_fn);
         let grouped = self.engine_call(py, |rt| {
             self.inner.group_by(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
@@ -497,6 +525,8 @@ impl PyCollection {
         left_key: Py<PyAny>,
         right_key: Py<PyAny>,
     ) -> PyResult<PyCollection> {
+        let callables = self.callables(py);
+        let (left_key, right_key) = (callables.hold(left_key), callables.hold(right_key));
         let mapped = self.engine_call(py, |rt| {
             let joined = self.inner.join(
                 rt,
@@ -554,7 +584,7 @@ impl PyCollection {
 struct PyKeyedCollection {
     pairs: IncrCollection<PyValue>,
     rows: IncrCollection<PyValue>,
-    index: RefCell<KeyIndex>,
+    index: Arc<SharedIndex>,
     rt: Py<PyRuntime>,
 }
 
@@ -568,7 +598,7 @@ impl PyKeyedCollection {
     /// The index, refused to a key or row method that calls back into this
     /// collection while an operation on it runs.
     fn index(&self) -> PyResult<RefMut<'_, KeyIndex>> {
-        self.index.try_borrow_mut().map_err(|_| {
+        self.index.try_borrow_mut().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "KeyedCollection used from a key or row method during an operation on it",
             )
@@ -580,17 +610,20 @@ impl PyKeyedCollection {
 impl PyKeyedCollection {
     #[new]
     fn new(runtime: Bound<'_, PyRuntime>) -> PyResult<Self> {
+        let index = Arc::new(SharedIndex::new());
         let (pairs, rows) = runtime.borrow().engine_call(|rt| {
             let pairs = rt.create_collection::<PyValue>();
             let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
                 Python::attach(|py| PyValue(or_stash(pair.0.bind(py).get_item(1)).unbind()))
             });
+            let weak: std::sync::Weak<SharedIndex> = Arc::downgrade(&index);
+            rt.register_state(Some(rows.version_node().erase()), weak);
             (pairs, rows)
         })?;
         Ok(PyKeyedCollection {
             pairs,
             rows,
-            index: RefCell::new(KeyIndex::new()),
+            index,
             rt: runtime.unbind(),
         })
     }
@@ -788,6 +821,7 @@ struct PyRuntime {
     /// keyed by the collection's internal version node, so repeated
     /// access and every wrapper of one collection share a single node.
     version_bridges: RefCell<HashMap<Incr<u64>, Incr<PyValue>>>,
+    callables: Callables,
 }
 
 #[expect(
@@ -841,6 +875,7 @@ impl PyRuntime {
         PyRuntime {
             holder: Holder::Owned(Runtime::new()),
             version_bridges: RefCell::new(HashMap::new()),
+            callables: Callables::default(),
         }
     }
 
@@ -949,6 +984,7 @@ impl PyRuntime {
     /// Register `callback` to fire on `stabilize()` whenever the node's
     /// value changed since the last firing.
     fn observe(&self, node: PyNodeId, callback: Py<PyAny>) -> PyResult<PyObserverId> {
+        let callback = self.callables.hold(callback);
         let id = self.engine_call(|rt| {
             rt.observe(node.inner, move |v: &PyValue| {
                 Python::attach(|py| {
@@ -981,8 +1017,8 @@ impl PyRuntime {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let opts = query_opts(py, fallback, fixpoint, replay)?;
-        let f = query_fn(py_func);
+        let opts = query_opts(py, fallback, fixpoint, replay, |f| self.callables.hold(f))?;
+        let f = query_fn(self.callables.hold(py_func));
         let node = self.engine_call(|rt| rt.create_query_with(f, opts))?;
         Ok(PyNodeId { inner: node })
     }
@@ -1091,6 +1127,32 @@ impl PyRuntime {
             }
             Ok(result.into_any().unbind())
         })
+    }
+
+    /// Memory held by this runtime: `{"bytes", "nodes", "py_refs",
+    /// "by_kind", "by_label"}`. `bytes` estimates what the engine holds from
+    /// sizes and capacities (node slots, values' own slots, closures' captures,
+    /// dependency lists, labels, collection logs and operator state); the
+    /// Python objects themselves are not in it. `py_refs` counts the
+    /// references the engine holds to Python objects: node values,
+    /// collection elements and logged changes, operator state, keyed
+    /// indexes, and every callable handed to it, but not the engine's own
+    /// copies of a `window`'s windows. `by_kind` splits nodes into "input",
+    /// "query" and "collection" (a collection's version node), and puts all
+    /// collection and operator state under "collection". `by_label` totals
+    /// labelled nodes by the label up to its first `/`, with a collection's
+    /// state under the label of its `version_node`; callables are not
+    /// attributed to labels. Walks the whole graph; nothing is counted
+    /// between calls.
+    fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let stats = self.engine_call(|rt| rt.memory_stats())?;
+        let bridges = self
+            .version_bridges
+            .borrow()
+            .iter()
+            .map(|(version, bridge)| (version.slot(), bridge.slot()))
+            .collect();
+        memory::stats_dict(py, &stats, self.callables.count(), &bridges)
     }
 
     fn node_count(&self) -> PyResult<usize> {
