@@ -259,12 +259,22 @@ impl<C: Cells> Runtime<C> {
     /// Callbacks run with no engine lock held; they may read from the
     /// runtime but must not call `stabilize` reentrantly from another
     /// thread if duplicate notifications matter.
+    ///
+    /// `stabilize` first routes the `group_by` routers this thread's calls
+    /// left queued, and, called with no entry of this runtime open, routes
+    /// after each callback, so later observers read groups a callback's
+    /// writes moved. A callback's own group reads see its writes only after
+    /// it returns.
     pub fn stabilize(&self) {
         value_code::check();
-        self.nested_entry(|| self.enter(|| self.stabilize_entered()));
+        let routes = !cycle_state::open_entry_of(self.runtime_id);
+        if routes {
+            self.route_if_queued();
+        }
+        self.nested_entry(|| self.enter(|| self.stabilize_entered(routes)));
     }
 
-    fn stabilize_entered(&self) {
+    fn stabilize_entered(&self, routes: bool) {
         let mut pending = Pending {
             rt: self,
             entries: self.drain_observed(),
@@ -276,6 +286,9 @@ impl<C: Cells> Runtime<C> {
             for (id, last_seen, run) in runs {
                 if let Some(stamp) = run(self, last_seen) {
                     self.inner.write().observers.advance(id, stamp);
+                }
+                if routes {
+                    self.route_in_stabilize();
                 }
             }
             pending.next += 1;
@@ -357,15 +370,53 @@ impl<C: Cells> Runtime<C> {
     /// `observer_read`'s walk of a node it found not Clean, under the
     /// record that lets the Dead arm return `Gone` for this node.
     /// `stamp` was loaded before `observed`.
-    #[cold]
-    #[inline(never)]
+    #[inline(always)]
     fn observer_walk<T: Value>(
         &self,
         handle: Incr<T>,
         observed: NodeState,
         stamp: u64,
     ) -> Result<(), ObsErr> {
+        self.observer_walk_failing(handle, observed, stamp)
+            .map_err(|(err, _)| err)
+    }
+
+    /// [`Self::observer_walk`] that hands back the panic of a run that
+    /// left the node Failed with its error.
+    #[cold]
+    #[inline(never)]
+    fn observer_walk_failing<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        stamp: u64,
+    ) -> Result<(), (ObsErr, Option<Box<dyn Any + Send>>)> {
         cycle_state::KeptUnwind::around(|| self.observer_walk_kept(handle, observed, stamp))
+    }
+
+    /// Brings a `group_by` router up to date as an observer's walk does,
+    /// recording no dependency and reading no value. A router Clean or
+    /// Failed when loaded is left alone, so an `Err` carries the panic of
+    /// a run this walk waited on or started. A router deleted under the
+    /// handle, or one in a cycle, is skipped.
+    pub(super) fn route_walk(&self, handle: Incr<u64>) -> Result<(), Box<dyn Any + Send>> {
+        let node = self.nodes.get(handle.slot());
+        let (observed, stamp) = {
+            let _inner = self.inner.read();
+            if node.generation() != handle.generation() {
+                return Ok(());
+            }
+            let stamp = self.observed_stamp(node);
+            C::fence_acquire();
+            (state::load::<C>(node.state_cell()), stamp)
+        };
+        if matches!(observed, NodeState::Clean | NodeState::Failed) {
+            return Ok(());
+        }
+        match self.observer_walk_failing(handle, observed, stamp) {
+            Err((_, Some(payload))) => Err(payload),
+            _ => Ok(()),
+        }
     }
 
     #[inline(always)]
@@ -374,7 +425,7 @@ impl<C: Cells> Runtime<C> {
         handle: Incr<T>,
         observed: NodeState,
         stamp: u64,
-    ) -> Result<(), ObsErr> {
+    ) -> Result<(), (ObsErr, Option<Box<dyn Any + Send>>)> {
         let id = NodeId(handle.slot());
         if observed == NodeState::Cyclic || is_computing(observed) {
             // `Ok` is a node on this thread's stack or held map, in a
@@ -383,7 +434,7 @@ impl<C: Cells> Runtime<C> {
                 .cycle_read(handle, observed, ReadKind::TryGet, None)
                 .is_some()
             {
-                return Err(ObsErr::Cycle(stamp));
+                return Err((ObsErr::Cycle(stamp), None));
             }
         }
         let _observing = Observing::record(self.runtime_id, id.0);
@@ -395,15 +446,18 @@ impl<C: Cells> Runtime<C> {
             })
         }));
         let computed = match walked {
-            Ok(computed) => computed.map_err(|_| ObsErr::Cycle(stamp))?,
-            Err(payload) => return Err(self.observed_failed(handle, payload)),
+            Ok(computed) => computed.map_err(|_| (ObsErr::Cycle(stamp), None))?,
+            Err(payload) => {
+                let (failed, payload) = self.observed_failed(handle, payload);
+                return Err((failed, Some(payload)));
+            }
         };
         match computed {
             Computed::Done | Computed::Unsettled => Ok(()),
-            Computed::Gone => Err(ObsErr::Gone),
-            Computed::Deferred => Err(ObsErr::Cycle(stamp)),
+            Computed::Gone => Err((ObsErr::Gone, None)),
+            Computed::Deferred => Err((ObsErr::Cycle(stamp), None)),
             // The reading run is thrown away and its retry reads again.
-            Computed::Doomed | Computed::Discarded => Err(ObsErr::Gone),
+            Computed::Doomed | Computed::Discarded => Err((ObsErr::Gone, None)),
             Computed::Skipped(_) | Computed::Replan | Computed::Revisit | Computed::RootTaken => {
                 unreachable!("incr-core: a walk's root is never skipped or replanned")
             }
@@ -413,10 +467,14 @@ impl<C: Cells> Runtime<C> {
     /// An unwind out of `observer_walk`: a user panic that left the
     /// observed node Failed is that node's error, so `stabilize` goes on to
     /// the next observer; a wound, an engine unwind or any other panic
-    /// unwinds on.
+    /// unwinds on. The node's error comes back with its payload.
     #[cold]
     #[inline(never)]
-    fn observed_failed<T: Value>(&self, handle: Incr<T>, payload: Box<dyn Any + Send>) -> ObsErr {
+    fn observed_failed<T: Value>(
+        &self,
+        handle: Incr<T>,
+        payload: Box<dyn Any + Send>,
+    ) -> (ObsErr, Box<dyn Any + Send>) {
         let node = self.nodes.get(handle.slot());
         let stamp = self.observed_stamp(node);
         C::fence_acquire();
@@ -427,7 +485,7 @@ impl<C: Cells> Runtime<C> {
         if !failed {
             resume_unwind(payload);
         }
-        ObsErr::Failed(stamp)
+        (ObsErr::Failed(stamp), payload)
     }
 
     /// `observer_read` found no value under an unmoved generation: the

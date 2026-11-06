@@ -48,7 +48,8 @@ use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
 use crate::reserve;
 use crate::segmented_nodes::{
-    SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED, WATCHED,
+    is_eager, SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE,
+    OWNED, WATCHED,
 };
 use crate::set_stack;
 use crate::slot_vec::SlotVec;
@@ -628,8 +629,9 @@ impl<C: Cells> SetClaim<'_, C> {
     /// `held` is cleared first so that an unwind out of this never
     /// releases the claim a second time. The release precedes the walk
     /// so that a delete or set waiting on the claim is not held up by it.
+    /// Returns the stamp, and whether the walk queued a router.
     #[inline(always)]
-    fn finish_written(mut self) -> u64 {
+    fn finish_written(mut self) -> (u64, bool) {
         self.held = false;
         let rev = self.rt.bump_revision();
         let walk_done = WalkDone { rt: self.rt, rev };
@@ -638,7 +640,7 @@ impl<C: Cells> SetClaim<'_, C> {
         self.node.settle_changed_at(stamp);
         self.node.release_set_claim(self.base, rev);
         set_stack::pop(self.rt.runtime_id, self.id.0);
-        self.rt.mark_dependents_dirty(self.id, self.flags);
+        let queued = self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         // After the walk, so a dependent read Clean before the walk
@@ -655,7 +657,7 @@ impl<C: Cells> SetClaim<'_, C> {
             self.rt.drop_stashes();
         }
         std::mem::forget(self);
-        stamp
+        (stamp, queued)
     }
 }
 
@@ -1659,6 +1661,7 @@ pub struct Runtime<C: Cells> {
     /// `verdict_watch`'s length, written under its lock; a run landing
     /// counts itself only when it is nonzero.
     watching: C::U32,
+    router_lists: routing_impl::RouterLists<C>,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1858,6 +1861,7 @@ impl<C: Cells> Runtime<C> {
             regens_held: std::sync::atomic::AtomicBool::new(false),
             verdict_watch: cycle_impl::verdict_watch::<C>(),
             watching: C::new_u32(0),
+            router_lists: routing_impl::RouterLists::new(runtime_id),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -3156,6 +3160,9 @@ impl<C: Cells> Runtime<C> {
             None
         };
         self.unwatch_deleted(slot, bits);
+        if is_eager(bits) {
+            self.forget_router(slot, node.generation());
+        }
         C::u8_store_relaxed(flags, 0);
         self.bury_tickets(slot, node.generation());
         node.bump_generation();
@@ -3225,13 +3232,15 @@ impl<C: Cells> Runtime<C> {
     /// is the state `get` loaded.
     #[inline(never)]
     fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
-        cycle_state::KeptUnwind::around_read(
+        let value = cycle_state::KeptUnwind::around_read(
             || match self.read_slow(handle, observed, ReadKind::Get) {
                 Ok(value) => value,
                 Err(cycle) => self.raise_cycle(cycle),
             },
             || self.reads_in_lazy_frame(),
-        )
+        );
+        self.route_if_queued();
+        value
     }
 
     /// Whether this runtime's read comes from the doomed frame that runs on
@@ -3290,6 +3299,7 @@ impl<C: Cells> Runtime<C> {
         if read.is_err() && cycle_state::depth() > 0 {
             self.note_cycle_caught(None);
         }
+        self.route_if_queued();
         read
     }
 
@@ -3892,6 +3902,7 @@ impl<C: Cells> Runtime<C> {
             std::mem::take(&mut inner.trace_log)
         };
         drop(disarm);
+        self.route_if_queued();
 
         let nodes_recomputed = node_traces
             .iter()
@@ -4008,15 +4019,31 @@ impl<C: Cells> Runtime<C> {
     /// `set` holder never waits while claimed. A delete and recycle that
     /// lands anywhere inside the call makes it panic as stale; it never
     /// writes into the occupant.
+    ///
+    /// A `group_by` router the change reaches is routed before `set`
+    /// returns (unless an entry of this runtime is open on the thread or a
+    /// routing hold is live), so `set` may run a `key_fn` and the router's
+    /// upstream chain. A caller that holds its own lock across `set` takes
+    /// [`Self::hold_routing`] first. A routing failure is kept for
+    /// [`Self::take_routing_failure`], never raised here.
     pub fn set<T: Value>(&self, handle: Incr<T>, value: T) {
+        if self.set_unrouted(handle, value) {
+            self.route_queued();
+        }
+    }
+
+    /// [`Self::set`] without routing: whether its walk queued a router.
+    #[inline(always)]
+    pub(crate) fn set_unrouted<T: Value>(&self, handle: Incr<T>, value: T) -> bool {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
-        let (displaced, _) = self.write_claimed(claim, arena, arena_slot, value, drop);
+        let (displaced, _, queued) = self.write_claimed(claim, arena, arena_slot, value, drop);
         // The old value's user `Drop`, or the reclaim its retire may run,
         // happens with no claim held and none of the locks this set took.
         drop(displaced);
         reclaim_probe::reached(RetireSite::SetRetire);
+        queued
     }
 
     /// `handle`'s `changed_at`, loaded with Acquire. `u64::MAX` while a
@@ -4051,12 +4078,15 @@ impl<C: Cells> Runtime<C> {
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
         let mut rejected = None;
-        let (displaced, stamp) =
+        let (displaced, stamp, queued) =
             self.write_claimed(claim, arena, arena_slot, value, |r| rejected = Some(r));
         let compared = match rejected {
             Some(rejected) => Compared::Equal(rejected),
             None => Compared::Replaced(displaced),
         };
+        if queued {
+            self.route_queued();
+        }
         (compared, stamp)
     }
 
@@ -4171,8 +4201,8 @@ impl<C: Cells> Runtime<C> {
     /// `set` from its claim to its walk. Returns what the write
     /// displaced, if it wrote, and the input's `changed_at` read under the
     /// claim: the stamp this write settled, or the one an equal value
-    /// already carried. An equal value is handed to `rejected` once its
-    /// earlier change has walked.
+    /// already carried, and whether the walk queued a router. An equal
+    /// value is handed to `rejected` once its earlier change has walked.
     fn write_claimed<T: Value>(
         &self,
         claim: SetClaim<'_, C>,
@@ -4180,7 +4210,7 @@ impl<C: Cells> Runtime<C> {
         arena_slot: u32,
         value: T,
         rejected: impl FnOnce(T),
-    ) -> (Option<Displaced<T, C>>, u64) {
+    ) -> (Option<Displaced<T, C>>, u64, bool) {
         let node = claim.node;
         // Publication order is the protocol's backbone:
         // 1. pending marker, so no verifier can stamp past this change
@@ -4206,11 +4236,11 @@ impl<C: Cells> Runtime<C> {
                 // `walked` is even, so reaching the stamp reaches the set.
                 self.wait_walked(changed_at);
                 rejected(equal);
-                (None, changed_at)
+                (None, changed_at, false)
             }
             Compared::Replaced(displaced) => {
-                let stamp = claim.finish_written();
-                (displaced, stamp)
+                let (stamp, queued) = claim.finish_written();
+                (displaced, stamp, queued)
             }
         }
     }
@@ -4314,12 +4344,14 @@ impl<C: Cells> Runtime<C> {
     /// node as Dirty. Every transition is a CAS so the walk can never
     /// clobber a `Computing` claim it raced with. `start_flags` is the
     /// set input's flags byte, so that a watched input is queued too.
-    fn mark_dependents_dirty(&self, start: NodeId, start_flags: &C::U8) {
+    /// Returns whether it queued a `group_by` router for routing.
+    fn mark_dependents_dirty(&self, start: NodeId, start_flags: &C::U8) -> bool {
         let mut queue: Vec<NodeId> = Vec::new();
+        let mut routers = false;
         {
             let inner = self.inner.read();
             if C::u8_load_relaxed(start_flags) & WATCHED != 0 {
-                self.enqueue_watched(start, self.nodes.get(start.0));
+                routers |= self.enqueue_watched(start, self.nodes.get(start.0));
             }
             let first = &inner.dependents[start.0 as usize];
             // Sized up front so a short walk allocates once and never
@@ -4356,7 +4388,7 @@ impl<C: Cells> Runtime<C> {
                             }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
-                                self.enqueue_watched(id, node);
+                                routers |= self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             push_pending(&pending, id, &mut queue);
@@ -4380,7 +4412,7 @@ impl<C: Cells> Runtime<C> {
                             }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
-                                self.enqueue_watched(id, node);
+                                routers |= self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             push_pending(&pending, id, &mut queue);
@@ -4408,7 +4440,7 @@ impl<C: Cells> Runtime<C> {
                             }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
-                                self.enqueue_watched(id, node);
+                                routers |= self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             push_pending(&pending, id, &mut queue);
@@ -4428,6 +4460,9 @@ impl<C: Cells> Runtime<C> {
                                 self.take_past_sets(id, &mut queue);
                             }
                             let inner = self.inner.read();
+                            if is_eager(C::u8_load_relaxed(flags)) {
+                                routers |= self.queue_eager(id, node, true);
+                            }
                             let list = &inner.dependents[id.0 as usize];
                             if (!list.is_empty() || pending.iter().any(|&(d, _)| d == id.0))
                                 && expanded_new.get_or_insert_with(HashSet::default).insert(id)
@@ -4449,7 +4484,7 @@ impl<C: Cells> Runtime<C> {
                             }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
-                                self.enqueue_watched(id, node);
+                                routers |= self.enqueue_watched(id, node);
                             }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             push_pending(&pending, id, &mut queue);
@@ -4473,6 +4508,9 @@ impl<C: Cells> Runtime<C> {
                             if past & contain_impl::past_bit(id.0) != 0 {
                                 self.take_past_sets(id, &mut queue);
                             }
+                            if is_eager(C::u8_load_relaxed(flags)) {
+                                routers |= self.queue_eager(id, node, true);
+                            }
                             break;
                         }
                     }
@@ -4490,6 +4528,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
+        routers
     }
 
     /// Ensure the node at `id` is Clean, recomputing the minimum
@@ -7152,7 +7191,7 @@ impl<C: Cells> Runtime<C> {
         }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
-                self.report_landing(id);
+                self.report_landing(id, target);
             }
             return target;
         }
@@ -7163,7 +7202,7 @@ impl<C: Cells> Runtime<C> {
             "only the claim's owner leaves ComputingDirty"
         );
         if !matches!(flagged, NodeState::Clean | NodeState::Cyclic) {
-            self.report_landing(id);
+            self.report_landing(id, flagged);
         }
         flagged
     }
@@ -7769,6 +7808,13 @@ mod observe_impl;
 
 #[path = "runtime_seed.rs"]
 mod seed_impl;
+
+#[path = "runtime_routing.rs"]
+mod routing_impl;
+
+#[cfg(all(test, not(loom)))]
+pub(crate) use routing_impl::queued_routers;
+pub use routing_impl::{RoutingFailed, RoutingHold};
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_seed_tests.rs"]

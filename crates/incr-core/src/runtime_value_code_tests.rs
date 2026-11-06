@@ -913,6 +913,7 @@ fn hash_that_reads_a_node_in_a_group_by_batch<C: Cells>(rt: Rc<Runtime<C>>) {
     let b = rt.create_input(5u32);
     let c = rt.create_collection::<Hooked>();
     let grouped = c.group_by(&rt, |h| h.0 % 2);
+    let routed_by_the_read = rt.hold_routing_suppressed();
     c.insert(&rt, Hooked(2));
     let hooked = Rc::clone(&rt);
     arm(Op::Hash, move || {
@@ -921,6 +922,7 @@ fn hash_that_reads_a_node_in_a_group_by_batch<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_read_allowed("get from Hash in the group_by key cache", || {
         rt.get(grouped.version_node());
     });
+    drop(routed_by_the_read);
     c.insert(&rt, Hooked(3));
     rt.get(grouped.version_node());
     assert_eq!(ids(&rt, &grouped.get_group(&0).unwrap()), vec![2]);

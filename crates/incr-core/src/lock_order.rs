@@ -39,6 +39,8 @@ pub enum LockKind {
     /// holds at most one.
     CollectionLog,
     Inner,
+    /// A runtime's lists of the routers each router's runs dirtied.
+    RouterLists,
     /// A `GenericArena`'s free-list lock.
     Arena,
     /// A directory's retired arrays, taken under the arena lock.
@@ -68,6 +70,7 @@ impl LockKind {
             LockKind::KeyCache => 56,
             LockKind::CollectionLog => 58,
             LockKind::Inner => 60,
+            LockKind::RouterLists => 62,
             LockKind::Arena => 65,
             LockKind::Directory => 66,
             LockKind::WatchQueue => 70,
@@ -317,6 +320,25 @@ pub(crate) fn assert_may_wait_on_claim() {
     });
 }
 
+/// Routing is about to run user code (`key_fn` and the router's upstream
+/// chain) that may take any lock: the thread may hold only an `aggregate`
+/// state lock (another runtime's `combine` writing to this one). A routing
+/// hold, taken before the lock and dropped after it, keeps routing out.
+#[inline]
+pub(crate) fn assert_may_route() {
+    #[cfg(all(debug_assertions, not(loom)))]
+    let _ = stack::HELD.try_with(|held| {
+        let held = held.borrow();
+        let kinds = stack::kinds(&held);
+        drop(held);
+        assert!(
+            kinds.iter().all(|k| matches!(k, LockKind::AggregateState)),
+            "incr-core: lock order: routing runs while holding {kinds:?}; take \
+             Runtime::hold_routing before the lock"
+        );
+    });
+}
+
 #[cfg(all(test, debug_assertions, not(loom)))]
 mod tests {
     use super::*;
@@ -438,6 +460,26 @@ mod tests {
         assert_may_wait_on_claim();
         enter_frame();
         leave_frame();
+    }
+
+    #[test]
+    fn routing_may_run_under_an_aggregate_state_only() {
+        let _agg = acquire(LockKind::AggregateState);
+        assert_may_route();
+    }
+
+    #[test]
+    #[should_panic(expected = "routing runs while holding [Binding]")]
+    fn routing_under_a_binding_lock_panics() {
+        let _b = acquire(LockKind::Binding);
+        assert_may_route();
+    }
+
+    #[test]
+    #[should_panic(expected = "routing runs while holding [Store]")]
+    fn routing_under_the_store_panics() {
+        let _s = acquire(LockKind::Store);
+        assert_may_route();
     }
 
     #[test]

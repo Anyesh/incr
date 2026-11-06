@@ -262,8 +262,11 @@ fn group_by_refuses_through_a_deferral<C: Cells>() {
 /// The router's upstream is a filter whose `pred` reads M, and the episode
 /// is entered at M, so the filter is a member off the stack when the
 /// router reads its version.
+/// Routing is held for the test, so the episode is entered at M, not at the
+/// router when an insert returns.
 fn group_by_refuses_a_member_upstream<C: Cells>() {
     let rt = OwnedRt::<C>::new();
+    let _entered_at_m = rt.hold_routing_suppressed();
     let s = rt.create_collection::<u64>();
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
     let (r, m) = (rt.r(), m_cell.clone());

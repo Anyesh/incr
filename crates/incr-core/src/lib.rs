@@ -91,7 +91,9 @@ pub use memory::{
     Held, MemoryStats, NodeKind, NodeMemory, StateKind, StateMemory, StateStats, ValueType,
 };
 pub use node::{NodeData, NodeId};
-pub use runtime::{DeleteError, ObserverId, Runtime, DEFAULT_MAX_FRAMES};
+pub use runtime::{
+    DeleteError, ObserverId, RoutingFailed, RoutingHold, Runtime, DEFAULT_MAX_FRAMES,
+};
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;

@@ -292,11 +292,14 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         value_code::check();
         let batch = StagedBatch::new(&self.hasher, changes);
         let committed = self.log.write().apply_batch(batch, report);
-        if let Some(version) = committed.version {
-            rt.set(self.version_node, version);
-        }
+        let routers = committed
+            .version
+            .is_some_and(|version| rt.set_unrouted(self.version_node, version));
         drop(committed.unused);
         committed.displaced.release(&self.log);
+        if routers {
+            rt.route_queued();
+        }
         committed.applied
     }
 }

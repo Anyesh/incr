@@ -817,6 +817,11 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     /// Insert a value. Bumps the underlying log version and notifies
     /// downstream queries by setting `version_node`.
     ///
+    /// Like [`Runtime::set`], routes a `group_by` the change reaches before
+    /// returning, so it may run a `key_fn`: a caller holding its own lock
+    /// across it takes [`Runtime::hold_routing`] first. The same holds for
+    /// `delete`, `replace`, `apply` and `extend`.
+    ///
     /// Panics if this collection is the output of an operator.
     pub fn insert(&self, rt: &Runtime<C>, value: T) {
         self.insert_with(rt, value, &mut (), |d| d.release(&self.log));
@@ -897,7 +902,8 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     /// displaced to `dispose`. User `Hash` and `Clone` ran in staging, before the guard,
     /// and user `Eq` runs before the first change, so a panic in either
     /// leaves the collection as it was. From the first change to the
-    /// version set no user code runs. Returns whether a remove side found
+    /// version set no user code runs. Routing a `group_by` the set reached
+    /// waits until `dispose` has run. Returns whether a remove side found
     /// its element.
     #[inline(always)]
     fn publish<const N: usize>(
@@ -907,10 +913,13 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         dispose: impl FnOnce(Displaced<T, N>),
     ) -> bool {
         let committed = change(&mut self.log.write());
-        if let Some(version) = committed.version {
-            rt.set(self.version_node, version);
-        }
+        let routers = committed
+            .version
+            .is_some_and(|version| rt.set_unrouted(self.version_node, version));
         dispose(committed.displaced);
+        if routers {
+            rt.route_queued();
+        }
         committed.removed
     }
 
@@ -927,11 +936,11 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     /// read, the same way `count`/`reduce` force it via their own query
     /// closures.
     ///
-    /// This does *not* extend to a `group_by` sub-collection: its
-    /// `version_node` is an input the operator sets directly, not a
-    /// query `rt.get` can force, so `values()` on a group only reflects
-    /// whatever the group last observed. Force `GroupedCollection`'s own
-    /// `version_node()` first if a group's contents need to be current.
+    /// A `group_by` group's `version_node` is an input its router sets,
+    /// and the router is routed when the write that reached it returns, so
+    /// a group is current here too. It lags while this thread holds a
+    /// routing hold ([`Runtime::hold_routing`]), and inside a compute that
+    /// wrote to the source, until the outermost call returns.
     pub fn values(&self, rt: &Runtime<C>) -> Vec<T> {
         value_code::check();
         rt.get(self.version_node);
@@ -1364,12 +1373,20 @@ where
     /// Group by an extracted key. Returns a `GroupedCollection<K, T, C>`
     /// holding one derived [`IncrCollection<T, C>`] per encountered key,
     /// each populated incrementally as upstream deltas arrive.
+    ///
+    /// The router that fills the groups runs once here and then whenever a
+    /// write reaching it returns ([`Runtime::set`]), so groups, and totals
+    /// and watches over them, are current without a read of the router. A
+    /// `key_fn` that panics leaves the router Failed and the groups as they
+    /// were; [`Runtime::take_routing_failure`] reports it, and a later read
+    /// of the router raises it.
     pub fn group_by<K, F>(&self, rt: &Runtime<C>, key_fn: F) -> GroupedCollection<K, T, C>
     where
         K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
         F: Fn(&T) -> K + Send + Sync + 'static,
     {
         value_code::check();
+        let hold = rt.hold_routing();
         let key_fn = lock_order::unlocked("key_fn", key_fn);
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
@@ -1406,7 +1423,7 @@ where
         let router_for_query = Arc::clone(&router);
 
         let rebuild = NeedsRebuild::new();
-        let version_node = rt.create_operator_query(move |rt| -> u64 {
+        let version_node = rt.create_router(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
             // A router's groups are inputs, which never hold a provisional
             // value, so it refuses one with the cycle before routing.
@@ -1532,6 +1549,8 @@ where
         }
         memory::register(rt, version_node.erase(), &groups);
         memory::register(rt, version_node.erase(), &key_cache);
+        rt.route_created(version_node);
+        drop(hold);
 
         GroupedCollection {
             groups,
@@ -2015,6 +2034,10 @@ mod apply_tests;
 #[cfg(test)]
 #[path = "collection_partition_tests.rs"]
 mod partition_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "collection_routing_tests.rs"]
+mod routing_tests;
 
 #[cfg(test)]
 mod tests {

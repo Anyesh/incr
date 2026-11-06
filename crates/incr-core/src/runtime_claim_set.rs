@@ -448,6 +448,7 @@ impl<C: Cells> Runtime<C> {
                 Step::Set => unreachable!("set_step decides a segment"),
             }
         }
+        self.route_if_queued();
         deleted
     }
 

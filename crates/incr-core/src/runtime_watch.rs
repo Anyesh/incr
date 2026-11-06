@@ -7,10 +7,15 @@
 //! entry under its write hold, so whenever `inner` is free every queued
 //! node is watched and live. Lock order: `inner` before the queue, and
 //! the queue lock is a leaf.
+//!
+//! A `group_by` router carries `WATCHED` from creation so that the walk
+//! reaches it for routing (`runtime_routing.rs`); whether the user watches
+//! it is the queue's `routers` set, consulted only for eager nodes.
 
 use std::collections::VecDeque;
 
 use super::*;
+use crate::segmented_nodes::is_eager;
 
 /// The watched nodes moved off Clean since the last drain, each at most
 /// once, in the order they were found, with the `QUEUED` bitset beside
@@ -18,6 +23,8 @@ use super::*;
 pub(crate) struct WatchQueue {
     entries: VecDeque<(u32, u32)>,
     queued: Vec<u64>,
+    /// The routers the user watches.
+    routers: HashSet<u32, FxBuildHasher>,
 }
 
 impl WatchQueue {
@@ -25,6 +32,7 @@ impl WatchQueue {
         Self {
             entries: VecDeque::new(),
             queued: Vec::new(),
+            routers: HashSet::default(),
         }
     }
 
@@ -109,13 +117,26 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn watch_held(&self, slot: u32, generation: u32) {
         let (node, flags) = self.nodes.get_with_flags(slot);
         let bits = C::u8_load_relaxed(flags);
-        if bits & WATCHED == 0 {
+        if is_eager(bits) {
+            self.watch_router(slot, generation, node);
+        } else if bits & WATCHED == 0 {
             C::u8_store_relaxed(flags, bits | WATCHED);
             // A landing whose read section came first has its state
             // stored by now, and Clean and Cyclic landings never report.
             if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
                 self.watch_queue.write().push(slot, generation);
             }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn watch_router(&self, slot: u32, generation: u32, node: &NodeData<C>) {
+        let mut queue = self.watch_queue.write();
+        if queue.routers.insert(slot)
+            && !matches!(node.state(), NodeState::Clean | NodeState::Cyclic)
+        {
+            queue.push(slot, generation);
         }
     }
 
@@ -132,7 +153,12 @@ impl<C: Cells> Runtime<C> {
             self.stale_handle(handle);
         }
         let bits = C::u8_load_relaxed(flags);
-        if bits & WATCHED != 0 {
+        if is_eager(bits) {
+            let mut queue = self.watch_queue.write();
+            if queue.routers.remove(&slot) {
+                queue.remove(slot);
+            }
+        } else if bits & WATCHED != 0 {
             C::u8_store_relaxed(flags, bits & !WATCHED);
             self.park(ParkPoint::UnwatchBeforeDequeue(NodeId(slot)));
             // Under the same hold, so the slot cannot have been recycled
@@ -146,8 +172,12 @@ impl<C: Cells> Runtime<C> {
     /// each once, in the order the dirty walks found them. A node left
     /// Dirty by an earlier drain and not read since is not reported
     /// again, because the next walk stops at it.
+    ///
+    /// Routes what this thread's calls queued first, so a total that
+    /// routing moves is in this drain.
     pub fn drain_dirtied_watched(&self) -> Vec<ErasedIncr> {
         value_code::check();
+        self.route_if_queued();
         let taken = self.watch_queue.write().take();
         taken
             .into_iter()
@@ -162,23 +192,45 @@ impl<C: Cells> Runtime<C> {
         queue.entries.iter().map(|&(slot, _)| slot).collect()
     }
 
-    /// Queue `id`, which the caller found watched under its `inner` hold.
+    /// Queue `id`, which a walk found watched under its `inner` hold: a
+    /// router for routing, and for the user only if the user watches it.
+    /// Returns whether it queued a router.
     #[cold]
     #[inline(never)]
-    pub(super) fn enqueue_watched(&self, id: NodeId, node: &NodeData<C>) {
-        self.watch_queue.write().push(id.0, node.generation());
+    pub(super) fn enqueue_watched(&self, id: NodeId, node: &NodeData<C>) -> bool {
+        let bits = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1);
+        if !is_eager(bits) {
+            self.watch_queue.write().push(id.0, node.generation());
+            return false;
+        }
+        self.report_router(id, node);
+        self.queue_eager(id, node, true)
+    }
+
+    fn report_router(&self, id: NodeId, node: &NodeData<C>) {
+        let mut queue = self.watch_queue.write();
+        if queue.routers.contains(&id.0) {
+            queue.push(id.0, node.generation());
+        }
     }
 
     /// After a landing whose target is neither Clean nor Cyclic: queue
-    /// the node if it is watched. The load sits in a read section so that
-    /// a concurrent `watch` either precedes it or sees the landed state.
+    /// the node if it is watched, and a router landing Dirty or New for
+    /// routing. The load sits in a read section so that a concurrent
+    /// `watch` either precedes it or sees the landed state.
     #[cold]
     #[inline(never)]
-    pub(super) fn report_landing(&self, id: NodeId) {
+    pub(super) fn report_landing(&self, id: NodeId, target: NodeState) {
         let inner = self.inner.read();
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        if C::u8_load_relaxed(flags) & WATCHED != 0 {
-            self.enqueue_watched(id, node);
+        let bits = C::u8_load_relaxed(flags);
+        if is_eager(bits) {
+            self.report_router(id, node);
+            if matches!(target, NodeState::Dirty | NodeState::New) {
+                self.queue_eager(id, node, false);
+            }
+        } else if bits & WATCHED != 0 {
+            self.watch_queue.write().push(id.0, node.generation());
         }
         drop(inner);
     }
@@ -192,8 +244,10 @@ impl<C: Cells> Runtime<C> {
         let mut queue = self.watch_queue.write();
         for (slot, generation) in entries.rev() {
             let (node, flags) = self.nodes.get_with_flags(slot);
+            let bits = C::u8_load_relaxed(flags);
             if node.generation() == generation
-                && C::u8_load_relaxed(flags) & WATCHED != 0
+                && bits & WATCHED != 0
+                && (!is_eager(bits) || queue.routers.contains(&slot))
                 && node.state() != NodeState::Dead
             {
                 queue.push_front(slot, generation);
@@ -208,7 +262,11 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     pub(super) fn unwatch_deleted(&self, slot: u32, bits: u8) {
         if bits & WATCHED != 0 {
-            self.watch_queue.write().remove(slot);
+            let mut queue = self.watch_queue.write();
+            queue.remove(slot);
+            if is_eager(bits) {
+                queue.routers.remove(&slot);
+            }
         }
     }
 }

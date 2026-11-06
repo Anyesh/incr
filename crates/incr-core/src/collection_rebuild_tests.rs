@@ -233,14 +233,24 @@ fn sources<C: Cells>(rt: &Runtime<C>) -> Sources<C> {
 /// The batch every run applies before forcing the operator: inserts,
 /// deletes and a duplicate on both sides.
 fn feed_batch<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) {
-    s.left.insert(rt, Bomb(7));
-    s.left.insert(rt, Bomb(4));
-    s.left.delete(rt, &Bomb(2));
-    s.left.insert(rt, Bomb(8));
-    s.left.delete(rt, &Bomb(6));
-    s.right.insert(rt, Bomb(5));
-    s.right.delete(rt, &Bomb(9));
-    s.right.insert(rt, Bomb(3));
+    s.left.apply(
+        rt,
+        [
+            Change::Insert(Bomb(7)),
+            Change::Insert(Bomb(4)),
+            Change::Delete(Bomb(2)),
+            Change::Insert(Bomb(8)),
+            Change::Delete(Bomb(6)),
+        ],
+    );
+    s.right.apply(
+        rt,
+        [
+            Change::Insert(Bomb(5)),
+            Change::Delete(Bomb(9)),
+            Change::Insert(Bomb(3)),
+        ],
+    );
 }
 
 /// A later change, which also moves an operator left Failed by the panic
@@ -258,13 +268,15 @@ fn run<C: Cells>(build: Build<C>, call: Call, nth: usize) -> Result<bool, String
     let s = sources(&rt);
     let probe = build(&rt, &s);
     let _ = (probe.read)(&rt);
-    feed_batch(&rt, &s);
 
+    // Armed before the batch, since a `group_by` routes when it returns.
     arm(call, nth);
     let panicked = failure(|| {
+        feed_batch(&rt, &s);
         rt.get(probe.node);
     })
-    .is_some();
+    .is_some()
+        | rt.take_routing_failure().is_some();
     disarm();
 
     feed_later(&rt, &s);
@@ -355,6 +367,10 @@ fn run_parked(build: Build<Shared>, call: Call, nth: usize) -> Result<(bool, boo
 
     let s = sources(&rt);
     let probe = build(&rt, &s);
+    // This thread routes only by reading, so the rebuild runs in the
+    // spawned thread's read and the inserts made while it is parked wait
+    // for it.
+    let _read_routes = rt.hold_routing_suppressed();
     let _ = (probe.read)(&rt);
     feed_batch(&rt, &s);
 

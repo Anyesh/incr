@@ -89,6 +89,17 @@ pub(crate) const NOT_REPLAYABLE: u8 = 64;
 /// section (`runtime_watch.rs`).
 pub(crate) const WATCHED: u8 = 128;
 
+/// `NodeFlags` bits: a `group_by` router, routed when the call whose walk
+/// reached it returns (`runtime_routing.rs`). No query is created with both
+/// replay bits otherwise, and `NOT_REPLAYABLE` wins where replay reads them.
+/// A router also carries [`WATCHED`], so the walk's watched arms reach it.
+pub(crate) const EAGER: u8 = REPLAYABLE | NOT_REPLAYABLE;
+
+#[inline(always)]
+pub(crate) fn is_eager(bits: u8) -> bool {
+    bits & EAGER == EAGER
+}
+
 const _: () = assert!(crate::bits::disjoint(&[
     HAS_CHILDREN as u64,
     IN_GROUP as u64,
