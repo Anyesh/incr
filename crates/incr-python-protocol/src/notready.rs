@@ -39,7 +39,9 @@ pub struct PyUnavailable {
 }
 
 /// `value` computed with `missing` contributions left out because they
-/// were not ready.
+/// were not ready. Through queries `missing` counts contributions: a query
+/// reading two totals that both miss one element reports 2. A collection
+/// total counts distinct elements.
 #[pyclass(name = "Incomplete", module = "incr", frozen)]
 pub struct PyIncomplete {
     #[pyo3(get)]
@@ -322,7 +324,7 @@ pub enum Status<'a, 'py> {
 /// Whether `value` is of a builtin type no not-ready value can have. One
 /// load and compare per type, with no call, for the common case.
 #[inline(always)]
-fn plainly_ready(value: &Bound<'_, PyAny>) -> bool {
+pub fn plainly_ready(value: &Bound<'_, PyAny>) -> bool {
     use pyo3::ffi;
     // SAFETY: `value` is a live object; the type statics are only compared
     // by address.

@@ -6,7 +6,7 @@
 
 use std::cell::Cell;
 
-use incr_python_protocol::notready::{incomplete, status, with_missing, Status};
+use incr_python_protocol::notready::{incomplete, plainly_ready, status, with_missing, Status};
 use incr_python_protocol::raise_into_engine;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -19,7 +19,16 @@ pyo3::create_exception!(
 );
 
 /// `value` read inside a query whose missing contributions are `missing`.
+#[inline(always)]
 pub(crate) fn read(py: Python<'_>, value: Py<PyAny>, missing: &Cell<u64>) -> PyResult<Py<PyAny>> {
+    if plainly_ready(value.bind(py)) {
+        return Ok(value);
+    }
+    read_any(py, value, missing)
+}
+
+#[inline(never)]
+fn read_any(py: Python<'_>, value: Py<PyAny>, missing: &Cell<u64>) -> PyResult<Py<PyAny>> {
     match status(value.bind(py)) {
         Status::Ready => Ok(value),
         Status::NotReady => Err(_NotReadySignal::new_err((value,))),
@@ -33,7 +42,7 @@ pub(crate) fn read(py: Python<'_>, value: Py<PyAny>, missing: &Cell<u64>) -> PyR
 
 /// The value a query lands from calling `f(rt_ref)`, where `missing` is
 /// the count `rt_ref`'s reads add to.
-#[inline(never)]
+#[inline]
 pub(crate) fn call_query(
     py: Python<'_>,
     f: &Py<PyAny>,
@@ -88,7 +97,16 @@ pub(crate) fn with_status(py: Python<'_>, value: Py<PyAny>) -> (Py<PyAny>, Py<Py
 
 /// The value a top-level read returns: an `Incomplete` value's `value`,
 /// anything else as stored.
+#[inline(always)]
 pub(crate) fn unwrapped(py: Python<'_>, value: Py<PyAny>) -> Py<PyAny> {
+    if plainly_ready(value.bind(py)) {
+        return value;
+    }
+    unwrapped_any(py, value)
+}
+
+#[inline(never)]
+fn unwrapped_any(py: Python<'_>, value: Py<PyAny>) -> Py<PyAny> {
     match incomplete(value.bind(py)) {
         Some(incomplete) => incomplete.get().value().clone_ref(py),
         None => value,

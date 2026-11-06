@@ -507,6 +507,10 @@ impl PyCollection {
         Ok(PyNodeId { inner: node })
     }
 
+    /// `fold_fn` of the list of rows, with not-ready elements left out
+    /// and an `Incomplete` element's `value` in; `Incomplete` when any
+    /// element is, counting each not-ready element once and each
+    /// `Incomplete` element's `missing`.
     fn reduce(&self, py: Python<'_>, fold_fn: Py<PyAny>) -> PyResult<PyNodeId> {
         let fold_fn = self.callables(py).hold(fold_fn);
         let node = self.engine_call(py, |rt| {
@@ -528,6 +532,8 @@ impl PyCollection {
     /// the aggregate domain, `combine` merges two aggregates, `identity`
     /// is the unit. O(log n) per change; see the Rust docs for the
     /// associativity contract.
+    /// Not-ready elements are left out and counted as for `reduce`, and
+    /// `lift` and `combine` never see a not-ready or `Incomplete` value.
     fn aggregate(
         &self,
         py: Python<'_>,
