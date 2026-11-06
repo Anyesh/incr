@@ -6,6 +6,7 @@
 
 use std::cell::Cell;
 
+use incr_compute::Runtime;
 use incr_python_protocol::notready::{incomplete, plainly_ready, status, with_missing, Status};
 use incr_python_protocol::raise_into_engine;
 use pyo3::intern;
@@ -40,33 +41,36 @@ fn read_any(py: Python<'_>, value: Py<PyAny>, missing: &Cell<u64>) -> PyResult<P
     }
 }
 
-/// The value a query lands from calling `f(rt_ref)`, where `missing` is
-/// the count `rt_ref`'s reads add to.
+/// The value a query of `rt` lands from calling `f(rt_ref)`, where
+/// `missing` is the count `rt_ref`'s reads add to.
 #[inline]
 pub(crate) fn call_query(
     py: Python<'_>,
+    rt: &Runtime,
     f: &Py<PyAny>,
     rt_ref: Py<PyAny>,
     missing: &Cell<u64>,
 ) -> Py<PyAny> {
     let value = f
         .call1(py, (rt_ref,))
-        .unwrap_or_else(|e| not_ready_or_raise(py, e));
+        .unwrap_or_else(|e| not_ready_or_raise(py, rt, e));
     match missing.get() {
         0 => value,
         missing => short_by(py, value, missing),
     }
 }
 
-/// The value a query whose closure raised `e` lands: the not-ready value
-/// `e` carries if it is the signal. Any other exception unwinds the engine,
-/// failing the node as before.
+/// The value a query of `rt` whose closure raised `e` lands: the
+/// not-ready value `e` carries if it is the signal, which stopped the
+/// closure before it asked for all its children, so they are kept. Any
+/// other exception unwinds the engine, failing the node as before.
 #[cold]
 #[inline(never)]
-pub(crate) fn not_ready_or_raise(py: Python<'_>, e: PyErr) -> Py<PyAny> {
+pub(crate) fn not_ready_or_raise(py: Python<'_>, rt: &Runtime, e: PyErr) -> Py<PyAny> {
     if !e.is_instance_of::<_NotReadySignal>(py) {
         raise_into_engine(e);
     }
+    rt.keep_untouched_children();
     e.value(py)
         .getattr(intern!(py, "args"))
         .and_then(|args| args.get_item(0))

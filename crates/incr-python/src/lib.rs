@@ -166,6 +166,7 @@ fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync +
             in_runtime(rt, || {
                 PyValue(ready::call_query(
                     py,
+                    rt,
                     &py_func,
                     rt_ref.clone_ref(py).into_any(),
                     &missing,

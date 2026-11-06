@@ -496,3 +496,25 @@ def test_get_traced_unwraps_an_incomplete_value_as_get_does():
     doubled = rt.create_query(lambda ctx: ctx.get(total) * 2)
     value, _ = rt.get_traced(doubled)
     assert value == 8
+
+
+def test_a_creator_cut_short_by_a_pending_lookup_keeps_its_children():
+    rt = Runtime()
+    use_leg = rt.create_input(False)
+
+    def creator(ctx):
+        rate = ctx.lookup("leg") if ctx.get(use_leg) else 1
+        return ctx.child_input("hours", lambda: 0), rate
+
+    node = rt.create_query(creator)
+    child, _ = rt.get(node)
+    rt.set(child, 8)
+
+    rt.set(use_leg, True)
+    assert rt.get(node) == Pending(key="leg")
+    assert rt.get(child) == 8
+
+    rt.resolve_lookups({"leg": 3})
+    again, rate = rt.get(node)
+    assert again == child and rate == 3
+    assert rt.get(again) == 8
