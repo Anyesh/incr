@@ -646,6 +646,10 @@ struct PyRuntime {
     version_bridges: RefCell<HashMap<Incr<u64>, Incr<PyValue>>>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per runtime, and boxing would add a hop to every call"
+)]
 enum Holder {
     Owned(Runtime),
     Closed,
