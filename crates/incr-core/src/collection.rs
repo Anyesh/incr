@@ -64,6 +64,9 @@ use crate::value_code;
 mod apply;
 pub use apply::Change;
 
+#[path = "collection_partition.rs"]
+mod partition;
+
 #[cfg(test)]
 pub(crate) fn park<C: Cells>(rt: &Runtime<C>, point: ParkPoint) {
     if let Some(hook) = rt.park_hook.get() {
@@ -2008,6 +2011,10 @@ mod cycle_tests;
 #[cfg(test)]
 #[path = "collection_apply_tests.rs"]
 mod apply_tests;
+
+#[cfg(test)]
+#[path = "collection_partition_tests.rs"]
+mod partition_tests;
 
 #[cfg(test)]
 mod tests {
