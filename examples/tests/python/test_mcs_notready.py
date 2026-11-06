@@ -481,3 +481,18 @@ def test_closing_releases_lookup_keys():
     rt.close()
     gc.collect()
     assert ref() is None
+
+
+def test_incomplete_refuses_a_value_that_is_itself_not_ready():
+    with pytest.raises(TypeError):
+        Incomplete(Pending(), 1)
+    with pytest.raises(TypeError):
+        Incomplete(Incomplete(1, 1), 1)
+
+
+def test_get_traced_unwraps_an_incomplete_value_as_get_does():
+    rt = Runtime()
+    total = rt.create_input(Incomplete(4, 1))
+    doubled = rt.create_query(lambda ctx: ctx.get(total) * 2)
+    value, _ = rt.get_traced(doubled)
+    assert value == 8

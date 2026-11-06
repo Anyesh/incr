@@ -57,7 +57,8 @@ impl PyCallable {
 // in a `Runtime<Local>`, which is neither, and in the `unsendable` classes
 // of this crate, so they are created, used and dropped on the one thread
 // that runtime lives on and the state's `Rc` is never touched from another.
-// `&PyCallable` reaches only the `Py`, which is `Sync` itself.
+// `&PyCallable` reaches the `Py`, which is `Sync` itself, and through
+// `state()` the `Rc`, which only that thread uses for the same reason.
 unsafe impl Send for PyCallable {}
 // SAFETY: see `Send`.
 unsafe impl Sync for PyCallable {}

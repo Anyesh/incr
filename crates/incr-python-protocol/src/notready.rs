@@ -222,10 +222,15 @@ impl PyUnavailable {
 #[pymethods]
 impl PyIncomplete {
     #[new]
-    fn py_new(value: Py<PyAny>, missing: u64) -> PyResult<Self> {
+    fn py_new(py: Python<'_>, value: Py<PyAny>, missing: u64) -> PyResult<Self> {
         if missing == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "an Incomplete value has at least one missing contribution",
+            ));
+        }
+        if !matches!(status(value.bind(py)), Status::Ready) {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "an Incomplete value's value must be ready",
             ));
         }
         Ok(Self { value, missing })

@@ -140,7 +140,7 @@ trait OnRuntime {
     }
 
     /// The runtime's binding state.
-    fn callables(&self, py: Python<'_>) -> RtState {
+    fn state(&self, py: Python<'_>) -> RtState {
         self.runtime().bind(py).borrow().state.clone()
     }
 }
@@ -373,7 +373,7 @@ impl PyNodeTable {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
-        let callables = self.callables(py);
+        let callables = self.state(py);
         let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
         let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
         let node = self.engine_call(py, |rt| {
@@ -456,7 +456,7 @@ impl PyCollection {
     }
 
     fn filter(&self, py: Python<'_>, predicate: Py<PyAny>) -> PyResult<PyCollection> {
-        let predicate = self.callables(py).hold(predicate);
+        let predicate = self.state(py).hold(predicate);
         let filtered = self.engine_call(py, |rt| {
             self.inner.filter(rt, move |val: &PyValue| -> bool {
                 Python::attach(|py| {
@@ -473,7 +473,7 @@ impl PyCollection {
     }
 
     fn map(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyCollection> {
-        let func = self.callables(py).hold(func);
+        let func = self.state(py).hold(func);
         let mapped = self.engine_call(py, |rt| {
             self.inner.map(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| {
@@ -512,7 +512,7 @@ impl PyCollection {
     /// element is, counting each not-ready element once and each
     /// `Incomplete` element's `missing`.
     fn reduce(&self, py: Python<'_>, fold_fn: Py<PyAny>) -> PyResult<PyNodeId> {
-        let fold_fn = self.callables(py).hold(fold_fn);
+        let fold_fn = self.state(py).hold(fold_fn);
         let node = self.engine_call(py, |rt| {
             self.inner.reduce(rt, move |values: &[PyValue]| -> PyValue {
                 Python::attach(|py| {
@@ -541,7 +541,7 @@ impl PyCollection {
         lift: Py<PyAny>,
         combine: Py<PyAny>,
     ) -> PyResult<PyNodeId> {
-        let callables = self.callables(py);
+        let callables = self.state(py);
         let (lift, combine) = (callables.hold(lift), callables.hold(combine));
         let lifted_identity = identity.clone_ref(py);
         let node = self.engine_call(py, |rt| {
@@ -568,7 +568,7 @@ impl PyCollection {
     }
 
     fn sort_by_key(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PySortedCollection> {
-        let key_fn = self.callables(py).hold(key_fn);
+        let key_fn = self.state(py).hold(key_fn);
         let sorted = self.engine_call(py, |rt| {
             self.inner.sort_by_key(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| {
@@ -587,7 +587,7 @@ impl PyCollection {
     }
 
     fn group_by(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PyGroupedCollection> {
-        let key_fn = self.callables(py).hold(key_fn);
+        let key_fn = self.state(py).hold(key_fn);
         let grouped = self.engine_call(py, |rt| {
             self.inner.group_by(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| {
@@ -612,7 +612,7 @@ impl PyCollection {
         left_key: Py<PyAny>,
         right_key: Py<PyAny>,
     ) -> PyResult<PyCollection> {
-        let callables = self.callables(py);
+        let callables = self.state(py);
         let (left_key, right_key) = (callables.hold(left_key), callables.hold(right_key));
         let mapped = self.engine_call(py, |rt| {
             let joined = self.inner.join(
@@ -1202,7 +1202,7 @@ impl PyRuntime {
             }
             trace_dict.set_item("node_traces", node_traces)?;
 
-            Ok((val.0, trace_dict.into_any().unbind()))
+            Ok((ready::unwrapped(py, val.0), trace_dict.into_any().unbind()))
         })
     }
 
@@ -1276,7 +1276,9 @@ impl PyRuntime {
     }
 
     /// Set each lookup to its value, from a mapping or an iterable of
-    /// `(key, value)` pairs, creating the ones not asked for yet.
+    /// `(key, value)` pairs, creating the ones not asked for yet. Not
+    /// atomic: if a key's `__hash__` or `__eq__` raises, the keys before it
+    /// are set.
     fn resolve_lookups(&self, py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<()> {
         let pairs = if values.hasattr("items")? {
             values.call_method0("items")?
