@@ -53,6 +53,7 @@ both!(
     a_key_fn_that_reads_the_source_routes_after_a_hold,
     a_pending_list_stays_bounded_under_writes_with_no_read,
     a_failing_key_fn_is_stored_and_fails_again_while_its_row_remains,
+    a_router_recovers_once_the_row_its_key_fn_refused_is_gone,
     a_stored_failure_is_not_taken_inside_a_compute,
     routing_runs_after_a_mutator_disposes,
     drain_dirtied_watched_reports_a_total_routing_moved,
@@ -395,7 +396,30 @@ fn a_failing_key_fn_is_stored_and_fails_again_while_its_row_remains<C: Cells>() 
         rt.take_routing_failure().is_some(),
         "a write reaching a router with a bad row routes and fails again"
     );
-    assert_eq!(group_values(&rt, &g, 1), vec![1], "a failed routing moved a group");
+    assert_eq!(
+        group_values(&rt, &g, 1),
+        vec![1],
+        "a failed routing moved a group"
+    );
+}
+
+fn a_router_recovers_once_the_row_its_key_fn_refused_is_gone<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let c = rt.create_collection::<i64>();
+    let g = c.group_by(&rt, bad_key);
+    c.insert(&rt, 1);
+    c.insert(&rt, 13);
+    assert!(rt.take_routing_failure().is_some());
+
+    c.delete(&rt, &13);
+    assert!(
+        rt.take_routing_failure().is_none(),
+        "routing failed after the refused row went"
+    );
+    c.insert(&rt, 3);
+    assert!(rt.take_routing_failure().is_none());
+    assert_eq!(group_values(&rt, &g, 1), vec![1, 3]);
+    let _ = rt.get(g.version_node());
 }
 
 fn a_stored_failure_is_not_taken_inside_a_compute<C: Cells>() {

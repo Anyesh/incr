@@ -1379,7 +1379,8 @@ where
     /// and watches over them, are current without a read of the router. A
     /// `key_fn` that panics leaves the router Failed and the groups as they
     /// were; [`Runtime::take_routing_failure`] reports it, and a later read
-    /// of the router raises it.
+    /// of the router raises it. Each later write that reaches the router
+    /// keys every row again, so routing recovers once the row is gone.
     pub fn group_by<K, F>(&self, rt: &Runtime<C>, key_fn: F) -> GroupedCollection<K, T, C>
     where
         K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
@@ -1486,8 +1487,9 @@ where
             let to = from + pending.len() as u64;
 
             // Stage: key extraction outside the locks. Deletes look up
-            // the cached key during apply instead.
-            let keyed = keyed_inserts(&key_fn, pending);
+            // the cached key during apply instead. A failure rebuilds, since
+            // the cursor stays before the row that failed.
+            let keyed = rebuild.guard(|| keyed_inserts(&key_fn, pending));
             rt.refuse_provisional();
 
             let mut grps = groups_for_query.write();
