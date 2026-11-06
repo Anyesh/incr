@@ -39,6 +39,7 @@ impl<C: MemoCells> CoreRef<C> {
         }
         let mut bag = Deferred::new();
         let handle = {
+            let _routing = rt.hold_routing();
             let mut state = self.lock_memo();
             self.restore(&mut state, rt, t, key, bytes, &mut bag)
         };

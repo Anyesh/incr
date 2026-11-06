@@ -265,6 +265,7 @@ impl<C: MemoCells> MemoCore<C> {
         let handle = self
             .externals
             .get_or_insert_input(rt, name.to_owned(), || 0);
+        let _routing = rt.hold_routing();
         let mut map = self.deps.write();
         rt.set(handle, fp);
         let stamp = changed_at(rt, handle);
