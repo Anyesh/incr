@@ -822,11 +822,10 @@ impl PySortedCollection {
             let win_collection = self.inner.window(rt, size);
             win_collection.map(rt, |window: &Vec<PyValue>| -> PyValue {
                 Python::attach(|py| {
-                    let py_list = pyo3::types::PyList::empty(py);
-                    for elem in window.iter() {
-                        py_list.append(elem.0.clone_ref(py)).unwrap();
-                    }
-                    PyValue(py_list.into_any().unbind())
+                    let tuple =
+                        pyo3::types::PyTuple::new(py, window.iter().map(|e| e.0.clone_ref(py)))
+                            .unwrap();
+                    PyValue(tuple.into_any().unbind())
                 })
             })
         })?;

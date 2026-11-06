@@ -139,6 +139,18 @@ def test_pairwise():
     assert rt.get(pair_count) == 2
 
 
+def test_window():
+    rt = incr.Runtime()
+    col = rt.create_collection()
+    listed = col.sort_by_key(lambda x: x).window(2).reduce(sorted)
+
+    col.extend([10, 20, 30])
+    assert rt.get(listed) == [(10, 20), (20, 30)]
+
+    col.delete(20)
+    assert rt.get(listed) == [(10, 30)]
+
+
 def test_sort_pairwise_map_reduce_pipeline():
     rt = incr.Runtime()
     visits = rt.create_collection()
