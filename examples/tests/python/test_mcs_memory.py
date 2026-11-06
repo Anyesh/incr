@@ -178,3 +178,32 @@ def test_a_hundred_thousand_node_call_takes_under_fifty_ms():
 
     assert stats["nodes"] == 100_000
     assert best < 0.050, f"memory_stats took {best * 1000:.1f} ms"
+
+
+class Key:
+    def __init__(self, name, hooks):
+        self.name = name
+        self.hooks = hooks
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        for hook in self.hooks:
+            hook()
+        return isinstance(other, Key) and self.name == other.name
+
+
+def test_stats_from_a_key_method_during_a_keyed_operation_report_the_index():
+    rt = Runtime()
+    keyed = KeyedCollection(rt)
+    hooks = []
+    seen = []
+    keyed.upsert(Key("a", hooks), 1)
+    rt.get(keyed.collection.version_node)
+    baseline = rt.memory_stats()["py_refs"]
+
+    hooks.append(lambda: seen.append(rt.memory_stats()["py_refs"]))
+    keyed.upsert(Key("a", hooks), 2)
+
+    assert seen == [baseline]

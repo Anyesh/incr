@@ -31,7 +31,7 @@ mod keyed;
 mod memory;
 
 use pyo3::prelude::*;
-use std::cell::{Cell, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use incr_compute::{
     DeleteError, Incr, IncrCollection, NodeId, NodeKindInfo, NodeTable, PropagationTrace, Runtime,
     SortedCollection, TraceAction,
 };
-use keyed::{KeyCounts, KeyIndex, SharedIndex, StagedKeys};
+use keyed::{IndexGuard, KeyCounts, SharedIndex, StagedKeys};
 use memory::{Callables, PyCallable};
 
 use incr_python_protocol::{
@@ -597,7 +597,7 @@ impl OnRuntime for PyKeyedCollection {
 impl PyKeyedCollection {
     /// The index, refused to a key or row method that calls back into this
     /// collection while an operation on it runs.
-    fn index(&self) -> PyResult<RefMut<'_, KeyIndex>> {
+    fn index(&self) -> PyResult<IndexGuard<'_>> {
         self.index.try_borrow_mut().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "KeyedCollection used from a key or row method during an operation on it",

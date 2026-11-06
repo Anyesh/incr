@@ -5,9 +5,10 @@
 //! ([`KeyIndex::commit`]) updates the index from what the collection
 //! reports it applied, running no user code, so the two never diverge.
 
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
+use std::ops::{Deref, DerefMut};
 
 use hashbrown::HashTable;
 use incr_compute::{Change, Held, StateKind, StateMemory, StateStats};
@@ -27,8 +28,13 @@ pub(crate) struct KeyIndex {
 }
 
 /// A `KeyedCollection`'s index, which the runtime's state registry also
-/// reaches, through a `Weak`.
-pub(crate) struct SharedIndex(RefCell<KeyIndex>);
+/// reaches, through a `Weak`. `settled` holds the index's pair count and
+/// allocation as of the last operation's end, for a stats walk run from a
+/// key or row method while an operation holds the index.
+pub(crate) struct SharedIndex {
+    index: RefCell<KeyIndex>,
+    settled: Cell<(usize, usize)>,
+}
 
 // SAFETY: the registry needs `Send + Sync`, but it lives in a
 // `Runtime<Local>`, which is neither, and the index otherwise only in the
@@ -40,26 +46,59 @@ unsafe impl Sync for SharedIndex {}
 
 impl SharedIndex {
     pub(crate) fn new() -> Self {
-        Self(RefCell::new(KeyIndex::new()))
+        Self {
+            index: RefCell::new(KeyIndex::new()),
+            settled: Cell::new((0, 0)),
+        }
     }
 
-    pub(crate) fn try_borrow_mut(&self) -> Option<RefMut<'_, KeyIndex>> {
-        self.0.try_borrow_mut().ok()
+    pub(crate) fn try_borrow_mut(&self) -> Option<IndexGuard<'_>> {
+        let index = self.index.try_borrow_mut().ok()?;
+        Some(IndexGuard {
+            index,
+            settled: &self.settled,
+        })
+    }
+}
+
+/// Mutable access to a [`SharedIndex`] that records its size on release.
+pub(crate) struct IndexGuard<'a> {
+    index: RefMut<'a, KeyIndex>,
+    settled: &'a Cell<(usize, usize)>,
+}
+
+impl Deref for IndexGuard<'_> {
+    type Target = KeyIndex;
+
+    fn deref(&self) -> &KeyIndex {
+        &self.index
+    }
+}
+
+impl DerefMut for IndexGuard<'_> {
+    fn deref_mut(&mut self) -> &mut KeyIndex {
+        &mut self.index
+    }
+}
+
+impl Drop for IndexGuard<'_> {
+    fn drop(&mut self) {
+        self.settled
+            .set((self.index.table.len(), self.index.table.allocation_size()));
     }
 }
 
 impl StateStats for SharedIndex {
     fn state_stats(&self) -> StateMemory {
-        let index = self
-            .0
-            .try_borrow()
-            .expect("memory_stats called from a key or row method during a keyed operation");
-        let pairs = index.table.len();
+        let (pairs, bytes) = match self.index.try_borrow() {
+            Ok(index) => (index.table.len(), index.table.allocation_size()),
+            Err(_) => self.settled.get(),
+        };
         StateMemory::new(
             StateKind::Other("keyed_index"),
             pairs,
             vec![Held::of::<Py<PyTuple>>(pairs)],
-            index.table.allocation_size(),
+            bytes,
         )
     }
 }
