@@ -12,6 +12,10 @@
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockKind {
+    /// A binding's index guard (incr-kube's and the Python bindings' keyed
+    /// collections). A thread may hold several: a user `Hash` run under one
+    /// can write to another keyed collection.
+    Binding,
     /// incr-persist's Store mutex S.
     Store,
     MemoCheckpoint,
@@ -53,7 +57,8 @@ impl LockKind {
     #[cfg_attr(not(all(debug_assertions, not(loom))), allow(dead_code))]
     fn rank(self) -> u16 {
         match self {
-            LockKind::Store => 0,
+            LockKind::Binding => 0,
+            LockKind::Store => 5,
             LockKind::MemoCheckpoint => 10,
             LockKind::Memo => 20,
             LockKind::MemoIndex => 30,
@@ -108,7 +113,7 @@ mod stack {
             if let Some(above) = held
                 .iter()
                 .filter(|e| e.frame == frame)
-                .find(|e| e.kind.rank() >= kind.rank())
+                .find(|e| reentered(e.kind, kind))
             {
                 let (above, held_kinds) = (above.kind, kinds(&held));
                 drop(held);
@@ -120,6 +125,16 @@ mod stack {
             held.push(Entry { kind, frame, id });
         });
         Held { id }
+    }
+
+    /// Whether `held` stops `taking` in the same frame: same or later rank,
+    /// except that a binding's index may be taken again.
+    fn reentered(held: LockKind, taking: LockKind) -> bool {
+        if taking == LockKind::Binding {
+            held.rank() > taking.rank()
+        } else {
+            held.rank() >= taking.rank()
+        }
     }
 
     pub(super) fn release(id: u64) {
@@ -206,8 +221,9 @@ impl<G: std::ops::DerefMut> std::ops::DerefMut for Ordered<G> {
     }
 }
 
-/// A compute frame is pushed: the only locks it may sit above are the Store
-/// mutex (a subscriber's work) and an `aggregate` state lock (`combine`).
+/// A compute frame is pushed: the only locks it may sit above are a
+/// binding's index (user staging code), the Store mutex (a subscriber's
+/// work) and an `aggregate` state lock (`combine`).
 #[inline]
 pub(crate) fn enter_frame() {
     #[cfg(all(debug_assertions, not(loom)))]
@@ -217,9 +233,10 @@ pub(crate) fn enter_frame() {
             let kinds = stack::kinds(&held);
             drop(held);
             assert!(
-                kinds
-                    .iter()
-                    .all(|k| matches!(k, LockKind::Store | LockKind::AggregateState)),
+                kinds.iter().all(|k| matches!(
+                    k,
+                    LockKind::Binding | LockKind::Store | LockKind::AggregateState
+                )),
                 "incr-core: lock order: a compute frame starts while holding {kinds:?}"
             );
         });
@@ -273,7 +290,8 @@ pub(crate) fn unlocked<F>(_closure: &'static str, f: F) -> F {
     f
 }
 
-/// A thread is about to wait on a claim. It may hold only the Store mutex,
+/// A thread is about to wait on a claim. It may hold only a binding's
+/// index, the Store mutex,
 /// the `DepIndex` (a `set` waiting on another `set`), `groups` and `key_cache`
 /// (the router's `rt.set`) and an aggregate's state (`combine`): no claim
 /// holder ever requests these.
@@ -287,7 +305,8 @@ pub(crate) fn assert_may_wait_on_claim() {
         assert!(
             kinds.iter().all(|k| matches!(
                 k,
-                LockKind::Store
+                LockKind::Binding
+                    | LockKind::Store
                     | LockKind::DepIndex
                     | LockKind::GroupState
                     | LockKind::AggregateState
@@ -397,6 +416,28 @@ mod tests {
         let _g = acquire(LockKind::GroupState);
         let _k = acquire(LockKind::KeyCache);
         assert_may_wait_on_claim();
+    }
+
+    #[test]
+    fn a_binding_lock_reenters_and_sits_below_the_store() {
+        let _outer = acquire(LockKind::Binding);
+        let _inner = acquire(LockKind::Binding);
+        let _s = acquire(LockKind::Store);
+    }
+
+    #[test]
+    #[should_panic(expected = "taking Binding while holding Store")]
+    fn a_binding_lock_under_the_store_panics() {
+        let _s = acquire(LockKind::Store);
+        let _b = acquire(LockKind::Binding);
+    }
+
+    #[test]
+    fn a_frame_and_a_claim_wait_may_sit_under_a_binding_lock() {
+        let _b = acquire(LockKind::Binding);
+        assert_may_wait_on_claim();
+        enter_frame();
+        leave_frame();
     }
 
     #[test]
