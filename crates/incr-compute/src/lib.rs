@@ -34,9 +34,9 @@ pub use incr_core::{
     set_aside_cycle_unwind, take_last_cycle, with_value_code, CycleUnwindAside,
 };
 pub use incr_core::{
-    Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
-    GridKey, GridTable as GridTableInner, GroupedCollection as GroupedCollectionInner, Incr,
-    IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
+    Change, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher,
+    FxHasher, GridKey, GridTable as GridTableInner, GroupedCollection as GroupedCollectionInner,
+    Incr, IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
     NodeTable as NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay,
     RuntimeId, SortDelta, SortedCollection as SortedCollectionInner, TableKey, TraceAction, Value,
     DEFAULT_MAX_FRAMES,
@@ -70,7 +70,7 @@ mod reexports {
     fn every_incr_core_item_is_reexported() {
         use crate::{
             active_frame_doomed, check_value_code, engine_unwind, engine_unwind_in_progress,
-            set_aside_cycle_unwind, take_last_cycle, with_value_code, Cycle, CycleStrategy,
+            set_aside_cycle_unwind, take_last_cycle, with_value_code, Change, Cycle, CycleStrategy,
             DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher, GridKey, GridTable,
             GridTableInner, GroupedCollection, GroupedCollectionInner, Incr, IncrCollection,
             IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable,
@@ -106,6 +106,7 @@ mod reexports {
         named::<Replay>();
         let _: u32 = DEFAULT_MAX_FRAMES;
         named::<DeleteError>();
+        named::<Change<u32>>();
         named::<Delta<u32>>();
         named::<ErasedIncr>();
         named::<GroupedCollection<u32, u32>>();

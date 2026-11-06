@@ -59,6 +59,10 @@ use crate::runtime::{ParkPoint, Runtime};
 use crate::value::Value;
 use crate::value_code;
 
+#[path = "collection_apply.rs"]
+mod apply;
+pub use apply::Change;
+
 #[cfg(test)]
 pub(crate) fn park<C: Cells>(rt: &Runtime<C>, point: ParkPoint) {
     if let Some(hook) = rt.park_hook.get() {
@@ -1879,6 +1883,10 @@ mod rebuild_tests;
 #[cfg(test)]
 #[path = "collection_cycle_tests.rs"]
 mod cycle_tests;
+
+#[cfg(test)]
+#[path = "collection_apply_tests.rs"]
+mod apply_tests;
 
 #[cfg(test)]
 mod tests {

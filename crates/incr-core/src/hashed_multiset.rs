@@ -193,11 +193,14 @@ impl<T> HashedMultiset<T> {
     }
 
     /// Ensure `additional` more distinct elements can be inserted without
-    /// a rehash. Runs no user code.
-    pub(crate) fn reserve(&mut self, additional: usize) {
-        if additional > self.growth_left {
+    /// a rehash. Runs no user code. Returns whether it rehashed, which
+    /// moves entries and so invalidates every located index.
+    pub(crate) fn reserve(&mut self, additional: usize) -> bool {
+        let rehash = additional > self.growth_left;
+        if rehash {
             self.rehash(additional);
         }
+        rehash
     }
 
     #[cold]
@@ -320,8 +323,9 @@ impl<T> HashedMultiset<T> {
         unsafe { self.table.entries()[i].assume_init_ref() }
     }
 
-    fn count(&mut self, i: usize) -> usize {
-        self.entry_mut(i).count
+    /// The multiplicity of the live entry at `i`.
+    pub(crate) fn count(&self, i: usize) -> usize {
+        self.entry(i).count
     }
 
     /// The value stored at `i`, a live entry.
@@ -407,6 +411,25 @@ impl<T> HashedMultiset<T> {
         });
         ctrl[i] = tag(hash);
         self.len += 1;
+    }
+
+    /// Insert `value` with count 1 at the first free slot of its probe
+    /// run, comparing it with no entry, so the caller must already know
+    /// that no entry equals it. Requires room from a prior `reserve`.
+    /// Returns its index.
+    pub(crate) fn insert_absent_probe(&mut self, hash: u64, value: T) -> usize {
+        assert!(
+            self.growth_left > 0,
+            "incr-core: multiset insert without a reserve"
+        );
+        let ctrl = self.table.ctrl();
+        let mask = ctrl.len() - 1;
+        let mut i = hash as usize & mask;
+        while ctrl[i] & FULL != 0 {
+            i = (i + 1) & mask;
+        }
+        self.insert_absent(hash, i, value);
+        i
     }
 
     /// Locate one change: removing one occurrence of `remove` and adding

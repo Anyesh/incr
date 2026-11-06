@@ -73,7 +73,7 @@ pub mod walk_ring;
 
 pub use arena::PrimitiveArena;
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
-pub use collection::{CollectionLog, Delta, GroupedCollection, IncrCollection};
+pub use collection::{Change, CollectionLog, Delta, GroupedCollection, IncrCollection};
 pub use cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay};
 #[doc(hidden)]
 pub use cycle_state::{
