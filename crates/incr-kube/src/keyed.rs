@@ -3,9 +3,10 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockWriteGuard};
 
 use incr_concurrent::{IncrCollection, Runtime};
+use incr_core::lock_order::{LockKind, Ordered};
 
 use crate::entry::Entry;
 
@@ -55,8 +56,10 @@ where
     Ver: Copy + Ord + Hash + Send + Sync + 'static,
 {
     collection: IncrCollection<Entry<K, V, Ver>>,
-    index: RwLock<HashMap<K, Entry<K, V, Ver>>>,
+    index: RwLock<Index<K, V, Ver>>,
 }
+
+type Index<K, V, Ver> = HashMap<K, Entry<K, V, Ver>>;
 
 impl<K, V, Ver> KeyedCollection<K, V, Ver>
 where
@@ -75,7 +78,8 @@ where
     /// Apply a keyed replace event. Rejects `version <= stored.version`
     /// as stale rather than applying it.
     pub fn upsert(&self, rt: &Runtime, key: K, version: Ver, value: V) -> UpsertOutcome {
-        let mut index = self.index.write().unwrap_or_else(PoisonError::into_inner);
+        let _routing = rt.hold_routing();
+        let mut index = self.write_index();
         match index.get(&key) {
             Some(existing) if existing.version >= version => UpsertOutcome::Stale,
             Some(existing) => {
@@ -103,7 +107,8 @@ where
     /// Apply a keyed delete event. Returns whether a live entry for
     /// `key` was found and removed.
     pub fn remove(&self, rt: &Runtime, key: &K) -> bool {
-        let mut index = self.index.write().unwrap_or_else(PoisonError::into_inner);
+        let _routing = rt.hold_routing();
+        let mut index = self.write_index();
         match index.remove(key) {
             Some(entry) => {
                 self.collection.delete(rt, &entry);
@@ -111,6 +116,14 @@ where
             }
             None => false,
         }
+    }
+
+    /// Taken under a routing hold, which must outlive it: routing runs
+    /// `key_fn`s, which may read this index.
+    fn write_index(&self) -> Ordered<RwLockWriteGuard<'_, Index<K, V, Ver>>> {
+        Ordered::take(LockKind::Binding, || {
+            self.index.write().unwrap_or_else(PoisonError::into_inner)
+        })
     }
 
     /// Direct point lookup, bypassing the incr graph: a synchronous
@@ -166,7 +179,8 @@ where
     /// (some keys already pruned, some not yet), not a transient
     /// artifact the way an unbatched same-key `replace` would expose.
     pub fn retain(&self, rt: &Runtime, keep: impl Fn(&K) -> bool) -> usize {
-        let mut index = self.index.write().unwrap_or_else(PoisonError::into_inner);
+        let _routing = rt.hold_routing();
+        let mut index = self.write_index();
         let stale: Vec<K> = index.keys().filter(|k| !keep(k)).cloned().collect();
         let mut removed = 0;
         for key in stale {

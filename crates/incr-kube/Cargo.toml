@@ -11,6 +11,7 @@ categories = ["algorithms", "data-structures", "concurrency"]
 
 [dependencies]
 incr-concurrent.workspace = true
+incr-core.workspace = true
 kube = { version = "4.2", default-features = false, features = ["runtime"] }
 futures = "0.3"
 
