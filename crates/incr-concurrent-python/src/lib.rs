@@ -40,8 +40,8 @@ use engine::{
     SortedCollection, TraceAction,
 };
 use incr_python_protocol::{
-    call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions,
-    PyFixpoint, PyValue,
+    call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, routing_error,
+    try_read, Exceptions, PyFixpoint, PyValue,
 };
 
 pyo3::create_exception!(
@@ -75,12 +75,16 @@ impl Exceptions for Exc {
 /// Runs a `#[pymethods]` engine call on `rt` with the GIL released,
 /// because the engine may wait on a claim whose holder needs the GIL to
 /// finish: the GIL is lock level -1, never held while waiting on an incr
-/// lock.
+/// lock. A `group_by` routing failure an earlier call on this thread
+/// stored is raised first, before the call consumes anything.
 fn engine_call<R: Ungil>(
     py: Python<'_>,
     rt: &Runtime,
     f: impl FnOnce() -> R + Ungil,
 ) -> PyResult<R> {
+    if let Some(failure) = rt.take_routing_failure() {
+        return Err(routing_error(py, failure));
+    }
     pyerr_boundary::<Exc, _>(|| in_runtime(rt, || py.detach(f)))
 }
 

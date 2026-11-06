@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+
+import incr_concurrent
 import pytest
 from incr import KeyedCollection, Pending, Runtime
 
@@ -181,3 +184,39 @@ def test_an_observer_that_writes_leaves_later_observers_reading_current_groups()
 )
 def test_the_pending_list_stays_bounded_under_writes_with_no_read():
     pass
+
+
+def test_concurrent_a_read_on_another_thread_sees_an_insert_routed():
+    rt = incr_concurrent.Runtime()
+    rows = rt.create_collection()
+    rows.insert(("ann", 8))
+    rows.insert(("bob", 6))
+    by_worker = rows.group_by(lambda row: row[0])
+    ann = by_worker.get_group("ann").count()
+    assert rt.get(ann) == 1
+
+    with ThreadPoolExecutor(max_workers=1) as writer:
+        writer.submit(rows.insert, ("ann", 4)).result()
+    with ThreadPoolExecutor(max_workers=1) as reader:
+        assert reader.submit(rt.get, ann).result() == 2
+        assert sorted(reader.submit(by_worker.keys).result()) == ["ann", "bob"]
+
+
+def test_concurrent_a_key_function_failure_is_raised_by_the_next_call():
+    rt = incr_concurrent.Runtime()
+    rows = rt.create_collection()
+    rows.insert(("ann", 8))
+
+    def key(row):
+        if row[0] == "bad":
+            raise Boom("no worker")
+        return row[0]
+
+    by_worker = rows.group_by(key)
+    ann = by_worker.get_group("ann").count()
+    assert rt.get(ann) == 1
+    rows.insert(("bad", 1))
+    with pytest.raises(RuntimeError, match="routing failed") as raised:
+        rt.node_count()
+    assert isinstance(raised.value.__cause__, Boom)
+    assert rt.get(ann) == 1
