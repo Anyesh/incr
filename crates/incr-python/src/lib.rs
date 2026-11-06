@@ -44,7 +44,7 @@ use incr_compute::{
     DeleteError, Incr, IncrCollection, NodeId, NodeKindInfo, NodeTable, PropagationTrace, Runtime,
     SortedCollection, TraceAction,
 };
-use incr_core::{Local, RoutingHold};
+use incr_core::{Local, RoutingFailed, RoutingHold};
 use keyed::{IndexGuard, KeyCounts, SharedIndex, StagedKeys};
 use state::{PyCallable, RtState};
 
@@ -52,8 +52,8 @@ use incr_python_protocol::notready::{
     lookup_failed, PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
 use incr_python_protocol::{
-    call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, routing_error,
-    try_read, Exceptions, PyFixpoint, PyValue,
+    call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, raise_into_engine,
+    routing_error, try_read, Exceptions, PyFixpoint, PyValue,
 };
 use ready::_NotReadySignal;
 
@@ -106,15 +106,20 @@ fn engine_write<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
 /// raised before `f` runs, so a consuming read never loses what it took.
 /// A failure from routing inside `f` is stored for the next read.
 fn engine_read<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
-    let routed = pyerr_boundary::<Exc, _>(|| {
+    pyerr_boundary::<Exc, _>(|| {
         in_runtime(rt, || {
-            match rt.take_routing_failure().or_else(|| rt.route_pending()) {
-                Some(failure) => Err(failure),
-                None => Ok(f()),
+            if let Some(failure) = rt.take_routing_failure().or_else(|| rt.route_pending()) {
+                raise_routing(failure);
             }
+            f()
         })
-    })?;
-    routed.map_err(|failure| Python::attach(|py| routing_error(py, failure)))
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn raise_routing(failure: RoutingFailed) -> ! {
+    raise_into_engine(Python::attach(|py| routing_error(py, failure)))
 }
 
 type TracedNode = (Option<String>, Option<Py<PyAny>>);
