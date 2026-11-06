@@ -29,6 +29,7 @@
 
 mod keyed;
 mod memory;
+mod ready;
 
 use pyo3::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -43,10 +44,14 @@ use incr_compute::{
 use keyed::{IndexGuard, KeyCounts, SharedIndex, StagedKeys};
 use memory::{Callables, PyCallable};
 
+use incr_python_protocol::notready::{
+    PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
+};
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions,
     PyFixpoint, PyValue,
 };
+use ready::_NotReadySignal;
 
 pyo3::create_exception!(
     incr,
@@ -136,11 +141,13 @@ trait OnRuntime {
 fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 'static {
     move |rt: &Runtime| -> PyValue {
         Python::attach(|py| {
+            let missing = Cell::new(0);
             let rt_ref = Py::new(
                 py,
                 PyRuntimeRef {
                     ptr: Cell::new(rt as *const _),
                     callables: py_func.callables(),
+                    missing: &missing,
                 },
             )
             .unwrap();
@@ -148,7 +155,12 @@ fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync +
             // one the callback kept never reaches a dropped runtime.
             let _guard = InvalidateRef(rt_ref.bind(py).clone());
             in_runtime(rt, || {
-                PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
+                PyValue(ready::call_query(
+                    py,
+                    &py_func,
+                    rt_ref.clone_ref(py).into_any(),
+                    &missing,
+                ))
             })
         })
     }
@@ -199,6 +211,9 @@ struct PyRuntimeRef {
     /// The runtime's callable count, valid while `ptr` is non-null: the
     /// running query's closure holds it.
     callables: *const Callables,
+    /// The missing contributions of the `Incomplete` values the running
+    /// query read, valid while `ptr` is non-null.
+    missing: *const Cell<u64>,
 }
 
 struct InvalidateRef<'py>(Bound<'py, PyRuntimeRef>);
@@ -224,6 +239,14 @@ impl PyRuntimeRef {
         Ok(unsafe { &*ptr })
     }
 
+    /// The runtime and the running query's missing count.
+    fn rt_and_missing(&self) -> PyResult<(&Runtime, &Cell<u64>)> {
+        let rt = self.rt()?;
+        // SAFETY: `rt` succeeded, so the query whose frame owns the count
+        // is still running.
+        Ok((rt, unsafe { &*self.missing }))
+    }
+
     /// The runtime and its callable count.
     fn rt_and_callables(&self) -> PyResult<(&Runtime, &Callables)> {
         let rt = self.rt()?;
@@ -237,17 +260,29 @@ impl PyRuntimeRef {
 // Python frames as an exception instead of a foreign panic.
 #[pymethods]
 impl PyRuntimeRef {
-    fn get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
-        let rt = self.rt()?;
+    /// The node's value. A `NotReady` value makes this query's value that
+    /// value; an `Incomplete` one gives its `value` and makes this query's
+    /// value `Incomplete`, with every `missing` it read added up.
+    fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        let (rt, missing) = self.rt_and_missing()?;
         let val: PyValue = engine_call(rt, || rt.get(node.inner))?;
-        Ok(val.0)
+        ready::read(py, val.0, missing)
     }
 
     /// Like `get`, but a cycle that leaves the node without a value
     /// raises `CycleError` as an ordinary exception the query may catch.
-    fn try_get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
+    fn try_get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        let (rt, missing) = self.rt_and_missing()?;
+        let val = try_read::<Exc>(engine_call(rt, || rt.try_get(node.inner))?)?;
+        ready::read(py, val, missing)
+    }
+
+    /// `(value, status)` as `Runtime.get_with_status` gives them, with
+    /// neither rule of `get` applied.
+    fn get_status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let rt = self.rt()?;
-        try_read::<Exc>(engine_call(rt, || rt.try_get(node.inner))?)
+        let val: PyValue = engine_call(rt, || rt.get(node.inner))?;
+        Ok(ready::with_status(py, val.0))
     }
 
     /// The input child named `key` of this query, created with `init()`
@@ -905,15 +940,30 @@ impl PyRuntime {
         Ok(PyNodeId { inner: node })
     }
 
-    fn get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
+    /// The node's value: a `NotReady` value as stored, and an `Incomplete`
+    /// value's `value`.
+    fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let val: PyValue = self.engine_call(|rt| rt.get(node.inner))?;
-        Ok(val.0)
+        Ok(ready::unwrapped(py, val.0))
+    }
+
+    /// `(value, status)`: the value `get` returns, and `None`, the
+    /// `NotReady` value, or the `Incomplete` value.
+    fn get_with_status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        let val: PyValue = self.engine_call(|rt| rt.get(node.inner))?;
+        Ok(ready::with_status(py, val.0))
+    }
+
+    /// The status `get_with_status` gives.
+    fn status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        Ok(self.get_with_status(py, node)?.1)
     }
 
     /// Like `get`, but a cycle that leaves the node without a value raises
     /// `CycleError` as an ordinary exception.
-    fn try_get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
-        try_read::<Exc>(self.engine_call(|rt| rt.try_get(node.inner))?)
+    fn try_get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        let val = try_read::<Exc>(self.engine_call(|rt| rt.try_get(node.inner))?)?;
+        Ok(ready::unwrapped(py, val))
     }
 
     fn set(&self, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
@@ -1167,6 +1217,12 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "HasDependentsError",
         m.py().get_type::<HasDependentsError>(),
     )?;
+    m.add("_NotReadySignal", m.py().get_type::<_NotReadySignal>())?;
+    m.add_class::<PyNotReady>()?;
+    m.add_class::<PyPending>()?;
+    m.add_class::<PyLookupFailed>()?;
+    m.add_class::<PyUnavailable>()?;
+    m.add_class::<PyIncomplete>()?;
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyNodeId>()?;
     m.add_class::<PyObserverId>()?;

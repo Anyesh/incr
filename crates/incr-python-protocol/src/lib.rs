@@ -19,6 +19,8 @@ use std::sync::{Mutex, PoisonError};
 
 use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, Runtime};
 
+pub mod notready;
+
 /// The exception types of one binding's module.
 pub trait Exceptions {
     /// `CycleError` with its `args`: the message and the participants'
