@@ -17,7 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, PoisonError};
 
-use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, Runtime};
+use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, RoutingFailed, Runtime};
 
 pub mod notready;
 
@@ -243,6 +243,25 @@ pub fn cycle_ids(cycle: &Cycle) -> Vec<u32> {
 
 fn cycle_error<E: Exceptions>(cycle: &Cycle) -> PyErr {
     E::cycle_error(format!("dependency cycle: {cycle}"), cycle_ids(cycle))
+}
+
+/// The `RuntimeError` a call raises for a failed `group_by` routing run,
+/// with the key function's exception as its `__cause__` when one raised.
+pub fn routing_error(py: Python<'_>, failure: RoutingFailed) -> PyErr {
+    let message = failure.message().map(str::to_owned);
+    let cause = match failure.into_payload().downcast::<PyStashPanic>() {
+        Ok(mut stashed) => stashed.0.take(),
+        Err(_) => None,
+    };
+    let detail = match (&cause, message) {
+        (Some(cause), _) => cause.to_string(),
+        (None, Some(message)) => message,
+        (None, None) => "a panic with a non-string payload".to_owned(),
+    };
+    let err =
+        pyo3::exceptions::PyRuntimeError::new_err(format!("group_by routing failed: {detail}"));
+    err.set_cause(py, cause);
+    err
 }
 
 /// A `try_get` result as Python sees it: the value, or `CycleError`

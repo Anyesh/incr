@@ -12,6 +12,8 @@ use std::ops::{Deref, DerefMut};
 
 use hashbrown::HashTable;
 use incr_compute::{Change, Held, StateKind, StateMemory, StateStats};
+use incr_core::lock_order::{self, LockKind};
+use incr_core::{Local, RoutingHold};
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -57,6 +59,25 @@ impl SharedIndex {
         Some(IndexGuard {
             index,
             settled: &self.settled,
+            _binding: None,
+            _routing: None,
+        })
+    }
+
+    /// [`Self::try_borrow_mut`] for an operation that writes, which runs
+    /// user key and row code with the index held: `routing` must outlive
+    /// the borrow, since routing runs key functions that may use the index.
+    pub(crate) fn try_borrow_for_write<'a>(
+        &'a self,
+        routing: RoutingHold<'a, Local>,
+    ) -> Option<IndexGuard<'a>> {
+        let binding = lock_order::acquire(LockKind::Binding);
+        let index = self.index.try_borrow_mut().ok()?;
+        Some(IndexGuard {
+            index,
+            settled: &self.settled,
+            _binding: Some(binding),
+            _routing: Some(routing),
         })
     }
 }
@@ -65,6 +86,8 @@ impl SharedIndex {
 pub(crate) struct IndexGuard<'a> {
     index: RefMut<'a, KeyIndex>,
     settled: &'a Cell<(usize, usize)>,
+    _binding: Option<lock_order::Held>,
+    _routing: Option<RoutingHold<'a, Local>>,
 }
 
 impl Deref for IndexGuard<'_> {
