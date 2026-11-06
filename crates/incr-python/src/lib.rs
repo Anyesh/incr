@@ -342,6 +342,20 @@ impl PyCollection {
         self.engine_call(py, |rt| self.inner.delete(rt, &PyValue(value)))
     }
 
+    fn extend(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<()> {
+        let values = rows
+            .try_iter()?
+            .map(|row| row.map(|row| PyValue(row.unbind())))
+            .collect::<PyResult<Vec<_>>>()?;
+        self.engine_call(py, |rt| self.inner.extend(rt, values))
+    }
+
+    fn replace(&self, py: Python<'_>, old: Py<PyAny>, new: Py<PyAny>) -> PyResult<bool> {
+        self.engine_call(py, |rt| {
+            self.inner.replace(rt, Some(&PyValue(old)), PyValue(new))
+        })
+    }
+
     fn snapshot_len(&self, py: Python<'_>) -> PyResult<usize> {
         self.engine_call(py, |_| self.inner.snapshot_len())
     }
