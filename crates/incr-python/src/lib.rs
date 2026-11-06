@@ -50,6 +50,13 @@ pyo3::create_exception!(
 
 pyo3::create_exception!(
     incr,
+    HasDependentsError,
+    pyo3::exceptions::PyRuntimeError,
+    "The node, or a node it owns, still has dependents; nothing was deleted."
+);
+
+pyo3::create_exception!(
+    incr,
     _IncrEngineUnwind,
     pyo3::exceptions::PyBaseException,
     "Carries an engine unwind through Python frames inside a query; never caught by `except Exception`."
@@ -74,6 +81,13 @@ impl Exceptions for Exc {
 /// stays held.
 fn engine_call<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
     pyerr_boundary::<Exc, _>(|| in_runtime(rt, f))
+}
+
+fn delete_error(e: DeleteError, key: impl Into<Py<PyAny>>) -> PyErr {
+    match e {
+        DeleteError::HasDependents => HasDependentsError::new_err(e.to_string()),
+        DeleteError::NotAlive => pyo3::exceptions::PyKeyError::new_err(key.into()),
+    }
 }
 
 /// A binding object that reaches its runtime through the `Runtime` object
@@ -286,8 +300,7 @@ impl PyNodeTable {
         let k = PyValue(key.clone_ref(py));
         match self.engine_call(py, |rt| self.inner.remove(rt, &k))? {
             Ok(()) => Ok(()),
-            Err(DeleteError::NotAlive) => Err(pyo3::exceptions::PyKeyError::new_err(key)),
-            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+            Err(e) => Err(delete_error(e, key)),
         }
     }
 
@@ -716,6 +729,22 @@ impl PyRuntime {
         self.engine_call(|rt| rt.delete_node(node.inner))
     }
 
+    /// Delete the node and the nodes it owns only if none of them has a
+    /// dependent. Raises `HasDependentsError` (deleting nothing) if one
+    /// does, and `KeyError` if the node is not alive.
+    fn try_delete_node(&self, py: Python<'_>, node: PyNodeId) -> PyResult<()> {
+        let inner = node.inner;
+        self.engine_call(|rt| rt.try_delete_node(inner))?
+            .map_err(|e| {
+                delete_error(
+                    e,
+                    node.into_pyobject(py)
+                        .map(|b| b.into_any().unbind())
+                        .unwrap_or_else(|_| py.None()),
+                )
+            })
+    }
+
     /// Delete the node, every node that depends on it (transitively)
     /// and every node an operator created for them. Returns how many
     /// nodes were deleted; 0 if the node was already gone. A query that
@@ -900,6 +929,10 @@ impl PyRuntime {
 #[pymodule]
 fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CycleError", m.py().get_type::<CycleError>())?;
+    m.add(
+        "HasDependentsError",
+        m.py().get_type::<HasDependentsError>(),
+    )?;
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyNodeId>()?;
     m.add_class::<PyObserverId>()?;

@@ -94,3 +94,38 @@ def test_close_inside_a_compute_raises_and_leaves_runtime_usable():
     assert rt.get(q) == 7
     a = rt.create_input(3)
     assert rt.get(a) == 3
+
+
+def test_try_delete_node_refuses_while_a_dependent_exists():
+    rt = incr.Runtime()
+    a = rt.create_input(1)
+    q = rt.create_query(lambda r: r.get(a) * 2)
+    assert rt.get(q) == 2
+    with pytest.raises(incr.HasDependentsError):
+        rt.try_delete_node(a)
+    assert issubclass(incr.HasDependentsError, RuntimeError)
+    assert rt.is_alive(a)
+    rt.set(a, 4)
+    assert rt.get(q) == 8
+
+
+def test_try_delete_node_succeeds_after_the_dependent_is_gone():
+    rt = incr.Runtime()
+    a = rt.create_input(1)
+    q = rt.create_query(lambda r: r.get(a) * 2)
+    assert rt.get(q) == 2
+    rt.try_delete_node(q)
+    rt.try_delete_node(a)
+    assert not rt.is_alive(a)
+    with pytest.raises(KeyError):
+        rt.try_delete_node(a)
+
+
+def test_table_remove_with_a_dependent_raises_has_dependents():
+    rt = incr.Runtime()
+    t = rt.create_table()
+    n = t.get_or_insert_input("k", lambda: 1)
+    q = rt.create_query(lambda r: r.get(n))
+    assert rt.get(q) == 1
+    with pytest.raises(incr.HasDependentsError):
+        t.remove("k")
