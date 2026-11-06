@@ -32,6 +32,7 @@ use crate::collection::{
 };
 use crate::handle::Incr;
 use crate::lock_order::{self, LockKind};
+use crate::memory::{self, vec_bytes, Held, Measure, StateKind, StateMemory};
 use crate::runtime::Runtime;
 use crate::value::Value;
 use crate::value_code;
@@ -60,6 +61,37 @@ pub(crate) struct SortedState<T, K> {
     pub(crate) base: u64,
     pub(crate) cursors: Vec<Arc<AtomicU64>>,
     pub(crate) version: u64,
+}
+
+impl<T: 'static, K: 'static> Measure for SortedState<T, K> {
+    fn measure(&self) -> StateMemory {
+        let sorted = self.sorted.len();
+        let pending = self.deltas.len();
+        StateMemory {
+            pending_deltas: pending,
+            ..StateMemory::new(
+                StateKind::Sort,
+                sorted,
+                vec![Held::of::<T>(sorted + pending), Held::of::<K>(sorted)],
+                vec_bytes(&self.sorted)
+                    + vec_bytes(&self.deltas)
+                    + vec_bytes(&self.spare)
+                    + vec_bytes(&self.cursors)
+                    + self.cursors.len() * std::mem::size_of::<(usize, usize, AtomicU64)>(),
+            )
+        }
+    }
+}
+
+impl<T: 'static> Measure for Vec<T> {
+    fn measure(&self) -> StateMemory {
+        StateMemory::new(
+            StateKind::SortMirror,
+            self.len(),
+            vec![Held::of::<T>(self.len())],
+            vec_bytes(self),
+        )
+    }
 }
 
 impl<T: Clone, K> SortedState<T, K> {
@@ -334,6 +366,7 @@ where
             cursor.store(to, MemOrdering::Release);
             st.version
         });
+        memory::register(rt, version_node.erase(), &state);
 
         SortedCollection {
             state,
@@ -474,6 +507,7 @@ where
         }
         let mirror: Arc<OpLock<Vec<T>, C>> =
             Arc::new(OpLock::new(LockKind::OperatorState, bootstrap));
+        let mirror_state = Arc::downgrade(&mirror);
 
         let rebuild = NeedsRebuild::new();
         let output_log_for_query = Arc::clone(&output_log);
@@ -524,7 +558,8 @@ where
             version
         });
 
-        IncrCollection::derived_with(output_log, version_node)
+        rt.register_state(Some(version_node.erase()), mirror_state);
+        IncrCollection::derived_with(rt, output_log, version_node)
     }
 }
 #[cfg(test)]

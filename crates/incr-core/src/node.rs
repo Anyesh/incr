@@ -685,6 +685,19 @@ impl<C: Cells> NodeData<C> {
         }
     }
 
+    /// The bytes of the node's overflow dep list, 0 when its deps fit
+    /// inline.
+    pub(crate) fn overflow_dep_bytes(&self) -> usize {
+        if Self::count_of(C::u8_load_acquire(&self.dep_count)) <= 7 {
+            return 0;
+        }
+        let mut bytes = 0;
+        self.overflow_deps.with_list(&mut |list| {
+            bytes = std::mem::size_of::<DepList>() + std::mem::size_of_val(&*list.deps);
+        });
+        bytes
+    }
+
     /// The deps as [`Self::for_each_dep`] scans them when they fit inline,
     /// or `None` when they overflow. A caller's loop body over these stays
     /// inline where a closure handed to `for_each_dep` may not, as its

@@ -55,6 +55,9 @@ pub trait ValueSlot<T: Value>: 'static {
     /// any reader reaches its slot).
     fn read(&self) -> T;
     fn try_read(&self) -> Option<T>;
+    /// `None` for an empty slot, else the heap bytes the slot owns for its
+    /// value beyond its own size. Reads no value and runs no user code.
+    fn filled_bytes(&self) -> Option<usize>;
     /// [`Self::try_read`] with `missing` run in place of `None`, so a
     /// slot that clones in place hands the value back with no `Option`
     /// to unwrap and copy.
@@ -187,6 +190,11 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
         unsafe { (*self.0.get()).as_ref().cloned() }
     }
 
+    fn filled_bytes(&self) -> Option<usize> {
+        // SAFETY: see read().
+        unsafe { (*self.0.get()).is_some() }.then_some(0)
+    }
+
     #[inline(always)]
     fn read_or(&self, missing: impl FnOnce() -> T) -> T {
         // SAFETY: see read().
@@ -311,6 +319,10 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
             // SAFETY: see read().
             unsafe { self.0.load(hp) }.cloned()
         })
+    }
+
+    fn filled_bytes(&self) -> Option<usize> {
+        (!self.0.load_ptr().is_null()).then_some(std::mem::size_of::<T>())
     }
 
     fn try_read_then(&self, loaded: impl FnOnce()) -> Option<T> {

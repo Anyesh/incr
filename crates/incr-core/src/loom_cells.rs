@@ -147,6 +147,9 @@ impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
     fn try_read(&self) -> Option<T> {
         self.current().cloned()
     }
+    fn filled_bytes(&self) -> Option<usize> {
+        self.current().map(|_| std::mem::size_of::<T>())
+    }
     fn try_read_then(&self, loaded: impl FnOnce()) -> Option<T> {
         let cur = self.current();
         loaded();

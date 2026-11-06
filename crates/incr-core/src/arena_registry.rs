@@ -72,6 +72,12 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     #[doc(hidden)]
     fn has_value(&self, slot: u32) -> bool;
 
+    /// [`ValueSlot::filled_bytes`] of `slot`; `None` past the arena too.
+    fn filled_bytes(&self, slot: u32) -> Option<usize>;
+
+    /// The value type's name and the size of one value slot.
+    fn value_type(&self) -> (&'static str, usize);
+
     /// Whether the arena's type has a placeholder.
     #[doc(hidden)]
     fn has_placeholder(&self) -> bool;
@@ -136,6 +142,17 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
 
     fn has_value(&self, slot: u32) -> bool {
         crate::value_code::run(|| self.try_read(slot).is_some())
+    }
+
+    fn filled_bytes(&self, slot: u32) -> Option<usize> {
+        GenericArena::filled_bytes(self, slot)
+    }
+
+    fn value_type(&self) -> (&'static str, usize) {
+        (
+            std::any::type_name::<T>(),
+            std::mem::size_of::<C::ValueSlot<T>>(),
+        )
     }
 
     fn has_placeholder(&self) -> bool {
@@ -334,6 +351,21 @@ impl<C: Cells> ArenaRegistry<C> {
             .store_release(Box::into_raw(entry));
         tags.tags.insert(type_id, tag);
         tag
+    }
+
+    /// Every type with an arena, by tag.
+    pub(crate) fn value_types(&self) -> Vec<crate::memory::ValueType> {
+        (0..self.entries.len())
+            .map_while(|tag| self.entry(tag as u16))
+            .map(|entry| {
+                let (name, slot_bytes) = entry.arena.value_type();
+                crate::memory::ValueType {
+                    type_id: entry.type_id,
+                    name,
+                    slot_bytes,
+                }
+            })
+            .collect()
     }
 
     #[cfg(all(test, not(loom)))]

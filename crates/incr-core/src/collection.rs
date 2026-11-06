@@ -54,6 +54,7 @@ use crate::handle::{ErasedIncr, Incr};
 use crate::hashed_multiset::HashedMultiset;
 use crate::lock_order::{self, LockKind, Ordered};
 use crate::locks::{Lock, OrderedLock};
+use crate::memory::{self, table_bytes, vec_bytes, Held, Measure, StateKind, StateMemory};
 use crate::persist_hooks::{RepSide, RepSink};
 use crate::runtime::{ParkPoint, Runtime};
 use crate::value::Value;
@@ -694,6 +695,26 @@ impl<T: Hash + Eq + Clone> Default for CollectionLog<T> {
     }
 }
 
+impl<T: Hash + Eq + Clone + 'static> Measure for CollectionLog<T> {
+    fn measure(&self) -> StateMemory {
+        let pending = self.deltas.len();
+        let bytes = self.elements.heap_bytes()
+            + vec_bytes(&self.deltas)
+            + vec_bytes(&self.spare)
+            + vec_bytes(&self.cursors)
+            + self.cursors.len() * std::mem::size_of::<(usize, usize, AtomicU64)>();
+        StateMemory {
+            pending_deltas: pending,
+            ..StateMemory::new(
+                StateKind::Collection,
+                self.len(),
+                vec![Held::of::<T>(self.elements.len() + pending)],
+                bytes,
+            )
+        }
+    }
+}
+
 /// Public collection handle. Cheap to clone (Arc + Copy handle).
 ///
 /// The `_confine` marker is `PhantomData<C::Ptr<()>>`: under `Local`
@@ -735,9 +756,11 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
             derived: false,
             _confine: std::marker::PhantomData,
         }
+        .registered(rt)
     }
 
     pub(crate) fn derived_with(
+        rt: &Runtime<C>,
         log: Arc<OpLock<CollectionLog<T>, C>>,
         version_node: Incr<u64>,
     ) -> Self {
@@ -749,6 +772,12 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
             derived: true,
             _confine: std::marker::PhantomData,
         }
+        .registered(rt)
+    }
+
+    fn registered(self, rt: &Runtime<C>) -> Self {
+        memory::register(rt, self.version_node.erase(), &self.log);
+        self
     }
 
     /// Internal: create a sub-collection from inside a compute closure
@@ -763,6 +792,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
             derived: true,
             _confine: std::marker::PhantomData,
         }
+        .registered(rt)
     }
 
     /// Public accessor for the collection's version node. Useful when a
@@ -1034,7 +1064,7 @@ where
             version
         });
 
-        IncrCollection::derived_with(output_log, version_node)
+        IncrCollection::derived_with(rt, output_log, version_node)
     }
     /// Count: number of live elements as an `Incr<u64>`. Maintains a
     /// running tally incrementally from upstream deltas; O(new deltas)
@@ -1129,7 +1159,7 @@ where
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
-        rt.create_operator_query(move |rt| -> U {
+        let node = rt.create_operator_query(move |rt| -> U {
             let _uv = rt.get(upstream_version);
 
             let _provisional = rebuild.provisional(rt);
@@ -1180,7 +1210,9 @@ where
             });
             cursor.store(to, MemOrdering::Release);
             st.cloned_root()
-        })
+        });
+        memory::register(rt, node.erase(), &state);
+        node
     }
 
     /// Join with another collection on a shared key. Emits the
@@ -1322,7 +1354,8 @@ where
             version
         });
 
-        IncrCollection::derived_with(output_log, version_node)
+        memory::register(rt, version_node.erase(), &state);
+        IncrCollection::derived_with(rt, output_log, version_node)
     }
 
     /// Group by an extracted key. Returns a `GroupedCollection<K, T, C>`
@@ -1494,6 +1527,8 @@ where
         for group in groups.read().values() {
             rt.adopt(version_node.erase(), group.version_node.erase());
         }
+        memory::register(rt, version_node.erase(), &groups);
+        memory::register(rt, version_node.erase(), &key_cache);
 
         GroupedCollection {
             groups,
@@ -1513,6 +1548,20 @@ struct JoinSide<A, K> {
 }
 
 impl<A: Hash + Eq + Clone, K: Hash + Eq + Clone> JoinSide<A, K> {
+    /// Its elements, the values of `A` and of `K` it holds, and its heap
+    /// bytes.
+    fn measure(&self) -> (usize, usize, usize, usize) {
+        let elements: usize = self.index.values().map(Vec::len).sum();
+        let buffers: usize = self.index.values().map(vec_bytes).sum();
+        let cached = self.keys.0.len();
+        (
+            elements,
+            elements + cached,
+            self.index.len() + cached,
+            table_bytes::<(K, Vec<A>)>(self.index.capacity()) + buffers + self.keys.heap_bytes(),
+        )
+    }
+
     fn new() -> Self {
         Self {
             index: HashMap::new(),
@@ -1568,6 +1617,28 @@ impl<A: Hash + Eq + Clone, K: Hash + Eq + Clone> JoinSide<A, K> {
 struct JoinState<T, U, K> {
     left: JoinSide<T, K>,
     right: JoinSide<U, K>,
+}
+
+impl<T, U, K> Measure for JoinState<T, U, K>
+where
+    T: Hash + Eq + Clone + 'static,
+    U: Hash + Eq + Clone + 'static,
+    K: Hash + Eq + Clone + 'static,
+{
+    fn measure(&self) -> StateMemory {
+        let (l_elements, l_values, l_keys, l_bytes) = self.left.measure();
+        let (r_elements, r_values, r_keys, r_bytes) = self.right.measure();
+        StateMemory::new(
+            StateKind::Join,
+            l_elements + r_elements,
+            vec![
+                Held::of::<T>(l_values),
+                Held::of::<U>(r_values),
+                Held::of::<K>(l_keys + r_keys),
+            ],
+            l_bytes + r_bytes,
+        )
+    }
 }
 
 impl<T, U, K> JoinState<T, U, K>
@@ -1636,6 +1707,10 @@ impl<T: Hash + Eq, K: Clone> KeyCache<T, K> {
         })
     }
 
+    fn heap_bytes(&self) -> usize {
+        table_bytes::<(T, (K, usize))>(self.0.capacity())
+    }
+
     fn remove(&mut self, value: &T) -> Option<K> {
         value_code::run(|| {
             let (key, copies) = self.0.get_mut(value)?;
@@ -1645,6 +1720,34 @@ impl<T: Hash + Eq, K: Clone> KeyCache<T, K> {
             }
             self.0.remove(value).map(|(key, _)| key)
         })
+    }
+}
+
+impl<T: Hash + Eq + 'static, K: Clone + 'static> Measure for KeyCache<T, K> {
+    fn measure(&self) -> StateMemory {
+        let n = self.0.len();
+        StateMemory::new(
+            StateKind::KeyCache,
+            n,
+            vec![Held::of::<T>(n), Held::of::<K>(n)],
+            self.heap_bytes(),
+        )
+    }
+}
+
+impl<K, T, C> Measure for HashMap<K, IncrCollection<T, C>>
+where
+    K: 'static,
+    T: Value + Hash + Eq,
+    C: Cells,
+{
+    fn measure(&self) -> StateMemory {
+        StateMemory::new(
+            StateKind::GroupBy,
+            self.len(),
+            vec![Held::of::<K>(self.len())],
+            table_bytes::<(K, IncrCollection<T, C>)>(self.capacity()),
+        )
     }
 }
 
@@ -1722,6 +1825,24 @@ pub(crate) fn paired_with<T, U>(f: &impl Fn(&T) -> U, values: Vec<T>) -> Vec<(T,
             (v, image)
         })
         .collect()
+}
+
+impl<T: Hash + Eq + Clone + 'static, U: 'static> Measure for AggState<T, U> {
+    fn measure(&self) -> StateMemory {
+        let buffers: usize = self.slots.values().map(vec_bytes).sum();
+        StateMemory::new(
+            StateKind::Aggregate,
+            self.high_water - self.free.len(),
+            vec![
+                Held::of::<T>(self.slots.len()),
+                Held::of::<U>(self.tree.nodes.len() + 1),
+            ],
+            vec_bytes(&self.tree.nodes)
+                + table_bytes::<(T, Vec<usize>)>(self.slots.capacity())
+                + buffers
+                + vec_bytes(&self.free),
+        )
+    }
 }
 
 impl<T: Hash + Eq + Clone, U: Clone> AggState<T, U> {

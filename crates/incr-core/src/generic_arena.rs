@@ -202,6 +202,11 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         self.slot(slot)?.try_read()
     }
 
+    /// [`ValueSlot::filled_bytes`] of `slot`, `None` past the arena.
+    pub(crate) fn filled_bytes(&self, slot: u32) -> Option<usize> {
+        self.slot(slot)?.filled_bytes()
+    }
+
     /// [`Self::try_read`] with `missing` run in place of `None`.
     #[inline(always)]
     pub fn read_or(&self, slot: u32, missing: impl FnOnce() -> T) -> T {

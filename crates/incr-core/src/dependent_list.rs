@@ -443,6 +443,24 @@ impl DependentList {
         self.has_block() && !unsafe { (*self.block()).index }.is_null()
     }
 
+    /// The bytes of the list's heap block and index, 0 when inline.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        if !self.has_block() {
+            return 0;
+        }
+        let block = self.block();
+        // SAFETY: a non-null block is live.
+        let (cap, index) = unsafe { ((*block).cap as usize, (*block).index) };
+        let index_bytes = if index.is_null() {
+            0
+        } else {
+            // SAFETY: a non-null index is live while its block is.
+            crate::memory::table_bytes::<(u32, u32)>(unsafe { (*index).capacity() })
+                + std::mem::size_of::<Index>()
+        };
+        Self::layout(cap).size() + index_bytes
+    }
+
     /// Whether the list holds a heap block.
     pub(crate) fn has_block(&self) -> bool {
         !self.is_inline() && !self.block().is_null()

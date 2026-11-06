@@ -1648,6 +1648,9 @@ pub struct Runtime<C: Cells> {
     /// one concurrent with the note may miss it either way.
     failed_past: std::sync::atomic::AtomicU64,
     regens: C::Lock<replay_impl::Regens>,
+    /// Collection and operator state, for [`Self::memory_stats`]. Written
+    /// only when state is created, read only by the walk.
+    pub(crate) states: C::Lock<crate::memory::StateRegistry>,
     /// Set once `regens` holds a record, so a delete looks for one only then.
     regens_held: std::sync::atomic::AtomicBool,
     /// Run landings of the nodes whose cycle verdict a read may have
@@ -1851,6 +1854,7 @@ impl<C: Cells> Runtime<C> {
             tickets_held: std::sync::atomic::AtomicBool::new(false),
             failed_past: std::sync::atomic::AtomicU64::new(0),
             regens: replay_impl::regens::<C>(),
+            states: crate::locks::Lock::new(crate::memory::StateRegistry::new()),
             regens_held: std::sync::atomic::AtomicBool::new(false),
             verdict_watch: cycle_impl::verdict_watch::<C>(),
             watching: C::new_u32(0),

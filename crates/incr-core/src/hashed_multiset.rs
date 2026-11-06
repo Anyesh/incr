@@ -175,9 +175,16 @@ impl<T> HashedMultiset<T> {
     }
 
     /// Number of distinct elements.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// The bytes of the table's allocation.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self.table.capacity {
+            0 => 0,
+            capacity => Table::<T>::layout(capacity).0.size(),
+        }
     }
 
     /// Distinct elements with their multiplicities, in table order.

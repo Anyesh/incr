@@ -47,6 +47,7 @@ pub mod loom_cells;
 mod loom_models;
 #[cfg(all(test, loom))]
 mod loom_seed_models;
+pub mod memory;
 pub mod node;
 mod notes;
 #[doc(hidden)]
@@ -86,6 +87,9 @@ pub use generic_arena::GenericArena;
 pub use grid_table::{GridKey, GridTable};
 pub use handle::{ErasedIncr, Incr, RuntimeId};
 pub use locks::{LocalLock, Lock};
+pub use memory::{
+    Held, MemoryStats, NodeKind, NodeMemory, StateKind, StateMemory, StateStats, ValueType,
+};
 pub use node::{NodeData, NodeId};
 pub use runtime::{DeleteError, ObserverId, Runtime, DEFAULT_MAX_FRAMES};
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
@@ -104,3 +108,5 @@ pub(crate) mod child_test;
 
 #[cfg(test)]
 mod child_selftest;
+#[cfg(test)]
+mod memory_tests;
