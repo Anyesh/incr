@@ -84,7 +84,8 @@ trait OnRuntime {
     /// [`engine_call`] on this object's runtime, which `f` receives.
     fn engine_call<R>(&self, py: Python<'_>, f: impl FnOnce(&Runtime) -> R) -> PyResult<R> {
         let rt = self.runtime().bind(py).borrow();
-        engine_call(&rt.inner, || f(&rt.inner))
+        let rt = rt.rt()?;
+        engine_call(rt, || f(rt))
     }
 }
 
@@ -485,8 +486,9 @@ impl PyCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
-        let rt = self.rt.bind(py).borrow();
-        engine_call(&rt.inner, || rt.version_bridge(self.inner.version_node()))
+        let this = self.rt.bind(py).borrow();
+        let rt = this.rt()?;
+        engine_call(rt, || this.version_bridge(rt, self.inner.version_node()))
     }
 }
 
@@ -558,8 +560,9 @@ impl PySortedCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
-        let rt = self.rt.bind(py).borrow();
-        engine_call(&rt.inner, || rt.version_bridge(self.inner.version_node()))
+        let this = self.rt.bind(py).borrow();
+        let rt = this.rt()?;
+        engine_call(rt, || this.version_bridge(rt, self.inner.version_node()))
     }
 }
 
@@ -601,32 +604,53 @@ impl PyGroupedCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
-        let rt = self.rt.bind(py).borrow();
-        engine_call(&rt.inner, || rt.version_bridge(self.inner.version_node()))
+        let this = self.rt.bind(py).borrow();
+        let rt = this.rt()?;
+        engine_call(rt, || this.version_bridge(rt, self.inner.version_node()))
     }
 }
 
 #[pyclass(name = "Runtime", unsendable)]
 struct PyRuntime {
-    inner: Runtime,
+    holder: Holder,
     /// The query each collection's `version_node` getter hands out,
     /// keyed by the collection's internal version node, so repeated
     /// access and every wrapper of one collection share a single node.
     version_bridges: RefCell<HashMap<Incr<u64>, Incr<PyValue>>>,
 }
 
+enum Holder {
+    Owned(Runtime),
+    Closed,
+}
+
 impl PyRuntime {
+    fn rt(&self) -> PyResult<&Runtime> {
+        match &self.holder {
+            Holder::Owned(rt) => Ok(rt),
+            Holder::Closed => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "runtime is closed",
+            )),
+        }
+    }
+
+    /// [`engine_call`] on this runtime, which `f` receives.
+    fn engine_call<R>(&self, f: impl FnOnce(&Runtime) -> R) -> PyResult<R> {
+        let rt = self.rt()?;
+        engine_call(rt, || f(rt))
+    }
+
     /// The Python-visible node mirroring `version`. Created on first use
     /// and again only if the user deleted the previous one, whose handle
     /// then stays stale like any deleted node's.
-    fn version_bridge(&self, version: Incr<u64>) -> PyNodeId {
+    fn version_bridge(&self, rt: &Runtime, version: Incr<u64>) -> PyNodeId {
         let mut bridges = self.version_bridges.borrow_mut();
         if let Some(&bridge) = bridges.get(&version) {
-            if self.inner.is_alive(bridge) {
+            if rt.is_alive(bridge) {
                 return PyNodeId { inner: bridge };
             }
         }
-        let bridge = self.inner.create_query(move |rt| -> PyValue {
+        let bridge = rt.create_query(move |rt| -> PyValue {
             let n: u64 = rt.get(version);
             Python::attach(|py| PyValue(n.into_pyobject(py).unwrap().into_any().unbind()))
         });
@@ -640,35 +664,56 @@ impl PyRuntime {
     #[new]
     fn new() -> Self {
         PyRuntime {
-            inner: Runtime::new(),
+            holder: Holder::Owned(Runtime::new()),
             version_bridges: RefCell::new(HashMap::new()),
         }
     }
 
+    /// Drop the engine and everything it holds: values, closures and the
+    /// Python objects they capture. Every later call on this runtime or an
+    /// object derived from it raises. Refused while a call on it is running.
+    fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let (holder, bridges) = {
+            let mut this = slf.try_borrow_mut().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "cannot close the runtime while a call on it is running",
+                )
+            })?;
+            let holder = std::mem::replace(&mut this.holder, Holder::Closed);
+            let bridges = std::mem::take(this.version_bridges.get_mut());
+            (holder, bridges)
+        };
+        // Dropped after the borrow ends, so a finalizer that calls back into
+        // this runtime sees it closed instead of a held borrow.
+        drop(bridges);
+        drop(holder);
+        Ok(())
+    }
+
     fn create_input(&self, value: Py<PyAny>) -> PyResult<PyNodeId> {
-        let node = engine_call(&self.inner, || self.inner.create_input(PyValue(value)))?;
+        let node = self.engine_call(|rt| rt.create_input(PyValue(value)))?;
         Ok(PyNodeId { inner: node })
     }
 
     fn get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
-        let val: PyValue = engine_call(&self.inner, || self.inner.get(node.inner))?;
+        let val: PyValue = self.engine_call(|rt| rt.get(node.inner))?;
         Ok(val.0)
     }
 
     /// Like `get`, but a cycle that leaves the node without a value raises
     /// `CycleError` as an ordinary exception.
     fn try_get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
-        try_read::<Exc>(engine_call(&self.inner, || self.inner.try_get(node.inner))?)
+        try_read::<Exc>(self.engine_call(|rt| rt.try_get(node.inner))?)
     }
 
     fn set(&self, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.set(node.inner, PyValue(value)))
+        self.engine_call(|rt| rt.set(node.inner, PyValue(value)))
     }
 
     /// Delete a node and recycle its slot. Every surviving handle to it
     /// raises on use. The node must have no dependents.
     fn delete_node(&self, node: PyNodeId) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.delete_node(node.inner))
+        self.engine_call(|rt| rt.delete_node(node.inner))
     }
 
     /// Delete the node, every node that depends on it (transitively)
@@ -676,38 +721,35 @@ impl PyRuntime {
     /// nodes were deleted; 0 if the node was already gone. A query that
     /// has never run is not reached, and raises as stale on first use.
     fn delete_with_dependents(&self, node: PyNodeId) -> PyResult<usize> {
-        engine_call(&self.inner, || {
-            self.inner.delete_with_dependents(node.inner)
-        })
+        self.engine_call(|rt| rt.delete_with_dependents(node.inner))
     }
 
     /// True while the node exists in this runtime. False after it is
     /// deleted, and for a node from another runtime.
     fn is_alive(&self, node: PyNodeId) -> PyResult<bool> {
-        engine_call(&self.inner, || self.inner.is_alive(node.inner))
+        self.engine_call(|rt| rt.is_alive(node.inner))
     }
 
     /// Report the node through `drain_dirtied_watched()` whenever a change
     /// moves it off Clean. A node that has no current value when watched
     /// is reported at once.
     fn watch(&self, node: PyNodeId) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.watch(node.inner))
+        self.engine_call(|rt| rt.watch(node.inner))
     }
 
     /// Stop reporting the node, and drop its pending report.
     fn unwatch(&self, node: PyNodeId) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.unwatch(node.inner))
+        self.engine_call(|rt| rt.unwatch(node.inner))
     }
 
     /// The watched nodes a change moved off Clean since the last drain,
     /// each once, in the order the changes reached them. A node deleted
     /// since is left out.
     fn drain_dirtied_watched(&self) -> PyResult<Vec<PyNodeId>> {
-        engine_call(&self.inner, || {
-            self.inner
-                .drain_dirtied_watched()
+        self.engine_call(|rt| {
+            rt.drain_dirtied_watched()
                 .into_iter()
-                .filter_map(|h| self.inner.typed_handle::<PyValue>(h))
+                .filter_map(|h| rt.typed_handle::<PyValue>(h))
                 .map(|inner| PyNodeId { inner })
                 .collect()
         })
@@ -716,8 +758,8 @@ impl PyRuntime {
     /// Register `callback` to fire on `stabilize()` whenever the node's
     /// value changed since the last firing.
     fn observe(&self, node: PyNodeId, callback: Py<PyAny>) -> PyResult<PyObserverId> {
-        let id = engine_call(&self.inner, || {
-            self.inner.observe(node.inner, move |v: &PyValue| {
+        let id = self.engine_call(|rt| {
+            rt.observe(node.inner, move |v: &PyValue| {
                 Python::attach(|py| {
                     call_stashing(py, &callback, (v.0.clone_ref(py),));
                 });
@@ -727,13 +769,13 @@ impl PyRuntime {
     }
 
     fn unobserve(&self, id: PyObserverId) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.unobserve(id.inner))
+        self.engine_call(|rt| rt.unobserve(id.inner))
     }
 
     /// Bring observed nodes up to date and fire callbacks for changed
     /// values.
     fn stabilize(&self) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.stabilize())
+        self.engine_call(|rt| rt.stabilize())
     }
 
     /// A query computing `py_func(runtime_ref)`. `fallback(ids)` or a
@@ -750,12 +792,12 @@ impl PyRuntime {
     ) -> PyResult<PyNodeId> {
         let opts = query_opts(py, fallback, fixpoint, replay)?;
         let f = query_fn(py_func);
-        let node = engine_call(&self.inner, || self.inner.create_query_with(f, opts))?;
+        let node = self.engine_call(|rt| rt.create_query_with(f, opts))?;
         Ok(PyNodeId { inner: node })
     }
 
     fn create_table(slf: PyRef<'_, Self>) -> PyResult<PyNodeTable> {
-        let table = engine_call(&slf.inner, || slf.inner.create_table::<PyValue, PyValue>())?;
+        let table = slf.engine_call(|rt| rt.create_table::<PyValue, PyValue>())?;
         let rt: Py<PyRuntime> = slf.into();
         Ok(PyNodeTable { inner: table, rt })
     }
@@ -763,38 +805,36 @@ impl PyRuntime {
     /// The value a replayed read returns in place of the node it wanted.
     /// Set once per runtime.
     fn set_placeholder(&self, value: Py<PyAny>) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.set_placeholder(PyValue(value)))
+        self.engine_call(|rt| rt.set_placeholder(PyValue(value)))
     }
 
     /// The frame budget past which a replayable query's read replays.
     fn set_max_frames(&self, n: u32) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.set_max_frames(n))
+        self.engine_call(|rt| rt.set_max_frames(n))
     }
 
     /// A stack budget in bytes beside the frame budget; 0 turns it off.
     fn set_max_stack_bytes(&self, n: usize) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.set_max_stack_bytes(n))
+        self.engine_call(|rt| rt.set_max_stack_bytes(n))
     }
 
     fn create_collection(slf: PyRef<'_, Self>) -> PyResult<PyCollection> {
-        let col = engine_call(&slf.inner, || slf.inner.create_collection::<PyValue>())?;
+        let col = slf.engine_call(|rt| rt.create_collection::<PyValue>())?;
         let rt: Py<PyRuntime> = slf.into();
         Ok(PyCollection { inner: col, rt })
     }
 
     fn set_label(&self, node: PyNodeId, label: String) -> PyResult<()> {
-        engine_call(&self.inner, || {
-            self.inner.set_label(node.inner.slot(), label)
-        })
+        self.engine_call(|rt| rt.set_label(node.inner.slot(), label))
     }
 
     fn set_label_by_id(&self, id: u32, label: String) -> PyResult<()> {
-        engine_call(&self.inner, || self.inner.set_label(id, label))
+        self.engine_call(|rt| rt.set_label(id, label))
     }
 
     fn get_traced(&self, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let (val, trace): (PyValue, PropagationTrace) =
-            engine_call(&self.inner, || self.inner.get_traced(node.inner))?;
+            self.engine_call(|rt| rt.get_traced(node.inner))?;
         Python::attach(|py| {
             let trace_dict = pyo3::types::PyDict::new(py);
             trace_dict.set_item("target", trace.target.0)?;
@@ -828,7 +868,7 @@ impl PyRuntime {
     }
 
     fn graph_snapshot(&self) -> PyResult<Py<PyAny>> {
-        let infos = engine_call(&self.inner, || self.inner.graph_snapshot())?;
+        let infos = self.engine_call(|rt| rt.graph_snapshot())?;
         Python::attach(|py| {
             let result = pyo3::types::PyList::empty(py);
             for info in &infos {
@@ -853,7 +893,7 @@ impl PyRuntime {
     }
 
     fn node_count(&self) -> PyResult<usize> {
-        engine_call(&self.inner, || self.inner.node_count())
+        self.engine_call(|rt| rt.node_count())
     }
 }
 
