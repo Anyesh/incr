@@ -772,7 +772,7 @@ impl<C: Cells> Runtime<C> {
         }
         for &slot in given {
             let (_, flags) = self.nodes.get_with_flags(slot);
-            self.mark_dependents_dirty(NodeId(slot), flags);
+            self.mark_dependents_dirty(NodeId(slot), flags, &mut false);
         }
     }
 

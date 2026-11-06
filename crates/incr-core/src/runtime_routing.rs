@@ -447,13 +447,12 @@ impl<C: Cells> Runtime<C> {
     /// a router's run also notes it on that router's list (`Shared`).
     #[cold]
     #[inline(never)]
-    pub(super) fn queue_eager(&self, id: NodeId, node: &NodeData<C>, in_walk: bool) -> bool {
+    pub(super) fn queue_eager(&self, id: NodeId, node: &NodeData<C>, in_walk: bool) {
         let router = (id.0, node.generation());
         queue(self.runtime_id, router);
         if !C::SINGLE_THREADED && in_walk {
             self.note_in_running_router(router);
         }
-        true
     }
 
     fn note_in_running_router(&self, dirtied: Router) {

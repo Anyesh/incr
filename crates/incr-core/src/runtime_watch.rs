@@ -194,17 +194,18 @@ impl<C: Cells> Runtime<C> {
 
     /// Queue `id`, which a walk found watched under its `inner` hold: a
     /// router for routing, and for the user only if the user watches it.
-    /// Returns whether it queued a router.
+    /// Sets `routers` if it queued a router.
     #[cold]
     #[inline(never)]
-    pub(super) fn enqueue_watched(&self, id: NodeId, node: &NodeData<C>) -> bool {
+    pub(super) fn enqueue_watched(&self, id: NodeId, node: &NodeData<C>, routers: &mut bool) {
         let bits = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1);
         if !is_eager(bits) {
             self.watch_queue.write().push(id.0, node.generation());
-            return false;
+            return;
         }
         self.report_router(id, node);
-        self.queue_eager(id, node, true)
+        self.queue_eager(id, node, true);
+        *routers = true;
     }
 
     fn report_router(&self, id: NodeId, node: &NodeData<C>) {

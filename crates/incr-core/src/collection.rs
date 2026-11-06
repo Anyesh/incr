@@ -603,6 +603,15 @@ fn release_each<T: Hash + Eq + Clone, C: Cells, const N: usize>(
     }
 }
 
+/// `publish`'s path for a set that queued a router, kept out of line so a
+/// set that queued none holds no flag across `dispose`.
+#[cold]
+#[inline(never)]
+fn dispose_then_route<D, C: Cells>(rt: &Runtime<C>, displaced: D, dispose: impl FnOnce(D)) {
+    dispose(displaced);
+    rt.route_queued();
+}
+
 /// Set when a user panic stopped an operator part-way through a batch,
 /// leaving its state and output logs partly updated. The operator's next
 /// run rebuilds from upstream snapshots instead of applying deltas, and
@@ -913,12 +922,13 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         dispose: impl FnOnce(Displaced<T, N>),
     ) -> bool {
         let committed = change(&mut self.log.write());
-        let routers = committed
+        if committed
             .version
-            .is_some_and(|version| rt.set_unrouted(self.version_node, version));
-        dispose(committed.displaced);
-        if routers {
-            rt.route_queued();
+            .is_some_and(|version| rt.set_unrouted(self.version_node, version))
+        {
+            dispose_then_route(rt, committed.displaced, dispose);
+        } else {
+            dispose(committed.displaced);
         }
         committed.removed
     }
