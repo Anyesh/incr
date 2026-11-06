@@ -526,6 +526,8 @@ const LOOKED_UP_UNRECORDED: u8 = 4;
 const STASH_READ: u8 = 8;
 /// [`ComputeCtl::marks`]: see [`ComputeCtl::spec_unchecked`].
 const SPEC_UNCHECKED: u8 = 16;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::cut_short`].
+const CUT_SHORT: u8 = 32;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -539,8 +541,8 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
-    /// `PATH_KEPT`, `READS_COUNTED`, `LOOKED_UP_UNRECORDED`, `STASH_READ`
-    /// and `SPEC_UNCHECKED`, which only get set.
+    /// `PATH_KEPT`, `READS_COUNTED`, `LOOKED_UP_UNRECORDED`, `STASH_READ`,
+    /// `SPEC_UNCHECKED` and `CUT_SHORT`, which only get set.
     marks: Cell<u8>,
     /// The frame's dep count at its last read that could unwind into it:
     /// a dep past it was read after.
@@ -638,6 +640,18 @@ impl ComputeCtl {
 
     pub(crate) fn mark_spec_unchecked(&self) {
         self.marks.set(self.marks.get() | SPEC_UNCHECKED);
+    }
+
+    /// Whether the closure said its run stopped before reaching every
+    /// child it would have asked for, so a Clean landing keeps the
+    /// children the run did not touch.
+    #[inline]
+    pub(crate) fn cut_short(&self) -> bool {
+        self.marks.get() & CUT_SHORT != 0
+    }
+
+    pub(crate) fn mark_cut_short(&self) {
+        self.marks.set(self.marks.get() | CUT_SHORT);
     }
 
     /// Whether a `BUFFERED` frame made a lookup that records no dep, which

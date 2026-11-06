@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::changes::Count;
-use crate::cycle::{Cycle, Erased, ErasedStrategy};
+use crate::cycle::{ComputeCtl, Cycle, Erased, ErasedStrategy};
 use crate::deferred::Unbuilt;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
@@ -115,8 +115,8 @@ pub(crate) struct Held {
     /// landing installs them all.
     installed: Vec<NodeId>,
     pub(crate) wrote: bool,
-    /// The last run reached the node's child index.
-    opened: bool,
+    /// How far the last run got with the node's children.
+    reach: RunReach,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
     /// The `POISONED` and `HANDLED` flags of the runs' frames.
@@ -136,6 +136,24 @@ pub(crate) struct Held {
     /// None until speculation writes, reads or sets a value of the claim,
     /// so a thread without a budget checks one pointer.
     spec: Option<Box<Spec>>,
+}
+
+/// How far a member run got with its node's children.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct RunReach {
+    /// The run reached the child index.
+    opened: bool,
+    /// See [`ComputeCtl::cut_short`].
+    cut_short: bool,
+}
+
+impl RunReach {
+    pub(crate) fn of(ctl: &ComputeCtl) -> Self {
+        Self {
+            opened: !ctl.children.get().is_null(),
+            cut_short: ctl.cut_short(),
+        }
+    }
 }
 
 /// What speculation left on a claim.
@@ -182,7 +200,7 @@ impl Held {
             last: Vec::new(),
             installed: Vec::new(),
             wrote: false,
-            opened: false,
+            reach: RunReach::default(),
             changed: false,
             poison: 0,
             failed: false,
@@ -194,8 +212,8 @@ impl Held {
         }
     }
 
-    /// Records a finished run: its deps, buffer, whether it reached the
-    /// child index and its frame's `POISONED` and `HANDLED` flags
+    /// Records a finished run: its deps, buffer, how far it got with its
+    /// children and its frame's `POISONED` and `HANDLED` flags
     /// (`poison`). Under speculation it first
     /// keeps the record it replaces, and no look adopts the run; outside,
     /// it settles first. Returns
@@ -206,7 +224,7 @@ impl Held {
         look: Look,
         deps: Vec<(NodeId, u32)>,
         buf: Option<Erased>,
-        opened: bool,
+        reach: RunReach,
         poison: u16,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
@@ -225,7 +243,7 @@ impl Held {
             }
         }
         self.last = deps;
-        self.opened = opened;
+        self.reach = reach;
         self.poison |= poison;
         (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
@@ -239,12 +257,12 @@ impl Held {
         &mut self,
         deps: Vec<(NodeId, u32)>,
         buf: Option<Erased>,
-        opened: bool,
+        reach: RunReach,
         poison: u16,
         basis: Basis,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let earlier = self.pre_spec_mut().map(|r| r.basis.take());
-        let out = self.record(Look::SPECULATIVE, deps, buf, opened, poison);
+        let out = self.record(Look::SPECULATIVE, deps, buf, reach, poison);
         self.keep_record().basis = match earlier {
             None => Some(basis),
             Some(Some(mut kept)) => {
@@ -376,7 +394,7 @@ impl Held {
             deps: self.deps.clone(),
             last: self.last.clone(),
             installed: self.installed.clone(),
-            opened: self.opened,
+            reach: self.reach,
             poison: self.poison,
             basis: None,
         })
@@ -407,7 +425,7 @@ impl Held {
         self.deps = r.deps;
         self.last = r.last;
         self.installed = r.installed;
-        self.opened = r.opened;
+        self.reach = r.reach;
         self.poison = r.poison;
         self.buf
             .take()
@@ -484,7 +502,11 @@ impl<H: Borrow<Held>> Seen<H> {
     }
 
     pub(crate) fn opened(&self) -> bool {
-        self.0.borrow().opened
+        self.0.borrow().reach.opened
+    }
+
+    pub(crate) fn cut_short(&self) -> bool {
+        self.0.borrow().reach.cut_short
     }
 
     /// The runs' `POISONED` and `HANDLED` flags: either lands Dirty.
@@ -568,7 +590,7 @@ struct RunRecord {
     deps: Vec<(NodeId, u32)>,
     last: Vec<(NodeId, u32)>,
     installed: Vec<NodeId>,
-    opened: bool,
+    reach: RunReach,
     poison: u16,
     /// What the speculative runs since read, if they read only real state:
     /// a look outside speculation adopts them while all of it is unchanged.

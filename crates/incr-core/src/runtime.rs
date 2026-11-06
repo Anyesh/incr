@@ -6936,7 +6936,7 @@ impl<C: Cells> Runtime<C> {
             let landing = if discard {
                 ChildLanding::Discard
             } else if target == NodeState::Clean && !run.has(cycle::DOOMED) {
-                ChildLanding::Sweep
+                ChildLanding::clean(run.cut_short())
             } else {
                 ChildLanding::Keep
             };

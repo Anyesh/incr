@@ -26,6 +26,19 @@ pub(crate) enum ChildLanding {
     Stashed,
 }
 
+impl ChildLanding {
+    /// A Clean landing's choice: a sweep, unless the run was cut short
+    /// ([`Runtime::keep_untouched_children`]).
+    #[inline]
+    pub(crate) fn clean(cut_short: bool) -> Self {
+        if cut_short {
+            Self::Keep
+        } else {
+            Self::Sweep
+        }
+    }
+}
+
 impl<C: Cells> Runtime<C> {
     /// The input child named `key` of the compute running on this
     /// runtime, created with `init()` and owned by that compute's node
@@ -107,6 +120,26 @@ impl<C: Cells> Runtime<C> {
         let child = self.create_query_erased::<false, _, _>(f, opts());
         self.attach_child::<K, T, true>(creator, ctl, key, child.erase());
         child
+    }
+
+    /// Marks the running compute's run as cut short: it stopped before
+    /// asking for every child it would have, so its landing keeps the
+    /// children it did not touch, as a landing Dirty does, instead of
+    /// deleting them. The next run that lands Clean unmarked sweeps as
+    /// usual. A rerun that regenerates a payload lands nothing, so the
+    /// call does nothing there.
+    ///
+    /// Panics outside a compute of this runtime.
+    pub fn keep_untouched_children(&self) {
+        if value_code::checked_word() & value_code::REGEN_BIT != 0 {
+            return;
+        }
+        let Some((_, ctl)) = self.dep_stack.active_compute(self.runtime_id) else {
+            panic!("incr-core: keep_untouched_children called outside a compute");
+        };
+        // SAFETY: the control block of the active frame is live while the
+        // frame is on the stack, which outlasts this call.
+        unsafe { &*ctl }.mark_cut_short();
     }
 
     /// The node and control block of this runtime's running compute.

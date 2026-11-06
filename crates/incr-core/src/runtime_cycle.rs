@@ -18,7 +18,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
-use crate::cycle_state::{Basis, Episode, Held, HeldMap, Look, Round, Seen, Step};
+use crate::cycle_state::{Basis, Episode, Held, HeldMap, Look, Round, RunReach, Seen, Step};
 use crate::deferred::Unbuilt;
 use crate::locks::Lock;
 use crate::{attempt, hold, reserve, set_stack, waits};
@@ -1272,11 +1272,10 @@ impl<C: Cells> Runtime<C> {
             let e = h
                 .recording(&(rt, slot), look)
                 .expect("incr-core: a member run's node is held");
-            let (buf, opened, poison) =
-                (ctl.buf.take(), !ctl.children.get().is_null(), ctl.poison());
+            let (buf, reach, poison) = (ctl.buf.take(), RunReach::of(&ctl), ctl.poison());
             let out = match basis {
-                Some(basis) => e.record_with_basis(deps, buf, opened, poison, basis),
-                None => e.record(look, deps, buf, opened, poison),
+                Some(basis) => e.record_with_basis(deps, buf, reach, poison, basis),
+                None => e.record(look, deps, buf, reach, poison),
             };
             e.hold |= ctl.has(cycle::HOLD);
             // An engine unwind is no fault of the member's.
@@ -1397,7 +1396,7 @@ impl<C: Cells> Runtime<C> {
             Look::here(),
             deps,
             ctl.buf.take(),
-            !ctl.children.get().is_null(),
+            RunReach::of(ctl),
             ctl.poison(),
         );
         debug_assert!(
@@ -2662,7 +2661,7 @@ impl<C: Cells> Runtime<C> {
             let (target, children) = if published == Publish::Superseded || poison != 0 {
                 (NodeState::Dirty, ChildLanding::Keep)
             } else {
-                (NodeState::Clean, ChildLanding::Sweep)
+                (NodeState::Clean, ChildLanding::clean(e.cut_short()))
             };
             self.children_landing(id, flags, children, e.opened(), bag);
             // The run computed the node alone, as the frame's run in the
@@ -2980,7 +2979,7 @@ impl<C: Cells> Runtime<C> {
             // discarded; the others keep the children of their last run,
             // which is the final pass.
             let children = match target {
-                NodeState::Clean => ChildLanding::Sweep,
+                NodeState::Clean => ChildLanding::clean(e.cut_short()),
                 NodeState::Dirty => ChildLanding::Keep,
                 _ => ChildLanding::Discard,
             };

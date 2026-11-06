@@ -934,3 +934,75 @@ fn shared_children_value_code_read_spins_through_a_rollback() {
     assert!(!rt.is_alive(held) && !rt.is_alive(busy));
     rt.assert_invariant_i();
 }
+
+/// A run that calls `keep_untouched_children` keeps the children it did
+/// not reach; the next Clean run that does not mark itself sweeps them.
+fn cut_short_run_keeps_children<C: Cells>(rt: &Runtime<C>) {
+    let mode = rt.create_input(0_u8);
+    let creator = rt.create_query(move |rt| match rt.get(mode) {
+        0 => Some(rt.child_input(0_u64, || 7_u64)),
+        1 => {
+            rt.keep_untouched_children();
+            None
+        }
+        _ => None,
+    });
+    let child = rt.get(creator).unwrap();
+    rt.set(child, 8);
+    rt.set(mode, 1);
+    assert_eq!(rt.get(creator), None);
+    assert_eq!(rt.state_of(creator), NodeState::Clean);
+    assert!(rt.is_alive(child), "the cut-short run kept its child");
+    rt.set(mode, 0);
+    assert_eq!(rt.get(creator), Some(child));
+    assert_eq!(rt.get(child), 8);
+    rt.set(mode, 1);
+    assert_eq!(rt.get(creator), None);
+    rt.set(mode, 2);
+    assert_eq!(rt.get(creator), None);
+    assert!(!rt.is_alive(child), "an unmarked Clean run swept it");
+    rt.assert_invariant_i();
+}
+local_and_shared!(
+    cut_short_run_keeps_children,
+    local_children_cut_short_run_keeps_children,
+    shared_children_cut_short_run_keeps_children
+);
+
+/// A fixpoint member whose final pass marks itself cut short keeps the
+/// children of its earlier passes.
+fn cut_short_final_pass_keeps_children<C: Cells>(rt: &Runtime<C>) {
+    let me: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let made: Made = Arc::default();
+    let q = {
+        let (me, made) = (me.clone(), made.clone());
+        rt.create_query_with(
+            move |rt| {
+                let v = rt.get(*me.get().unwrap());
+                if v < 3 {
+                    made.lock().unwrap().push(rt.child_input(v, move || v));
+                } else {
+                    rt.keep_untouched_children();
+                }
+                (v + 1).min(3)
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_u64)),
+                ..Default::default()
+            },
+        )
+    };
+    me.set(q).unwrap();
+    assert_eq!(rt.get(q), 3);
+    let made = made.lock().unwrap();
+    assert!(!made.is_empty());
+    for &k in made.iter() {
+        assert!(rt.is_alive(k), "the cut-short final pass kept its children");
+    }
+    rt.assert_invariant_i();
+}
+local_and_shared!(
+    cut_short_final_pass_keeps_children,
+    local_children_cut_short_final_pass_keeps_children,
+    shared_children_cut_short_final_pass_keeps_children
+);

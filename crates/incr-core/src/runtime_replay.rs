@@ -1034,7 +1034,7 @@ impl<C: Cells> Runtime<C> {
         };
         if let Some(index) = a.stash.index {
             let landing = if target == NodeState::Clean {
-                ChildLanding::Sweep
+                ChildLanding::clean(index.cut_short)
             } else {
                 ChildLanding::Keep
             };
@@ -1181,6 +1181,7 @@ impl<C: Cells> Runtime<C> {
         (C::u8_load_relaxed(flags) & HAS_INDEX != 0).then(|| StashedIndex {
             epoch: self.index_at(id).with(|s| s.epoch),
             opened: !ctl.children.get().is_null(),
+            cut_short: ctl.cut_short(),
         })
     }
 
@@ -6510,7 +6511,8 @@ impl ForeignReads {
 }
 
 /// The child index of a creator whose run is stashed: the index's run
-/// number, and whether the run reached it. Children the run created stay
+/// number, whether the run reached it and whether it was cut short.
+/// Children the run created stay
 /// the claim in progress's until the adoption sweeps or keeps them, or the
 /// stash's drop discards them; a later run that opens the index takes them
 /// over instead.
@@ -6518,6 +6520,7 @@ impl ForeignReads {
 struct StashedIndex {
     epoch: u64,
     opened: bool,
+    cut_short: bool,
 }
 
 enum Outcome {
