@@ -9,6 +9,7 @@ use incr_python_protocol::notready::{
     incomplete, status, unavailable, with_missing, PyIncomplete, PyUnavailable, Status,
 };
 use incr_python_protocol::or_stash;
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
@@ -192,4 +193,27 @@ pub(crate) fn pair(py: Python<'_>, left: &Py<PyAny>, right: &Py<PyAny>) -> Py<Py
         (Wrap::Ready, Wrap::Ready) => Wrap::Ready,
     };
     rewrap(py, rows, wrap)
+}
+
+/// A `pairwise` or `window` output holding `elements`: `output` itself, or
+/// `Unavailable` with `output` as its row when an element is not ready, so
+/// a total over the outputs counts it missing.
+#[inline]
+pub(crate) fn sequence<'a>(
+    py: Python<'_>,
+    output: Py<PyAny>,
+    mut elements: impl Iterator<Item = &'a Py<PyAny>>,
+) -> Py<PyAny> {
+    if elements.all(|e| is_ready(e.bind(py))) {
+        output
+    } else {
+        holding_not_ready(py, output)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn holding_not_ready(py: Python<'_>, output: Py<PyAny>) -> Py<PyAny> {
+    let reason = intern!(py, "contains a not-ready element").clone();
+    or_stash(unavailable(py, reason.into_any().unbind(), output))
 }

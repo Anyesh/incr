@@ -807,7 +807,11 @@ impl PySortedCollection {
                         &[pair.0 .0.clone_ref(py), pair.1 .0.clone_ref(py)],
                     )
                     .unwrap();
-                    PyValue(tuple.into_any().unbind())
+                    PyValue(elements::sequence(
+                        py,
+                        tuple.into_any().unbind(),
+                        [&pair.0 .0, &pair.1 .0].into_iter(),
+                    ))
                 })
             })
         })?;
@@ -825,7 +829,11 @@ impl PySortedCollection {
                     let tuple =
                         pyo3::types::PyTuple::new(py, window.iter().map(|e| e.0.clone_ref(py)))
                             .unwrap();
-                    PyValue(tuple.into_any().unbind())
+                    PyValue(elements::sequence(
+                        py,
+                        tuple.into_any().unbind(),
+                        window.iter().map(|e| &e.0),
+                    ))
                 })
             })
         })?;

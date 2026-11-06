@@ -518,3 +518,47 @@ def test_a_creator_cut_short_by_a_pending_lookup_keeps_its_children():
     again, rate = rt.get(node)
     assert again == child and rate == 3
     assert rt.get(again) == 8
+
+
+def gap_total(outputs):
+    return outputs.aggregate(0, lambda w: w[-1][1] - w[0][1], lambda a, b: a + b)
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [lambda ordered: ordered.pairwise(), lambda ordered: ordered.window(2)],
+    ids=["pairwise", "window"],
+)
+def test_an_output_holding_a_not_ready_element_is_unavailable(outputs):
+    rt = Runtime()
+    rows = shifts(rt)
+    gaps = outputs(rows.sort_by_key(lambda row: row[1]))
+    total = gap_total(gaps)
+    assert rt.get_with_status(total) == (4, None)
+
+    quarantine(rows, ("ann", 4))
+    assert rt.status(total) == Incomplete(2, 1)
+    held = Unavailable("quarantined", row=("ann", 4))
+    unavailable = [
+        o
+        for o in gaps.sort_by_key(repr).snapshot()
+        if isinstance(o, Unavailable) and o.row[0] == held
+    ]
+    assert len(unavailable) == 1
+    assert unavailable[0].reason == "contains a not-ready element"
+
+    quarantine(rows, ("bob", 6))
+    assert rt.status(total) == Incomplete(0, 2)
+
+    rows.replace(Unavailable("quarantined", row=("bob", 6)), ("bob", 6))
+    rows.replace(held, ("ann", 4))
+    assert rt.get_with_status(total) == (4, None)
+
+
+def test_an_incomplete_element_makes_its_window_unavailable():
+    rt = Runtime()
+    rows = shifts(rt)
+    gaps = rows.sort_by_key(lambda row: row[1]).window(2)
+    total = gap_total(gaps)
+    rows.replace(("bob", 6), Incomplete(("bob", 6), 3))
+    assert rt.status(total) == Incomplete(0, 2)
