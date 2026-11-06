@@ -79,3 +79,24 @@ jobs:
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: maturin publish --skip-existing --manifest-path "$MANIFEST"
+
+  publish-pypi-aarch64:
+    name: Publish the Linux aarch64 incr-compute wheel to PyPI
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          maturin-version: v1.15.0
+          manylinux: "2_28"
+          args: --release --out dist --manifest-path crates/incr-python/Cargo.toml
+      - name: Publish
+        uses: PyO3/maturin-action@v1.51.0
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        with:
+          maturin-version: v1.15.0
+          command: upload
+          args: --skip-existing dist/*

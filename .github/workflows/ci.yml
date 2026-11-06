@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "ci/**"]
   pull_request:
     branches: [main]
 
@@ -322,6 +322,32 @@ jobs:
           pip install maturin pytest
           maturin develop --release --manifest-path crates/incr-python/Cargo.toml
           maturin develop --release --manifest-path crates/incr-concurrent-python/Cargo.toml
+          python -m pytest examples/tests/python/ -q
+
+  wheel-linux-aarch64:
+    name: Linux aarch64 wheels
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the incr-compute wheel
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          maturin-version: v1.15.0
+          manylinux: "2_28"
+          args: --release --out dist --manifest-path crates/incr-python/Cargo.toml
+      - name: Build the incr-concurrent wheel
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          maturin-version: v1.15.0
+          manylinux: "2_28"
+          args: --release --out dist --manifest-path crates/incr-concurrent-python/Cargo.toml
+      - run: |
+          python -m venv .wheel-venv
+          source .wheel-venv/bin/activate
+          pip install pytest dist/*.whl
           python -m pytest examples/tests/python/ -q
 
   clippy:
