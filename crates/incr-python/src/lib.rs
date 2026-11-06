@@ -962,14 +962,25 @@ struct PyRuntime {
     state: RtState,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one per runtime, and boxing would add a hop to every call"
-)]
+/// Boxed because `Runtime` is 64-byte aligned and Python aligns a
+/// pyclass object to 16 bytes.
 enum Holder {
-    Owned(Runtime),
+    Owned(Box<Runtime>),
     Closed,
 }
+
+const _: () = {
+    use std::mem::align_of;
+    assert!(align_of::<PyNodeId>() <= 16);
+    assert!(align_of::<PyObserverId>() <= 16);
+    assert!(align_of::<PyRuntimeRef>() <= 16);
+    assert!(align_of::<PyNodeTable>() <= 16);
+    assert!(align_of::<PyCollection>() <= 16);
+    assert!(align_of::<PyKeyedCollection>() <= 16);
+    assert!(align_of::<PySortedCollection>() <= 16);
+    assert!(align_of::<PyGroupedCollection>() <= 16);
+    assert!(align_of::<PyRuntime>() <= 16);
+};
 
 impl PyRuntime {
     fn rt(&self) -> PyResult<&Runtime> {
@@ -1017,7 +1028,7 @@ impl PyRuntime {
     #[new]
     fn new() -> Self {
         PyRuntime {
-            holder: Holder::Owned(Runtime::new()),
+            holder: Holder::Owned(Box::new(Runtime::new())),
             version_bridges: RefCell::new(HashMap::new()),
             state: RtState::default(),
         }

@@ -376,6 +376,17 @@ where
     Ok(QueryOpts { cycle, replay })
 }
 
+const _: () = {
+    use notready::*;
+    use std::mem::align_of;
+    assert!(align_of::<PyNotReady>() <= 16);
+    assert!(align_of::<PyPending>() <= 16);
+    assert!(align_of::<PyLookupFailed>() <= 16);
+    assert!(align_of::<PyUnavailable>() <= 16);
+    assert!(align_of::<PyIncomplete>() <= 16);
+    assert!(align_of::<PyFixpoint>() <= 16);
+};
+
 /// A fixed-point cycle strategy: every member starts at `initial()`, and
 /// iteration `k` gives it `step(previous, output, k)` (the output by
 /// default) until every member has `converged(previous, current)` (equal

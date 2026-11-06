@@ -649,6 +649,18 @@ struct PyRuntime {
     bridges: Arc<VersionBridges>,
 }
 
+const _: () = {
+    use std::mem::align_of;
+    assert!(align_of::<PyNodeId>() <= 16);
+    assert!(align_of::<PyObserverId>() <= 16);
+    assert!(align_of::<PyRuntimeRef>() <= 16);
+    assert!(align_of::<PyNodeTable>() <= 16);
+    assert!(align_of::<PyCollection>() <= 16);
+    assert!(align_of::<PySortedCollection>() <= 16);
+    assert!(align_of::<PyGroupedCollection>() <= 16);
+    assert!(align_of::<PyRuntime>() <= 16);
+};
+
 #[pymethods]
 impl PyRuntime {
     #[new]
