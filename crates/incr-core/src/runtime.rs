@@ -3017,6 +3017,19 @@ impl<C: Cells> Runtime<C> {
         ))
     }
 
+    /// The handle of the live node at `id`'s slot, at the slot's current
+    /// generation: `None` for a dead slot or one this runtime never
+    /// allocated. A slot from a trace or snapshot that was since deleted
+    /// and reused names the new occupant.
+    pub fn erased_handle(&self, id: NodeId) -> Option<ErasedIncr> {
+        self.dep_stack.unrecorded_lookup();
+        if id.0 >= self.nodes.len() {
+            return None;
+        }
+        let handle = self.erased_at(id.0);
+        self.alive(handle).then_some(handle)
+    }
+
     /// The deletion path behind every public delete. Never panics on a
     /// dependent or on a node that is already gone; it reports them. An
     /// owned node counts as a dependent: callers delete owned nodes first.
@@ -8558,6 +8571,34 @@ mod tests {
     #[test]
     fn typed_handle_checks_runtime_generation_and_type_shared() {
         typed_handle_checks_runtime_generation_and_type::<Shared>();
+    }
+
+    fn erased_handle_names_the_live_occupant_of_a_slot<C: Cells>() {
+        let rt = Runtime::<C>::new();
+        let a = rt.create_input(1_i64);
+        let q = rt.create_query(move |rt: &Runtime<C>| rt.get(a) + 1);
+        assert_eq!(rt.erased_handle(NodeId(a.slot())), Some(a.erase()));
+        assert_eq!(rt.erased_handle(NodeId(q.slot())), Some(q.erase()));
+        assert_eq!(rt.erased_handle(NodeId::SENTINEL), None, "out of range");
+
+        rt.delete_node(q);
+        assert_eq!(rt.erased_handle(NodeId(q.slot())), None, "a dead slot");
+
+        let recycled = rt.create_input(3_i64);
+        assert_eq!(recycled.slot(), q.slot());
+        let current = rt.erased_handle(NodeId(q.slot()));
+        assert_eq!(current, Some(recycled.erase()));
+        assert_ne!(current, Some(q.erase()), "the deleted generation");
+    }
+
+    #[test]
+    fn erased_handle_names_the_live_occupant_of_a_slot_local() {
+        erased_handle_names_the_live_occupant_of_a_slot::<Local>();
+    }
+
+    #[test]
+    fn erased_handle_names_the_live_occupant_of_a_slot_shared() {
+        erased_handle_names_the_live_occupant_of_a_slot::<Shared>();
     }
 
     #[test]
