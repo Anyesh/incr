@@ -27,6 +27,7 @@
 //! into the PyRuntime allocation, which dangled if Python dropped the
 //! runtime first.)
 
+mod elements;
 mod keyed;
 mod memory;
 mod ready;
@@ -99,15 +100,21 @@ type TracedNode = (Option<String>, Option<Py<PyAny>>);
 
 /// The memoized value of a node a trace just left Clean, so the read
 /// recomputes nothing. `None` for a dead slot, a cycle, or a value type
-/// other than `PyValue` and `u64`.
+/// other than `PyValue`, `u64` and `(u64, u64)`.
 fn traced_value(rt: &Runtime, id: NodeId) -> Option<Py<PyAny>> {
     let handle = rt.erased_handle(id)?;
     if let Some(node) = rt.typed_handle::<PyValue>(handle) {
         return rt.try_get(node).ok().map(|v| v.0);
     }
-    let n = rt.try_get(rt.typed_handle::<u64>(handle)?).ok()?;
+    if let Some(node) = rt.typed_handle::<u64>(handle) {
+        let n = rt.try_get(node).ok()?;
+        return Some(Python::attach(|py| {
+            n.into_pyobject(py).unwrap().into_any().unbind()
+        }));
+    }
+    let pair = rt.try_get(rt.typed_handle::<(u64, u64)>(handle)?).ok()?;
     Some(Python::attach(|py| {
-        n.into_pyobject(py).unwrap().into_any().unbind()
+        pair.into_pyobject(py).unwrap().into_any().unbind()
     }))
 }
 
@@ -441,7 +448,9 @@ impl PyCollection {
         let filtered = self.engine_call(py, |rt| {
             self.inner.filter(rt, move |val: &PyValue| -> bool {
                 Python::attach(|py| {
-                    or_stash(call_stashing(py, &predicate, (val.0.clone_ref(py),)).is_truthy(py))
+                    elements::keep(val.0.bind(py), |row| {
+                        or_stash(call_stashing(py, &predicate, (row,)).is_truthy(py))
+                    })
                 })
             })
         })?;
@@ -455,7 +464,11 @@ impl PyCollection {
         let func = self.callables(py).hold(func);
         let mapped = self.engine_call(py, |rt| {
             self.inner.map(rt, move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &func, (val.0.clone_ref(py),))))
+                Python::attach(|py| {
+                    PyValue(elements::map(val.0.bind(py), |row| {
+                        call_stashing(py, &func, (row,))
+                    }))
+                })
             })
         })?;
         Ok(PyCollection {
@@ -464,14 +477,19 @@ impl PyCollection {
         })
     }
 
+    /// The number of ready elements, `Incomplete` with the number of
+    /// not-ready and `Incomplete` elements when there are any.
     fn count(&self, py: Python<'_>) -> PyResult<PyNodeId> {
         let node = self.engine_call(py, |rt| {
-            let count_node: Incr<u64> = self.inner.count(rt);
-            // Bridge u64 -> PyValue so the Python side receives a node
-            // returning an int, matching the single PyNodeId type.
+            let parts = self.inner.count_partition(rt, |val: &PyValue| {
+                Python::attach(|py| elements::is_ready(val.0.bind(py)))
+            });
             rt.create_query(move |rt| -> PyValue {
-                let c: u64 = rt.get(count_node);
-                Python::attach(|py| PyValue(c.into_pyobject(py).unwrap().into_any().unbind()))
+                let (ready, missing) = rt.get(parts);
+                Python::attach(|py| {
+                    let ready = ready.into_pyobject(py).unwrap().into_any().unbind();
+                    PyValue(elements::total(py, ready, missing))
+                })
             })
         })?;
         Ok(PyNodeId { inner: node })
@@ -480,13 +498,14 @@ impl PyCollection {
     fn reduce(&self, py: Python<'_>, fold_fn: Py<PyAny>) -> PyResult<PyNodeId> {
         let fold_fn = self.callables(py).hold(fold_fn);
         let node = self.engine_call(py, |rt| {
-            self.inner.reduce(rt, move |elements| -> PyValue {
+            self.inner.reduce(rt, move |values: &[PyValue]| -> PyValue {
                 Python::attach(|py| {
-                    let py_list = pyo3::types::PyList::empty(py);
-                    for elem in elements.iter() {
-                        py_list.append(elem.0.clone_ref(py)).unwrap();
-                    }
-                    PyValue(call_stashing(py, &fold_fn, (py_list,)))
+                    let (rows, missing) = elements::foldable(py, values.iter().map(|v| &v.0));
+                    PyValue(elements::total(
+                        py,
+                        call_stashing(py, &fold_fn, (rows,)),
+                        missing,
+                    ))
                 })
             })
         })?;
@@ -506,20 +525,23 @@ impl PyCollection {
     ) -> PyResult<PyNodeId> {
         let callables = self.callables(py);
         let (lift, combine) = (callables.hold(lift), callables.hold(combine));
+        let lifted_identity = identity.clone_ref(py);
         let node = self.engine_call(py, |rt| {
             self.inner.aggregate(
                 rt,
                 PyValue(identity),
                 move |val: &PyValue| -> PyValue {
-                    Python::attach(|py| PyValue(call_stashing(py, &lift, (val.0.clone_ref(py),))))
+                    Python::attach(|py| {
+                        PyValue(elements::lift(val.0.bind(py), &lifted_identity, |row| {
+                            call_stashing(py, &lift, (row,))
+                        }))
+                    })
                 },
                 move |a: &PyValue, b: &PyValue| -> PyValue {
                     Python::attach(|py| {
-                        PyValue(call_stashing(
-                            py,
-                            &combine,
-                            (a.0.clone_ref(py), b.0.clone_ref(py)),
-                        ))
+                        PyValue(elements::combine(a.0.bind(py), b.0.bind(py), |a, b| {
+                            call_stashing(py, &combine, (a, b))
+                        }))
                     })
                 },
             )
@@ -531,7 +553,13 @@ impl PyCollection {
         let key_fn = self.callables(py).hold(key_fn);
         let sorted = self.engine_call(py, |rt| {
             self.inner.sort_by_key(rt, move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
+                Python::attach(|py| {
+                    PyValue(call_stashing(
+                        py,
+                        &key_fn,
+                        (elements::key_row(val.0.bind(py)),),
+                    ))
+                })
             })
         })?;
         Ok(PySortedCollection {
@@ -544,7 +572,13 @@ impl PyCollection {
         let key_fn = self.callables(py).hold(key_fn);
         let grouped = self.engine_call(py, |rt| {
             self.inner.group_by(rt, move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
+                Python::attach(|py| {
+                    PyValue(call_stashing(
+                        py,
+                        &key_fn,
+                        (elements::key_row(val.0.bind(py)),),
+                    ))
+                })
             })
         })?;
         Ok(PyGroupedCollection {
@@ -568,26 +602,25 @@ impl PyCollection {
                 &right.inner,
                 move |val: &PyValue| -> PyValue {
                     Python::attach(|py| {
-                        PyValue(call_stashing(py, &left_key, (val.0.clone_ref(py),)))
+                        PyValue(call_stashing(
+                            py,
+                            &left_key,
+                            (elements::key_row(val.0.bind(py)),),
+                        ))
                     })
                 },
                 move |val: &PyValue| -> PyValue {
                     Python::attach(|py| {
-                        PyValue(call_stashing(py, &right_key, (val.0.clone_ref(py),)))
+                        PyValue(call_stashing(
+                            py,
+                            &right_key,
+                            (elements::key_row(val.0.bind(py)),),
+                        ))
                     })
                 },
             );
-            // join yields (PyValue, PyValue) pairs; map to Python tuples
-            // for the unified element type.
             joined.map(rt, |pair: &(PyValue, PyValue)| -> PyValue {
-                Python::attach(|py| {
-                    let tuple = pyo3::types::PyTuple::new(
-                        py,
-                        &[pair.0 .0.clone_ref(py), pair.1 .0.clone_ref(py)],
-                    )
-                    .unwrap();
-                    PyValue(tuple.into_any().unbind())
-                })
+                Python::attach(|py| PyValue(elements::pair(py, &pair.0 .0, &pair.1 .0)))
             })
         })?;
         Ok(PyCollection {

@@ -199,3 +199,186 @@ def test_status_of_watched_outputs_after_a_drain():
         Unavailable("quarantined"),
         Unavailable("quarantined"),
     )
+
+
+def shifts(rt):
+    rows = rt.create_collection()
+    rows.extend([("ann", 8), ("ann", 4), ("bob", 6)])
+    return rows
+
+
+def quarantine(rows, row):
+    rows.replace(row, Unavailable("quarantined", row=row))
+
+
+def test_count_excludes_and_counts_not_ready_elements():
+    rt = Runtime()
+    rows = shifts(rt)
+    n = rows.count()
+    assert rt.get_with_status(n) == (3, None)
+
+    quarantine(rows, ("ann", 4))
+    rows.insert(Pending(key="s9"))
+    rows.insert(Incomplete(("bob", 1), 3))
+    assert rt.get_with_status(n) == (2, Incomplete(2, 3))
+    assert rt.get(n) == 2
+
+    rows.delete(Pending(key="s9"))
+    rows.delete(Incomplete(("bob", 1), 3))
+    rows.replace(Unavailable("quarantined", row=("ann", 4)), ("ann", 4))
+    assert rt.get_with_status(n) == (3, None)
+
+
+def test_a_count_built_over_not_ready_elements_counts_them():
+    rt = Runtime()
+    rows = shifts(rt)
+    quarantine(rows, ("bob", 6))
+    assert rt.status(rows.count()) == Incomplete(2, 1)
+
+
+def hours_total(rows):
+    return rows.aggregate(0, lambda row: row[1], lambda a, b: a + b)
+
+
+def test_aggregate_leaves_out_not_ready_elements_and_adds_incomplete_ones():
+    rt = Runtime()
+    rows = shifts(rt)
+    total = hours_total(rows)
+    assert rt.get_with_status(total) == (18, None)
+
+    quarantine(rows, ("ann", 4))
+    assert rt.get_with_status(total) == (14, Incomplete(14, 1))
+
+    rows.insert(Incomplete(("cat", 5), 2))
+    assert rt.status(total) == Incomplete(19, 3)
+
+    rows.insert(Pending())
+    assert rt.status(total) == Incomplete(19, 4)
+
+    rows.delete(Pending())
+    rows.delete(Incomplete(("cat", 5), 2))
+    rows.replace(Unavailable("quarantined", row=("ann", 4)), ("ann", 4))
+    assert rt.get_with_status(total) == (18, None)
+
+
+def test_an_aggregate_built_over_not_ready_elements_counts_them():
+    rt = Runtime()
+    rows = shifts(rt)
+    quarantine(rows, ("ann", 8))
+    assert rt.status(hours_total(rows)) == Incomplete(10, 1)
+
+
+def test_aggregate_callables_never_see_not_ready_values():
+    rt = Runtime()
+    rows = rt.create_collection()
+    seen = []
+
+    def lift(x):
+        seen.append(x)
+        return x
+
+    def combine(a, b):
+        seen.extend([a, b])
+        return a + b
+
+    total = rows.aggregate(0, lift, combine)
+    rows.extend([1, 2, Unavailable("q", row=3), Incomplete(4, 1)])
+    assert rt.status(total) == Incomplete(7, 2)
+    assert all(isinstance(x, int) for x in seen)
+
+
+def test_reduce_folds_ready_elements_and_counts_the_rest():
+    rt = Runtime()
+    rows = shifts(rt)
+    folded = []
+
+    def fold(elements):
+        folded.append(list(elements))
+        return sum(row[1] for row in elements)
+
+    total = rows.reduce(fold)
+    assert rt.get_with_status(total) == (18, None)
+
+    quarantine(rows, ("bob", 6))
+    rows.insert(Incomplete(("cat", 5), 2))
+    assert rt.status(total) == Incomplete(17, 3)
+    assert sorted(folded[-1]) == [("ann", 4), ("ann", 8), ("cat", 5)]
+
+
+def test_a_two_level_chain_over_a_total_carries_its_missing():
+    rt = Runtime()
+    rows = shifts(rt)
+    total = hours_total(rows)
+    n = rows.count()
+    rate = rt.create_input(20)
+    pay = rt.create_query(lambda ctx: ctx.get(total) * ctx.get(rate))
+    average = rt.create_query(lambda ctx: ctx.get(pay) / ctx.get(n))
+    assert rt.get_with_status(average) == (120.0, None)
+
+    quarantine(rows, ("ann", 4))
+    assert rt.status(pay) == Incomplete(280, 1)
+    assert rt.status(average) == Incomplete(140.0, 2)
+
+
+def test_group_by_files_a_not_ready_element_under_its_row_key():
+    rt = Runtime()
+    rows = shifts(rt)
+    by_worker = rows.group_by(lambda row: row[0])
+    quarantine(rows, ("ann", 4))
+    rt.get(by_worker.version_node)
+    ann = hours_total(by_worker.get_group("ann"))
+    bob = hours_total(by_worker.get_group("bob"))
+    assert rt.status(ann) == Incomplete(8, 1)
+    assert rt.get_with_status(bob) == (6, None)
+
+
+def test_map_and_filter_apply_to_the_row_and_rewrap_it():
+    rt = Runtime()
+    rows = shifts(rt)
+    quarantine(rows, ("ann", 4))
+    rows.insert(Pending(key="s9"))
+    rows.insert(Incomplete(("cat", 5), 2))
+
+    hours = rows.map(lambda row: row[1])
+    assert sorted(rt.get(hours.reduce(tuple))) == [5, 6, 8]
+    assert rt.status(hours.reduce(lambda xs: sum(xs))) == Incomplete(19, 4)
+
+    long = rows.filter(lambda row: row[1] >= 5)
+    assert rt.status(long.count()) == Incomplete(2, 2)
+    short = rows.filter(lambda row: row[1] < 5)
+    assert rt.status(short.count()) == Incomplete(0, 2)
+
+
+def test_a_keyed_operator_refuses_a_not_ready_element_without_a_row():
+    rt = Runtime()
+    rows = shifts(rt)
+    rows.insert(Pending(key="s9"))
+    with pytest.raises(TypeError, match="no row"):
+        rows.group_by(lambda row: row[0])
+    with pytest.raises(TypeError, match="no row"):
+        rows.sort_by_key(lambda row: row[1])
+
+
+def test_join_keys_on_the_row_and_makes_the_pair_not_ready():
+    rt = Runtime()
+    rows = shifts(rt)
+    rates = rt.create_collection()
+    rates.extend([("ann", 20), ("bob", 30)])
+    quarantine(rows, ("bob", 6))
+    pairs = rows.join(rates, lambda row: row[0], lambda rate: rate[0])
+    pay = pairs.aggregate(0, lambda p: p[0][1] * p[1][1], lambda a, b: a + b)
+    assert rt.status(pay) == Incomplete(240, 1)
+    listed = rt.get(pairs.reduce(lambda xs: len(xs)))
+    assert listed == 2
+
+
+def test_sort_by_key_sorts_a_not_ready_element_by_its_row():
+    rt = Runtime()
+    rows = shifts(rt)
+    quarantine(rows, ("ann", 4))
+    ordered = rows.sort_by_key(lambda row: row[1])
+    assert ordered.snapshot() == [
+        Unavailable("quarantined", row=("ann", 4)),
+        ("bob", 6),
+        ("ann", 8),
+    ]

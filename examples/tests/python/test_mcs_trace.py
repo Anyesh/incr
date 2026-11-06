@@ -56,7 +56,7 @@ def test_trace_entries_keep_id_and_action():
         assert set(entry) == {"id", "action", "label", "value"}
 
 
-def test_engine_u64_node_shows_its_value():
+def test_engine_count_node_shows_its_value():
     rt = Runtime()
     c = rt.create_collection()
     count = c.count()
@@ -68,5 +68,5 @@ def test_engine_u64_node_shows_its_value():
 
     internal = [e for e in trace["node_traces"] if e["id"] != count.id]
     assert len(internal) == 1
-    assert internal[0]["value"] == 2
+    assert internal[0]["value"] == (2, 0)
     assert entries_by_id(trace)[count.id]["value"] == 2
