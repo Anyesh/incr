@@ -31,7 +31,11 @@ MUTATING = {
     "try_delete_node",
     "delete_with_dependents",
 }
-ENTRIES = ("engine_read", "engine_write")
+ENTRIES = {
+    "engine_read": "engine_read",
+    "engine_in_query": "engine_read",
+    "engine_write": "engine_write",
+}
 
 
 def matching(text, open_at, opening, closing):
@@ -154,7 +158,9 @@ def local_violations(text, helper_texts=()):
         for m in re.finditer(rf"\b{entry}\(", text):
             if any(s <= m.start() <= e for s, _, e in methods):
                 open_at = m.end() - 1
-                spans.append((entry, open_at, matching(text, open_at, "(", ")")))
+                spans.append(
+                    (ENTRIES[entry], open_at, matching(text, open_at, "(", ")"))
+                )
 
     problems = []
     for _, body, e in methods:

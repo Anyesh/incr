@@ -121,6 +121,14 @@ fn engine_read<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
     })
 }
 
+/// Runs a `RuntimeRef` call from inside a running query. An entry of the
+/// runtime is open on this thread, so there is no stored routing failure
+/// to raise and nothing to route: the call is the boundary and the
+/// runtime marker only.
+fn engine_in_query<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
+    pyerr_boundary::<Exc, _>(|| in_runtime(rt, f))
+}
+
 #[cold]
 #[inline(never)]
 fn raise_routing(failure: RoutingFailed) -> ! {
@@ -324,7 +332,7 @@ impl PyRuntimeRef {
     /// value `Incomplete`, with every `missing` it read added up.
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
-        let val: PyValue = engine_read(rt, || rt.get(node.inner))?;
+        let val: PyValue = engine_in_query(rt, || rt.get(node.inner))?;
         ready::read(py, val.0, missing)
     }
 
@@ -332,7 +340,7 @@ impl PyRuntimeRef {
     /// raises `CycleError` as an ordinary exception the query may catch.
     fn try_get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
-        let val = try_read::<Exc>(engine_read(rt, || rt.try_get(node.inner))?)?;
+        let val = try_read::<Exc>(engine_in_query(rt, || rt.try_get(node.inner))?)?;
         ready::read(py, val, missing)
     }
 
@@ -342,7 +350,7 @@ impl PyRuntimeRef {
         let (rt, state) = self.rt_and_state()?;
         let (_, missing) = self.rt_and_missing()?;
         let lookups = state.lookups();
-        let val = engine_read(rt, || rt.get(lookups.node(rt, py, &key)))?;
+        let val = engine_in_query(rt, || rt.get(lookups.node(rt, py, &key)))?;
         ready::read(py, val.0, missing)
     }
 
@@ -350,7 +358,7 @@ impl PyRuntimeRef {
     /// neither rule of `get` applied.
     fn get_status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let rt = self.rt()?;
-        let val: PyValue = engine_read(rt, || rt.get(node.inner))?;
+        let val: PyValue = engine_in_query(rt, || rt.get(node.inner))?;
         Ok(ready::with_status(py, val.0))
     }
 
@@ -363,7 +371,7 @@ impl PyRuntimeRef {
         key: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
-        let val = engine_read(rt, || table.value_of(py, rt, PyValue(key)))??;
+        let val = engine_in_query(rt, || table.value_of(py, rt, PyValue(key)))??;
         ready::read(py, val.0, missing)
     }
 
@@ -373,7 +381,7 @@ impl PyRuntimeRef {
     fn child_input(&self, key: Py<PyAny>, init: Py<PyAny>) -> PyResult<PyNodeId> {
         let rt = self.rt()?;
         let (key, init) = (PyValue(key), init_fn(init));
-        let node = engine_read(rt, || rt.child_input(key, init))?;
+        let node = engine_in_query(rt, || rt.child_input(key, init))?;
         Ok(PyNodeId { inner: node })
     }
 
@@ -392,7 +400,7 @@ impl PyRuntimeRef {
         let (rt, callables) = self.rt_and_state()?;
         let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
         let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
-        let node = engine_read(rt, || rt.child_query_with(key, f, opts))?;
+        let node = engine_in_query(rt, || rt.child_query_with(key, f, opts))?;
         Ok(PyNodeId { inner: node })
     }
 }
