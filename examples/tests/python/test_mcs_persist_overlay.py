@@ -548,3 +548,42 @@ def test_a_retried_set_of_a_persisted_input_after_a_routing_failure_is_restored(
     assert rt.get(n) == 1
     store.checkpoint()
     store.close()
+
+
+def test_an_overlay_that_cannot_enter_on_a_stored_routing_failure_leaves_the_store_usable():
+    store = Store.open(MemoryBackend(), build_id=1)
+    rt = store.runtime
+    rows, _, state = routing_failure_source(rt)
+    n = store.input("n", 1, CODEC)
+    state["fail"] = True
+    rows.insert("bad")
+    with pytest.raises(RuntimeError, match="routing failed"):
+        with rt.overlay():
+            pass
+    state["fail"] = False
+    store.set(n, 2)
+    store.checkpoint()
+    with rt.overlay() as ov:
+        ov.set(n, 9)
+        assert ov.get(n) == 9
+    assert rt.get(n) == 2
+    store.set(n, 3)
+    store.close()
+
+
+def test_an_overlay_exit_whose_settle_raises_still_closes_the_scope():
+    store = Store.open(MemoryBackend(), build_id=1)
+    rt = store.runtime
+    rows, _, state = routing_failure_source(rt)
+    n = store.input("n", 1, CODEC)
+    with pytest.raises(RuntimeError, match="routing failed"):
+        with rt.overlay() as ov:
+            ov.set(n, 9)
+            state["fail"] = True
+            rows.insert("bad")
+    state["fail"] = False
+    assert rt.get(n) == 1
+    store.set(n, 4)
+    store.checkpoint()
+    assert rt.get(n) == 4
+    store.close()

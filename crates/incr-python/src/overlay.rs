@@ -198,14 +198,21 @@ impl PyOverlay {
                     "an overlay is already active on this runtime",
                 ));
             }
-            let scope = runtime
-                .store_core()
-                .map(|core| OverlayScope::open(slf.py(), core))
-                .transpose()?;
             let reported = runtime.engine_read(|rt| {
                 rt.hold_child_sweeps(true);
                 rt.watch_reported()
             })?;
+            let scope = match runtime
+                .store_core()
+                .map(|core| OverlayScope::open(slf.py(), core))
+                .transpose()
+            {
+                Ok(scope) => scope,
+                Err(e) => {
+                    runtime.engine_write(|rt| rt.hold_child_sweeps(false))?;
+                    return Err(e);
+                }
+            };
             let mut overlay = Overlay::default();
             overlay.reported_at_entry = reported.into_iter().collect();
             overlay.with_scope(scope);
@@ -235,8 +242,13 @@ impl PyOverlay {
             });
             match restored.and_then(|r| r) {
                 Ok(()) => {
-                    runtime.engine_read(|rt| settle(rt, &overlay))?;
-                    scope.map(|scope| scope.close(py)).transpose()?;
+                    let settled = runtime.engine_read(|rt| settle(rt, &overlay));
+                    if settled.is_err() {
+                        runtime.engine_write(|rt| rt.take_held_sweep_creators())?;
+                    }
+                    let closed = scope.map(|scope| scope.close(py)).transpose();
+                    settled?;
+                    closed?;
                     None
                 }
                 Err(e) => Some(e),
