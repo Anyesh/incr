@@ -122,6 +122,38 @@ incr-compute = "0.2.0-beta.6"      # single-threaded
 incr-concurrent = "0.2.0-beta.6"   # multi-threaded (Send + Sync)
 ```
 
+**Python (`incr-compute`, Local runtime) for a live service:**
+
+```python
+from incr import KeyedCollection, Runtime, Unavailable
+
+rt = Runtime()
+shifts = KeyedCollection(rt)
+shifts.reconcile({"s1": ("ann", 8), "s2": ("bob", 6)})   # (inserted, replaced, removed)
+hours = shifts.collection.aggregate(0, lambda row: row[1], lambda a, b: a + b)
+by_worker = shifts.collection.group_by(lambda row: row[0])
+
+shifts.upsert("s3", ("ann", 4))                            # an equal row recomputes nothing
+assert rt.get(hours) == 18 and rt.get(by_worker.get_group("ann").count()) == 2
+
+with rt.overlay() as ov:                                   # what-if: restored exactly on exit
+    shifts.upsert("s4", ("bob", 10))
+    assert ov.get(hours) == 28
+assert rt.get(hours) == 18
+
+rows = rt.create_collection()
+rows.extend([("ann", 8), ("ann", 4), ("bob", 6)])
+total = rows.aggregate(0, lambda row: row[1], lambda a, b: a + b)
+rows.replace(("ann", 4), Unavailable("quarantined", row=("ann", 4)))
+value, status = rt.get_with_status(total)                  # 14, Incomplete(14, missing=1)
+```
+
+- **Bulk and keyed loading:** `Collection.extend(rows)` and `Collection.replace(old, new)` apply atomically; `KeyedCollection` keeps one row per key with `upsert`, `remove`, `get` and `reconcile`.
+- **Not-ready values:** `Pending`, `LookupFailed`, `Unavailable` and `Incomplete(value, missing)` flow through queries, and `count`, `aggregate` and `reduce` report how many parts are missing. `rt.create_lookup(key)` makes a node that starts `Pending`, which `drain_pending_lookups()`, `resolve_lookups`, `fail_lookup` and `retry_lookups` settle.
+- **Inspection and cleanup:** `rt.memory_stats()` returns bytes and Python references by kind and label, `rt.get_traced(node)` entries carry `label` and `value`, `rt.try_delete_node(node)` raises `HasDependentsError` instead of deleting dependents, and `rt.close()` releases everything the runtime holds.
+- **Persistence:** `incr.persist.Store.open(backend, build_id=...)` persists inputs, collections and keyed collections with your codecs on any Python object that implements the backend methods (`MemoryBackend` is built in); `store.batch()` appends all its writes at once, so a progress input set in the batch lands with the rows it covers, and `store.open_memo(...)` restores memoized values after a restart. Overlays work on a persisted graph and leave the log untouched. See `examples/python/mcs_live_e2e.py` for a run on a sqlite3 backend, and `examples/tests/python/test_mcs_*.py` for each feature.
+- **Not provided:** the GIL is held during propagation (releasing it measured slower for the writer once another Python thread runs), so keep writes short with bulk `extend` and `reconcile`.
+
 **Running the tests:**
 
 ```bash
