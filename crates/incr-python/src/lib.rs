@@ -1178,7 +1178,7 @@ impl PyGroupedCollection {
         Ok(group.map(|collection| PyCollection {
             inner: collection,
             rt: self.rt.clone_ref(py),
-            born: Born::default(),
+            born: self.born.clone(),
             persisted: false,
         }))
     }

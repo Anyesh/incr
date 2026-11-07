@@ -115,6 +115,22 @@ def test_collection_created_inside_is_dead_after_exit():
     assert base.snapshot_len() == 3
 
 
+def test_a_group_is_dead_after_exit_only_when_its_grouped_collection_is():
+    rt = incr.Runtime()
+    base = rt.create_collection()
+    base.extend([1, 2, 3])
+    base_grouped = base.group_by(lambda v: v % 2)
+    with rt.overlay():
+        made_grouped = base.group_by(lambda v: v % 2)
+        made_group = made_grouped.get_group(1)
+        base_group = base_grouped.get_group(1)
+        assert made_group.snapshot_len() == 2
+    with pytest.raises(RuntimeError, match="created inside an overlay"):
+        made_group.snapshot_len()
+    assert base_group.snapshot_len() == 2
+    assert base_grouped.get_group(1).snapshot_len() == 2
+
+
 def test_a_version_node_read_inside_an_overlay_leaves_node_count_unchanged():
     rt = incr.Runtime()
     base = rt.create_collection()
