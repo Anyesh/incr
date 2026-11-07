@@ -44,15 +44,22 @@ impl ChildLanding {
 #[derive(Default)]
 pub(crate) struct SweepHold {
     held: std::sync::atomic::AtomicBool,
-    creators: std::sync::Mutex<Vec<ErasedIncr>>,
+    creators: std::sync::Mutex<HeldCreators>,
+}
+
+#[derive(Default)]
+struct HeldCreators {
+    order: Vec<ErasedIncr>,
+    seen: HashSet<ErasedIncr>,
 }
 
 impl<C: Cells> Runtime<C> {
     /// While `hold` is true, a creator's Clean landing keeps the children
     /// its run did not request, as a cut-short run does, and the creator
-    /// is recorded for [`Self::take_held_sweep_creators`]. Reading a
-    /// recorded creator after releasing the hold sweeps them. Get and set
-    /// paths do not read the flag.
+    /// is recorded for [`Self::take_held_sweep_creators`], which readies
+    /// each recorded creator to rerun at its next read after the hold is
+    /// released, and that rerun sweeps them. Get and set paths do not read
+    /// the flag.
     pub fn hold_child_sweeps(&self, hold: bool) {
         self.sweep_hold
             .held
@@ -60,9 +67,46 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The creators whose sweep the hold kept, each once, in the order
-    /// first held; clears the record.
+    /// first held; clears the record. Each creator still alive is made to
+    /// rerun at its next read, as a never-verified node is, and its
+    /// dependents are dirtied behind it: they stay Clean if the rerun
+    /// gives an equal value. A creator that landed Clean under the hold
+    /// would otherwise never run again, and keep its unrequested children.
     pub fn take_held_sweep_creators(&self) -> Vec<ErasedIncr> {
-        std::mem::take(&mut *self.sweep_hold.creators.lock().unwrap())
+        let held = std::mem::take(&mut *self.sweep_hold.creators.lock().unwrap());
+        for &creator in &held.order {
+            if self.alive(creator) {
+                self.force_rerun(NodeId(creator.slot()));
+            }
+        }
+        held.order
+    }
+
+    fn force_rerun(&self, id: NodeId) {
+        let (node, flags) = self.nodes.get_with_flags(id.0);
+        loop {
+            match state::load::<C>(node.state_cell()) {
+                NodeState::Clean => {
+                    node.set_verified_at(0);
+                    if state::try_transition::<C>(
+                        node.state_cell(),
+                        NodeState::Clean,
+                        NodeState::Dirty,
+                    )
+                    .is_ok()
+                    {
+                        let _moving = self.settle_move();
+                        self.mark_dependents_dirty(id, flags, &mut false);
+                        return;
+                    }
+                }
+                NodeState::Dirty => {
+                    node.set_verified_at(0);
+                    return;
+                }
+                _ => return,
+            }
+        }
     }
 
     fn sweep_is_held(&self, id: NodeId) -> bool {
@@ -75,8 +119,8 @@ impl<C: Cells> Runtime<C> {
         }
         let creator = ErasedIncr::new(id.0, self.nodes.get(id.0).generation(), self.runtime_id);
         let mut creators = self.sweep_hold.creators.lock().unwrap();
-        if !creators.contains(&creator) {
-            creators.push(creator);
+        if creators.seen.insert(creator) {
+            creators.order.push(creator);
         }
         true
     }

@@ -229,6 +229,43 @@ local_and_shared!(
     shared_children_sweep_hold_keeps_base_children
 );
 
+/// A creator that lands Clean under the hold, after the base value is
+/// restored, has nothing dirty when the hold is released; its recorded
+/// sweep must still run at its next read.
+fn sweep_hold_release_sweeps_a_clean_creator<C: Cells>(rt: &Runtime<C>) {
+    let x = rt.create_input(2_u64);
+    let inits = Arc::new(AtomicU32::new(0));
+    let creator = keyed_creator(rt, x, inits.clone());
+    let kids = rt.get(creator);
+    rt.hold_child_sweeps(true);
+    rt.set(x, 3);
+    let grown = rt.get(creator);
+    assert_eq!(grown.len(), 3);
+    rt.set(x, 2);
+    assert_eq!(rt.get(creator), kids);
+    rt.hold_child_sweeps(false);
+    assert_eq!(rt.take_held_sweep_creators(), vec![creator.erase()]);
+    assert_eq!(
+        rt.get(creator),
+        kids,
+        "the base children keep their handles"
+    );
+    assert!(
+        !rt.is_alive(grown[2]),
+        "the read after the release swept the overlay-only child"
+    );
+    rt.set(x, 3);
+    let again = rt.get(creator);
+    assert_ne!(again[2], grown[2]);
+    assert_eq!(inits.load(SeqCst), 4, "the overlay key got a fresh init");
+    rt.assert_invariant_i();
+}
+local_and_shared!(
+    sweep_hold_release_sweeps_a_clean_creator,
+    local_children_sweep_hold_release_sweeps_a_clean_creator,
+    shared_children_sweep_hold_release_sweeps_a_clean_creator
+);
+
 /// A verification landing ran no closure, so it sweeps nothing.
 fn verified_landing_sweeps_nothing<C: Cells>(rt: &Runtime<C>) {
     let x = rt.create_input(2_u64);
