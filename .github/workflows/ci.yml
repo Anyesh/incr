@@ -320,9 +320,9 @@ jobs:
           python -m venv .ci-venv
           source .ci-venv/bin/activate
           pip install maturin pytest
-          maturin develop --release --manifest-path crates/incr-python/Cargo.toml
+          maturin develop --release --features conformance --manifest-path crates/incr-python/Cargo.toml
           maturin develop --release --manifest-path crates/incr-concurrent-python/Cargo.toml
-          python -m pytest examples/tests/python/ -q
+          python -m pytest examples/tests/python/ -q -rs
 
   wheel-linux-aarch64:
     name: Linux aarch64 wheels
@@ -348,7 +348,7 @@ jobs:
           python -m venv .wheel-venv
           source .wheel-venv/bin/activate
           pip install pytest dist/*.whl
-          python -m pytest examples/tests/python/ -q
+          python -m pytest examples/tests/python/ -q -rs
 
   clippy:
     name: Clippy

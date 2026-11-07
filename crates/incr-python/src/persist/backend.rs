@@ -8,7 +8,11 @@
 //! `load_snapshot() -> (position, records) | None`,
 //! `snapshot_id() -> (position, generation) | None`,
 //! `compact(upto, records)` and `writable() -> bool`. A raised exception
-//! fails the store call it happened in and reaches the caller as itself.
+//! fails the store call it happened in and reaches the caller as itself,
+//! except that `incr.persist.ReadOnly` (a write on a read-only handle) and
+//! `InvalidCompaction(upto, snapshot_at, tail)` (a `compact` outside the
+//! snapshot and the tail) are the store's own errors, which its logic
+//! branches on.
 
 use std::fmt;
 
@@ -20,7 +24,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 
-use super::{persist_error, Busy};
+use super::{persist_error, Busy, InvalidCompaction, ReadOnly};
 
 /// A Python exception a backend method raised, carried through
 /// incr-persist's `Error::Backend` so the store call raises it unchanged.
@@ -48,14 +52,37 @@ impl fmt::Display for PyBackendError {
 
 impl std::error::Error for PyBackendError {}
 
-/// `err` as the store's error: `incr.persist.Busy` is the store's own
-/// `Busy`, so a skipped checkpoint stays one, and any other exception is
+/// `err` as the store's error: `incr.persist.Busy`, `ReadOnly` and
+/// `InvalidCompaction` are the store's own variants, so a skipped
+/// checkpoint or a rejected write stays one, and any other exception is
 /// carried so the call raises it unchanged.
 pub(super) fn raised(err: PyErr) -> Error {
-    if Python::attach(|py| err.is_instance_of::<Busy>(py)) {
-        return Error::Busy;
+    if let Some(known) = Python::attach(|py| well_known(py, &err)) {
+        return known;
     }
     Error::Backend(Box::new(PyBackendError(err)))
+}
+
+fn well_known(py: Python<'_>, err: &PyErr) -> Option<Error> {
+    if err.is_instance_of::<Busy>(py) {
+        return Some(Error::Busy);
+    }
+    if err.is_instance_of::<ReadOnly>(py) {
+        return Some(Error::ReadOnly);
+    }
+    if err.is_instance_of::<InvalidCompaction>(py) {
+        let (upto, snapshot_at, tail) = err
+            .value(py)
+            .getattr("args")
+            .and_then(|args| args.extract::<(u64, u64, u64)>())
+            .ok()?;
+        return Some(Error::InvalidCompaction {
+            upto: Position(upto),
+            snapshot_at: Position(snapshot_at),
+            tail: Position(tail),
+        });
+    }
+    None
 }
 
 pub(super) fn bad_return(what: &str) -> Error {

@@ -12,6 +12,9 @@ name = "incr"
 crate-type = ["cdylib"]
 doc = false
 
+[features]
+conformance = ["incr-persist/backend-tests"]
+
 [dependencies]
 hashbrown = { version = "=0.17.1", default-features = false }
 incr_compute = { package = "incr-compute", version = "=0.2.0-beta.6", path = "../incr-compute" }
