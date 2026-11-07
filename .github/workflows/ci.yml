@@ -103,12 +103,18 @@ jobs:
           - { crate: incr-core, part: lib-3 }
           - { crate: incr-core, part: lib-4 }
           - { crate: incr-core, part: lib-5 }
+          - { crate: incr-core, part: lib-6 }
+          - { crate: incr-core, part: lib-7 }
+          - { crate: incr-core, part: lib-8 }
+          - { crate: incr-core, part: lib-9 }
+          - { crate: incr-core, part: lib-10 }
+          - { crate: incr-core, part: lib-11 }
           - { crate: incr-core, part: stress }
           - { crate: incr-kube, part: all }
     env:
       CRATE: ${{ matrix.crate }}
       PART: ${{ matrix.part }}
-      LIB_SHARDS: 6
+      LIB_SHARDS: 12
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -127,7 +133,7 @@ jobs:
               cargo +nightly miri test -p "$CRATE" --lib -- --list --ignored | sed -n 's/: test$//p' > "$RUNNER_TEMP/ignored"
               python3 scripts/miri-shard.py scripts/miri-times.tsv "$LIB_SHARDS" "${PART#lib-}" \
                 "$RUNNER_TEMP/tests" "$RUNNER_TEMP/ignored" > "$RUNNER_TEMP/shard"
-              cargo +nightly miri test -p "$CRATE" --lib -- --test-threads=1 --exact $(cat "$RUNNER_TEMP/shard")
+              cargo +nightly miri test -p "$CRATE" --lib -- --test-threads=1 -Zunstable-options --report-time --exact $(cat "$RUNNER_TEMP/shard")
               ;;
             *) echo "unknown part $PART"; exit 1 ;;
           esac
