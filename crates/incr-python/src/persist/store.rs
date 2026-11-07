@@ -3,7 +3,7 @@
 //! runtime and the graph API read them like any other node.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -37,7 +37,6 @@ pub(crate) struct StoreCore {
     collections: RefCell<HashMap<u32, PyPersistedCollection>>,
     pub(super) keyed: RefCell<Vec<Rc<KeyedBinding>>>,
     pub(super) following: RefCell<Option<Following>>,
-    pub(super) foreign: RefCell<HashSet<String>>,
 }
 
 impl StoreCore {
@@ -89,7 +88,6 @@ impl StoreCore {
         py: Python<'_>,
         f: impl FnOnce(&Store<Local, PyBackend>) -> incr_persist::Result<R>,
     ) -> PyResult<R> {
-        self.foreign.borrow_mut().clear();
         let result = self.registry.run(py, || f(&self.store));
         let drained = self.registry.scoped(|| self.drain(py));
         match (result, drained) {
@@ -206,7 +204,6 @@ impl PyStore {
             collections: RefCell::default(),
             keyed: RefCell::default(),
             following: RefCell::default(),
-            foreign: RefCell::default(),
         });
         let runtime = Py::new(py, PyRuntime::persisted(Rc::clone(&core)))?;
         Ok(PyStore {

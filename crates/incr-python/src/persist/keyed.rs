@@ -8,7 +8,7 @@
 //! the store keeps one subscription that queues those records, and every
 //! store call drains the queue into the indexes once it returns.
 
-use std::collections::HashSet;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -17,7 +17,7 @@ use incr_persist::{
     enter_value_context, Input, Origin, PersistedCollection, Record, SubscriptionId, ValueContext,
 };
 use incr_python_protocol::PyValue;
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -35,7 +35,21 @@ pub(super) struct KeyedBinding {
     key: String,
     pub(super) pairs: PyPersistedCollection,
     pub(super) index: Arc<SharedIndex>,
+    /// Counts the changes to the index that did not come from this
+    /// binding's own writes, so a write can tell that what it staged came
+    /// from an index that has since moved.
+    epoch: Cell<u64>,
 }
+
+impl KeyedBinding {
+    fn moved(&self) {
+        self.epoch.set(self.epoch.get() + 1);
+    }
+}
+
+/// How often a write recomputes its staged keys against the collection
+/// before giving up, when writers keep changing the same keys.
+const REPAIR_ROUNDS: usize = 3;
 
 /// The store subscription that queues records the store did not write.
 pub(super) struct Following {
@@ -53,6 +67,7 @@ enum Op {
 struct Staging {
     binding: Rc<KeyedBinding>,
     staged: StagedKeys,
+    epoch: u64,
 }
 
 /// The writes of one store call or batch, collected before the store
@@ -122,6 +137,7 @@ impl Pending {
             Some(at) => at,
             None => {
                 self.keyed.push(Staging {
+                    epoch: binding.epoch.get(),
                     binding,
                     staged: StagedKeys::default(),
                 });
@@ -213,9 +229,9 @@ impl StoreCore {
     }
 
     /// Appends `pending` as one run, applies it, then lets each staged
-    /// index take its keys. An index whose collection also took records
-    /// another writer appended is rebuilt instead, since what was staged
-    /// came from an index that lacked them.
+    /// index take its keys. An index that moved since its keys were staged,
+    /// because the call also took records another writer appended, is
+    /// rebuilt and the keys are repaired instead.
     pub(super) fn write(&self, py: Python<'_>, pending: Pending) -> PyResult<()> {
         let Pending { ops, keyed } = pending;
         let changes: Vec<Vec<Change<PyValue>>> =
@@ -248,15 +264,56 @@ impl StoreCore {
                 })
                 .map(drop)
         })?;
-        for Staging { binding, staged } in &keyed {
-            if self.foreign.borrow().contains(&binding.key) {
-                self.rebuild(py, binding)?;
+        for Staging {
+            binding,
+            staged,
+            epoch,
+        } in &keyed
+        {
+            if binding.epoch.get() != *epoch {
+                self.repair(py, binding, staged)?;
             } else {
                 let mut index = binding.index.try_borrow_mut().ok_or_else(index_in_use)?;
                 index.commit_staged(py, staged);
             }
         }
         Ok(())
+    }
+
+    /// Leaves each key `staged` altered holding the pair it was staged to
+    /// hold: the write was computed from an index that lacked records the
+    /// collection took in the same call, so the collection may hold other
+    /// pairs for those keys, which a further write deletes. The staged
+    /// write is the later one, so it wins, and both stores end with one
+    /// pair per key once the other has refreshed.
+    fn repair(&self, py: Python<'_>, binding: &KeyedBinding, staged: &StagedKeys) -> PyResult<()> {
+        for _ in 0..REPAIR_ROUNDS {
+            self.rebuild(py, binding)?;
+            let fixes = binding
+                .index
+                .try_borrow_mut()
+                .ok_or_else(index_in_use)?
+                .repairs(py, staged)?;
+            if fixes.is_empty() {
+                return Ok(());
+            }
+            self.run(py, |store| {
+                store
+                    .batch(|batch| {
+                        for fix in fixes {
+                            match fix {
+                                Change::Insert(pair) => batch.insert(&binding.pairs, pair),
+                                Change::Delete(pair) => batch.delete(&binding.pairs, &pair),
+                            };
+                        }
+                    })
+                    .map(drop)
+            })?;
+        }
+        Err(PyRuntimeError::new_err(format!(
+            "keyed collection {:?} kept changing under other writers: refresh and retry",
+            binding.key
+        )))
     }
 
     /// Declares the persisted collection `key` and the index over its
@@ -283,6 +340,7 @@ impl StoreCore {
             key: key.to_owned(),
             pairs,
             index,
+            epoch: Cell::new(0),
         }))
     }
 
@@ -299,6 +357,7 @@ impl StoreCore {
         let fresh = self.index_of(py, &binding.pairs)?;
         let mut index = binding.index.try_borrow_mut().ok_or_else(index_in_use)?;
         *index = fresh;
+        binding.moved();
         Ok(())
     }
 
@@ -344,7 +403,6 @@ impl StoreCore {
             return Ok(());
         }
         let bindings = self.keyed.borrow().clone();
-        let mut touched = HashSet::new();
         for binding in &bindings {
             let mine: Vec<&Record> = records
                 .iter()
@@ -354,7 +412,7 @@ impl StoreCore {
             if mine.is_empty() {
                 continue;
             }
-            touched.insert(binding.key.clone());
+            binding.moved();
             let resets = mine
                 .iter()
                 .any(|record| matches!(record, Record::Delete { .. } | Record::Forget { .. }));
@@ -362,7 +420,6 @@ impl StoreCore {
                 self.rebuild(py, binding)?;
             }
         }
-        self.foreign.borrow_mut().extend(touched);
         Ok(())
     }
 

@@ -12,6 +12,23 @@ class PickleCodec:
         return pickle.loads(data)
 
 
+class FlakyDecode(PickleCodec):
+    """Raises the second time it decodes the same bytes: the store decodes
+    a foreign record first, so the binding's own decode of it fails."""
+
+    def __init__(self):
+        self.seen = {}
+        self.raised = 0
+        self.armed = True
+
+    def decode(self, data):
+        self.seen[data] = self.seen.get(data, 0) + 1
+        if self.armed and self.seen[data] == 2:
+            self.raised += 1
+            raise RuntimeError("second decode refused")
+        return super().decode(data)
+
+
 class Poison:
     armed = False
 
@@ -406,3 +423,97 @@ def test_a_memo_opened_after_an_overlay_vouches_for_the_inputs_it_touched():
     again = Graph(log, memo_backend)
     assert again.value(3) == 30
     assert again.calls == []
+
+
+def leader_and_standby():
+    backend = MemoryBackend()
+    leader = Store.open(backend, build_id=1)
+    standby = Store.open(backend, build_id=1)
+    return leader, keyed(leader), standby, keyed(standby)
+
+
+def settled(leader, kc_leader, standby, kc_standby):
+    leader.refresh()
+    standby.refresh()
+    return [
+        (len(kc), rows_of(store.runtime, kc.collection))
+        for store, kc in ((leader, kc_leader), (standby, kc_standby))
+    ]
+
+
+def test_a_standby_upsert_of_a_key_the_leader_just_wrote_leaves_one_pair():
+    leader, kc_leader, standby, kc_standby = leader_and_standby()
+    leader.upsert(kc_leader, "k", 1)
+    standby.upsert(kc_standby, "k", 2)
+    assert (len(kc_standby), kc_standby.get("k")) == (1, 2)
+    assert rows_of(standby.runtime, kc_standby.collection) == [2]
+    assert settled(leader, kc_leader, standby, kc_standby) == [(1, [2]), (1, [2])]
+    assert (kc_leader.get("k"), kc_standby.get("k")) == (2, 2)
+
+
+def test_a_standby_upsert_over_a_row_the_leader_replaced_leaves_one_pair():
+    leader, kc_leader, standby, kc_standby = leader_and_standby()
+    leader.upsert(kc_leader, "k", 1)
+    standby.refresh()
+    leader.upsert(kc_leader, "k", 5)
+    standby.upsert(kc_standby, "k", 9)
+    assert (len(kc_standby), kc_standby.get("k")) == (1, 9)
+    assert settled(leader, kc_leader, standby, kc_standby) == [(1, [9]), (1, [9])]
+
+
+def test_a_standby_remove_of_a_key_the_leader_replaced_removes_it_everywhere():
+    leader, kc_leader, standby, kc_standby = leader_and_standby()
+    leader.upsert(kc_leader, "k", 1)
+    standby.refresh()
+    leader.upsert(kc_leader, "k", 5)
+    standby.remove(kc_standby, "k")
+    assert (len(kc_standby), kc_standby.get("k")) == (0, None)
+    assert settled(leader, kc_leader, standby, kc_standby) == [(0, []), (0, [])]
+
+
+def test_a_standby_reconcile_after_the_leader_wrote_leaves_exactly_its_rows():
+    leader, kc_leader, standby, kc_standby = leader_and_standby()
+    leader.upsert(kc_leader, "k", 1)
+    leader.upsert(kc_leader, "z", 7)
+    standby.reconcile(kc_standby, {"k": 2, "m": 3})
+    assert settled(leader, kc_leader, standby, kc_standby) == [
+        (2, [2, 3]),
+        (2, [2, 3]),
+    ]
+    assert (kc_standby.get("z"), kc_leader.get("z")) == (None, None)
+
+
+def test_a_batch_open_across_a_refresh_composes_with_the_leaders_rows():
+    leader, kc_leader, standby, kc_standby = leader_and_standby()
+    with standby.batch() as b:
+        b.upsert(kc_standby, "k", 2)
+        leader.upsert(kc_leader, "k", 1)
+        standby.refresh()
+    assert settled(leader, kc_leader, standby, kc_standby) == [(1, [2]), (1, [2])]
+
+
+def test_a_standby_write_that_catches_up_other_keys_changes_nothing_else():
+    leader, kc_leader, standby, kc_standby = leader_and_standby()
+    leader.upsert(kc_leader, "a", 1)
+    standby.upsert(kc_standby, "b", 2)
+    assert settled(leader, kc_leader, standby, kc_standby) == [(2, [1, 2]), (2, [1, 2])]
+
+
+def test_the_index_is_rebuilt_when_applying_a_foreign_record_fails():
+    backend = MemoryBackend()
+    leader = Store.open(backend, build_id=1)
+    standby = Store.open(backend, build_id=1)
+    kc_leader = keyed(leader)
+    flaky = FlakyDecode()
+    kc_standby = keyed(standby, codec=flaky)
+    leader.upsert(kc_leader, "a", 1)
+    leader.upsert(kc_leader, "b", 2)
+    standby.refresh()
+    assert flaky.raised == 1
+    flaky.armed = False
+    assert (kc_standby.get("a"), kc_standby.get("b"), len(kc_standby)) == (1, 2, 2)
+    standby.upsert(kc_standby, "a", 5)
+    assert len(kc_standby) == 2
+    assert rows_of(standby.runtime, kc_standby.collection) == [2, 5]
+    standby.remove(kc_standby, "b")
+    assert (kc_standby.get("b"), len(kc_standby)) == (None, 1)

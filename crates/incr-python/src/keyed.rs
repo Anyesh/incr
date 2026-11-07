@@ -301,6 +301,76 @@ impl KeyIndex {
         Ok(())
     }
 
+    /// The changes to the pair collection that leave each key `staged`
+    /// altered holding exactly the pair it was staged to hold (or none),
+    /// whatever else the collection took meanwhile: every other pair for
+    /// the key is deleted, and the staged pair inserted if none is held.
+    /// After a reconcile that covers every named key and, since the
+    /// collection may hold keys the staging never saw, deletes the pairs of
+    /// the others. Hashes each key afresh, since a rebuilt index has its
+    /// own hasher.
+    pub(crate) fn repairs(
+        &self,
+        py: Python<'_>,
+        staged: &StagedKeys,
+    ) -> PyResult<Vec<Change<PyValue>>> {
+        let pair = |p: &Py<PyTuple>| PyValue(p.clone_ref(py).into_any());
+        let mut fixes = Vec::new();
+        let mut known = HashTable::new();
+        for (at, k) in staged.keys.iter().enumerate() {
+            let key = k.key.bind(py);
+            let hash = self.hash(key)?;
+            known.insert_unique(hash, (hash, at), |e| e.0);
+            let altered = match (&k.held, &k.next) {
+                (Some(held), Some(next)) => staged.complete || !held.is(next),
+                (None, None) => false,
+                _ => true,
+            };
+            if !altered {
+                continue;
+            }
+            let mut held = Vec::new();
+            for (_, entry) in self.table.iter_hash(hash).filter(|e| e.0 == hash) {
+                if equal(&item(entry.bind(py), 0), key)? {
+                    held.push(entry);
+                }
+            }
+            let mut keep = None;
+            if let Some(next) = &k.next {
+                for (at, entry) in held.iter().enumerate() {
+                    if equal(entry.bind(py).as_any(), next.bind(py).as_any())? {
+                        keep = Some(at);
+                        break;
+                    }
+                }
+                if keep.is_none() {
+                    fixes.push(Change::Insert(pair(next)));
+                }
+            }
+            fixes.extend(
+                held.iter()
+                    .enumerate()
+                    .filter(|(at, _)| Some(*at) != keep)
+                    .map(|(_, entry)| Change::Delete(pair(entry))),
+            );
+        }
+        if staged.complete {
+            for (hash, entry) in self.table.iter() {
+                let key = item(entry.bind(py), 0);
+                let named = find(
+                    &known,
+                    *hash,
+                    |e| e.0,
+                    |&(_, at)| equal(staged.keys[at].key.bind(py), &key),
+                )?;
+                if named.is_none() {
+                    fixes.push(Change::Delete(pair(entry)));
+                }
+            }
+        }
+        Ok(fixes)
+    }
+
     /// Reverses `steps` newest first, through stored hashes and pair
     /// identity, with no user code.
     pub(crate) fn undo(&mut self, py: Python<'_>, steps: &[KeyStep]) {
@@ -422,6 +492,8 @@ struct StagedKey {
 pub(crate) struct StagedKeys {
     keys: Vec<StagedKey>,
     by_key: HashTable<usize>,
+    /// Set by a reconcile: the staged keys are all the collection is to hold.
+    complete: bool,
 }
 
 impl StagedKeys {
@@ -539,6 +611,7 @@ impl StagedKeys {
             let (key, row): (Bound<'_, PyAny>, Bound<'_, PyAny>) = pair?.extract()?;
             self.stage(index, &key, Some(&row))?;
         }
+        self.complete = true;
         self.stage_removal_of_the_rest(rows.py(), index)
     }
 
