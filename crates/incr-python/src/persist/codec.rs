@@ -32,7 +32,7 @@ use incr_python_protocol::PyValue;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes};
+use pyo3::types::{PyByteArray, PyBytes, PyTuple};
 
 use super::PersistError;
 
@@ -129,15 +129,24 @@ impl Registry {
         f: impl FnOnce() -> incr_persist::Result<R>,
     ) -> PyResult<R> {
         self.failure.borrow_mut().take();
-        let result = {
-            let _restore = Restore(ACTIVE.with(|active| active.replace(Some(Rc::clone(self)))));
-            f()
-        };
+        let result = self.scoped(f);
         let failure = self.failure.borrow_mut().take();
         match result {
             Ok(value) => Ok(value),
             Err(error) => Err(failure.unwrap_or_else(|| super::persist_error(py, error))),
         }
+    }
+
+    /// Runs `f` with this registry's codecs active.
+    pub(crate) fn scoped<R>(self: &Rc<Self>, f: impl FnOnce() -> R) -> R {
+        let _restore = Restore(ACTIVE.with(|active| active.replace(Some(Rc::clone(self)))));
+        f()
+    }
+
+    /// The exception a codec raised since the last [`Self::run`] or call
+    /// to this, for a decode that went through serde directly.
+    pub(crate) fn take_failure(&self) -> Option<PyErr> {
+        self.failure.borrow_mut().take()
     }
 
     fn stash(&self, err: PyErr) -> String {
@@ -287,14 +296,18 @@ impl<'a> Reader<'a> {
         match self.take(1)?[0] {
             0 => Ok(py.None()),
             1 => {
-                let len = u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes"));
-                let bytes = self.take(len as usize)?;
+                let bytes = self.field()?;
                 user_decode(py, codec, bytes)
             }
             other => Err(PyValueError::new_err(format!(
                 "a persisted field has unknown presence byte {other}"
             ))),
         }
+    }
+
+    fn field(&mut self) -> PyResult<&'a [u8]> {
+        let len = u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes"));
+        self.take(len as usize)
     }
 
     fn finish(self) -> PyResult<()> {
@@ -341,4 +354,39 @@ fn unframe(py: Python<'_>, codec: &Py<PyAny>, bytes: &[u8]) -> PyResult<Py<PyAny
     };
     reader.finish()?;
     Ok(value)
+}
+
+/// The codec of a keyed collection's `(key, row)` pairs: each half is framed
+/// with its own user codec, so a not-ready row persists as itself.
+#[pyclass(module = "incr.persist")]
+pub(crate) struct PairCodec {
+    key: Py<PyAny>,
+    row: Py<PyAny>,
+}
+
+impl PairCodec {
+    pub(crate) fn new(key: Py<PyAny>, row: Py<PyAny>) -> Self {
+        Self { key, row }
+    }
+}
+
+#[pymethods]
+impl PairCodec {
+    fn encode(&self, py: Python<'_>, pair: &Bound<'_, PyTuple>) -> PyResult<Vec<u8>> {
+        let mut out = Vec::new();
+        push_field(&mut out, &frame(py, &self.key, &pair.get_item(0)?)?)?;
+        push_field(&mut out, &frame(py, &self.row, &pair.get_item(1)?)?)?;
+        Ok(out)
+    }
+
+    fn decode<'py>(&self, py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyTuple>> {
+        let mut reader = Reader(bytes);
+        let key = reader.field()?;
+        let row = reader.field()?;
+        reader.finish()?;
+        PyTuple::new(
+            py,
+            [unframe(py, &self.key, key)?, unframe(py, &self.row, row)?],
+        )
+    }
 }

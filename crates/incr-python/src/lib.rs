@@ -808,6 +808,9 @@ struct PyKeyedCollection {
     index: Arc<SharedIndex>,
     rt: Py<PyRuntime>,
     born: Born,
+    /// Set for a keyed collection a store persists, which only the store
+    /// writes.
+    persisted: bool,
 }
 
 impl OnRuntime for PyKeyedCollection {
@@ -864,6 +867,58 @@ impl PyKeyedCollection {
         Ok(counts)
     }
 
+    /// A keyed collection over `pairs`, a persisted collection's view when
+    /// the store persists it, else a new pair collection.
+    fn over(
+        runtime: Bound<'_, PyRuntime>,
+        pairs: Option<IncrCollection<PyValue>>,
+        index: Arc<SharedIndex>,
+    ) -> PyResult<Self> {
+        let persisted = pairs.is_some();
+        let state = runtime.borrow().state.clone();
+        let (pairs, rows) = runtime.borrow().engine_read(|rt| {
+            let pairs = pairs.unwrap_or_else(|| rt.create_collection::<PyValue>());
+            let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
+                Python::attach(|py| PyValue(or_stash(pair.0.bind(py).get_item(1)).unbind()))
+            });
+            let weak: std::sync::Weak<SharedIndex> = Arc::downgrade(&index);
+            rt.register_state(Some(rows.version_node().erase()), weak);
+            (pairs, rows)
+        })?;
+        state.journal(|overlay| {
+            if !persisted {
+                overlay.created(pairs.version_node().erase());
+            }
+            overlay.created(rows.version_node().erase());
+        });
+        Ok(PyKeyedCollection {
+            pairs,
+            rows,
+            index,
+            rt: runtime.unbind(),
+            born: state.born(),
+            persisted,
+        })
+    }
+
+    /// A keyed collection over the pair collection a store persists.
+    pub(crate) fn persisted(
+        runtime: Bound<'_, PyRuntime>,
+        pairs: IncrCollection<PyValue>,
+        index: Arc<SharedIndex>,
+    ) -> PyResult<Self> {
+        Self::over(runtime, Some(pairs), index)
+    }
+
+    fn refuse_if_persisted(&self) -> PyResult<()> {
+        if self.persisted {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "keyed collection is persisted: write it with store.upsert, store.remove, store.reconcile or a store.batch",
+            ));
+        }
+        Ok(())
+    }
+
     /// [`Self::index`] for an operation that writes, under `routing`.
     fn index_for_write<'a>(&'a self, routing: RoutingHold<'a, Local>) -> PyResult<IndexGuard<'a>> {
         self.index
@@ -876,34 +931,14 @@ impl PyKeyedCollection {
 impl PyKeyedCollection {
     #[new]
     fn new(runtime: Bound<'_, PyRuntime>) -> PyResult<Self> {
-        let index = Arc::new(SharedIndex::new());
-        let state = runtime.borrow().state.clone();
-        let (pairs, rows) = runtime.borrow().engine_read(|rt| {
-            let pairs = rt.create_collection::<PyValue>();
-            let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(or_stash(pair.0.bind(py).get_item(1)).unbind()))
-            });
-            let weak: std::sync::Weak<SharedIndex> = Arc::downgrade(&index);
-            rt.register_state(Some(rows.version_node().erase()), weak);
-            (pairs, rows)
-        })?;
-        state.journal(|overlay| {
-            overlay.created(pairs.version_node().erase());
-            overlay.created(rows.version_node().erase());
-        });
-        Ok(PyKeyedCollection {
-            pairs,
-            rows,
-            index,
-            rt: runtime.unbind(),
-            born: state.born(),
-        })
+        Self::over(runtime, None, Arc::new(SharedIndex::new()))
     }
 
     /// Hold `row` for `key`: nothing happens if the held row is `==` to
     /// it, otherwise the pair is replaced or inserted.
     fn upsert(&self, py: Python<'_>, key: Bound<'_, PyAny>, row: Bound<'_, PyAny>) -> PyResult<()> {
         self.check_alive()?;
+        self.refuse_if_persisted()?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
@@ -917,6 +952,7 @@ impl PyKeyedCollection {
     /// Remove `key`'s pair. Raises `KeyError` if no row is held for it.
     fn remove(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<()> {
         self.check_alive()?;
+        self.refuse_if_persisted()?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
@@ -950,21 +986,13 @@ impl PyKeyedCollection {
     /// change. Returns how many keys were `(inserted, replaced, removed)`.
     fn reconcile(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<KeyCounts> {
         self.check_alive()?;
+        self.refuse_if_persisted()?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
         let mut index = self.index_for_write(routing)?;
         let mut staged = StagedKeys::default();
-        let pairs = if rows.hasattr("items")? {
-            rows.call_method0("items")?
-        } else {
-            rows.clone()
-        };
-        for pair in pairs.try_iter()? {
-            let (key, row): (Bound<'_, PyAny>, Bound<'_, PyAny>) = pair?.extract()?;
-            staged.stage(&index, &key, Some(&row))?;
-        }
-        staged.stage_removal_of_the_rest(py, &index)?;
+        staged.stage_reconcile(&index, rows)?;
         self.apply_staged(py, rt, &runtime.state, &mut index, staged)
     }
 

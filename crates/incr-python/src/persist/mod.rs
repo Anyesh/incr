@@ -7,7 +7,9 @@
 //! persisted key.
 
 mod backend;
+mod batch;
 mod codec;
+mod keyed;
 mod store;
 
 use incr_persist::Error;
@@ -51,6 +53,7 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("PersistError", py.get_type::<PersistError>())?;
     module.add_class::<backend::PyMemoryBackend>()?;
     module.add_class::<store::PyStore>()?;
+    module.add_class::<batch::PyBatch>()?;
     codec::install_hook();
     parent.add("persist", &module)?;
     py.import("sys")?

@@ -57,9 +57,14 @@ unsafe impl Sync for SharedIndex {}
 
 impl SharedIndex {
     pub(crate) fn new() -> Self {
+        Self::holding(KeyIndex::new())
+    }
+
+    pub(crate) fn holding(index: KeyIndex) -> Self {
+        let settled = (index.table.len(), index.table.allocation_size());
         Self {
-            index: RefCell::new(KeyIndex::new()),
-            settled: Cell::new((0, 0)),
+            index: RefCell::new(index),
+            settled: Cell::new(settled),
         }
     }
 
@@ -212,16 +217,70 @@ impl KeyIndex {
         if changes.is_empty() {
             return Ok(((0, 0, 0), Vec::new()));
         }
+        self.reserve_for(&staged);
+        let applied = apply(changes)?;
+        let kept = journal.is_some().then(|| applied.clone());
+        let counts = self.commit(py, &staged, applied, journal);
+        Ok((counts, kept.unwrap_or_default()))
+    }
+
+    fn reserve_for(&mut self, staged: &StagedKeys) {
         let added = staged
             .keys
             .iter()
             .filter(|k| k.held.is_none() && k.next.is_some())
             .count();
         self.table.reserve(added, |e| e.0);
-        let applied = apply(changes)?;
-        let kept = journal.is_some().then(|| applied.clone());
-        let counts = self.commit(py, &staged, applied, journal);
-        Ok((counts, kept.unwrap_or_default()))
+    }
+
+    /// Phase 2 for a pair collection the store has applied `staged` to:
+    /// the index takes the staged keys, through stored hashes and pair
+    /// identity, with no user code.
+    pub(crate) fn commit_staged(&mut self, py: Python<'_>, staged: &StagedKeys) {
+        self.reserve_for(staged);
+        self.commit(py, staged, staged.changes(py), None);
+    }
+
+    /// An index holding exactly `pairs`, which must be `(key, row)` tuples.
+    /// Runs the keys' `__hash__`.
+    pub(crate) fn of_pairs<'py>(
+        pairs: impl IntoIterator<Item = Bound<'py, PyTuple>>,
+    ) -> PyResult<KeyIndex> {
+        let mut index = KeyIndex::new();
+        for pair in pairs {
+            index.insert_pair(pair)?;
+        }
+        Ok(index)
+    }
+
+    /// Holds `pair` alongside any pair held for an equal key, as the pair
+    /// collection, a multiset, does.
+    pub(crate) fn insert_pair(&mut self, pair: Bound<'_, PyTuple>) -> PyResult<()> {
+        let hash = self.hash(&item(&pair, 0))?;
+        self.table.reserve(1, |e| e.0);
+        self.table
+            .insert_unique(hash, (hash, pair.unbind()), |e| e.0);
+        Ok(())
+    }
+
+    /// Drops one held pair `==` to `pair`, if any, as the pair collection
+    /// drops one occurrence of an element.
+    pub(crate) fn remove_pair(&mut self, pair: &Bound<'_, PyTuple>) -> PyResult<()> {
+        let hash = self.hash(&item(pair, 0))?;
+        let py = pair.py();
+        let held = find(
+            &self.table,
+            hash,
+            |e| e.0,
+            |(_, held)| equal(held.bind(py).as_any(), pair.as_any()),
+        )?
+        .map(|(_, held)| held.clone_ref(py));
+        if let Some(held) = held {
+            if let Ok(entry) = self.table.find_entry(hash, |e| e.1.is(&held)) {
+                entry.remove();
+            }
+        }
+        Ok(())
     }
 
     /// Reverses `steps` newest first, through stored hashes and pair
@@ -433,9 +492,41 @@ impl StagedKeys {
         i
     }
 
+    /// How many keys the staged changes insert, give a new row, and remove.
+    pub(crate) fn counts(&self) -> KeyCounts {
+        self.keys
+            .iter()
+            .fold((0, 0, 0), |(ins, rep, rem), k| match (&k.held, &k.next) {
+                (None, Some(_)) => (ins + 1, rep, rem),
+                (Some(held), Some(next)) if !held.is(next) => (ins, rep + 1, rem),
+                (Some(_), None) => (ins, rep, rem + 1),
+                _ => (ins, rep, rem),
+            })
+    }
+
+    /// Stages `rows`, a mapping or an iterable of `(key, row)` pairs (a
+    /// later pair for a key wins), as the complete set of keys, so every
+    /// other held key is staged for removal.
+    pub(crate) fn stage_reconcile(
+        &mut self,
+        index: &KeyIndex,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let pairs = if rows.hasattr("items")? {
+            rows.call_method0("items")?
+        } else {
+            rows.clone()
+        };
+        for pair in pairs.try_iter()? {
+            let (key, row): (Bound<'_, PyAny>, Bound<'_, PyAny>) = pair?.extract()?;
+            self.stage(index, &key, Some(&row))?;
+        }
+        self.stage_removal_of_the_rest(rows.py(), index)
+    }
+
     /// The changes to the pair collection: each staged key whose pair
     /// changes removes the held pair and inserts the next one.
-    fn changes(&self, py: Python<'_>) -> Vec<Change<PyValue>> {
+    pub(crate) fn changes(&self, py: Python<'_>) -> Vec<Change<PyValue>> {
         let pair = |p: &Py<PyTuple>| PyValue(p.clone_ref(py).into_any());
         let mut changes = Vec::new();
         for k in &self.keys {

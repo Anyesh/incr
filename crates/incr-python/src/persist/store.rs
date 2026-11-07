@@ -3,34 +3,39 @@
 //! runtime and the graph API read them like any other node.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use incr_core::Local;
 use incr_persist::memo::fingerprint;
-use incr_persist::{Durability, Input, Options, PersistedCollection, Store};
+use incr_persist::{Durability, Input, Options, Store};
 use incr_python_protocol::PyValue;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use super::backend::PyBackend;
-use super::codec::{Registry, Slot};
+use super::batch::PyBatch;
+use super::codec::{PairCodec, Registry, Slot};
+use super::keyed::{Following, KeyedBinding, Pending, PyPersistedCollection};
+use crate::keyed::KeyCounts;
 use crate::overlay::Born;
-use crate::{engine_write, PyCollection, PyNodeId, PyRuntime};
-
-type PyPersistedCollection = PersistedCollection<PyValue, Local>;
+use crate::{engine_write, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
 
 /// What the store's Python objects share: the incr-persist store with the
 /// runtime it owns, the codecs of its slots, and the persisted nodes the
 /// binding must keep direct writes off.
 pub(crate) struct StoreCore {
     store: Store<Local, PyBackend>,
-    registry: Rc<Registry>,
+    pub(super) registry: Rc<Registry>,
     #[expect(dead_code, reason = "the memo layer opens with it")]
     build_id: u128,
     inputs: RefCell<HashMap<u32, Input<PyValue>>>,
     collections: RefCell<HashMap<u32, PyPersistedCollection>>,
+    pub(super) keyed: RefCell<Vec<Rc<KeyedBinding>>>,
+    pub(super) following: RefCell<Option<Following>>,
+    pub(super) foreign: RefCell<HashSet<String>>,
 }
 
 impl StoreCore {
@@ -42,7 +47,7 @@ impl StoreCore {
         self.inputs.borrow().contains_key(&slot)
     }
 
-    fn input_of(&self, node: &PyNodeId) -> PyResult<Input<PyValue>> {
+    pub(super) fn input_of(&self, node: &PyNodeId) -> PyResult<Input<PyValue>> {
         self.inputs
             .borrow()
             .get(&node.inner.slot())
@@ -51,7 +56,10 @@ impl StoreCore {
             .ok_or_else(|| PyValueError::new_err("node is not a persisted input of this store"))
     }
 
-    fn collection_of(&self, collection: &PyCollection) -> PyResult<PyPersistedCollection> {
+    pub(super) fn collection_of(
+        &self,
+        collection: &PyCollection,
+    ) -> PyResult<PyPersistedCollection> {
         self.collections
             .borrow()
             .get(&collection.inner.version_node().slot())
@@ -71,12 +79,26 @@ impl StoreCore {
         }
     }
 
-    fn run<R>(
+    /// Runs a store call, then applies the records it queued for the keyed
+    /// collections. A failure of that is the call's own when the call
+    /// succeeded, else its cause.
+    pub(super) fn run<R>(
         &self,
         py: Python<'_>,
         f: impl FnOnce(&Store<Local, PyBackend>) -> incr_persist::Result<R>,
     ) -> PyResult<R> {
-        self.registry.run(py, || f(&self.store))
+        self.foreign.borrow_mut().clear();
+        let result = self.registry.run(py, || f(&self.store));
+        let drained = self.registry.scoped(|| self.drain(py));
+        match (result, drained) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(drain)) => Err(drain),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(drain)) => {
+                error.set_cause(py, Some(drain));
+                Err(error)
+            }
+        }
     }
 }
 
@@ -105,13 +127,13 @@ pub(crate) struct PyStore {
 const _: () = assert!(std::mem::align_of::<PyStore>() <= 16);
 
 impl PyStore {
-    fn core(&self) -> PyResult<&Rc<StoreCore>> {
+    pub(super) fn core(&self) -> PyResult<&Rc<StoreCore>> {
         self.core
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
     }
 
-    fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Rc<StoreCore>> {
+    pub(super) fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Rc<StoreCore>> {
         let core = Rc::clone(self.core()?);
         if self.runtime.bind(py).borrow().state.overlay_active() {
             return Err(PyRuntimeError::new_err(
@@ -166,6 +188,9 @@ impl PyStore {
             build_id,
             inputs: RefCell::default(),
             collections: RefCell::default(),
+            keyed: RefCell::default(),
+            following: RefCell::default(),
+            foreign: RefCell::default(),
         });
         let runtime = Py::new(py, PyRuntime::persisted(Rc::clone(&core)))?;
         Ok(PyStore {
@@ -334,6 +359,110 @@ impl PyStore {
                     })
                     .map(drop)
             })
+        })?
+    }
+
+    /// Declares the keyed collection `key`: a `KeyedCollection` over a
+    /// persisted collection of `(key, row)` pairs, whose index is rebuilt
+    /// from the pairs the log restores. `key_codec` and `codec` encode the
+    /// keys and the rows, under the contracts of `store.input`. Write it
+    /// with `store.upsert`, `store.remove`, `store.reconcile` or a
+    /// `store.batch`; its own writes raise.
+    fn keyed_collection(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        key_codec: Py<PyAny>,
+        codec: Py<PyAny>,
+    ) -> PyResult<PyKeyedCollection> {
+        let core = self.core_outside_overlay(py)?;
+        let slot = Slot::Key(key.to_owned());
+        if core.registry.is_registered(&slot) {
+            return Err(PyValueError::new_err(format!(
+                "the key {key:?} is already declared"
+            )));
+        }
+        let pairs = Py::new(py, PairCodec::new(key_codec, codec))?;
+        core.registry.register(slot.clone(), pairs.into_any())?;
+        let declared = engine_write(core.runtime(), || core.declare_keyed(py, key))
+            .and_then(|declared| declared);
+        match declared {
+            Ok(binding) => PyKeyedCollection::persisted(
+                self.runtime.bind(py).clone().into_any().downcast_into()?,
+                binding.pairs.handle().clone(),
+                Arc::clone(&binding.index),
+            ),
+            Err(e) => {
+                core.registry.unregister(&slot);
+                Err(e)
+            }
+        }
+    }
+
+    /// Holds `row` for `key` in a persisted keyed collection, as
+    /// `KeyedCollection.upsert` does, logging the change.
+    fn upsert(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Bound<'_, PyAny>,
+        row: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let core = self.core_outside_overlay(py)?;
+        let mut pending = Pending::default();
+        pending.upsert(&core, &kc, &key, &row)?;
+        engine_write(core.runtime(), || core.write(py, pending))?
+    }
+
+    /// Removes `key`'s pair from a persisted keyed collection. Raises
+    /// `KeyError` if no row is held for it.
+    fn remove(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let core = self.core_outside_overlay(py)?;
+        let mut pending = Pending::default();
+        pending.remove(&core, &kc, &key)?;
+        engine_write(core.runtime(), || core.write(py, pending))?
+    }
+
+    /// Makes a persisted keyed collection hold exactly `rows`, as
+    /// `KeyedCollection.reconcile` does, in one logged step. Returns how
+    /// many keys were `(inserted, replaced, removed)`.
+    fn reconcile(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<KeyCounts> {
+        let core = self.core_outside_overlay(py)?;
+        let mut pending = Pending::default();
+        pending.reconcile(&core, &kc, rows)?;
+        let counts = pending.counts();
+        engine_write(core.runtime(), || core.write(py, pending))??;
+        Ok(counts)
+    }
+
+    /// Starts a batch: `with store.batch() as b:` collects `b.set`,
+    /// `b.insert`, `b.delete`, `b.replace`, `b.upsert`, `b.remove` and
+    /// `b.reconcile`, and on leaving the block appends them all as one
+    /// run, so a restore sees all of them or none. A block that raises
+    /// writes nothing.
+    fn batch(slf: &Bound<'_, Self>) -> PyResult<PyBatch> {
+        let py = slf.py();
+        slf.try_borrow()?.core_outside_overlay(py)?;
+        Ok(PyBatch::new(slf.clone().unbind()))
+    }
+
+    /// Applies the records other writers appended since this store last
+    /// read the log, across a compaction too, and returns the position it
+    /// has applied through.
+    fn refresh(&self, py: Python<'_>) -> PyResult<u64> {
+        let core = self.core_outside_overlay(py)?;
+        engine_write(core.runtime(), || {
+            core.run(py, |store| store.refresh().map(|at| at.0))
         })?
     }
 

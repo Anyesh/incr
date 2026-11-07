@@ -18,4 +18,5 @@ incr_compute = { package = "incr-compute", version = "=0.2.0-beta.6", path = "..
 incr-core.workspace = true
 incr-persist = { path = "../incr-persist" }
 incr-python-protocol = { path = "../incr-python-protocol", features = ["persist"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
