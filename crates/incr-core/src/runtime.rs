@@ -3964,6 +3964,11 @@ impl<C: Cells> Runtime<C> {
         self.inner.write().labels.insert(slot, label);
     }
 
+    /// Remove the label of a node slot.
+    pub fn clear_label(&self, slot: u32) {
+        self.inner.write().labels.remove(&slot);
+    }
+
     /// Retrieve the label for a node slot, if any.
     pub fn label(&self, slot: u32) -> Option<String> {
         self.dep_stack.unrecorded_lookup();
