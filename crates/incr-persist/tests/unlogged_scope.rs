@@ -314,6 +314,26 @@ fn a_scope_over_a_foreign_handle_fails<C: MemoCells>() {
     scope.close().unwrap();
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+fn a_shared_scope_holds_the_store_and_closes_or_poisons_like_a_borrowed_one<C: MemoCells>() {
+    let log = MemoryBackend::new();
+    let store = Arc::new(open::<C>(&log));
+    let x = store.input("x", 1_u8).unwrap();
+    let mut scope = store.unlogged_scope_shared().unwrap();
+    assert!(matches!(
+        store.unlogged_scope(),
+        Err(Error::UnloggedScopeOpen)
+    ));
+    scope.touched(x).unwrap();
+    store.runtime().set(scope.input(x).unwrap(), 9);
+    store.runtime().set(x.handle(), 1);
+    scope.close().unwrap();
+    store.set(x, 2).unwrap();
+
+    drop(store.unlogged_scope_shared().unwrap());
+    assert!(matches!(store.set(x, 3), Err(Error::Poisoned)));
+}
+
 macro_rules! both {
     ($($name:ident),* $(,)?) => {
         mod local {
@@ -326,6 +346,7 @@ macro_rules! both {
 }
 
 both!(
+    a_shared_scope_holds_the_store_and_closes_or_poisons_like_a_borrowed_one,
     a_memo_entry_over_a_touched_input_survives_a_checkpoint_after_close,
     a_memo_opened_after_a_scope_vouches_for_the_inputs_it_touched,
     an_input_changed_before_the_scope_is_never_vouched,

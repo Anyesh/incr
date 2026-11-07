@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::PoisonError;
+use std::ops::Deref;
+use std::sync::{Arc, PoisonError};
 
 use incr_core::persist_hooks::changed_at_erased;
 use incr_core::{Cells, Incr, IncrCollection};
@@ -21,26 +22,58 @@ use crate::{Backend, Error, Kind, Result};
 /// `close` can tell the restored value from one changed earlier.
 #[must_use = "dropping an unlogged scope without closing it poisons the store"]
 pub struct UnloggedScope<'s, C: Cells, B: Backend> {
-    store: &'s Store<C, B>,
+    store: StoreRef<'s, C, B>,
     touched: HashMap<u32, bool>,
     closed: bool,
+}
+
+enum StoreRef<'s, C: Cells, B: Backend> {
+    Borrowed(&'s Store<C, B>),
+    Shared(Arc<Store<C, B>>),
+}
+
+impl<C: Cells, B: Backend> Deref for StoreRef<'_, C, B> {
+    type Target = Store<C, B>;
+
+    fn deref(&self) -> &Store<C, B> {
+        match self {
+            StoreRef::Borrowed(store) => store,
+            StoreRef::Shared(store) => store,
+        }
+    }
 }
 
 impl<C: Cells, B: Backend> Store<C, B> {
     /// Opens an [`UnloggedScope`]. Fails with [`Error::UnloggedScopeOpen`]
     /// when one is already open.
     pub fn unlogged_scope(&self) -> Result<UnloggedScope<'_, C, B>> {
+        self.open_scope()?;
+        Ok(UnloggedScope {
+            store: StoreRef::Borrowed(self),
+            touched: HashMap::new(),
+            closed: false,
+        })
+    }
+
+    /// [`Self::unlogged_scope`] for a store held in an `Arc`: the scope
+    /// keeps the store alive, so it can be stored beside other owners of it.
+    pub fn unlogged_scope_shared(self: &Arc<Self>) -> Result<UnloggedScope<'static, C, B>> {
+        self.open_scope()?;
+        Ok(UnloggedScope {
+            store: StoreRef::Shared(Arc::clone(self)),
+            touched: HashMap::new(),
+            closed: false,
+        })
+    }
+
+    fn open_scope(&self) -> Result<()> {
         let mut state = self.state()?;
         state.refuse_in_scope()?;
         state.unlogged = true;
         if let Some(deps) = &state.deps {
             deps.set_unlogged(true);
         }
-        Ok(UnloggedScope {
-            store: self,
-            touched: HashMap::new(),
-            closed: false,
-        })
+        Ok(())
     }
 }
 
