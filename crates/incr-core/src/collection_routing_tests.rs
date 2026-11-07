@@ -558,7 +558,8 @@ fn drain_dirtied_watched_reports_a_total_routing_moved<C: Cells>() {
 }
 
 fn a_drain_inside_another_runtimes_compute_leaves_its_frame_untainted<C: Cells>() {
-    let a = Runtime::<C>::new();
+    let mut a = Runtime::<C>::new();
+    a.all_replayable = false;
     let b = Runtime::<C>::new();
     let c = b.create_collection::<i64>();
     let g = c.group_by(&b, |x| x % 2);
