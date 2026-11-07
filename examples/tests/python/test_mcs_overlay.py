@@ -394,3 +394,35 @@ def test_a_tie_under_sort_by_key_keeps_the_sorted_keys_after_exit():
         col.insert((1, "z"))
     assert rt.get(keys) == (1, 1, 2)
     assert sorted(ordered.snapshot()) == [(1, "a"), (1, "b"), (2, "c")]
+
+
+class Boom(Exception):
+    pass
+
+
+def routing_failure_source(rt):
+    rows = rt.create_collection()
+    state = {"fail": False}
+
+    def key(row):
+        if state["fail"] and row == "bad":
+            raise Boom("no key")
+        return row
+
+    grouped = rows.group_by(key)
+    return rows, grouped, state
+
+
+def test_a_retried_set_after_a_raised_routing_failure_is_restored():
+    rt = incr.Runtime()
+    rows, _, state = routing_failure_source(rt)
+    n = rt.create_input(1)
+    with rt.overlay() as ov:
+        state["fail"] = True
+        rows.insert("bad")
+        with pytest.raises(RuntimeError, match="routing failed"):
+            ov.set(n, 5)
+        state["fail"] = False
+        ov.set(n, 5)
+        assert ov.get(n) == 5
+    assert rt.get(n) == 1

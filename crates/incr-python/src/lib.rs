@@ -1333,6 +1333,31 @@ impl PyRuntime {
         engine_read(rt, || f(rt))
     }
 
+    fn set_journaled(
+        &self,
+        node: &PyNodeId,
+        value: Py<PyAny>,
+        first: bool,
+        persisted: bool,
+    ) -> PyResult<()> {
+        if first && persisted {
+            self.state
+                .journal_with(|overlay| overlay.touch(node))
+                .transpose()?;
+        }
+        let old = if first {
+            Some(self.engine_read(|rt| rt.get(node.inner))?)
+        } else {
+            None
+        };
+        self.engine_write(|rt| rt.set(node.inner, PyValue(value)))?;
+        if let Some(old) = old {
+            self.state
+                .journal(|overlay| overlay.push(Undo::Set(node.inner, old)));
+        }
+        Ok(())
+    }
+
     /// The Python-visible node mirroring `version`. Created on first use
     /// and again only if the user deleted the previous one, whose handle
     /// then stays stale like any deleted node's.
@@ -1435,22 +1460,11 @@ impl PyRuntime {
             .state
             .journal_with(|overlay| overlay.first_set(node.inner))
             .unwrap_or(false);
-        if first && persisted {
-            self.state
-                .journal_with(|overlay| overlay.touch(&node))
-                .transpose()?;
+        let result = self.set_journaled(&node, value, first, persisted);
+        if first && result.is_err() {
+            self.state.journal(|overlay| overlay.forget_set(node.inner));
         }
-        let old = if first {
-            Some(self.engine_read(|rt| rt.get(node.inner))?)
-        } else {
-            None
-        };
-        self.engine_write(|rt| rt.set(node.inner, PyValue(value)))?;
-        if let Some(old) = old {
-            self.state
-                .journal(|overlay| overlay.push(Undo::Set(node.inner, old)));
-        }
-        Ok(())
+        result
     }
 
     /// Delete a node and recycle its slot. Every surviving handle to it

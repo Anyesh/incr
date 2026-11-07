@@ -517,3 +517,34 @@ def test_the_index_is_rebuilt_when_applying_a_foreign_record_fails():
     assert rows_of(standby.runtime, kc_standby.collection) == [2, 5]
     standby.remove(kc_standby, "b")
     assert (kc_standby.get("b"), len(kc_standby)) == (None, 1)
+
+
+def routing_failure_source(rt):
+    rows = rt.create_collection()
+    state = {"fail": False}
+
+    def key(row):
+        if state["fail"] and row == "bad":
+            raise RuntimeError("no key")
+        return row
+
+    grouped = rows.group_by(key)
+    return rows, grouped, state
+
+
+def test_a_retried_set_of_a_persisted_input_after_a_routing_failure_is_restored():
+    store = Store.open(MemoryBackend(), build_id=1)
+    rt = store.runtime
+    rows, _, state = routing_failure_source(rt)
+    n = store.input("n", 1, CODEC)
+    with rt.overlay() as ov:
+        state["fail"] = True
+        rows.insert("bad")
+        with pytest.raises(RuntimeError, match="routing failed"):
+            ov.set(n, 5)
+        state["fail"] = False
+        ov.set(n, 5)
+        assert ov.get(n) == 5
+    assert rt.get(n) == 1
+    store.checkpoint()
+    store.close()

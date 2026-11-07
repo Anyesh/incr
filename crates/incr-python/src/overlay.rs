@@ -70,6 +70,10 @@ impl Overlay {
         self.set_seen.insert(node)
     }
 
+    pub(crate) fn forget_set(&mut self, node: Incr<PyValue>) {
+        self.set_seen.remove(&node);
+    }
+
     pub(crate) fn with_scope(&mut self, scope: Option<OverlayScope>) {
         self.persist = scope;
     }
