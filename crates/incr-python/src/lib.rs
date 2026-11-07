@@ -31,6 +31,7 @@ mod elements;
 mod keyed;
 mod lookups;
 mod memory;
+mod overlay;
 mod ready;
 mod state;
 
@@ -41,11 +42,12 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use incr_compute::{
-    DeleteError, Incr, IncrCollection, NodeId, NodeKindInfo, NodeTable, PropagationTrace, Runtime,
-    SortedCollection, TraceAction,
+    Change, DeleteError, ErasedIncr, Incr, IncrCollection, NodeId, NodeKindInfo, NodeTable,
+    PropagationTrace, Runtime, SortedCollection, TraceAction,
 };
 use incr_core::{Local, RoutingFailed, RoutingHold};
 use keyed::{IndexGuard, KeyCounts, SharedIndex, StagedKeys};
+use overlay::{Born, Undo};
 use state::{PyCallable, RtState};
 
 use incr_python_protocol::notready::{
@@ -156,8 +158,20 @@ fn delete_error(e: DeleteError, key: impl Into<Py<PyAny>>) -> PyErr {
 trait OnRuntime {
     fn runtime(&self) -> &Py<PyRuntime>;
 
+    /// Raises if this object was created inside an overlay that has ended.
+    fn check_alive(&self) -> PyResult<()> {
+        Ok(())
+    }
+
+    /// Lists a node this object's call created in the active overlay, so
+    /// its exit deletes it.
+    fn created(&self, py: Python<'_>, node: ErasedIncr) {
+        self.state(py).journal(|overlay| overlay.created(node));
+    }
+
     /// [`engine_write`] on this object's runtime, which `f` receives.
     fn engine_write<R>(&self, py: Python<'_>, f: impl FnOnce(&Runtime) -> R) -> PyResult<R> {
+        self.check_alive()?;
         let rt = self.runtime().bind(py).borrow();
         let rt = rt.rt()?;
         engine_write(rt, || f(rt))
@@ -165,6 +179,7 @@ trait OnRuntime {
 
     /// [`engine_read`] on this object's runtime, which `f` receives.
     fn engine_read<R>(&self, py: Python<'_>, f: impl FnOnce(&Runtime) -> R) -> PyResult<R> {
+        self.check_alive()?;
         let rt = self.runtime().bind(py).borrow();
         let rt = rt.rt()?;
         engine_read(rt, || f(rt))
@@ -389,6 +404,10 @@ impl PyNodeTable {
         key: Py<PyAny>,
         init: Py<PyAny>,
     ) -> PyResult<PyNodeId> {
+        self.rt
+            .bind(py)
+            .borrow()
+            .forbid_in_overlay("NodeTable.get_or_insert_input")?;
         let (key, init) = (PyValue(key), init_fn(init));
         let node = self.engine_read(py, |rt| self.inner.get_or_insert_input(rt, key, init))?;
         Ok(PyNodeId { inner: node })
@@ -405,6 +424,10 @@ impl PyNodeTable {
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
     ) -> PyResult<PyNodeId> {
+        self.rt
+            .bind(py)
+            .borrow()
+            .forbid_in_overlay("NodeTable.get_or_insert_query")?;
         let callables = self.state(py);
         let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
         let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
@@ -424,6 +447,10 @@ impl PyNodeTable {
     /// Deletes `key`'s node and removes the entry. Raises `KeyError` if
     /// the table holds no live node for it.
     fn remove(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<()> {
+        self.rt
+            .bind(py)
+            .borrow()
+            .forbid_in_overlay("NodeTable.remove")?;
         let k = PyValue(key.clone_ref(py));
         match self.engine_write(py, |rt| self.inner.remove(rt, &k))? {
             Ok(()) => Ok(()),
@@ -451,21 +478,63 @@ impl PyNodeTable {
 struct PyCollection {
     inner: IncrCollection<PyValue>,
     rt: Py<PyRuntime>,
+    born: Born,
 }
 
 impl OnRuntime for PyCollection {
     fn runtime(&self) -> &Py<PyRuntime> {
         &self.rt
     }
+
+    fn check_alive(&self) -> PyResult<()> {
+        self.born.check()
+    }
+}
+
+impl PyCollection {
+    /// A collection a call on `parent` just created: dead when the active
+    /// overlay ends, and its node deleted then.
+    fn made(parent: &impl OnRuntime, py: Python<'_>, inner: IncrCollection<PyValue>) -> Self {
+        parent.created(py, inner.version_node().erase());
+        PyCollection {
+            inner,
+            rt: parent.runtime().clone_ref(py),
+            born: parent.state(py).born(),
+        }
+    }
+
+    /// Applies `changes` as one atomic step, and in an overlay journals
+    /// what it reports applied.
+    fn apply_journaled(
+        &self,
+        py: Python<'_>,
+        changes: Vec<Change<PyValue>>,
+    ) -> PyResult<Vec<Change<PyValue>>> {
+        let applied = self.engine_write(py, |rt| self.inner.apply(rt, changes))?;
+        if !applied.is_empty() {
+            self.state(py).journal(|overlay| {
+                overlay.push(Undo::Collection(self.inner.clone(), applied.clone()));
+            });
+        }
+        Ok(applied)
+    }
 }
 
 #[pymethods]
 impl PyCollection {
     fn insert(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        if self.state(py).overlay_active() {
+            self.apply_journaled(py, vec![Change::Insert(PyValue(value))])?;
+            return Ok(());
+        }
         self.engine_write(py, |rt| self.inner.insert(rt, PyValue(value)))
     }
 
     fn delete(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<bool> {
+        if self.state(py).overlay_active() {
+            let applied = self.apply_journaled(py, vec![Change::Delete(PyValue(value))])?;
+            return Ok(!applied.is_empty());
+        }
         self.engine_write(py, |rt| self.inner.delete(rt, &PyValue(value)))
     }
 
@@ -474,10 +543,23 @@ impl PyCollection {
             .try_iter()?
             .map(|row| row.map(|row| PyValue(row.unbind())))
             .collect::<PyResult<Vec<_>>>()?;
+        if self.state(py).overlay_active() {
+            self.apply_journaled(py, values.into_iter().map(Change::Insert).collect())?;
+            return Ok(());
+        }
         self.engine_write(py, |rt| self.inner.extend(rt, values))
     }
 
     fn replace(&self, py: Python<'_>, old: Py<PyAny>, new: Py<PyAny>) -> PyResult<bool> {
+        if self.state(py).overlay_active() {
+            let applied = self.apply_journaled(
+                py,
+                vec![Change::Delete(PyValue(old)), Change::Insert(PyValue(new))],
+            )?;
+            // An insert is never skipped, so an empty net change means the
+            // delete happened and the equal insert cancelled it.
+            return Ok(applied.is_empty() || applied.iter().any(|c| matches!(c, Change::Delete(_))));
+        }
         self.engine_write(py, |rt| {
             self.inner.replace(rt, Some(&PyValue(old)), PyValue(new))
         })
@@ -498,10 +580,7 @@ impl PyCollection {
                 })
             })
         })?;
-        Ok(PyCollection {
-            inner: filtered,
-            rt: self.rt.clone_ref(py),
-        })
+        Ok(PyCollection::made(self, py, filtered))
     }
 
     fn map(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyCollection> {
@@ -515,27 +594,27 @@ impl PyCollection {
                 })
             })
         })?;
-        Ok(PyCollection {
-            inner: mapped,
-            rt: self.rt.clone_ref(py),
-        })
+        Ok(PyCollection::made(self, py, mapped))
     }
 
     /// The number of ready elements, `Incomplete` with the number of
     /// not-ready and `Incomplete` elements when there are any.
     fn count(&self, py: Python<'_>) -> PyResult<PyNodeId> {
-        let node = self.engine_read(py, |rt| {
+        let (parts, node) = self.engine_read(py, |rt| {
             let parts = self.inner.count_partition(rt, |val: &PyValue| {
                 Python::attach(|py| elements::is_ready(val.0.bind(py)))
             });
-            rt.create_query(move |rt| -> PyValue {
+            let node = rt.create_query(move |rt| -> PyValue {
                 let (ready, missing) = rt.get(parts);
                 Python::attach(|py| {
                     let ready = ready.into_pyobject(py).unwrap().into_any().unbind();
                     PyValue(elements::total(py, ready, missing))
                 })
-            })
+            });
+            (parts, node)
         })?;
+        self.created(py, parts.erase());
+        self.created(py, node.erase());
         Ok(PyNodeId { inner: node })
     }
 
@@ -557,6 +636,7 @@ impl PyCollection {
                 })
             })
         })?;
+        self.created(py, node.erase());
         Ok(PyNodeId { inner: node })
     }
 
@@ -596,6 +676,7 @@ impl PyCollection {
                 },
             )
         })?;
+        self.created(py, node.erase());
         Ok(PyNodeId { inner: node })
     }
 
@@ -612,9 +693,11 @@ impl PyCollection {
                 })
             })
         })?;
+        self.created(py, sorted.version_node().erase());
         Ok(PySortedCollection {
             inner: sorted,
             rt: self.rt.clone_ref(py),
+            born: self.state(py).born(),
         })
     }
 
@@ -631,9 +714,11 @@ impl PyCollection {
                 })
             })
         })?;
+        self.created(py, grouped.version_node().erase());
         Ok(PyGroupedCollection {
             inner: grouped,
             rt: self.rt.clone_ref(py),
+            born: self.state(py).born(),
         })
     }
 
@@ -646,7 +731,7 @@ impl PyCollection {
     ) -> PyResult<PyCollection> {
         let callables = self.state(py);
         let (left_key, right_key) = (callables.hold(left_key), callables.hold(right_key));
-        let mapped = self.engine_read(py, |rt| {
+        let (joined_node, mapped) = self.engine_read(py, |rt| {
             let joined = self.inner.join(
                 rt,
                 &right.inner,
@@ -669,14 +754,13 @@ impl PyCollection {
                     })
                 },
             );
-            joined.map(rt, |pair: &(PyValue, PyValue)| -> PyValue {
+            let mapped = joined.map(rt, |pair: &(PyValue, PyValue)| -> PyValue {
                 Python::attach(|py| PyValue(elements::pair(py, &pair.0 .0, &pair.1 .0)))
-            })
+            });
+            (joined.version_node(), mapped)
         })?;
-        Ok(PyCollection {
-            inner: mapped,
-            rt: self.rt.clone_ref(py),
-        })
+        self.created(py, joined_node.erase());
+        Ok(PyCollection::made(self, py, mapped))
     }
 
     #[getter]
@@ -704,11 +788,16 @@ struct PyKeyedCollection {
     rows: IncrCollection<PyValue>,
     index: Arc<SharedIndex>,
     rt: Py<PyRuntime>,
+    born: Born,
 }
 
 impl OnRuntime for PyKeyedCollection {
     fn runtime(&self) -> &Py<PyRuntime> {
         &self.rt
+    }
+
+    fn check_alive(&self) -> PyResult<()> {
+        self.born.check()
     }
 }
 
@@ -725,6 +814,37 @@ impl PyKeyedCollection {
         self.index.try_borrow_mut().ok_or_else(index_in_use)
     }
 
+    /// Applies `staged` to the pair collection and the index, and in an
+    /// overlay journals both.
+    fn apply_staged(
+        &self,
+        py: Python<'_>,
+        rt: &Runtime,
+        state: &RtState,
+        index: &mut IndexGuard<'_>,
+        staged: StagedKeys,
+    ) -> PyResult<KeyCounts> {
+        let mut steps = Vec::new();
+        let journaling = state.overlay_active();
+        let (counts, applied) = index.apply_staged(
+            py,
+            staged,
+            |changes| engine_write(rt, || self.pairs.apply(rt, changes)),
+            journaling.then_some(&mut steps),
+        )?;
+        if journaling && !applied.is_empty() {
+            state.journal(|overlay| {
+                overlay.push(Undo::Keyed {
+                    pairs: self.pairs.clone(),
+                    index: Arc::clone(&self.index),
+                    applied,
+                    steps,
+                });
+            });
+        }
+        Ok(counts)
+    }
+
     /// [`Self::index`] for an operation that writes, under `routing`.
     fn index_for_write<'a>(&'a self, routing: RoutingHold<'a, Local>) -> PyResult<IndexGuard<'a>> {
         self.index
@@ -738,6 +858,7 @@ impl PyKeyedCollection {
     #[new]
     fn new(runtime: Bound<'_, PyRuntime>) -> PyResult<Self> {
         let index = Arc::new(SharedIndex::new());
+        let state = runtime.borrow().state.clone();
         let (pairs, rows) = runtime.borrow().engine_read(|rt| {
             let pairs = rt.create_collection::<PyValue>();
             let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
@@ -747,31 +868,36 @@ impl PyKeyedCollection {
             rt.register_state(Some(rows.version_node().erase()), weak);
             (pairs, rows)
         })?;
+        state.journal(|overlay| {
+            overlay.created(pairs.version_node().erase());
+            overlay.created(rows.version_node().erase());
+        });
         Ok(PyKeyedCollection {
             pairs,
             rows,
             index,
             rt: runtime.unbind(),
+            born: state.born(),
         })
     }
 
     /// Hold `row` for `key`: nothing happens if the held row is `==` to
     /// it, otherwise the pair is replaced or inserted.
     fn upsert(&self, py: Python<'_>, key: Bound<'_, PyAny>, row: Bound<'_, PyAny>) -> PyResult<()> {
+        self.check_alive()?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
         let mut index = self.index_for_write(routing)?;
         let mut staged = StagedKeys::default();
         staged.stage(&index, &key, Some(&row))?;
-        index.apply_staged(py, staged, |changes| {
-            engine_write(rt, || self.pairs.apply(rt, changes))
-        })?;
+        self.apply_staged(py, rt, &runtime.state, &mut index, staged)?;
         Ok(())
     }
 
     /// Remove `key`'s pair. Raises `KeyError` if no row is held for it.
     fn remove(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<()> {
+        self.check_alive()?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
@@ -780,22 +906,23 @@ impl PyKeyedCollection {
         if !staged.stage(&index, &key, None)? {
             return Err(pyo3::exceptions::PyKeyError::new_err(key.unbind()));
         }
-        index.apply_staged(py, staged, |changes| {
-            engine_write(rt, || self.pairs.apply(rt, changes))
-        })?;
+        self.apply_staged(py, rt, &runtime.state, &mut index, staged)?;
         Ok(())
     }
 
     /// The row held for `key`, or `None`.
     fn get<'py>(&self, key: Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.check_alive()?;
         self.index()?.row(&key)
     }
 
     fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
+        self.check_alive()?;
         Ok(self.index()?.row(&key)?.is_some())
     }
 
     fn __len__(&self) -> PyResult<usize> {
+        self.check_alive()?;
         Ok(self.index()?.len())
     }
 
@@ -803,6 +930,7 @@ impl PyKeyedCollection {
     /// `(key, row)` pairs (a later pair for a key wins), in one atomic
     /// change. Returns how many keys were `(inserted, replaced, removed)`.
     fn reconcile(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<KeyCounts> {
+        self.check_alive()?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
@@ -818,9 +946,7 @@ impl PyKeyedCollection {
             staged.stage(&index, &key, Some(&row))?;
         }
         staged.stage_removal_of_the_rest(py, &index)?;
-        index.apply_staged(py, staged, |changes| {
-            engine_write(rt, || self.pairs.apply(rt, changes))
-        })
+        self.apply_staged(py, rt, &runtime.state, &mut index, staged)
     }
 
     #[getter]
@@ -828,6 +954,7 @@ impl PyKeyedCollection {
         PyCollection {
             inner: self.rows.clone(),
             rt: self.rt.clone_ref(py),
+            born: self.born.clone(),
         }
     }
 }
@@ -836,20 +963,25 @@ impl PyKeyedCollection {
 struct PySortedCollection {
     inner: SortedCollection<PyValue, PyValue>,
     rt: Py<PyRuntime>,
+    born: Born,
 }
 
 impl OnRuntime for PySortedCollection {
     fn runtime(&self) -> &Py<PyRuntime> {
         &self.rt
     }
+
+    fn check_alive(&self) -> PyResult<()> {
+        self.born.check()
+    }
 }
 
 #[pymethods]
 impl PySortedCollection {
     fn pairwise(&self, py: Python<'_>) -> PyResult<PyCollection> {
-        let mapped = self.engine_read(py, |rt| {
+        let (pair_collection, mapped) = self.engine_read(py, |rt| {
             let pair_collection = self.inner.pairwise(rt);
-            pair_collection.map(rt, |pair: &(PyValue, PyValue)| -> PyValue {
+            let mapped = pair_collection.map(rt, |pair: &(PyValue, PyValue)| -> PyValue {
                 Python::attach(|py| {
                     let tuple = pyo3::types::PyTuple::new(
                         py,
@@ -862,18 +994,17 @@ impl PySortedCollection {
                         [&pair.0 .0, &pair.1 .0].into_iter(),
                     ))
                 })
-            })
+            });
+            (pair_collection.version_node(), mapped)
         })?;
-        Ok(PyCollection {
-            inner: mapped,
-            rt: self.rt.clone_ref(py),
-        })
+        self.created(py, pair_collection.erase());
+        Ok(PyCollection::made(self, py, mapped))
     }
 
     fn window(&self, py: Python<'_>, size: usize) -> PyResult<PyCollection> {
-        let mapped = self.engine_read(py, |rt| {
+        let (win_node, mapped) = self.engine_read(py, |rt| {
             let win_collection = self.inner.window(rt, size);
-            win_collection.map(rt, |window: &Vec<PyValue>| -> PyValue {
+            let mapped = win_collection.map(rt, |window: &Vec<PyValue>| -> PyValue {
                 Python::attach(|py| {
                     let tuple =
                         pyo3::types::PyTuple::new(py, window.iter().map(|e| e.0.clone_ref(py)))
@@ -884,12 +1015,11 @@ impl PySortedCollection {
                         window.iter().map(|e| &e.0),
                     ))
                 })
-            })
+            });
+            (win_collection.version_node(), mapped)
         })?;
-        Ok(PyCollection {
-            inner: mapped,
-            rt: self.rt.clone_ref(py),
-        })
+        self.created(py, win_node.erase());
+        Ok(PyCollection::made(self, py, mapped))
     }
 
     fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -917,11 +1047,16 @@ impl PySortedCollection {
 struct PyGroupedCollection {
     inner: incr_compute::GroupedCollection<PyValue, PyValue>,
     rt: Py<PyRuntime>,
+    born: Born,
 }
 
 impl OnRuntime for PyGroupedCollection {
     fn runtime(&self) -> &Py<PyRuntime> {
         &self.rt
+    }
+
+    fn check_alive(&self) -> PyResult<()> {
+        self.born.check()
     }
 }
 
@@ -942,6 +1077,7 @@ impl PyGroupedCollection {
         Ok(group.map(|collection| PyCollection {
             inner: collection,
             rt: self.rt.clone_ref(py),
+            born: Born::default(),
         }))
     }
 
@@ -971,6 +1107,7 @@ struct PyRuntime {
 /// pyclass object to 16 bytes.
 enum Holder {
     Owned(Box<Runtime>),
+    Poisoned(#[expect(dead_code, reason = "held so close drops it")] Box<Runtime>),
     Closed,
 }
 
@@ -991,10 +1128,42 @@ impl PyRuntime {
     fn rt(&self) -> PyResult<&Runtime> {
         match &self.holder {
             Holder::Owned(rt) => Ok(rt),
+            Holder::Poisoned(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "runtime poisoned by a failed overlay restore",
+            )),
             Holder::Closed => Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "runtime is closed",
             )),
         }
+    }
+
+    fn relabel(&self, slot: u32, label: String) -> PyResult<()> {
+        let old = self.engine_read(|rt| {
+            let old = rt.label(slot);
+            rt.set_label(slot, label);
+            old
+        })?;
+        self.state
+            .journal(|overlay| overlay.push(Undo::Label(slot, old)));
+        Ok(())
+    }
+
+    /// Keeps the runtime for `close` to drop but refuses every other call:
+    /// a half-restored base has no defined state.
+    fn poison(&mut self) {
+        if let Holder::Owned(rt) = std::mem::replace(&mut self.holder, Holder::Closed) {
+            self.holder = Holder::Poisoned(rt);
+        }
+    }
+
+    /// Raises inside an overlay, for an operation it cannot undo.
+    fn forbid_in_overlay(&self, what: &str) -> PyResult<()> {
+        if self.state.overlay_active() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{what} cannot run inside an overlay"
+            )));
+        }
+        Ok(())
     }
 
     /// [`engine_write`] on this runtime, which `f` receives.
@@ -1043,6 +1212,13 @@ impl PyRuntime {
     /// Python objects they capture. Every later call on this runtime or an
     /// object derived from it raises. Refused while a call on it is running.
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+        slf.try_borrow()
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "cannot close the runtime while a call on it is running",
+                )
+            })?
+            .forbid_in_overlay("close")?;
         let (holder, bridges) = {
             let mut this = slf.try_borrow_mut().map_err(|_| {
                 pyo3::exceptions::PyRuntimeError::new_err(
@@ -1061,8 +1237,17 @@ impl PyRuntime {
         Ok(())
     }
 
+    /// Run candidate changes against the live graph and put it back
+    /// exactly on exit; see `Overlay`.
+    fn overlay(slf: &Bound<'_, Self>) -> overlay::PyOverlay {
+        overlay::PyOverlay {
+            rt: slf.clone().unbind(),
+        }
+    }
+
     fn create_input(&self, value: Py<PyAny>) -> PyResult<PyNodeId> {
         let node = self.engine_read(|rt| rt.create_input(PyValue(value)))?;
+        self.state.journal(|overlay| overlay.created(node.erase()));
         Ok(PyNodeId { inner: node })
     }
 
@@ -1093,12 +1278,27 @@ impl PyRuntime {
     }
 
     fn set(&self, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
-        self.engine_write(|rt| rt.set(node.inner, PyValue(value)))
+        let first = self
+            .state
+            .journal_with(|overlay| overlay.first_set(node.inner))
+            .unwrap_or(false);
+        let old = if first {
+            Some(self.engine_read(|rt| rt.get(node.inner))?)
+        } else {
+            None
+        };
+        self.engine_write(|rt| rt.set(node.inner, PyValue(value)))?;
+        if let Some(old) = old {
+            self.state
+                .journal(|overlay| overlay.push(Undo::Set(node.inner, old)));
+        }
+        Ok(())
     }
 
     /// Delete a node and recycle its slot. Every surviving handle to it
     /// raises on use. The node must have no dependents.
     fn delete_node(&self, node: PyNodeId) -> PyResult<()> {
+        self.forbid_in_overlay("delete_node")?;
         self.engine_write(|rt| rt.delete_node(node.inner))
     }
 
@@ -1106,6 +1306,7 @@ impl PyRuntime {
     /// dependent. Raises `HasDependentsError` (deleting nothing) if one
     /// does, and `KeyError` if the node is not alive.
     fn try_delete_node(&self, py: Python<'_>, node: PyNodeId) -> PyResult<()> {
+        self.forbid_in_overlay("try_delete_node")?;
         let inner = node.inner;
         self.engine_write(|rt| rt.try_delete_node(inner))?
             .map_err(|e| {
@@ -1123,6 +1324,7 @@ impl PyRuntime {
     /// nodes were deleted; 0 if the node was already gone. A query that
     /// has never run is not reached, and raises as stale on first use.
     fn delete_with_dependents(&self, node: PyNodeId) -> PyResult<usize> {
+        self.forbid_in_overlay("delete_with_dependents")?;
         self.engine_write(|rt| rt.delete_with_dependents(node.inner))
     }
 
@@ -1136,11 +1338,13 @@ impl PyRuntime {
     /// moves it off Clean. A node that has no current value when watched
     /// is reported at once.
     fn watch(&self, node: PyNodeId) -> PyResult<()> {
+        self.forbid_in_overlay("watch")?;
         self.engine_read(|rt| rt.watch(node.inner))
     }
 
     /// Stop reporting the node, and drop its pending report.
     fn unwatch(&self, node: PyNodeId) -> PyResult<()> {
+        self.forbid_in_overlay("unwatch")?;
         self.engine_read(|rt| rt.unwatch(node.inner))
     }
 
@@ -1148,6 +1352,7 @@ impl PyRuntime {
     /// each once, in the order the changes reached them. A node deleted
     /// since is left out.
     fn drain_dirtied_watched(&self) -> PyResult<Vec<PyNodeId>> {
+        self.forbid_in_overlay("drain_dirtied_watched")?;
         self.engine_read(|rt| {
             rt.drain_dirtied_watched()
                 .into_iter()
@@ -1160,6 +1365,7 @@ impl PyRuntime {
     /// Register `callback` to fire on `stabilize()` whenever the node's
     /// value changed since the last firing.
     fn observe(&self, node: PyNodeId, callback: Py<PyAny>) -> PyResult<PyObserverId> {
+        self.forbid_in_overlay("observe")?;
         let callback = self.state.hold(callback);
         let id = self.engine_read(|rt| {
             rt.observe(node.inner, move |v: &PyValue| {
@@ -1172,12 +1378,14 @@ impl PyRuntime {
     }
 
     fn unobserve(&self, id: PyObserverId) -> PyResult<()> {
+        self.forbid_in_overlay("unobserve")?;
         self.engine_read(|rt| rt.unobserve(id.inner))
     }
 
     /// Bring observed nodes up to date and fire callbacks for changed
     /// values.
     fn stabilize(&self) -> PyResult<()> {
+        self.forbid_in_overlay("stabilize")?;
         self.engine_read(|rt| rt.stabilize())
     }
 
@@ -1196,10 +1404,12 @@ impl PyRuntime {
         let opts = query_opts(py, fallback, fixpoint, replay, |f| self.state.hold(f))?;
         let f = query_fn(self.state.hold(py_func));
         let node = self.engine_read(|rt| rt.create_query_with(f, opts))?;
+        self.state.journal(|overlay| overlay.created(node.erase()));
         Ok(PyNodeId { inner: node })
     }
 
     fn create_table(slf: PyRef<'_, Self>) -> PyResult<PyNodeTable> {
+        slf.forbid_in_overlay("create_table")?;
         let table = slf.engine_read(|rt| rt.create_table::<PyValue, PyValue>())?;
         let rt: Py<PyRuntime> = slf.into();
         Ok(PyNodeTable { inner: table, rt })
@@ -1223,16 +1433,23 @@ impl PyRuntime {
 
     fn create_collection(slf: PyRef<'_, Self>) -> PyResult<PyCollection> {
         let col = slf.engine_read(|rt| rt.create_collection::<PyValue>())?;
+        let state = slf.state.clone();
+        state.journal(|overlay| overlay.created(col.version_node().erase()));
+        let born = state.born();
         let rt: Py<PyRuntime> = slf.into();
-        Ok(PyCollection { inner: col, rt })
+        Ok(PyCollection {
+            inner: col,
+            rt,
+            born,
+        })
     }
 
     fn set_label(&self, node: PyNodeId, label: String) -> PyResult<()> {
-        self.engine_read(|rt| rt.set_label(node.inner.slot(), label))
+        self.relabel(node.inner.slot(), label)
     }
 
     fn set_label_by_id(&self, id: u32, label: String) -> PyResult<()> {
-        self.engine_read(|rt| rt.set_label(id, label))
+        self.relabel(id, label)
     }
 
     fn get_traced(&self, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
@@ -1354,6 +1571,7 @@ impl PyRuntime {
     /// atomic: if a key's `__hash__` or `__eq__` raises, the keys before it
     /// are set.
     fn resolve_lookups(&self, py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.forbid_in_overlay("resolve_lookups")?;
         let pairs = if values.hasattr("items")? {
             values.call_method0("items")?
         } else {
@@ -1373,6 +1591,7 @@ impl PyRuntime {
 
     /// Set `key`'s lookup to `LookupFailed(reason, key)`.
     fn fail_lookup(&self, py: Python<'_>, key: Py<PyAny>, reason: Py<PyAny>) -> PyResult<()> {
+        self.forbid_in_overlay("fail_lookup")?;
         let failed = lookup_failed(py, reason, key.clone_ref(py))?;
         let lookups = self.state.lookups();
         self.engine_write(|rt| lookups.set(rt, py, &key, failed))
@@ -1380,6 +1599,7 @@ impl PyRuntime {
 
     /// Set each key's lookup back to `Pending(key)` and queue it again.
     fn retry_lookups(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.forbid_in_overlay("retry_lookups")?;
         let keys = keys
             .try_iter()?
             .map(|key| key.map(Bound::unbind))
@@ -1416,6 +1636,7 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntimeRef>()?;
     m.add_class::<PyFixpoint>()?;
     m.add_class::<PyNodeTable>()?;
+    m.add_class::<overlay::PyOverlay>()?;
     m.add_class::<PyCollection>()?;
     m.add_class::<PyKeyedCollection>()?;
     m.add_class::<PySortedCollection>()?;

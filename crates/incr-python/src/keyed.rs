@@ -21,6 +21,15 @@ use pyo3::types::PyTuple;
 /// How many keys an operation inserted, gave a new row, and removed.
 pub(crate) type KeyCounts = (usize, usize, usize);
 
+/// One index change an operation made, kept by an overlay to undo it:
+/// the pair, its stored hash, and whether the operation inserted it (else
+/// it removed it).
+pub(crate) struct KeyStep {
+    hash: u64,
+    pair: Py<PyTuple>,
+    inserted: bool,
+}
+
 /// Each held key's hash and the `(key, row)` tuple the pair collection
 /// stores for it, the same object, so a pair is named to the collection
 /// and found here by identity. Rebuildable from the pairs alone.
@@ -197,10 +206,11 @@ impl KeyIndex {
         py: Python<'_>,
         staged: StagedKeys,
         apply: impl FnOnce(Vec<Change<PyValue>>) -> PyResult<Vec<Change<PyValue>>>,
-    ) -> PyResult<KeyCounts> {
+        journal: Option<&mut Vec<KeyStep>>,
+    ) -> PyResult<(KeyCounts, Vec<Change<PyValue>>)> {
         let changes = staged.changes(py);
         if changes.is_empty() {
-            return Ok((0, 0, 0));
+            return Ok(((0, 0, 0), Vec::new()));
         }
         let added = staged
             .keys
@@ -209,7 +219,24 @@ impl KeyIndex {
             .count();
         self.table.reserve(added, |e| e.0);
         let applied = apply(changes)?;
-        Ok(self.commit(py, &staged, applied))
+        let kept = journal.is_some().then(|| applied.clone());
+        let counts = self.commit(py, &staged, applied, journal);
+        Ok((counts, kept.unwrap_or_default()))
+    }
+
+    /// Reverses `steps` newest first, through stored hashes and pair
+    /// identity, with no user code.
+    pub(crate) fn undo(&mut self, py: Python<'_>, steps: &[KeyStep]) {
+        for step in steps.iter().rev() {
+            if step.inserted {
+                if let Ok(entry) = self.table.find_entry(step.hash, |e| e.1.is(&step.pair)) {
+                    entry.remove();
+                }
+            } else {
+                self.table
+                    .insert_unique(step.hash, (step.hash, step.pair.clone_ref(py)), |e| e.0);
+            }
+        }
     }
 
     /// Phase 2: makes the index hold what `applied` reports the pair
@@ -220,6 +247,7 @@ impl KeyIndex {
         py: Python<'_>,
         staged: &StagedKeys,
         applied: Vec<Change<PyValue>>,
+        mut journal: Option<&mut Vec<KeyStep>>,
     ) -> KeyCounts {
         let mut by_pair = HashMap::new();
         for (i, k) in staged.keys.iter().enumerate() {
@@ -234,6 +262,20 @@ impl KeyIndex {
                 Change::Delete(PyValue(pair)) => match by_pair.get(&pair.as_ptr()) {
                     Some(&i) => {
                         done[i].0 = true;
+                        if let Some(steps) = journal.as_deref_mut() {
+                            let k = &staged.keys[i];
+                            if let Some(tuple) = [&k.held, &k.next]
+                                .into_iter()
+                                .flatten()
+                                .find(|t| t.as_ptr() == pair.as_ptr())
+                            {
+                                steps.push(KeyStep {
+                                    hash: k.hash,
+                                    pair: tuple.clone_ref(py),
+                                    inserted: false,
+                                });
+                            }
+                        }
                         if let Ok(entry) = self
                             .table
                             .find_entry(staged.keys[i].hash, |e| e.1.is(&pair))
@@ -243,6 +285,15 @@ impl KeyIndex {
                     }
                     None => {
                         stray_removals += 1;
+                        if let Some(steps) = journal.as_deref_mut() {
+                            steps.extend(self.table.iter().filter(|e| e.1.is(&pair)).map(|e| {
+                                KeyStep {
+                                    hash: e.0,
+                                    pair: e.1.clone_ref(py),
+                                    inserted: false,
+                                }
+                            }));
+                        }
                         self.table.retain(|e| !e.1.is(&pair));
                     }
                 },
@@ -256,6 +307,13 @@ impl KeyIndex {
                         .next
                         .as_ref()
                         .expect("an inserted pair is a staged next pair");
+                    if let Some(steps) = journal.as_deref_mut() {
+                        steps.push(KeyStep {
+                            hash: k.hash,
+                            pair: next.clone_ref(py),
+                            inserted: true,
+                        });
+                    }
                     self.table
                         .insert_unique(k.hash, (k.hash, next.clone_ref(py)), |e| e.0);
                 }
