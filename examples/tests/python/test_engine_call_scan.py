@@ -12,11 +12,23 @@ CONCURRENT = CRATES / "incr-concurrent-python" / "src" / "lib.rs"
 # kind can name one of the binding's own helpers.
 ENGINE_CALL = re.compile(
     r"\b\w+\.inner\.(\w+)\(|\brt\.(\w+)\(|\bself\.rt\.(\w+)\(|\.(\w+)\(\s*&?(?:self\.)?rt\w*\b"
+    r"|\bcore\.(run|write|declare_keyed)\(|\bmemo\.(checkpoint)\("
 )
 # Handle accessors that take no lock, and PyO3's own methods on `Py<_>`.
 ALLOWED = {"slot", "hash", "bind", "clone_ref", "borrow", "borrow_mut"}
-# A routing hold only bumps a counter and runs no user code.
-ALLOWED_LOCAL = ALLOWED | {"hold_routing", "hold_routing_suppressed"}
+# A routing hold only bumps a counter and runs no user code, and neither
+# does the sweep hold or taking the creators it kept (they only mark nodes
+# to rerun). The last three are methods of a backend object that
+# `.inner` holds in the persist backends, not of the engine.
+ALLOWED_LOCAL = ALLOWED | {
+    "hold_routing",
+    "hold_routing_suppressed",
+    "hold_child_sweeps",
+    "take_held_sweep_creators",
+    "read_only",
+    "writable",
+    "load",
+}
 # Core calls that write: inside one, a reached `group_by` router is queued.
 MUTATING = {
     "set",
@@ -30,6 +42,10 @@ MUTATING = {
     "delete_node",
     "try_delete_node",
     "delete_with_dependents",
+    "run",
+    "write",
+    "declare_keyed",
+    "checkpoint",
 }
 ENTRIES = {
     "engine_read": "engine_read",
@@ -181,12 +197,23 @@ def local_violations(text, helper_texts=()):
     return problems
 
 
-def test_every_local_engine_call_goes_through_the_entry_its_kind_needs():
-    text = (LOCAL / "lib.rs").read_text()
-    assert method_blocks(text), "no #[pymethods] blocks found"
-    others = [
-        p.read_text() for p in sorted(LOCAL.rglob("*.rs")) if p != LOCAL / "lib.rs"
-    ]
+LOCAL_SOURCES = [
+    p.relative_to(LOCAL).as_posix()
+    for p in sorted(LOCAL.rglob("*.rs"))
+    if method_blocks(p.read_text())
+]
+
+
+def test_the_local_scan_covers_the_files_with_pymethods():
+    assert {"lib.rs", "overlay.rs", "persist/store.rs", "persist/memo.rs"} <= set(
+        LOCAL_SOURCES
+    )
+
+
+@pytest.mark.parametrize("source", LOCAL_SOURCES)
+def test_every_local_engine_call_goes_through_the_entry_its_kind_needs(source):
+    text = (LOCAL / source).read_text()
+    others = [p.read_text() for p in sorted(LOCAL.rglob("*.rs")) if p != LOCAL / source]
     problems = local_violations(text, others)
     assert not problems, "\n".join(problems)
 
@@ -219,6 +246,36 @@ impl Lookups {
 
 def test_the_local_scan_accepts_a_binding_that_follows_the_rule():
     assert local_violations(SYNTHETIC.replace("BODY", ""), [HELPER]) == []
+
+
+def test_the_local_scan_flags_a_bare_core_call_in_an_overlay_style_pymethod():
+    text = """
+#[pymethods]
+impl PyOverlay {
+    fn __exit__(&self, py: Python<'_>) -> PyResult<bool> {
+        let runtime = self.rt.bind(py).borrow();
+        let rt = runtime.rt()?;
+        rt.delete_with_dependents(node);
+        Ok(false)
+    }
+}
+"""
+    problems = local_violations(text)
+    assert len(problems) == 1, problems
+    assert "outside engine_read/engine_write" in problems[0]
+
+
+def test_the_local_scan_flags_a_store_write_outside_an_entry():
+    text = """
+#[pymethods]
+impl PyStore {
+    fn set(&self, py: Python<'_>) -> PyResult<()> {
+        core.run(py, |store| store.checkpoint())
+    }
+}
+"""
+    problems = local_violations(text)
+    assert len(problems) == 1, problems
 
 
 @pytest.mark.parametrize(

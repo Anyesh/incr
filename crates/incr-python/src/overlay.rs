@@ -209,7 +209,8 @@ impl PyOverlay {
             {
                 Ok(scope) => scope,
                 Err(e) => {
-                    runtime.engine_write(|rt| rt.hold_child_sweeps(false))?;
+                    let rt = runtime.rt()?;
+                    rt.hold_child_sweeps(false);
                     return Err(e);
                 }
             };
@@ -244,7 +245,8 @@ impl PyOverlay {
                 Ok(()) => {
                     let settled = runtime.engine_read(|rt| settle(rt, &overlay));
                     if settled.is_err() {
-                        runtime.engine_write(|rt| rt.take_held_sweep_creators())?;
+                        let rt = runtime.rt()?;
+                        rt.take_held_sweep_creators();
                     }
                     let closed = scope.map(|scope| scope.close(py)).transpose();
                     settled?;
