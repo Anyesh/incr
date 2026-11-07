@@ -274,8 +274,9 @@ impl<C: Cells> Runtime<C> {
     pub fn memory_stats(&self) -> MemoryStats {
         value_code::check();
         self.dep_stack.unrecorded_lookup();
-        let len = self.nodes.len() as usize;
         let live = self.states.write().live();
+        // Read after `live`: a registered node's slot predates its registration.
+        let len = self.nodes.len() as usize;
         let mut collection_slot = vec![false; len];
         let states: Vec<StateMemory> = live
             .iter()
