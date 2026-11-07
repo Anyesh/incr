@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use incr_core::persist_hooks::set_returning_displaced;
+use incr_core::persist_hooks::{changed_at, set_returning_displaced};
 use incr_core::value_slot::Compared;
 use incr_core::{with_value_code, Cells, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
@@ -74,6 +74,16 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     #[cfg(debug_assertions)]
     fn check_bypass(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()>;
 
+    /// After an unlogged scope in which the caller restored the node:
+    /// when the node holds what `logged` says, moves the mapped stamp to
+    /// the node's `changed_at` and returns the fingerprint and stamp to
+    /// register; `None` for a collection or a node holding something else.
+    fn restamp(
+        &mut self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+    ) -> Result<Option<(u128, u64)>>;
+
     /// The records a snapshot keeps for this key, given its logged state.
     /// Empty when the key holds only its logged default, compared by
     /// decoded value, which is how compaction forgets it.
@@ -100,6 +110,16 @@ pub(crate) struct InputBinding<T: 'static> {
     /// mapped write that wrote. A no-op write leaves it, so a bypass write
     /// through the runtime keeps `changed_at` away from it.
     pub stamp: u64,
+}
+
+impl<T: Value + Serialize + DeserializeOwned> InputBinding<T> {
+    fn holds_logged<C: Cells>(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<bool> {
+        let held = rt.get(self.handle);
+        let (applied, _) = self.value_of(logged)?;
+        // Equal bytes cover values unequal to themselves, such as NaN.
+        Ok(with_value_code(|| held == applied)
+            || encode(&self.key, &held)? == encode(&self.key, &applied)?)
+    }
 }
 
 impl<T: Value + DeserializeOwned> InputBinding<T> {
@@ -226,18 +246,25 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
 
     #[cfg(debug_assertions)]
     fn check_bypass(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()> {
-        let held = rt.get(self.handle);
-        let (applied, _) = self.value_of(logged)?;
-        // Equal bytes cover values unequal to themselves, such as NaN.
-        if with_value_code(|| held == applied)
-            || encode(&self.key, &held)? == encode(&self.key, &applied)?
-        {
+        if self.holds_logged(rt, logged)? {
             Ok(())
         } else {
             Err(Error::Bypassed {
                 key: self.key.clone(),
             })
         }
+    }
+
+    fn restamp(
+        &mut self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+    ) -> Result<Option<(u128, u64)>> {
+        if !self.holds_logged(rt, logged)? {
+            return Ok(None);
+        }
+        self.stamp = changed_at(rt, self.handle);
+        Ok(Some((self.fp, self.stamp)))
     }
 
     fn fold(&self, _rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {

@@ -31,6 +31,9 @@ impl<C: MemoCells> CoreRef<C> {
         if frame_doomed(rt) {
             return pending_handle(rt);
         }
+        if self.deps.unlogged() {
+            return t.cold(self, rt, key);
+        }
         check_value_code();
         let Some(bytes) = encode(&t.name, MemoPart::Key, &key) else {
             return t.cold(self, rt, key);

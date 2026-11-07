@@ -12,7 +12,7 @@ use super::memo_core::{CoreRef, IndexGen, MemoCells};
 use super::table_core::Snap;
 use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, StoredDep};
 use crate::value_context::EncodeMismatch;
-use crate::Result;
+use crate::{Error, Result};
 
 impl<C: MemoCells> CoreRef<C> {
     pub(crate) fn checkpoint(&self, rt: &Runtime<C>) -> Result<CheckpointStats> {
@@ -21,6 +21,9 @@ impl<C: MemoCells> CoreRef<C> {
             "incr-persist: Memo::checkpoint called from inside a query's compute"
         );
         check_value_code();
+        if self.deps.unlogged() {
+            return Err(Error::UnloggedScopeOpen);
+        }
         let _checkpoint = self.lock_checkpoint();
         let mut bag = Deferred::new();
         let (snaps, moved) = {

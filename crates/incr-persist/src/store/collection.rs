@@ -108,14 +108,22 @@ impl<T: PersistValue + Hash + Eq, C: Cells> PersistedCollection<T, C> {
         })
     }
 
-    fn key_in(&self, state: &State<C>) -> Result<String> {
+    pub(super) fn unlogged_in(&self, state: &State<C>) -> Result<IncrCollection<T, C>> {
+        self.binding_in(state)
+            .map(|binding| binding.collection.clone())
+    }
+
+    fn binding_in<'s>(&self, state: &'s State<C>) -> Result<&'s CollectionBinding<T, C>> {
         state
             .bindings
             .get(&self.id)
             .and_then(|binding| binding.as_any().downcast_ref::<CollectionBinding<T, C>>())
             .filter(|binding| binding.collection.version_node() == self.view.version_node())
-            .map(|binding| binding.key.clone())
             .ok_or(Error::UnknownHandle)
+    }
+
+    fn key_in(&self, state: &State<C>) -> Result<String> {
+        self.binding_in(state).map(|binding| binding.key.clone())
     }
 }
 
@@ -601,6 +609,14 @@ where
     #[cfg(debug_assertions)]
     fn check_bypass(&self, _rt: &Runtime<C>, _logged: Option<&LoggedKey>) -> Result<()> {
         Ok(())
+    }
+
+    fn restamp(
+        &mut self,
+        _rt: &Runtime<C>,
+        _logged: Option<&LoggedKey>,
+    ) -> Result<Option<(u128, u64)>> {
+        Ok(None)
     }
 
     fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {

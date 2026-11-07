@@ -87,6 +87,12 @@ pub enum Error {
     #[error("input {key:?} was written through the runtime, bypassing the store's log")]
     Bypassed { key: String },
 
+    /// A store operation was attempted while an
+    /// [`UnloggedScope`](crate::UnloggedScope) is open on the store, or a
+    /// second scope was opened. Close the scope first.
+    #[error("an unlogged scope is open on this store; close it before this call")]
+    UnloggedScopeOpen,
+
     /// Another handle holds the memo checkpoint lock, or wrote a newer
     /// memo generation since this one loaded its base. The checkpoint wrote
     /// nothing; a later one can try again.

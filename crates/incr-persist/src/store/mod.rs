@@ -18,6 +18,7 @@ use dep_index::{fp_of, DepFp, DepIndex};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
 pub use collection::PersistedCollection;
+pub use scope::UnloggedScope;
 
 mod binding;
 mod collection;
@@ -26,6 +27,10 @@ pub(crate) mod dep_index;
 #[path = "dep_index_tests.rs"]
 mod dep_index_tests;
 mod logged;
+mod scope;
+#[cfg(test)]
+#[path = "scope_tests.rs"]
+mod scope_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -192,6 +197,7 @@ struct State<C: Cells> {
     /// still holds.
     snapshot: Option<SnapshotId>,
     poisoned: bool,
+    unlogged: bool,
     since_checkpoint: u64,
     logged: LoggedKeys,
     bound: HashMap<String, u32>,
@@ -297,6 +303,14 @@ impl<C: Cells, B: Backend> Batch<'_, C, B> {
 }
 
 impl<C: Cells> State<C> {
+    fn refuse_in_scope(&self) -> Result<()> {
+        if self.unlogged {
+            Err(Error::UnloggedScopeOpen)
+        } else {
+            Ok(())
+        }
+    }
+
     /// The id under which this store bound `key`, if it did. Fails with
     /// [`Error::KindMismatch`] when the key is bound as the other kind.
     fn bound_id(&self, key: &str, kind: Kind) -> Result<Option<u32>> {
@@ -374,6 +388,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 applied: Position::ZERO,
                 snapshot: None,
                 poisoned: false,
+                unlogged: false,
                 since_checkpoint: 0,
                 logged: LoggedKeys::new(),
                 bound: HashMap::new(),
@@ -398,6 +413,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     pub(crate) fn open_dep_index(&self) -> Result<Arc<DepIndex>> {
         let mut guard = self.state()?;
         let state = &mut *guard;
+        state.refuse_in_scope()?;
         if let Some(deps) = &state.deps {
             return Ok(Arc::clone(deps));
         }
@@ -559,6 +575,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let target = key.into();
         let mut guard = self.state()?;
         let state = &mut *guard;
+        state.refuse_in_scope()?;
         let Some(id) = state.binding_id(&target)? else {
             return Ok(());
         };
@@ -894,6 +911,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// poisons the store, because a retry would append the records again
     /// and a collection insert is not idempotent.
     fn write(&self, state: &mut State<C>, records: Vec<Record>) -> Result<Position> {
+        state.refuse_in_scope()?;
         if let Some(threshold) = self.options.auto_checkpoint_records {
             if state.since_checkpoint >= threshold {
                 self.checkpoint_locked(state)?;
@@ -957,6 +975,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// when it advanced, because a handle may read through a compaction
     /// record by record instead of reporting it.
     fn catch_up(&self, state: &mut State<C>, own: Option<RangeInclusive<Position>>) -> Result<()> {
+        state.refuse_in_scope()?;
         self.reconcile(state)?;
         let start = state.applied;
         let mut read = Vec::new();
@@ -1028,6 +1047,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// as [`Origin::Snapshot`] records. A snapshot beyond `applied` is left
     /// to `catch_up`, which crosses it.
     fn reconcile(&self, state: &mut State<C>) -> Result<()> {
+        state.refuse_in_scope()?;
         loop {
             let Some(id) = self
                 .backend

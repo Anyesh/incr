@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use incr_core::lock_order::{LockKind, Ordered};
@@ -50,6 +51,10 @@ pub(crate) struct External {
 #[derive(Default)]
 pub(crate) struct DepIndex {
     map: RwLock<DepMap>,
+    /// Set while an unlogged scope is open on the store: a memo then
+    /// neither restores nor checkpoints, because its fingerprints describe
+    /// the logged state while the runtime holds something else.
+    unlogged: AtomicBool,
 }
 
 #[derive(Default)]
@@ -64,6 +69,14 @@ pub(crate) struct DepMap {
 }
 
 impl DepIndex {
+    pub(crate) fn unlogged(&self) -> bool {
+        self.unlogged.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_unlogged(&self, open: bool) {
+        self.unlogged.store(open, Ordering::Release);
+    }
+
     // Poisoning is ignored: a mapped write that panics marks the one key it
     // was writing untrusted before the hold is released.
     #[cfg_attr(not(test), allow(dead_code))]
