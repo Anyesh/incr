@@ -21,6 +21,8 @@ impl<C: MemoCells> CoreRef<C> {
             "incr-persist: Memo::checkpoint called from inside a query's compute"
         );
         check_value_code();
+        // On a Shared store a scope another thread opens after this check is
+        // not covered: the snapshot below may then see unlogged changes.
         if self.deps.unlogged() {
             return Err(Error::UnloggedScopeOpen);
         }

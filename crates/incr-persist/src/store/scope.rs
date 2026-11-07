@@ -123,9 +123,10 @@ impl<C: Cells, B: Backend> UnloggedScope<'_, C, B> {
     /// checkpointable. Costs one decode per touched input.
     ///
     /// A failure to compare one input leaves it unvouched and is returned
-    /// after the others are handled; the scope is closed either way.
+    /// after the others are handled; the scope is closed either way. A
+    /// close that cannot reach the store's state, by an error or a panic,
+    /// ends in the scope's drop, which poisons the store.
     pub fn close(mut self) -> Result<()> {
-        self.closed = true;
         let mut guard = self.store.state()?;
         let state = &mut *guard;
         let rt = self.store.runtime();
@@ -156,6 +157,7 @@ impl<C: Cells, B: Backend> UnloggedScope<'_, C, B> {
             drop(map);
             deps.set_unlogged(false);
         }
+        self.closed = true;
         failure.map_or(Ok(()), Err)
     }
 }

@@ -334,6 +334,30 @@ fn a_shared_scope_holds_the_store_and_closes_or_poisons_like_a_borrowed_one<C: M
     assert!(matches!(store.set(x, 3), Err(Error::Poisoned)));
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+fn a_close_that_panics_leaves_the_store_poisoned_not_stuck_open<C: MemoCells>() {
+    let log = MemoryBackend::new();
+    let store = Arc::new(open::<C>(&log));
+    let x = store.input("x", 1_u8).unwrap();
+    let scope = store.unlogged_scope_shared().unwrap();
+    let address = Box::into_raw(Box::new(scope)) as usize;
+    let query = store.runtime().create_query(move |_| {
+        // SAFETY: the pointer came from the Box above and the compute runs once.
+        let scope = unsafe {
+            Box::from_raw(address as *mut incr_persist::UnloggedScope<'static, C, MemoryBackend>)
+        };
+        let _ = scope.close();
+        0_u8
+    });
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.runtime().get(query)));
+    assert!(outcome.is_err(), "close inside a compute panics");
+    assert!(
+        matches!(store.set(x, 2), Err(Error::Poisoned)),
+        "the store is poisoned, not stuck on UnloggedScopeOpen"
+    );
+}
+
 macro_rules! both {
     ($($name:ident),* $(,)?) => {
         mod local {
@@ -346,6 +370,7 @@ macro_rules! both {
 }
 
 both!(
+    a_close_that_panics_leaves_the_store_poisoned_not_stuck_open,
     a_shared_scope_holds_the_store_and_closes_or_poisons_like_a_borrowed_one,
     a_memo_entry_over_a_touched_input_survives_a_checkpoint_after_close,
     a_memo_opened_after_a_scope_vouches_for_the_inputs_it_touched,
