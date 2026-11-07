@@ -80,6 +80,10 @@ impl WatchQueue {
         self.entries.remove(at);
     }
 
+    fn entry(&self, slot: u32, generation: u32) -> bool {
+        self.is_queued(slot) && self.entries.contains(&(slot, generation))
+    }
+
     pub(super) fn take(&mut self) -> VecDeque<(u32, u32)> {
         // A store through `self.queued` may alias its own pointer and
         // length, so iterating through it reloads both per entry.
@@ -183,6 +187,26 @@ impl<C: Cells> Runtime<C> {
             .into_iter()
             .map(|(slot, generation)| ErasedIncr::new(slot, generation, self.runtime_id))
             .collect()
+    }
+
+    /// The nodes now reported, in order, without taking them.
+    pub fn watch_reported(&self) -> Vec<ErasedIncr> {
+        let queue = self.watch_queue.read();
+        queue
+            .entries
+            .iter()
+            .map(|&(slot, generation)| ErasedIncr::new(slot, generation, self.runtime_id))
+            .collect()
+    }
+
+    /// Drops `handle`'s pending report, leaving it watched, so the next
+    /// change that moves it off Clean reports it again. A node that is
+    /// not Clean has no later walk to reach it, so read it first.
+    pub fn unreport_watched(&self, handle: ErasedIncr) {
+        let mut queue = self.watch_queue.write();
+        if queue.entry(handle.slot(), handle.generation()) {
+            queue.remove(handle.slot());
+        }
     }
 
     /// The queued slots, in order.

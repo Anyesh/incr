@@ -192,6 +192,43 @@ fn sweep<C: Cells>(rt: &Runtime<C>) {
 }
 local_and_shared!(sweep, local_children_sweep, shared_children_sweep);
 
+/// Under the sweep hold a creator's Clean landing keeps the children its
+/// run did not request and is recorded once; after the release, reading
+/// the creator re-binds the base child and sweeps the overlay-only ones.
+fn sweep_hold_keeps_base_children<C: Cells>(rt: &Runtime<C>) {
+    let x = rt.create_input(2_u64);
+    let creator = keyed_creator(rt, x, Arc::default());
+    let kids = rt.get(creator);
+    rt.set(kids[1], 99);
+    assert!(rt.take_held_sweep_creators().is_empty());
+    rt.hold_child_sweeps(true);
+    rt.set(x, 1);
+    assert_eq!(rt.get(creator).len(), 1);
+    assert!(rt.is_alive(kids[1]), "the hold kept an unrequested child");
+    rt.set(x, 4);
+    let grown = rt.get(creator);
+    rt.set(x, 1);
+    assert_eq!(rt.get(creator).len(), 1);
+    assert!(grown[2..].iter().all(|k| rt.is_alive(*k)));
+    rt.set(x, 2);
+    rt.hold_child_sweeps(false);
+    assert_eq!(rt.take_held_sweep_creators(), vec![creator.erase()]);
+    assert!(rt.take_held_sweep_creators().is_empty());
+    let again = rt.get(creator);
+    assert_eq!(again, kids, "the base children are re-bound by key");
+    assert_eq!(rt.get(again[1]), 99);
+    assert!(
+        grown[2..].iter().all(|k| !rt.is_alive(*k)),
+        "the reread swept the overlay-only children"
+    );
+    rt.assert_invariant_i();
+}
+local_and_shared!(
+    sweep_hold_keeps_base_children,
+    local_children_sweep_hold_keeps_base_children,
+    shared_children_sweep_hold_keeps_base_children
+);
+
 /// A verification landing ran no closure, so it sweeps nothing.
 fn verified_landing_sweeps_nothing<C: Cells>(rt: &Runtime<C>) {
     let x = rt.create_input(2_u64);

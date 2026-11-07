@@ -1763,6 +1763,7 @@ pub struct Runtime<C: Cells> {
     /// unverifying its readers, a replay rerun of a Failed node), odd while
     /// one is under way.
     pub(crate) unsettled: C::U64,
+    pub(crate) sweep_hold: children_impl::SweepHold,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -1915,6 +1916,7 @@ impl<C: Cells> Runtime<C> {
             held_marks: C::new_u64(0),
             group_unrun_landings: C::new_u64(0),
             unsettled: C::new_u64(0),
+            sweep_hold: children_impl::SweepHold::default(),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]

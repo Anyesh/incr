@@ -44,6 +44,7 @@ both!(
     set_reports_its_own_watched_input,
     drain_follows_the_walk_order,
     watch_reports_a_node_that_is_not_clean,
+    watch_reported_peeks_and_unreport_drops_one,
     unwatch_drops_the_entry,
     recycled_slot_reports_only_the_new_node,
     delete_drops_a_watched_entry,
@@ -130,6 +131,31 @@ fn watch_reports_a_node_that_is_not_clean<C: Cells>() {
         drained(&rt).is_empty(),
         "a watch of a watched node reported it"
     );
+}
+
+fn watch_reported_peeks_and_unreport_drops_one<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    let a = rt.create_query(move |rt| rt.get(x) + 1);
+    let b = rt.create_query(move |rt| rt.get(x) + 2);
+    assert_eq!((rt.get(a), rt.get(b)), (2, 3));
+    rt.watch(a);
+    rt.watch(b);
+    assert!(rt.watch_reported().is_empty());
+    rt.set(x, 2);
+    let peeked = rt.watch_reported();
+    assert_eq!(peeked.iter().collect::<HashSet<_>>().len(), 2);
+    assert!(peeked.contains(&a.erase()) && peeked.contains(&b.erase()));
+    assert_eq!(rt.watch_reported(), peeked, "a peek drained");
+    assert_eq!((rt.get(a), rt.get(b)), (3, 4));
+    rt.unreport_watched(a.erase());
+    assert_eq!(rt.watch_reported(), vec![b.erase()]);
+    rt.unreport_watched(a.erase());
+    assert_eq!(rt.watch_reported(), vec![b.erase()]);
+    rt.set(x, 3);
+    let after = drained(&rt);
+    assert_eq!(after.len(), 2);
+    assert!(after.contains(&a.erase()) && after.contains(&b.erase()));
 }
 
 fn unwatch_drops_the_entry<C: Cells>() {

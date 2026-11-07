@@ -39,7 +39,48 @@ impl ChildLanding {
     }
 }
 
+/// The sweep hold: a flag read only on the sweep path, and the creators
+/// whose sweep it held since they were last taken.
+#[derive(Default)]
+pub(crate) struct SweepHold {
+    held: std::sync::atomic::AtomicBool,
+    creators: std::sync::Mutex<Vec<ErasedIncr>>,
+}
+
 impl<C: Cells> Runtime<C> {
+    /// While `hold` is true, a creator's Clean landing keeps the children
+    /// its run did not request, as a cut-short run does, and the creator
+    /// is recorded for [`Self::take_held_sweep_creators`]. Reading a
+    /// recorded creator after releasing the hold sweeps them. Get and set
+    /// paths do not read the flag.
+    pub fn hold_child_sweeps(&self, hold: bool) {
+        self.sweep_hold
+            .held
+            .store(hold, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The creators whose sweep the hold kept, each once, in the order
+    /// first held; clears the record.
+    pub fn take_held_sweep_creators(&self) -> Vec<ErasedIncr> {
+        std::mem::take(&mut *self.sweep_hold.creators.lock().unwrap())
+    }
+
+    fn sweep_is_held(&self, id: NodeId) -> bool {
+        if !self
+            .sweep_hold
+            .held
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let creator = ErasedIncr::new(id.0, self.nodes.get(id.0).generation(), self.runtime_id);
+        let mut creators = self.sweep_hold.creators.lock().unwrap();
+        if !creators.contains(&creator) {
+            creators.push(creator);
+        }
+        true
+    }
+
     /// The input child named `key` of the compute running on this
     /// runtime, created with `init()` and owned by that compute's node
     /// the first time it asks. Later runs that ask for `key` get the same
@@ -355,6 +396,10 @@ impl<C: Cells> Runtime<C> {
                     s.land();
                     s.orphans().to_vec()
                 })
+            }
+            ChildLanding::Sweep if self.sweep_is_held(id) => {
+                index.with(|s| s.land());
+                return;
             }
             ChildLanding::Sweep => index.with(|s| {
                 if !opened {
