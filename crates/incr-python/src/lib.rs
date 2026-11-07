@@ -821,6 +821,7 @@ impl PyCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
+        self.check_alive()?;
         let this = self.rt.bind(py).borrow();
         let rt = this.rt()?;
         engine_read(rt, || this.version_bridge(rt, self.inner.version_node()))
@@ -1136,6 +1137,7 @@ impl PySortedCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
+        self.check_alive()?;
         let this = self.rt.bind(py).borrow();
         let rt = this.rt()?;
         engine_read(rt, || this.version_bridge(rt, self.inner.version_node()))
@@ -1187,6 +1189,7 @@ impl PyGroupedCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
+        self.check_alive()?;
         let this = self.rt.bind(py).borrow();
         let rt = this.rt()?;
         engine_read(rt, || this.version_bridge(rt, self.inner.version_node()))
@@ -1373,6 +1376,8 @@ impl PyRuntime {
             Python::attach(|py| PyValue(n.into_pyobject(py).unwrap().into_any().unbind()))
         });
         bridges.insert(version, bridge);
+        self.state
+            .journal(|overlay| overlay.created(bridge.erase()));
         PyNodeId { inner: bridge }
     }
 }

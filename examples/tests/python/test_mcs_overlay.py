@@ -1,3 +1,5 @@
+import random
+
 import incr
 import pytest
 
@@ -94,16 +96,37 @@ def test_collection_created_inside_is_dead_after_exit():
         derived = base.map(lambda v: v + 1)
         kc = incr.KeyedCollection(rt)
         kc.upsert("k", 1)
+        ordered = base.sort_by_key(lambda v: v)
+        grouped = base.group_by(lambda v: v % 2)
     for use in (
         lambda: made.insert(2),
         lambda: made.snapshot_len(),
         lambda: derived.snapshot_len(),
         lambda: kc.upsert("k", 2),
+        lambda: made.version_node,
+        lambda: derived.version_node,
+        lambda: ordered.version_node,
+        lambda: grouped.version_node,
+        lambda: kc.collection.version_node,
     ):
         with pytest.raises(RuntimeError, match="created inside an overlay"):
             use()
     base.insert(3)
     assert base.snapshot_len() == 3
+
+
+def test_a_version_node_read_inside_an_overlay_leaves_node_count_unchanged():
+    rt = incr.Runtime()
+    base = rt.create_collection()
+    base.extend([1, 2])
+    ordered = base.sort_by_key(lambda v: v)
+    grouped = base.group_by(lambda v: v % 2)
+    before = rt.node_count()
+    with rt.overlay():
+        for collection in (base, ordered, grouped):
+            collection.version_node
+    assert rt.node_count() == before
+    assert rt.get(base.version_node) is not None
 
 
 def test_labels_are_restored():
@@ -345,8 +368,6 @@ def read_all(rt, nodes, grouped):
 
 
 def test_random_candidates_match_from_scratch_graphs():
-    import random
-
     rng = random.Random(7)
     base_rows = [(i * 3, rng.choice("abc")) for i in range(30)]
     rt = incr.Runtime()
