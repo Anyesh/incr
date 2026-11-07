@@ -266,49 +266,53 @@ fn refresh_runs_in_the_slots_context() {
     drop(fc);
 }
 
-#[derive(Clone, Copy, Debug, Eq)]
-struct NeverEqual(u32);
-
-impl Hash for NeverEqual {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl PartialEq for NeverEqual {
-    fn eq(&self, _: &Self) -> bool {
-        false
-    }
-}
-
-impl Serialize for NeverEqual {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        record("never", Op::Ser);
-        self.0.serialize(s)
-    }
-}
-
-impl<'de> Deserialize<'de> for NeverEqual {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        record("never", Op::De);
-        u32::deserialize(d).map(NeverEqual)
-    }
-}
-
 #[cfg(debug_assertions)]
-#[test]
-fn the_bypass_check_encodes_in_the_inputs_context() {
-    let log = MemoryBackend::new();
-    let store = open_store(&log);
-    let x = store.input("x", NeverEqual(1)).unwrap();
-    take_seen();
-    store.set(x, NeverEqual(2)).unwrap();
-    let seen = take_seen();
-    assert!(
-        seen.iter().filter(|s| s.1 == Op::Ser).count() >= 3,
-        "the check encodes both values besides the write: {seen:?}"
-    );
-    assert!(seen.iter().all(|s| s.2 == key("x")), "{seen:?}");
+mod bypass_check {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq)]
+    struct NeverEqual(u32);
+
+    impl Hash for NeverEqual {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for NeverEqual {
+        fn eq(&self, _: &Self) -> bool {
+            false
+        }
+    }
+
+    impl Serialize for NeverEqual {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            record("never", Op::Ser);
+            self.0.serialize(s)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for NeverEqual {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            record("never", Op::De);
+            u32::deserialize(d).map(NeverEqual)
+        }
+    }
+
+    #[test]
+    fn the_bypass_check_encodes_in_the_inputs_context() {
+        let log = MemoryBackend::new();
+        let store = open_store(&log);
+        let x = store.input("x", NeverEqual(1)).unwrap();
+        take_seen();
+        store.set(x, NeverEqual(2)).unwrap();
+        let seen = take_seen();
+        assert!(
+            seen.iter().filter(|s| s.1 == Op::Ser).count() >= 3,
+            "the check encodes both values besides the write: {seen:?}"
+        );
+        assert!(seen.iter().all(|s| s.2 == key("x")), "{seen:?}");
+    }
 }
 
 type MK = Probe<MKey>;
