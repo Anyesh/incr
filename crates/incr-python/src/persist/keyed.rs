@@ -35,9 +35,10 @@ pub(super) struct KeyedBinding {
     key: String,
     pub(super) pairs: PyPersistedCollection,
     pub(super) index: Arc<SharedIndex>,
-    /// Counts the changes to the index that did not come from this
-    /// binding's own writes, so a write can tell that what it staged came
-    /// from an index that has since moved.
+    /// Counts every change to the index, this binding's own commits
+    /// included, so a write can tell that what it staged came from an
+    /// index that has since moved, whether a refresh, a direct write or
+    /// another batch moved it.
     epoch: Cell<u64>,
 }
 
@@ -275,6 +276,8 @@ impl StoreCore {
             } else {
                 let mut index = binding.index.try_borrow_mut().ok_or_else(index_in_use)?;
                 index.commit_staged(py, staged);
+                drop(index);
+                binding.moved();
             }
         }
         Ok(())

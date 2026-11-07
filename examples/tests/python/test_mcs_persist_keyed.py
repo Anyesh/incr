@@ -566,3 +566,39 @@ def test_refresh_without_a_keyed_collection_applies_plain_nodes():
     leader.set(count_leader, 4)
     standby.refresh()
     assert standby.runtime.get(count_standby) == 4
+
+
+def assert_one_pair_for_k_after_restart(store, inner, kc, last):
+    assert kc.get("k") == last
+    assert len(kc) == 1
+    assert rows_of(store.runtime, kc.collection) == [last]
+    store.close()
+    again = open_store(inner)
+    reopened = declare(again)
+    assert len(reopened) == 1
+    assert reopened.get("k") == last
+    assert rows_of(again.runtime, reopened.collection) == [last]
+
+
+def test_a_direct_write_inside_an_open_batch_leaves_one_pair_for_the_key():
+    inner = MemoryBackend()
+    store = open_store(inner)
+    kc = declare(store)
+    store.upsert(kc, "k", 0)
+    with store.batch() as b:
+        b.upsert(kc, "k", 1)
+        store.upsert(kc, "k", 2)
+    assert_one_pair_for_k_after_restart(store, inner, kc, 1)
+
+
+def test_two_open_batches_on_one_key_leave_one_pair():
+    inner = MemoryBackend()
+    store = open_store(inner)
+    kc = declare(store)
+    store.upsert(kc, "k", 0)
+    first = store.batch()
+    second = store.batch()
+    with first as a, second as b:
+        a.upsert(kc, "k", 1)
+        b.upsert(kc, "k", 2)
+    assert_one_pair_for_k_after_restart(store, inner, kc, 1)
