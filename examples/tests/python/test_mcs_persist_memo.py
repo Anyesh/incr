@@ -502,3 +502,47 @@ def test_memory_memo_protocol():
     guard.release()
     guard.release()
     backend.lock_checkpoint().release()
+
+
+class LoadFailsOnce:
+    def __init__(self, inner):
+        self.inner = inner
+        self.failed = False
+
+    def lock_checkpoint(self):
+        return self.inner.lock_checkpoint()
+
+    def load(self):
+        if not self.failed:
+            self.failed = True
+            raise OSError("load refused")
+        return self.inner.load()
+
+    def read_entry(self, generation, item):
+        return self.inner.read_entry(generation, item)
+
+    def write_generation(self, base, generation, header, entries):
+        return self.inner.write_generation(base, generation, header, entries)
+
+    def remove_generation(self, generation):
+        return self.inner.remove_generation(generation)
+
+
+def test_a_failed_open_memo_keeps_the_declared_tables_for_the_retry():
+    store = Store.open(MemoryBackend(), build_id="b1")
+    base = store.input("base", 2, JsonCodec())
+    first = store.memo_table(
+        "first", 1, JsonCodec(), JsonCodec(), lambda ctx, key: ctx.get(base) * key
+    )
+    second = store.memo_table(
+        "second", 1, JsonCodec(), JsonCodec(), lambda ctx, key: ctx.memo(first, key) + 1
+    )
+    backend = LoadFailsOnce(MemoryMemo())
+    with pytest.raises(OSError, match="load refused"):
+        store.open_memo(backend)
+    memo = store.open_memo(backend)
+    rt = store.runtime
+    assert rt.get(memo.get_or_insert(first, 5)) == 10
+    assert rt.get(memo.get_or_insert(second, 5)) == 11
+    assert rt.get(rt.create_query(lambda ctx: ctx.memo(first, 3))) == 6
+    store.close()

@@ -8,6 +8,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use incr_compute::Runtime;
 use incr_core::Local;
@@ -21,7 +22,7 @@ use super::codec::Slot;
 use super::memo_backend::PyMemoBackend;
 use super::persist_error;
 use super::store::{PyStore, StoreCore};
-use crate::state::PyCallable;
+use crate::state::{PyCallable, RtState};
 use crate::{engine_read, engine_write, ready, InvalidateRef, PyNodeId, PyRuntimeRef};
 
 /// The closure the engine runs for a memo table: `py_func` called with a
@@ -57,7 +58,29 @@ fn memo_fn(
     }
 }
 
+type TableHandle = Rc<Cell<MemoTable<PyValue, PyValue>>>;
+
+/// A declared memo table, kept so a builder consumed by a failed open can
+/// be made again. Its handle is shared with the `MemoTable` object, whose
+/// handle names the builder that declared it and so is replaced with it.
+pub(super) struct MemoDecl {
+    name: String,
+    version: u32,
+    func: Py<PyAny>,
+    handle: TableHandle,
+}
+
 impl StoreCore {
+    fn restore_memo_builder(&self, py: Python<'_>, state: &RtState) {
+        let mut builder = self.new_memo_builder();
+        for decl in self.memo_decls.borrow().iter() {
+            let handle = builder.table::<PyValue, PyValue>(&decl.name, decl.version);
+            builder.define(handle, memo_fn(state.hold(decl.func.clone_ref(py))));
+            decl.handle.set(handle);
+        }
+        *self.memo_builder.borrow_mut() = Some(builder);
+    }
+
     fn open_memo(&self) -> PyResult<&Memo<Local, PyBackend>> {
         self.memo
             .get()
@@ -107,11 +130,23 @@ pub(super) fn declare_table(
     }
     core.registry.register(key_slot, key_codec)?;
     core.registry.register(value_slot, codec)?;
-    let callable = store.runtime.bind(py).borrow().state.hold(func);
+    let callable = store
+        .runtime
+        .bind(py)
+        .borrow()
+        .state
+        .hold(func.clone_ref(py));
     let mut builder = core.memo_builder.borrow_mut();
     let builder = builder.get_or_insert_with(|| core.new_memo_builder());
     let handle = builder.table::<PyValue, PyValue>(name, version);
     builder.define(handle, memo_fn(callable));
+    let handle = Rc::new(Cell::new(handle));
+    core.memo_decls.borrow_mut().push(MemoDecl {
+        name: name.to_owned(),
+        version,
+        func,
+        handle: Rc::clone(&handle),
+    });
     Ok(PyMemoTable {
         store: slf.clone().unbind(),
         name: name.to_owned(),
@@ -131,11 +166,20 @@ pub(super) fn open(slf: &Bound<'_, PyStore>, backend: Py<PyAny>) -> PyResult<PyM
         .borrow_mut()
         .take()
         .unwrap_or_else(|| core.new_memo_builder());
-    let memo = engine_write(core.runtime(), || {
+    let opened = engine_write(core.runtime(), || {
         core.registry.run(py, || {
             builder.open(&core.store, PyMemoBackend::new(backend))
         })
-    })??;
+    })
+    .and_then(|opened| opened);
+    let memo = match opened {
+        Ok(memo) => memo,
+        Err(e) => {
+            let state = store.runtime.bind(py).borrow().state.clone();
+            core.restore_memo_builder(py, &state);
+            return Err(e);
+        }
+    };
     core.memo
         .set(memo)
         .map_err(|_| PyRuntimeError::new_err("the memo is already open"))?;
@@ -150,7 +194,7 @@ pub(super) fn open(slf: &Bound<'_, PyStore>, backend: Py<PyAny>) -> PyResult<PyM
 pub(crate) struct PyMemoTable {
     store: Py<PyStore>,
     name: String,
-    handle: MemoTable<PyValue, PyValue>,
+    handle: TableHandle,
 }
 
 const _: () = assert!(std::mem::align_of::<PyMemoTable>() <= 16);
@@ -169,7 +213,7 @@ impl PyMemoTable {
             )));
         }
         let value = core.registry.scoped(|| {
-            let node = memo.get_or_insert(self.handle, key);
+            let node = memo.get_or_insert(self.handle.get(), key);
             rt.get(node)
         });
         drop(core.registry.take_failure());
@@ -239,7 +283,7 @@ impl PyMemo {
         let memo = core.open_memo()?;
         let node = engine_read(core.runtime(), || {
             core.registry
-                .scoped(|| memo.get_or_insert(table.handle, PyValue(key)))
+                .scoped(|| memo.get_or_insert(table.handle.get(), PyValue(key)))
         })?;
         drop(core.registry.take_failure());
         Ok(PyNodeId { inner: node })
