@@ -20,6 +20,8 @@ use std::sync::{Mutex, PoisonError};
 use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, RoutingFailed, Runtime};
 
 pub mod notready;
+#[cfg(feature = "persist")]
+pub mod persist;
 
 /// The exception types of one binding's module.
 pub trait Exceptions {
