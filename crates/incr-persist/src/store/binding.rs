@@ -6,6 +6,8 @@ use incr_core::{with_value_code, Cells, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::value_context::in_key;
+
 use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard};
 use super::logged::{Elements, LoggedKey};
 use crate::{Error, Kind, Record, Result};
@@ -227,7 +229,9 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         let held = rt.get(self.handle);
         let (applied, _) = self.value_of(logged)?;
         // Equal bytes cover values unequal to themselves, such as NaN.
-        if with_value_code(|| held == applied) || encode(&held)? == encode(&applied)? {
+        if with_value_code(|| held == applied)
+            || encode(&self.key, &held)? == encode(&self.key, &applied)?
+        {
             Ok(())
         } else {
             Err(Error::Bypassed {
@@ -262,14 +266,14 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
     }
 }
 
-pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    with_value_code(|| postcard::to_stdvec(value)).map_err(Error::Encode)
+pub(crate) fn encode<T: Serialize>(key: &str, value: &T) -> Result<Vec<u8>> {
+    in_key(key, || with_value_code(|| postcard::to_stdvec(value))).map_err(Error::Encode)
 }
 
 /// Decodes a value logged under `key`, rejecting bytes left over, since
 /// leftovers mean the bytes were written as some other type.
 pub(crate) fn decode<T: DeserializeOwned>(key: &str, bytes: &[u8]) -> Result<T> {
-    match with_value_code(|| postcard::take_from_bytes(bytes)) {
+    match in_key(key, || with_value_code(|| postcard::take_from_bytes(bytes))) {
         Ok((value, [])) => Ok(value),
         Ok(_) => Err(Error::TypeMismatch {
             key: key.to_owned(),

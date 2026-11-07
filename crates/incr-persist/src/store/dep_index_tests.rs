@@ -16,7 +16,7 @@ fn open<C: Cells>() -> Store<C, MemoryBackend> {
 }
 
 fn h<T: Serialize>(value: &T) -> u128 {
-    fp_of(&encode(value).unwrap())
+    fp_of(&encode("k", value).unwrap())
 }
 
 fn known(deps: &DepIndex, key: &str) -> u128 {

@@ -84,24 +84,27 @@ impl<T: PersistValue + Hash + Eq, C: Cells> PersistedCollection<T, C> {
     }
 
     fn insert_record(&self, state: &State<C>, value: &T) -> Result<Record> {
+        let key = self.key_in(state)?;
         Ok(Record::Insert {
-            key: self.key_in(state)?,
-            element: encode(value)?,
+            element: encode(&key, value)?,
+            key,
         })
     }
 
     fn delete_record(&self, state: &State<C>, value: &T) -> Result<Record> {
+        let key = self.key_in(state)?;
         Ok(Record::Remove {
-            key: self.key_in(state)?,
-            element: encode(value)?,
+            element: encode(&key, value)?,
+            key,
         })
     }
 
     fn replace_record(&self, state: &State<C>, old: Option<&T>, new: &T) -> Result<Record> {
+        let key = self.key_in(state)?;
         Ok(Record::Replace {
-            key: self.key_in(state)?,
-            old: old.map(encode).transpose()?,
-            new: encode(new)?,
+            old: old.map(|old| encode(&key, old)).transpose()?,
+            new: encode(&key, new)?,
+            key,
         })
     }
 
@@ -241,23 +244,23 @@ impl<C: Cells, B: Backend> Store<C, B> {
 
 /// The sum, mod 2^128, of the fingerprints of the encodings of `values`,
 /// one per stored occurrence: a collection's fingerprint.
-pub(super) fn fp_of_elements<T: Serialize>(values: &[T]) -> Result<u128> {
+pub(super) fn fp_of_elements<T: Serialize>(key: &str, values: &[T]) -> Result<u128> {
     values.iter().try_fold(0u128, |sum, value| {
-        Ok(sum.wrapping_add(fp_of(&encode(value)?)))
+        Ok(sum.wrapping_add(fp_of(&encode(key, value)?)))
     })
 }
 
 /// What a single mutation changes in a collection's fingerprint, from the
 /// representatives the core reports for it.
-#[derive(Default)]
-struct FpDelta {
+struct FpDelta<'a> {
+    key: &'a str,
     delta: u128,
     failed: bool,
 }
 
-impl<T: Serialize> RepSink<T> for FpDelta {
+impl<T: Serialize> RepSink<T> for FpDelta<'_> {
     fn on_rep(&mut self, side: RepSide, rep: &T) {
-        let Ok(bytes) = encode(rep) else {
+        let Ok(bytes) = encode(self.key, rep) else {
             self.failed = true;
             return;
         };
@@ -269,7 +272,15 @@ impl<T: Serialize> RepSink<T> for FpDelta {
     }
 }
 
-impl FpDelta {
+impl<'a> FpDelta<'a> {
+    fn new(key: &'a str) -> Self {
+        FpDelta {
+            key,
+            delta: 0,
+            failed: false,
+        }
+    }
+
     fn apply_to(&self, map: &mut DepMap, key: &str) {
         match map.entry(key).map(|entry| entry.fp) {
             _ if self.failed => map.untrust(key),
@@ -361,7 +372,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
         if guard.deps().is_some() {
-            let mut sink = FpDelta::default();
+            let mut sink = FpDelta::new(&self.key);
             self.mutate(rt, op, &mut sink, &mut spent);
             if let Some(map) = guard.deps() {
                 sink.apply_to(map, &self.key);
@@ -384,7 +395,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
             .collection
             .values(rt)
             .iter()
-            .map(encode)
+            .map(|value| encode(&self.key, value))
             .collect::<Result<Vec<_>>>()?;
         encoded.sort_unstable();
         Ok(encoded)
@@ -407,7 +418,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         let mut moved = HashSet::new();
         for stored in current.keys() {
             if let Some((wanted, _)) = with_value_code(|| target.get_key_value(stored)) {
-                if encode(stored)? != encode(wanted)? {
+                if encode(&self.key, stored)? != encode(&self.key, wanted)? {
                     moved.insert(with_value_code(|| stored.clone()));
                 }
             }
@@ -421,7 +432,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
             for (value, &have) in &plan.current {
                 let want = plan.kept(value, &plan.target);
                 if want < have {
-                    let element = encode(value)?;
+                    let element = encode(&self.key, value)?;
                     changes.extend((want..have).map(|_| Record::Remove {
                         key: self.key.clone(),
                         element: element.clone(),
@@ -431,7 +442,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
             for (value, &want) in &plan.target {
                 let have = plan.kept(value, &plan.current);
                 if have < want {
-                    let element = encode(value)?;
+                    let element = encode(&self.key, value)?;
                     changes.extend((have..want).map(|_| Record::Insert {
                         key: self.key.clone(),
                         element: element.clone(),
@@ -488,7 +499,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         }
         let fp = guard.deps().is_some().then(|| {
             spent.values = self.collection.values(rt);
-            match fp_of_elements(&spent.values) {
+            match fp_of_elements(&self.key, &spent.values) {
                 Ok(fp) => DepFp::Known(fp),
                 Err(_) => DepFp::Untrusted,
             }
@@ -535,7 +546,10 @@ where
         if !rt.is_alive(self.node()) {
             return Ok(DepFp::Untrusted);
         }
-        Ok(DepFp::Known(fp_of_elements(&self.collection.values(rt))?))
+        Ok(DepFp::Known(fp_of_elements(
+            &self.key,
+            &self.collection.values(rt),
+        )?))
     }
 
     fn apply(

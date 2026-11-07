@@ -23,6 +23,7 @@ mod record;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod store;
+mod value_context;
 
 pub use backend::{Backend, Position, ReadOutcome, SnapshotId};
 pub use error::{Error, Result};
@@ -35,4 +36,8 @@ pub use sqlite::{SqliteBackend, SqliteDurability, SqliteOptions};
 pub use store::{
     Batch, Durability, Input, KeyRef, Options, Origin, PersistValue, PersistedCollection, Store,
     SubscriptionId,
+};
+pub use value_context::{
+    current_value_context, enter_value_context, EncodeMismatch, MemoPart, ValueContext,
+    ValueContextGuard,
 };

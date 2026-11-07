@@ -13,6 +13,7 @@ use super::handle::{MemoCtx, MemoKey, MemoValue};
 use super::mapping::{map_live, LiveDep};
 use super::memo_core::{CoreRef, MemoCells};
 use crate::store::dep_index::DepMap;
+use crate::value_context::{in_memo, EncodeMismatch, MemoPart};
 
 pub(crate) type MemoFn<K, T, C> = dyn Fn(&MemoCtx<'_, C>, &K) -> T + Send + Sync;
 
@@ -42,34 +43,51 @@ pub(crate) struct Snap {
 }
 
 pub(crate) trait Encode {
-    /// The key's and value's bytes, or `None` if either does not decode
-    /// back equal to itself.
-    fn encode(&self) -> Option<(Vec<u8>, Vec<u8>)>;
+    /// The key's and value's bytes, or the part that does not encode or
+    /// does not decode back equal to itself.
+    fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), EncodeMismatch>;
 }
 
 struct Typed<K, T> {
+    table: Arc<str>,
     key: K,
     value: T,
 }
 
 impl<K: MemoKey, T: MemoValue> Encode for Typed<K, T> {
-    fn encode(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let key = encode(&self.key)?;
-        let value = encode(&self.value)?;
-        let same = with_value_code(|| {
-            decode::<K>(&key).is_some_and(|k| k == self.key)
-                && decode::<T>(&value).is_some_and(|v| v == self.value)
-        });
-        same.then_some((key, value))
+    fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), EncodeMismatch> {
+        let mismatch = |part| EncodeMismatch {
+            table: self.table.to_string(),
+            part,
+        };
+        let table = &*self.table;
+        let key = encode(table, MemoPart::Key, &self.key).ok_or_else(|| mismatch(MemoPart::Key))?;
+        let value =
+            encode(table, MemoPart::Value, &self.value).ok_or_else(|| mismatch(MemoPart::Value))?;
+        let key_same = decode::<K>(table, MemoPart::Key, &key)
+            .is_some_and(|k| with_value_code(|| k == self.key));
+        if !key_same {
+            return Err(mismatch(MemoPart::Key));
+        }
+        let value_same = decode::<T>(table, MemoPart::Value, &value)
+            .is_some_and(|v| with_value_code(|| v == self.value));
+        if !value_same {
+            return Err(mismatch(MemoPart::Value));
+        }
+        Ok((key, value))
     }
 }
 
-pub(crate) fn encode<X: Serialize>(x: &X) -> Option<Vec<u8>> {
-    with_value_code(|| postcard::to_allocvec(x).ok())
+pub(crate) fn encode<X: Serialize>(table: &str, part: MemoPart, x: &X) -> Option<Vec<u8>> {
+    in_memo(table, part, || {
+        with_value_code(|| postcard::to_allocvec(x).ok())
+    })
 }
 
-pub(crate) fn decode<X: DeserializeOwned>(bytes: &[u8]) -> Option<X> {
-    with_value_code(|| postcard::from_bytes(bytes).ok())
+pub(crate) fn decode<X: DeserializeOwned>(table: &str, part: MemoPart, bytes: &[u8]) -> Option<X> {
+    in_memo(table, part, || {
+        with_value_code(|| postcard::from_bytes(bytes).ok())
+    })
 }
 
 /// A table's typed operations for code that walks entries of every table.
@@ -123,6 +141,7 @@ pub(crate) trait ErasedTable<C: MemoCells> {
 
 pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
     pub(crate) index: u32,
+    pub(crate) name: Arc<str>,
     pub(crate) nodes: NodeTable<K, T, C>,
     pub(crate) f: Arc<MemoFn<K, T, C>>,
 }
@@ -179,7 +198,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
         base: &SeedBase,
         bag: &mut Deferred<C>,
     ) -> (Incr<T>, Seeded) {
-        let Some(value) = decode::<T>(value) else {
+        let Some(value) = decode::<T>(&self.name, MemoPart::Value, value) else {
             return (self.cold_into(core, rt, key, bag), Seeded::Corrupt);
         };
         let mut value = Some(value);
@@ -224,7 +243,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         key: &[u8],
         bag: &mut Deferred<C>,
     ) -> Result<Option<ErasedIncr>, ()> {
-        let key = decode::<K>(key).ok_or(())?;
+        let key = decode::<K>(&self.name, MemoPart::Key, key).ok_or(())?;
         let live = self.probe(rt, &key).map(Incr::erase);
         bag.push(key);
         Ok(live)
@@ -237,7 +256,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         key: &[u8],
         bag: &mut Deferred<C>,
     ) -> Option<ErasedIncr> {
-        let key = decode::<K>(key)?;
+        let key = decode::<K>(&self.name, MemoPart::Key, key)?;
         Some(self.cold_into(core, rt, key, bag).erase())
     }
 
@@ -252,7 +271,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         base: &SeedBase,
         bag: &mut Deferred<C>,
     ) -> Option<(ErasedIncr, Seeded)> {
-        let key = decode::<K>(key)?;
+        let key = decode::<K>(&self.name, MemoPart::Key, key)?;
         let (handle, seeded) = self.seed(core, rt, key, value, deps, reuse, base, bag);
         Some((handle.erase(), seeded))
     }
@@ -288,6 +307,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
                 deps,
                 in_group: seen.in_group,
                 item: Box::new(Typed {
+                    table: Arc::clone(&self.name),
                     key,
                     value: seen.value,
                 }),

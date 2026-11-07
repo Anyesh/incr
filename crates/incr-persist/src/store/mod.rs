@@ -462,7 +462,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                     source: None,
                 });
         }
-        let declared = self.declare(state, key, Kind::Input, || encode(&default))?;
+        let declared = self.declare(state, key, Kind::Input, || encode(key, &default))?;
         let logged_default: T = decode(key, &declared.default)?;
         let default_fp = fp_of(&declared.default);
         let (value, fp) = match &state.logged[key].value {
@@ -1236,7 +1236,7 @@ fn set_record<C: Cells, T: PersistValue>(
     let _ = rt;
     Ok(Record::Set {
         key: binding.key.clone(),
-        value: encode(value)?,
+        value: encode(&binding.key, value)?,
     })
 }
 

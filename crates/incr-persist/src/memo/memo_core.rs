@@ -13,6 +13,7 @@ use super::{
     Generation, IndexItem, MemoBackend, TableDesc,
 };
 use crate::store::dep_index::{DepIndex, External};
+use crate::value_context::EncodeMismatch;
 use crate::Result;
 
 /// Restores and checkpoints by count, since the memo opened.
@@ -142,6 +143,15 @@ pub(crate) struct MemoState {
     /// a live handle; checkpoints prune them.
     pub(crate) seed_info: HashMap<ErasedIncr, (u128, u64)>,
     pub(crate) stats: MemoStats,
+    pub(crate) mismatches: Vec<EncodeMismatch>,
+}
+
+impl MemoState {
+    pub(crate) fn record_mismatch(&mut self, mismatch: EncodeMismatch) {
+        if !self.mismatches.contains(&mismatch) {
+            self.mismatches.push(mismatch);
+        }
+    }
 }
 
 /// Everything a restore, a checkpoint and a memo closure share.

@@ -12,6 +12,7 @@ use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats};
 use super::options::MemoOptions;
 use super::table_core::{ErasedTable, TableCore};
 use super::{CheckpointStats, GenId, Generation, MemoBackend, TableDesc};
+use crate::value_context::EncodeMismatch;
 use crate::{Backend, Error, Result, Store};
 
 static NEXT_MEMO: AtomicU64 = AtomicU64::new(1);
@@ -80,9 +81,11 @@ impl<C: MemoCells> MemoBuilder<C> {
             declared.desc.name
         );
         let index = table.index;
+        let name: Arc<str> = declared.desc.name.as_str().into();
         declared.make = Some(Box::new(move |rt| {
             Box::new(TableCore::<K, T, C> {
                 index,
+                name,
                 nodes: rt.create_table(),
                 f: Arc::new(f),
             })
@@ -203,6 +206,15 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
     pub fn stats(&self) -> MemoStats {
         check_value_code();
         self.core.lock_memo().stats.clone()
+    }
+
+    /// The entries checkpoints left out since the last call because their
+    /// key or value did not round-trip through serde, one per table and
+    /// part. The checkpoint itself succeeded; those entries are recomputed
+    /// after the next restart.
+    pub fn take_encode_mismatches(&self) -> Vec<EncodeMismatch> {
+        check_value_code();
+        std::mem::take(&mut self.core.lock_memo().mismatches)
     }
 }
 

@@ -11,6 +11,7 @@ use super::mapping::LiveDep;
 use super::memo_core::{CoreRef, IndexGen, MemoCells};
 use super::table_core::Snap;
 use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, StoredDep};
+use crate::value_context::EncodeMismatch;
 use crate::Result;
 
 impl<C: MemoCells> CoreRef<C> {
@@ -42,13 +43,19 @@ impl<C: MemoCells> CoreRef<C> {
         };
         drop(moved);
         bag.drain(rt);
+        let mut mismatches = Vec::new();
+        let fresh = fresh(snaps, &mut mismatches);
         let done = self.backend.checkpoint(CheckpointInput {
             build: self.build,
             tables: self.catalog.clone(),
-            fresh: fresh(snaps),
+            fresh,
             max_bytes: self.max_bytes,
-        })?;
+        });
         let mut state = self.lock_memo();
+        for mismatch in mismatches {
+            state.record_mismatch(mismatch);
+        }
+        let done = done?;
         self.swap_index(IndexGen::new(done.generation, self.build, &self.catalog));
         state.stats.checkpoints += 1;
         // Restores hold M, so none is still reading the old generation.
@@ -67,8 +74,10 @@ impl<C: MemoCells> CoreRef<C> {
 /// allows: encoded and decoding back equal, not in a cycle group, and
 /// every dep mapped. A query dep maps to another snapshot entry, whose
 /// value's fingerprint it records.
-fn fresh(snaps: Vec<Snap>) -> Vec<Entry> {
+fn fresh(snaps: Vec<Snap>, mismatches: &mut Vec<EncodeMismatch>) -> Vec<Entry> {
     let encoded: Vec<_> = snaps.iter().map(|snap| snap.item.encode()).collect();
+    mismatches.extend(encoded.iter().filter_map(|e| e.as_ref().err().cloned()));
+    let encoded: Vec<_> = encoded.into_iter().map(Result::ok).collect();
     let by_handle: HashMap<ErasedIncr, (u32, &[u8], u128)> = snaps
         .iter()
         .zip(&encoded)
