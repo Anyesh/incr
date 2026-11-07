@@ -20,7 +20,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 
-use super::persist_error;
+use super::{persist_error, Busy};
 
 /// A Python exception a backend method raised, carried through
 /// incr-persist's `Error::Backend` so the store call raises it unchanged.
@@ -48,11 +48,17 @@ impl fmt::Display for PyBackendError {
 
 impl std::error::Error for PyBackendError {}
 
-fn raised(err: PyErr) -> Error {
+/// `err` as the store's error: `incr.persist.Busy` is the store's own
+/// `Busy`, so a skipped checkpoint stays one, and any other exception is
+/// carried so the call raises it unchanged.
+pub(super) fn raised(err: PyErr) -> Error {
+    if Python::attach(|py| err.is_instance_of::<Busy>(py)) {
+        return Error::Busy;
+    }
     Error::Backend(Box::new(PyBackendError(err)))
 }
 
-fn bad_return(what: &str) -> Error {
+pub(super) fn bad_return(what: &str) -> Error {
     raised(PyTypeError::new_err(format!(
         "backend {what} returned a value of the wrong shape"
     )))

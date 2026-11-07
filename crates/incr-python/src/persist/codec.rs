@@ -64,7 +64,7 @@ impl Slot {
         }
     }
 
-    fn describe(&self) -> String {
+    pub(super) fn describe(&self) -> String {
         match self {
             Slot::Key(key) => format!("persisted key '{key}'"),
             Slot::MemoKey(table) => format!("keys of memo table '{table}'"),

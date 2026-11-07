@@ -60,6 +60,25 @@ pub(crate) fn call_query(
     }
 }
 
+/// [`call_query`] for a memo table's function, which takes the entry's
+/// `key` after the ref.
+pub(crate) fn call_memo(
+    py: Python<'_>,
+    rt: &Runtime,
+    f: &Py<PyAny>,
+    rt_ref: Py<PyAny>,
+    key: Py<PyAny>,
+    missing: &Cell<u64>,
+) -> Py<PyAny> {
+    let value = f
+        .call1(py, (rt_ref, key))
+        .unwrap_or_else(|e| not_ready_or_raise(py, rt, e));
+    match missing.get() {
+        0 => value,
+        missing => short_by(py, value, missing),
+    }
+}
+
 /// The value a query of `rt` whose closure raised `e` lands: the
 /// not-ready value `e` carries if it is the signal, which stopped the
 /// closure before it asked for all its children, so they are kept. Any

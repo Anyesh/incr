@@ -2,13 +2,13 @@
 //! live in a backend's log. Writes to them go through the store; the
 //! runtime and the graph API read them like any other node.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use incr_core::Local;
-use incr_persist::memo::fingerprint;
+use incr_persist::memo::{fingerprint, Memo, MemoBuilder};
 use incr_persist::{Durability, Input, Options, Store};
 use incr_python_protocol::PyValue;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -19,6 +19,7 @@ use super::backend::PyBackend;
 use super::batch::PyBatch;
 use super::codec::{PairCodec, Registry, Slot};
 use super::keyed::{Following, KeyedBinding, Pending, PyPersistedCollection};
+use super::memo::{self, PyMemo, PyMemoTable};
 use crate::keyed::KeyCounts;
 use crate::overlay::Born;
 use crate::{engine_write, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
@@ -27,10 +28,11 @@ use crate::{engine_write, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
 /// runtime it owns, the codecs of its slots, and the persisted nodes the
 /// binding must keep direct writes off.
 pub(crate) struct StoreCore {
-    store: Store<Local, PyBackend>,
+    pub(super) store: Arc<Store<Local, PyBackend>>,
     pub(super) registry: Rc<Registry>,
-    #[expect(dead_code, reason = "the memo layer opens with it")]
-    build_id: u128,
+    pub(super) build_id: u128,
+    pub(super) memo_builder: RefCell<Option<MemoBuilder<Local>>>,
+    pub(super) memo: OnceCell<Memo<Local, PyBackend>>,
     inputs: RefCell<HashMap<u32, Input<PyValue>>>,
     collections: RefCell<HashMap<u32, PyPersistedCollection>>,
     pub(super) keyed: RefCell<Vec<Rc<KeyedBinding>>>,
@@ -121,7 +123,7 @@ impl StoreCore {
 #[pyclass(name = "Store", module = "incr.persist", unsendable)]
 pub(crate) struct PyStore {
     core: Option<Rc<StoreCore>>,
-    runtime: Py<PyRuntime>,
+    pub(super) runtime: Py<PyRuntime>,
 }
 
 const _: () = assert!(std::mem::align_of::<PyStore>() <= 16);
@@ -182,10 +184,16 @@ impl PyStore {
         };
         let registry = Rc::new(Registry::default());
         let store = registry.run(py, || Store::open(PyBackend::new(backend), options))?;
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "MemoBuilder::open takes the store as an Arc"
+        )]
         let core = Rc::new(StoreCore {
-            store,
+            store: Arc::new(store),
             registry,
             build_id,
+            memo_builder: RefCell::default(),
+            memo: OnceCell::new(),
             inputs: RefCell::default(),
             collections: RefCell::default(),
             keyed: RefCell::default(),
@@ -454,6 +462,33 @@ impl PyStore {
         let py = slf.py();
         slf.try_borrow()?.core_outside_overlay(py)?;
         Ok(PyBatch::new(slf.clone().unbind()))
+    }
+
+    /// Declares the memo table `name`, whose entries `func(ctx, key)`
+    /// computes, and returns it. `ctx` is the `RuntimeRef` queries receive,
+    /// and `ctx.memo(table, key)` reads another entry as a dependency.
+    /// `key_codec` and `codec` encode the keys and the values under the
+    /// contracts of `store.input`, and `func` must be a pure function of
+    /// its key and what it reads through `ctx`. Bump `version` when it
+    /// changes meaning: entries are kept only while the name and version
+    /// match. Declare every table before `store.open_memo`.
+    fn memo_table(
+        slf: &Bound<'_, Self>,
+        name: &str,
+        version: u32,
+        key_codec: Py<PyAny>,
+        codec: Py<PyAny>,
+        func: Py<PyAny>,
+    ) -> PyResult<PyMemoTable> {
+        memo::declare_table(slf, name, version, key_codec, codec, func)
+    }
+
+    /// Opens the memo over `backend`, an object that implements the memo
+    /// backend protocol (see `incr.persist.MemoryMemo`), and loads its
+    /// current generation. Entries written under another `build_id`, or by
+    /// a table of another name, version or type, are ignored.
+    fn open_memo(slf: &Bound<'_, Self>, backend: Py<PyAny>) -> PyResult<PyMemo> {
+        memo::open(slf, backend)
     }
 
     /// Applies the records other writers appended since this store last

@@ -353,6 +353,19 @@ impl PyRuntimeRef {
         Ok(ready::with_status(py, val.0))
     }
 
+    /// The value of `table`'s entry for `key` (see `Store.memo_table`),
+    /// restored from the memo or computed, read as `get` reads a node.
+    fn memo(
+        &self,
+        py: Python<'_>,
+        table: PyRef<'_, persist::PyMemoTable>,
+        key: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let (rt, missing) = self.rt_and_missing()?;
+        let val = engine_read(rt, || table.value_of(py, rt, PyValue(key)))??;
+        ready::read(py, val.0, missing)
+    }
+
     /// The input child named `key` of this query, created with `init()`
     /// the first time this query asks for it. Children this query stops
     /// asking for are deleted when it next lands.
