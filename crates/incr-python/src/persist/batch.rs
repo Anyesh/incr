@@ -82,7 +82,7 @@ impl PyBatch {
 
     fn set(&mut self, py: Python<'_>, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
         self.open()?;
-        let core = self.store.bind(py).borrow().core()?.clone();
+        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.set(&core, &node, value)
     }
 
@@ -93,7 +93,7 @@ impl PyBatch {
         row: Py<PyAny>,
     ) -> PyResult<()> {
         self.open()?;
-        let core = self.store.bind(py).borrow().core()?.clone();
+        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.insert(&core, &collection, row)
     }
 
@@ -104,7 +104,7 @@ impl PyBatch {
         row: Py<PyAny>,
     ) -> PyResult<()> {
         self.open()?;
-        let core = self.store.bind(py).borrow().core()?.clone();
+        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.delete(&core, &collection, row)
     }
 
@@ -116,7 +116,7 @@ impl PyBatch {
         new: Py<PyAny>,
     ) -> PyResult<()> {
         self.open()?;
-        let core = self.store.bind(py).borrow().core()?.clone();
+        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.replace(&core, &collection, old, new)
     }
 
@@ -128,7 +128,7 @@ impl PyBatch {
         row: Bound<'_, PyAny>,
     ) -> PyResult<()> {
         self.open()?;
-        let core = self.store.bind(py).borrow().core()?.clone();
+        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.upsert(&core, &kc, &key, &row)
     }
 
@@ -139,7 +139,7 @@ impl PyBatch {
         key: Bound<'_, PyAny>,
     ) -> PyResult<()> {
         self.open()?;
-        let core = self.store.bind(py).borrow().core()?.clone();
+        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.remove(&core, &kc, &key)
     }
 
@@ -150,7 +150,7 @@ impl PyBatch {
         rows: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         self.open()?;
-        let core = self.store.bind(py).borrow().core()?.clone();
+        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.reconcile(&core, &kc, rows)
     }
 }

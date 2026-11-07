@@ -14,7 +14,8 @@ use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 
 use crate::keyed::{KeyStep, SharedIndex};
-use crate::{engine_read, PyNodeId, PyRuntime};
+use crate::persist::OverlayScope;
+use crate::{engine_read, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
 
 /// Set when the overlay that created an object ends, after which the
 /// object's nodes are gone and every use of it raises.
@@ -51,6 +52,11 @@ pub(crate) struct Overlay {
     created: Vec<ErasedIncr>,
     dead: Vec<Rc<Cell<bool>>>,
     pub(crate) reported_at_entry: HashSet<ErasedIncr>,
+    persist: Option<OverlayScope>,
+}
+
+fn no_scope() -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err("the overlay holds no persisted scope")
 }
 
 impl Overlay {
@@ -62,6 +68,35 @@ impl Overlay {
     /// only set whose old value the exit restores.
     pub(crate) fn first_set(&mut self, node: Incr<PyValue>) -> bool {
         self.set_seen.insert(node)
+    }
+
+    pub(crate) fn with_scope(&mut self, scope: Option<OverlayScope>) {
+        self.persist = scope;
+    }
+
+    pub(crate) fn take_scope(&mut self) -> Option<OverlayScope> {
+        self.persist.take()
+    }
+
+    pub(crate) fn touch(&mut self, node: &PyNodeId) -> PyResult<()> {
+        self.persist.as_mut().ok_or_else(no_scope)?.touch(node)
+    }
+
+    pub(crate) fn writable_collection(
+        &mut self,
+        collection: &PyCollection,
+    ) -> PyResult<IncrCollection<PyValue>> {
+        self.persist
+            .as_mut()
+            .ok_or_else(no_scope)?
+            .collection(collection)
+    }
+
+    pub(crate) fn writable_pairs(
+        &mut self,
+        kc: &PyKeyedCollection,
+    ) -> PyResult<IncrCollection<PyValue>> {
+        self.persist.as_mut().ok_or_else(no_scope)?.pairs(kc)
     }
 
     pub(crate) fn created(&mut self, node: ErasedIncr) {
@@ -159,12 +194,17 @@ impl PyOverlay {
                     "an overlay is already active on this runtime",
                 ));
             }
+            let scope = runtime
+                .store_core()
+                .map(|core| OverlayScope::open(slf.py(), core))
+                .transpose()?;
             let reported = runtime.engine_read(|rt| {
                 rt.hold_child_sweeps(true);
                 rt.watch_reported()
             })?;
             let mut overlay = Overlay::default();
             overlay.reported_at_entry = reported.into_iter().collect();
+            overlay.with_scope(scope);
             runtime.state.begin_overlay(overlay);
         }
         Ok(slf)
@@ -183,6 +223,7 @@ impl PyOverlay {
             let Some(mut overlay) = runtime.state.end_overlay() else {
                 return Ok(false);
             };
+            let scope = overlay.take_scope();
             let restored = runtime.engine_write(|rt| {
                 let restored = overlay.restore(rt);
                 rt.hold_child_sweeps(false);
@@ -191,6 +232,7 @@ impl PyOverlay {
             match restored.and_then(|r| r) {
                 Ok(()) => {
                     runtime.engine_read(|rt| settle(rt, &overlay))?;
+                    scope.map(|scope| scope.close(py)).transpose()?;
                     None
                 }
                 Err(e) => Some(e),

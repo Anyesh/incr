@@ -37,6 +37,7 @@ mod ready;
 mod state;
 
 use pyo3::prelude::*;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -48,7 +49,7 @@ use incr_compute::{
     PropagationTrace, Runtime, SortedCollection, TraceAction,
 };
 use incr_core::{Local, RoutingFailed, RoutingHold};
-use keyed::{IndexGuard, KeyCounts, SharedIndex, StagedKeys};
+use keyed::{Applied, IndexGuard, KeyCounts, SharedIndex, StagedKeys};
 use overlay::{Born, Undo};
 use state::{PyCallable, RtState};
 
@@ -509,14 +510,22 @@ impl OnRuntime for PyCollection {
 }
 
 impl PyCollection {
+    /// The collection a write goes to: this one, or for a persisted
+    /// collection, which only the store writes, the unlogged handle an
+    /// overlay's scope gives out.
     #[inline]
-    fn check_writable(&self) -> PyResult<()> {
-        if self.persisted {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "collection is persisted: write it with store.insert, store.delete, store.replace or store.extend",
-            ));
+    fn target(&self, py: Python<'_>) -> PyResult<Cow<'_, IncrCollection<PyValue>>> {
+        if !self.persisted {
+            return Ok(Cow::Borrowed(&self.inner));
         }
-        Ok(())
+        self.state(py)
+            .journal_with(|overlay| overlay.writable_collection(self))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "collection is persisted: write it with store.insert, store.delete, store.replace or store.extend",
+                )
+            })?
+            .map(Cow::Owned)
     }
 
     /// A collection a call on `parent` just created: dead when the active
@@ -536,12 +545,13 @@ impl PyCollection {
     fn apply_journaled(
         &self,
         py: Python<'_>,
+        target: &IncrCollection<PyValue>,
         changes: Vec<Change<PyValue>>,
     ) -> PyResult<Vec<Change<PyValue>>> {
-        let applied = self.engine_write(py, |rt| self.inner.apply(rt, changes))?;
+        let applied = self.engine_write(py, |rt| target.apply(rt, changes))?;
         if !applied.is_empty() {
             self.state(py).journal(|overlay| {
-                overlay.push(Undo::Collection(self.inner.clone(), applied.clone()));
+                overlay.push(Undo::Collection(target.clone(), applied.clone()));
             });
         }
         Ok(applied)
@@ -551,41 +561,47 @@ impl PyCollection {
 #[pymethods]
 impl PyCollection {
     fn insert(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
-        self.check_writable()?;
+        let target = self.target(py)?;
         if self.state(py).overlay_active() {
-            self.apply_journaled(py, vec![Change::Insert(PyValue(value))])?;
+            self.apply_journaled(py, &target, vec![Change::Insert(PyValue(value))])?;
             return Ok(());
         }
-        self.engine_write(py, |rt| self.inner.insert(rt, PyValue(value)))
+        self.engine_write(py, |rt| target.insert(rt, PyValue(value)))
     }
 
     fn delete(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<bool> {
-        self.check_writable()?;
+        let target = self.target(py)?;
         if self.state(py).overlay_active() {
-            let applied = self.apply_journaled(py, vec![Change::Delete(PyValue(value))])?;
+            let applied =
+                self.apply_journaled(py, &target, vec![Change::Delete(PyValue(value))])?;
             return Ok(!applied.is_empty());
         }
-        self.engine_write(py, |rt| self.inner.delete(rt, &PyValue(value)))
+        self.engine_write(py, |rt| target.delete(rt, &PyValue(value)))
     }
 
     fn extend(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.check_writable()?;
+        let target = self.target(py)?;
         let values = rows
             .try_iter()?
             .map(|row| row.map(|row| PyValue(row.unbind())))
             .collect::<PyResult<Vec<_>>>()?;
         if self.state(py).overlay_active() {
-            self.apply_journaled(py, values.into_iter().map(Change::Insert).collect())?;
+            self.apply_journaled(
+                py,
+                &target,
+                values.into_iter().map(Change::Insert).collect(),
+            )?;
             return Ok(());
         }
-        self.engine_write(py, |rt| self.inner.extend(rt, values))
+        self.engine_write(py, |rt| target.extend(rt, values))
     }
 
     fn replace(&self, py: Python<'_>, old: Py<PyAny>, new: Py<PyAny>) -> PyResult<bool> {
-        self.check_writable()?;
+        let target = self.target(py)?;
         if self.state(py).overlay_active() {
             let applied = self.apply_journaled(
                 py,
+                &target,
                 vec![Change::Delete(PyValue(old)), Change::Insert(PyValue(new))],
             )?;
             // An insert is never skipped, so an empty net change means the
@@ -593,7 +609,7 @@ impl PyCollection {
             return Ok(applied.is_empty() || applied.iter().any(|c| matches!(c, Change::Delete(_))));
         }
         self.engine_write(py, |rt| {
-            self.inner.replace(rt, Some(&PyValue(old)), PyValue(new))
+            target.replace(rt, Some(&PyValue(old)), PyValue(new))
         })
     }
 
@@ -858,19 +874,25 @@ impl PyKeyedCollection {
         state: &RtState,
         index: &mut IndexGuard<'_>,
         staged: StagedKeys,
+        pairs: &IncrCollection<PyValue>,
     ) -> PyResult<KeyCounts> {
         let mut steps = Vec::new();
         let journaling = state.overlay_active();
         let (counts, applied) = index.apply_staged(
             py,
             staged,
-            |changes| engine_write(rt, || self.pairs.apply(rt, changes)),
+            |changes| engine_write(rt, || pairs.apply(rt, changes)),
             journaling.then_some(&mut steps),
+            if self.persisted {
+                Applied::AsStaged
+            } else {
+                Applied::Reported
+            },
         )?;
         if journaling && !applied.is_empty() {
             state.journal(|overlay| {
                 overlay.push(Undo::Keyed {
-                    pairs: self.pairs.clone(),
+                    pairs: pairs.clone(),
                     index: Arc::clone(&self.index),
                     applied,
                     steps,
@@ -923,13 +945,21 @@ impl PyKeyedCollection {
         Self::over(runtime, Some(pairs), index)
     }
 
-    fn refuse_if_persisted(&self) -> PyResult<()> {
-        if self.persisted {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "keyed collection is persisted: write it with store.upsert, store.remove, store.reconcile or a store.batch",
-            ));
+    /// The pair collection a write goes to: this one's, or for a persisted
+    /// one, which only the store writes, the unlogged handle an overlay's
+    /// scope gives out.
+    fn pairs_for_write(&self, py: Python<'_>) -> PyResult<Cow<'_, IncrCollection<PyValue>>> {
+        if !self.persisted {
+            return Ok(Cow::Borrowed(&self.pairs));
         }
-        Ok(())
+        self.state(py)
+            .journal_with(|overlay| overlay.writable_pairs(self))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "keyed collection is persisted: write it with store.upsert, store.remove, store.reconcile or a store.batch",
+                )
+            })?
+            .map(Cow::Owned)
     }
 
     /// [`Self::index`] for an operation that writes, under `routing`.
@@ -951,21 +981,21 @@ impl PyKeyedCollection {
     /// it, otherwise the pair is replaced or inserted.
     fn upsert(&self, py: Python<'_>, key: Bound<'_, PyAny>, row: Bound<'_, PyAny>) -> PyResult<()> {
         self.check_alive()?;
-        self.refuse_if_persisted()?;
+        let pairs = self.pairs_for_write(py)?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
         let mut index = self.index_for_write(routing)?;
         let mut staged = StagedKeys::default();
         staged.stage(&index, &key, Some(&row))?;
-        self.apply_staged(py, rt, &runtime.state, &mut index, staged)?;
+        self.apply_staged(py, rt, &runtime.state, &mut index, staged, &pairs)?;
         Ok(())
     }
 
     /// Remove `key`'s pair. Raises `KeyError` if no row is held for it.
     fn remove(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<()> {
         self.check_alive()?;
-        self.refuse_if_persisted()?;
+        let pairs = self.pairs_for_write(py)?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
@@ -974,7 +1004,7 @@ impl PyKeyedCollection {
         if !staged.stage(&index, &key, None)? {
             return Err(pyo3::exceptions::PyKeyError::new_err(key.unbind()));
         }
-        self.apply_staged(py, rt, &runtime.state, &mut index, staged)?;
+        self.apply_staged(py, rt, &runtime.state, &mut index, staged, &pairs)?;
         Ok(())
     }
 
@@ -999,14 +1029,14 @@ impl PyKeyedCollection {
     /// change. Returns how many keys were `(inserted, replaced, removed)`.
     fn reconcile(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<KeyCounts> {
         self.check_alive()?;
-        self.refuse_if_persisted()?;
+        let pairs = self.pairs_for_write(py)?;
         let runtime = self.rt.bind(py).borrow();
         let rt = runtime.rt()?;
         let routing = rt.hold_routing_suppressed();
         let mut index = self.index_for_write(routing)?;
         let mut staged = StagedKeys::default();
         staged.stage_reconcile(&index, rows)?;
-        self.apply_staged(py, rt, &runtime.state, &mut index, staged)
+        self.apply_staged(py, rt, &runtime.state, &mut index, staged, &pairs)
     }
 
     #[getter]
@@ -1245,6 +1275,13 @@ impl PyRuntime {
         }
     }
 
+    pub(crate) fn store_core(&self) -> Option<&Rc<persist::StoreCore>> {
+        match &self.holder {
+            Holder::Persisted(core) => Some(core),
+            _ => None,
+        }
+    }
+
     fn relabel(&self, slot: u32, label: String) -> PyResult<()> {
         let old = self.engine_read(|rt| {
             let old = rt.label(slot);
@@ -1378,17 +1415,23 @@ impl PyRuntime {
     }
 
     fn set(&self, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
-        if let Holder::Persisted(core) = &self.holder {
-            if core.is_persisted_input(node.inner.slot()) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "input is persisted: write it with store.set(node, value)",
-                ));
-            }
+        let persisted = self
+            .store_core()
+            .is_some_and(|core| core.is_persisted_input(node.inner.slot()));
+        if persisted && !self.state.overlay_active() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "input is persisted: write it with store.set(node, value)",
+            ));
         }
         let first = self
             .state
             .journal_with(|overlay| overlay.first_set(node.inner))
             .unwrap_or(false);
+        if first && persisted {
+            self.state
+                .journal_with(|overlay| overlay.touch(&node))
+                .transpose()?;
+        }
         let old = if first {
             Some(self.engine_read(|rt| rt.get(node.inner))?)
         } else {

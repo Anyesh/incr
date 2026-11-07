@@ -21,6 +21,19 @@ use pyo3::types::PyTuple;
 /// How many keys an operation inserted, gave a new row, and removed.
 pub(crate) type KeyCounts = (usize, usize, usize);
 
+/// What phase 2 treats as applied to the pair collection.
+#[derive(Clone, Copy)]
+pub(crate) enum Applied {
+    /// The changes the collection reports, matched to staged pairs by
+    /// identity: for a collection whose stored pairs are the index's own.
+    Reported,
+    /// Every staged change, for a persisted collection, whose stored pairs
+    /// are decoded copies that are equal to the index's but never the same
+    /// objects. The index mirrors the collection, so a staged delete of a
+    /// held pair always finds its equal in the collection.
+    AsStaged,
+}
+
 /// One index change an operation made, kept by an overlay to undo it:
 /// the pair, its stored hash, and whether the operation inserted it (else
 /// it removed it).
@@ -212,6 +225,7 @@ impl KeyIndex {
         staged: StagedKeys,
         apply: impl FnOnce(Vec<Change<PyValue>>) -> PyResult<Vec<Change<PyValue>>>,
         journal: Option<&mut Vec<KeyStep>>,
+        applied_as: Applied,
     ) -> PyResult<(KeyCounts, Vec<Change<PyValue>>)> {
         let changes = staged.changes(py);
         if changes.is_empty() {
@@ -220,7 +234,11 @@ impl KeyIndex {
         self.reserve_for(&staged);
         let applied = apply(changes)?;
         let kept = journal.is_some().then(|| applied.clone());
-        let counts = self.commit(py, &staged, applied, journal);
+        let committed = match applied_as {
+            Applied::Reported => applied,
+            Applied::AsStaged => staged.changes(py),
+        };
+        let counts = self.commit(py, &staged, committed, journal);
         Ok((counts, kept.unwrap_or_default()))
     }
 

@@ -220,14 +220,16 @@ fn mismatch_message(tables: &[(String, &'static str)]) -> String {
 #[pymethods]
 impl PyMemo {
     /// The node of `table`'s entry for `key`: the live one, or one restored
-    /// from the memo, or a new one. Read it with `runtime.get`.
+    /// from the memo, or a new one. Read it with `runtime.get`. Inside an
+    /// overlay it computes fresh and records nothing, so no candidate value
+    /// is restored from the memo or reaches it.
     fn get_or_insert(
         &self,
         py: Python<'_>,
         table: PyRef<'_, PyMemoTable>,
         key: Py<PyAny>,
     ) -> PyResult<PyNodeId> {
-        let core = self.core(py)?;
+        let core = self.store.bind(py).try_borrow()?.core_live(py)?;
         if !table.store.is(&self.store) {
             return Err(PyValueError::new_err(format!(
                 "memo table '{}' belongs to another store",

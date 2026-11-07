@@ -12,6 +12,7 @@ mod codec;
 mod keyed;
 mod memo;
 mod memo_backend;
+mod scope;
 mod store;
 
 use incr_persist::Error;
@@ -19,6 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 pub(crate) use memo::PyMemoTable;
+pub(crate) use scope::OverlayScope;
 pub(crate) use store::StoreCore;
 
 pyo3::create_exception!(

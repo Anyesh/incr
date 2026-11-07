@@ -135,14 +135,22 @@ impl PyStore {
             .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
     }
 
-    pub(super) fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Rc<StoreCore>> {
+    /// The core of a store whose runtime is usable: a runtime poisoned by
+    /// a failed overlay restore refuses every store call, since a
+    /// checkpoint would fold the half-restored collections.
+    pub(super) fn core_live(&self, py: Python<'_>) -> PyResult<Rc<StoreCore>> {
         let core = Rc::clone(self.core()?);
+        self.runtime.bind(py).borrow().rt()?;
+        Ok(core)
+    }
+
+    pub(super) fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Rc<StoreCore>> {
         if self.runtime.bind(py).borrow().state.overlay_active() {
             return Err(PyRuntimeError::new_err(
                 "store calls cannot run inside an overlay",
             ));
         }
-        Ok(core)
+        self.core_live(py)
     }
 }
 
