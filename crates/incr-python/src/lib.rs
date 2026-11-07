@@ -32,6 +32,7 @@ mod keyed;
 mod lookups;
 mod memory;
 mod overlay;
+mod persist;
 mod ready;
 mod state;
 
@@ -39,6 +40,7 @@ use pyo3::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use incr_compute::{
@@ -479,6 +481,8 @@ struct PyCollection {
     inner: IncrCollection<PyValue>,
     rt: Py<PyRuntime>,
     born: Born,
+    /// Set for a collection a store persists, which only the store writes.
+    persisted: bool,
 }
 
 impl OnRuntime for PyCollection {
@@ -492,6 +496,16 @@ impl OnRuntime for PyCollection {
 }
 
 impl PyCollection {
+    #[inline]
+    fn check_writable(&self) -> PyResult<()> {
+        if self.persisted {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "collection is persisted: write it with store.insert, store.delete, store.replace or store.extend",
+            ));
+        }
+        Ok(())
+    }
+
     /// A collection a call on `parent` just created: dead when the active
     /// overlay ends, and its node deleted then.
     fn made(parent: &impl OnRuntime, py: Python<'_>, inner: IncrCollection<PyValue>) -> Self {
@@ -500,6 +514,7 @@ impl PyCollection {
             inner,
             rt: parent.runtime().clone_ref(py),
             born: parent.state(py).born(),
+            persisted: false,
         }
     }
 
@@ -523,6 +538,7 @@ impl PyCollection {
 #[pymethods]
 impl PyCollection {
     fn insert(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        self.check_writable()?;
         if self.state(py).overlay_active() {
             self.apply_journaled(py, vec![Change::Insert(PyValue(value))])?;
             return Ok(());
@@ -531,6 +547,7 @@ impl PyCollection {
     }
 
     fn delete(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<bool> {
+        self.check_writable()?;
         if self.state(py).overlay_active() {
             let applied = self.apply_journaled(py, vec![Change::Delete(PyValue(value))])?;
             return Ok(!applied.is_empty());
@@ -539,6 +556,7 @@ impl PyCollection {
     }
 
     fn extend(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.check_writable()?;
         let values = rows
             .try_iter()?
             .map(|row| row.map(|row| PyValue(row.unbind())))
@@ -551,6 +569,7 @@ impl PyCollection {
     }
 
     fn replace(&self, py: Python<'_>, old: Py<PyAny>, new: Py<PyAny>) -> PyResult<bool> {
+        self.check_writable()?;
         if self.state(py).overlay_active() {
             let applied = self.apply_journaled(
                 py,
@@ -955,6 +974,7 @@ impl PyKeyedCollection {
             inner: self.rows.clone(),
             rt: self.rt.clone_ref(py),
             born: self.born.clone(),
+            persisted: false,
         }
     }
 }
@@ -1078,6 +1098,7 @@ impl PyGroupedCollection {
             inner: collection,
             rt: self.rt.clone_ref(py),
             born: Born::default(),
+            persisted: false,
         }))
     }
 
@@ -1107,7 +1128,11 @@ struct PyRuntime {
 /// pyclass object to 16 bytes.
 enum Holder {
     Owned(Box<Runtime>),
+    Persisted(Rc<persist::StoreCore>),
     Poisoned(#[expect(dead_code, reason = "held so close drops it")] Box<Runtime>),
+    PoisonedPersisted(
+        #[expect(dead_code, reason = "held so close drops it")] Rc<persist::StoreCore>,
+    ),
     Closed,
 }
 
@@ -1125,12 +1150,54 @@ const _: () = {
 };
 
 impl PyRuntime {
+    fn persisted(core: Rc<persist::StoreCore>) -> Self {
+        PyRuntime {
+            holder: Holder::Persisted(core),
+            version_bridges: RefCell::new(HashMap::new()),
+            state: RtState::default(),
+        }
+    }
+
+    /// Closes a store's runtime, for `store.close()`.
+    fn close_persisted(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Self::close_any(slf)
+    }
+
+    fn close_any(slf: &Bound<'_, Self>) -> PyResult<()> {
+        slf.try_borrow()
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "cannot close the runtime while a call on it is running",
+                )
+            })?
+            .forbid_in_overlay("close")?;
+        let (holder, bridges) = {
+            let mut this = slf.try_borrow_mut().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "cannot close the runtime while a call on it is running",
+                )
+            })?;
+            let holder = std::mem::replace(&mut this.holder, Holder::Closed);
+            let bridges = std::mem::take(this.version_bridges.get_mut());
+            let lookups = this.state.lookups().clear();
+            (holder, (bridges, lookups))
+        };
+        // Dropped after the borrow ends, so a finalizer that calls back into
+        // this runtime sees it closed instead of a held borrow.
+        drop(bridges);
+        drop(holder);
+        Ok(())
+    }
+
     fn rt(&self) -> PyResult<&Runtime> {
         match &self.holder {
             Holder::Owned(rt) => Ok(rt),
-            Holder::Poisoned(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "runtime poisoned by a failed overlay restore",
-            )),
+            Holder::Persisted(core) => Ok(core.runtime()),
+            Holder::Poisoned(_) | Holder::PoisonedPersisted(_) => {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "runtime poisoned by a failed overlay restore",
+                ))
+            }
             Holder::Closed => Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "runtime is closed",
             )),
@@ -1151,8 +1218,10 @@ impl PyRuntime {
     /// Keeps the runtime for `close` to drop but refuses every other call:
     /// a half-restored base has no defined state.
     fn poison(&mut self) {
-        if let Holder::Owned(rt) = std::mem::replace(&mut self.holder, Holder::Closed) {
-            self.holder = Holder::Poisoned(rt);
+        match std::mem::replace(&mut self.holder, Holder::Closed) {
+            Holder::Owned(rt) => self.holder = Holder::Poisoned(rt),
+            Holder::Persisted(core) => self.holder = Holder::PoisonedPersisted(core),
+            other => self.holder = other,
         }
     }
 
@@ -1210,31 +1279,21 @@ impl PyRuntime {
 
     /// Drop the engine and everything it holds: values, closures and the
     /// Python objects they capture. Every later call on this runtime or an
-    /// object derived from it raises. Refused while a call on it is running.
+    /// object derived from it raises. Refused while a call on it is running,
+    /// and for the runtime of a store, which `store.close()` closes.
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
-        slf.try_borrow()
-            .map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "cannot close the runtime while a call on it is running",
-                )
-            })?
-            .forbid_in_overlay("close")?;
-        let (holder, bridges) = {
-            let mut this = slf.try_borrow_mut().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "cannot close the runtime while a call on it is running",
-                )
-            })?;
-            let holder = std::mem::replace(&mut this.holder, Holder::Closed);
-            let bridges = std::mem::take(this.version_bridges.get_mut());
-            let lookups = this.state.lookups().clear();
-            (holder, (bridges, lookups))
-        };
-        // Dropped after the borrow ends, so a finalizer that calls back into
-        // this runtime sees it closed instead of a held borrow.
-        drop(bridges);
-        drop(holder);
-        Ok(())
+        if matches!(
+            slf.try_borrow().map(|this| matches!(
+                this.holder,
+                Holder::Persisted(_) | Holder::PoisonedPersisted(_)
+            )),
+            Ok(true)
+        ) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "this runtime belongs to a store: close it with store.close()",
+            ));
+        }
+        Self::close_any(slf)
     }
 
     /// Run candidate changes against the live graph and put it back
@@ -1278,6 +1337,13 @@ impl PyRuntime {
     }
 
     fn set(&self, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
+        if let Holder::Persisted(core) = &self.holder {
+            if core.is_persisted_input(node.inner.slot()) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "input is persisted: write it with store.set(node, value)",
+                ));
+            }
+        }
         let first = self
             .state
             .journal_with(|overlay| overlay.first_set(node.inner))
@@ -1441,6 +1507,7 @@ impl PyRuntime {
             inner: col,
             rt,
             born,
+            persisted: false,
         })
     }
 
@@ -1641,5 +1708,6 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKeyedCollection>()?;
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
+    persist::register(m)?;
     Ok(())
 }

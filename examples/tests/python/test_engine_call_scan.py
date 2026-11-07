@@ -178,7 +178,9 @@ def local_violations(text, helper_texts=()):
 def test_every_local_engine_call_goes_through_the_entry_its_kind_needs():
     text = (LOCAL / "lib.rs").read_text()
     assert method_blocks(text), "no #[pymethods] blocks found"
-    others = [p.read_text() for p in sorted(LOCAL.glob("*.rs")) if p.name != "lib.rs"]
+    others = [
+        p.read_text() for p in sorted(LOCAL.rglob("*.rs")) if p != LOCAL / "lib.rs"
+    ]
     problems = local_violations(text, others)
     assert not problems, "\n".join(problems)
 
