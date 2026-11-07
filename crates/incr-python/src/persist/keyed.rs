@@ -40,6 +40,10 @@ pub(super) struct KeyedBinding {
     /// index that has since moved, whether a refresh, a direct write or
     /// another batch moved it.
     epoch: Cell<u64>,
+    /// Set while the index may not match the collection, because a drain
+    /// or a failed write could not bring it up to date; the next drain
+    /// rebuilds it.
+    stale: Cell<bool>,
 }
 
 impl KeyedBinding {
@@ -237,7 +241,7 @@ impl StoreCore {
         let Pending { ops, keyed } = pending;
         let changes: Vec<Vec<Change<PyValue>>> =
             keyed.iter().map(|s| s.staged.changes(py)).collect();
-        self.run(py, |store| {
+        let appended = self.run(py, |store| {
             store
                 .batch(|batch| {
                     for op in ops {
@@ -264,7 +268,17 @@ impl StoreCore {
                     }
                 })
                 .map(drop)
-        })?;
+        });
+        if let Err(error) = appended {
+            for staging in &keyed {
+                if let Err(rebuild) = self.rebuild(py, &staging.binding) {
+                    if error.cause(py).is_none() {
+                        error.set_cause(py, Some(rebuild));
+                    }
+                }
+            }
+            return Err(error);
+        }
         for Staging {
             binding,
             staged,
@@ -344,6 +358,7 @@ impl StoreCore {
             pairs,
             index,
             epoch: Cell::new(0),
+            stale: Cell::new(false),
         }))
     }
 
@@ -357,9 +372,11 @@ impl StoreCore {
     }
 
     fn rebuild(&self, py: Python<'_>, binding: &KeyedBinding) -> PyResult<()> {
+        binding.stale.set(true);
         let fresh = self.index_of(py, &binding.pairs)?;
         let mut index = binding.index.try_borrow_mut().ok_or_else(index_in_use)?;
         *index = fresh;
+        binding.stale.set(false);
         binding.moved();
         Ok(())
     }
@@ -390,8 +407,10 @@ impl StoreCore {
 
     /// Applies the records queued since the last drain to the keyed
     /// collections they name. A key that saw a `Delete` or `Forget`, or
-    /// whose records fail to apply, has its index rebuilt from the
-    /// collection, which the store already brought up to date.
+    /// whose records fail to apply, or whose index an earlier call left
+    /// stale, has its index rebuilt from the collection, which the store
+    /// already brought up to date. A binding whose turn never came because
+    /// a rebuild failed stays stale for the next call.
     pub(super) fn drain(&self, py: Python<'_>) -> PyResult<()> {
         let records = match &*self.following.borrow() {
             Some(following) => std::mem::take(
@@ -402,25 +421,36 @@ impl StoreCore {
             ),
             None => return Ok(()),
         };
-        if records.is_empty() {
-            return Ok(());
-        }
         let bindings = self.keyed.borrow().clone();
+        let mut pending = Vec::new();
         for binding in &bindings {
+            let touched = records
+                .iter()
+                .any(|(record, _)| record.key() == binding.key);
+            let behind = binding.stale.get();
+            if touched || behind {
+                binding.stale.set(true);
+                pending.push((binding, behind));
+            }
+            if touched {
+                binding.moved();
+            }
+        }
+        for (binding, behind) in pending {
             let mine: Vec<&Record> = records
                 .iter()
                 .map(|(record, _)| record)
                 .filter(|record| record.key() == binding.key)
                 .collect();
-            if mine.is_empty() {
-                continue;
-            }
-            binding.moved();
-            let resets = mine
-                .iter()
-                .any(|record| matches!(record, Record::Delete { .. } | Record::Forget { .. }));
+            let resets = behind
+                || mine.is_empty()
+                || mine
+                    .iter()
+                    .any(|record| matches!(record, Record::Delete { .. } | Record::Forget { .. }));
             if resets || self.apply_foreign(py, binding, &mine).is_err() {
                 self.rebuild(py, binding)?;
+            } else {
+                binding.stale.set(false);
             }
         }
         Ok(())

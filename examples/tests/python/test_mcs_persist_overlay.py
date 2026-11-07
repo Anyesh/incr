@@ -587,3 +587,53 @@ def test_an_overlay_exit_whose_settle_raises_still_closes_the_scope():
     store.checkpoint()
     assert rt.get(n) == 4
     store.close()
+
+
+class Probe:
+    """Hashes like every other probe and, when compared, runs `hook` once:
+    a store call made while a lookup holds the index of its collection."""
+
+    hook = None
+
+    def __init__(self, name):
+        self.name = name
+
+    def __hash__(self):
+        return 7
+
+    def __eq__(self, other):
+        hook, Probe.hook = Probe.hook, None
+        if hook:
+            hook()
+        return False
+
+    def __reduce__(self):
+        return (Probe, (self.name,))
+
+
+def standby_whose_drain_hits_a_held_index():
+    backend = MemoryBackend()
+    leader = Store.open(backend, build_id=1)
+    standby = Store.open(backend, build_id=1)
+    kc_leader = keyed(leader, "a")
+    held = keyed(standby, "a")
+    other = keyed(standby, "b")
+    standby.upsert(held, Probe("x"), 1)
+    leader.upsert(kc_leader, "y", 2)
+    Probe.hook = lambda: standby.upsert(other, "new", 1)
+    with pytest.raises(RuntimeError, match="during an operation"):
+        held.get(Probe("probe"))
+    return standby, held, other
+
+
+def test_a_drain_error_after_the_append_leaves_the_index_holding_the_logged_keys():
+    standby, held, other = standby_whose_drain_hits_a_held_index()
+    assert (other.get("new"), len(other)) == (1, 1)
+    assert rows_of(standby.runtime, other.collection) == [1]
+
+
+def test_an_index_a_failed_drain_left_behind_is_rebuilt_by_the_next_store_call():
+    standby, held, other = standby_whose_drain_hits_a_held_index()
+    standby.refresh()
+    assert (held.get("y"), len(held)) == (2, 2)
+    assert rows_of(standby.runtime, held.collection) == [1, 2]
