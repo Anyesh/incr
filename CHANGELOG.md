@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Python: the minimum Rust version of `incr-python` is 1.89.** The binding depends on incr-persist, whose `rust-version` is 1.89, so building incr-compute's Python wheel from source needs Rust 1.89 or newer; CI checks `-p incr-python` on 1.89. The other crates keep 1.88.
+
 ## [0.2.0-beta.6] - 2026-10-29
 
 ### Added

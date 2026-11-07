@@ -2,7 +2,7 @@
 name = "incr-python"
 version.workspace = true
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Python bindings for the incr single-threaded incremental computation engine"
 license = "Apache-2.0"
 publish = false
@@ -16,5 +16,6 @@ doc = false
 hashbrown = { version = "=0.17.1", default-features = false }
 incr_compute = { package = "incr-compute", version = "=0.2.0-beta.6", path = "../incr-compute" }
 incr-core.workspace = true
-incr-python-protocol = { path = "../incr-python-protocol" }
+incr-persist = { path = "../incr-persist" }
+incr-python-protocol = { path = "../incr-python-protocol", features = ["persist"] }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
