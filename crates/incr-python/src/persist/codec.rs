@@ -271,7 +271,7 @@ fn frame(py: Python<'_>, codec: &Py<PyAny>, value: &Bound<'_, PyAny>) -> PyResul
                 push_value(py, codec, &mut out, unavailable.row().bind(py))?;
             } else {
                 return Err(PyTypeError::new_err(format!(
-                    "cannot persist a {} value: only Pending, LookupFailed and Unavailable are persistable not-ready values",
+                    "cannot persist a {} value: only Pending, LookupFailed, Unavailable and Incomplete persist, and a NotReady of another kind (a subclass included) does not",
                     value.get_type().name()?
                 )));
             }

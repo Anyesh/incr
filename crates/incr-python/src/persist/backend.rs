@@ -12,7 +12,11 @@
 //! except that `incr.persist.ReadOnly` (a write on a read-only handle) and
 //! `InvalidCompaction(upto, snapshot_at, tail)` (a `compact` outside the
 //! snapshot and the tail) are the store's own errors, which its logic
-//! branches on.
+//! branches on. `writable()` is the exception to raising: incr-persist's
+//! trait gives it no error channel, so an exception from it reads as
+//! `False`. The store itself never calls it (only the conformance cases
+//! do), so a read-only handle is known by its `append` and `compact`
+//! raising `ReadOnly`.
 
 use std::fmt;
 
