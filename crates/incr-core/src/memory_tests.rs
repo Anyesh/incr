@@ -235,12 +235,15 @@ fn memory_stats_report_registered_external_state<C: Cells>() {
 #[test]
 fn shared_memory_stats_survives_concurrent_collection_creation() {
     let rt = Runtime::<Shared>::new();
+    // Each reader call scans every node, so the work grows with the square
+    // of the count: 5000 per creator runs for hours under Miri.
+    let per_creator = if cfg!(miri) { 64 } else { 5000 };
     let live_creators = std::sync::atomic::AtomicUsize::new(4);
     std::thread::scope(|s| {
         for _ in 0..4 {
             s.spawn(|| {
                 let mut kept = Vec::new();
-                for _ in 0..5000 {
+                for _ in 0..per_creator {
                     let col: IncrCollection<u64, Shared> = rt.create_collection();
                     kept.push(col);
                 }
