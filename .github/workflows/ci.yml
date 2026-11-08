@@ -133,7 +133,12 @@ jobs:
               cargo +nightly miri test -p "$CRATE" --lib -- --list --ignored | sed -n 's/: test$//p' > "$RUNNER_TEMP/ignored"
               python3 scripts/miri-shard.py scripts/miri-times.tsv "$LIB_SHARDS" "${PART#lib-}" \
                 "$RUNNER_TEMP/tests" "$RUNNER_TEMP/ignored" > "$RUNNER_TEMP/shard"
-              cargo +nightly miri test -p "$CRATE" --lib -- --test-threads=1 -Zunstable-options --report-time --exact $(cat "$RUNNER_TEMP/shard")
+              split -l 12 "$RUNNER_TEMP/shard" "$RUNNER_TEMP/chunk."
+              for c in "$RUNNER_TEMP"/chunk.*; do
+                start=$SECONDS
+                cargo +nightly miri test -p "$CRATE" --lib -- --test-threads=1 --exact $(cat "$c")
+                echo "::notice title=miri chunk::$(basename "$c") $((SECONDS - start)) s, first $(head -1 "$c")"
+              done
               ;;
             *) echo "unknown part $PART"; exit 1 ;;
           esac
