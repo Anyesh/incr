@@ -874,6 +874,13 @@ impl PyKeyedCollection {
         self.index.try_borrow_mut().ok_or_else(index_in_use)
     }
 
+    /// The index lives in this object, not the engine, so a read that only
+    /// consults it must ask the runtime whether it is closed.
+    fn check_open(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_alive()?;
+        self.rt.bind(py).borrow().rt().map(drop)
+    }
+
     /// Applies `staged` to the pair collection and the index, and in an
     /// overlay journals both.
     fn apply_staged(
@@ -1019,17 +1026,17 @@ impl PyKeyedCollection {
 
     /// The row held for `key`, or `None`.
     fn get<'py>(&self, key: Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        self.check_alive()?;
+        self.check_open(key.py())?;
         self.index()?.row(&key)
     }
 
     fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
-        self.check_alive()?;
+        self.check_open(key.py())?;
         Ok(self.index()?.row(&key)?.is_some())
     }
 
-    fn __len__(&self) -> PyResult<usize> {
-        self.check_alive()?;
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        self.check_open(py)?;
         Ok(self.index()?.len())
     }
 
@@ -1049,13 +1056,14 @@ impl PyKeyedCollection {
     }
 
     #[getter]
-    fn collection(&self, py: Python<'_>) -> PyCollection {
-        PyCollection {
+    fn collection(&self, py: Python<'_>) -> PyResult<PyCollection> {
+        self.check_open(py)?;
+        Ok(PyCollection {
             inner: self.rows.clone(),
             rt: self.rt.clone_ref(py),
             born: self.born.clone(),
             persisted: false,
-        }
+        })
     }
 }
 

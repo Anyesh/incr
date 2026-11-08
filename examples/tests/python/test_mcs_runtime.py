@@ -56,6 +56,30 @@ def test_collection_created_before_close_raises():
         t.get_or_insert_input("k", 0)
 
 
+def test_keyed_collection_and_table_reads_raise_after_close():
+    rt = incr.Runtime()
+    kc = incr.KeyedCollection(rt)
+    kc.upsert("a", 1)
+    t = rt.create_table()
+    t.get_or_insert_input("k", lambda: 0)
+    rt.close()
+    calls = [
+        lambda: kc.get("a"),
+        lambda: "a" in kc,
+        lambda: len(kc),
+        lambda: kc.upsert("b", 2),
+        lambda: kc.remove("a"),
+        lambda: kc.reconcile({}),
+        lambda: kc.collection,
+        lambda: t.get("k"),
+        lambda: t.remove("k"),
+        lambda: t.items(),
+    ]
+    for call in calls:
+        with pytest.raises(RuntimeError, match="runtime is closed"):
+            call()
+
+
 def test_close_releases_captured_objects():
     rt = incr.Runtime()
     box = Box()
