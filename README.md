@@ -117,9 +117,9 @@ The engine itself lives in [`incr-core`](crates/incr-core/) under a `Cells` stra
 
 ```toml
 [dependencies]
-incr-compute = "0.2.0-beta.6"      # single-threaded
+incr-compute = "0.2.0-beta.7"      # single-threaded
 # or
-incr-concurrent = "0.2.0-beta.6"   # multi-threaded (Send + Sync)
+incr-concurrent = "0.2.0-beta.7"   # multi-threaded (Send + Sync)
 ```
 
 **Python (`incr-compute`, Local runtime) for a live service:**

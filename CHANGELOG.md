@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0-beta.7] - 2026-11-08
 
 ### Added
 
@@ -16,7 +16,7 @@ All notable changes to this project are documented here. Format roughly follows 
 - **Python: `group_by` routes without reading `version_node`.** An insert is visible in `get_group`, `keys()` and watched group totals without anyone reading the router (see Fixed for the change in when `key_fn` runs). Core routes a `group_by` router when the write that reached it returns, with a per-runtime hold that layered APIs (incr-persist, incr-kube) take until their locks drop, and `LockKind::Binding` is a re-enterable lock rank below Store.
 - **Python: `Runtime.overlay()`.** `with rt.overlay() as ov:` applies candidate changes (`set`, collection and keyed writes, new nodes and labels), lets you read results, and on exit restores the base graph exactly: values, collections and keyed indexes, labels, node count, and watch reports (a drain after exit reports only changes the overlay did not cause). Operations an overlay cannot undo (`delete_node`, `watch`, `stabilize`, `create_table`, table inserts, lookup resolution and others) raise `RuntimeError`, and collections created inside it are dead after exit. At 240,000 shifts an overlay costs about 14 microseconds at p50, in memory and on a persisted graph (`examples/python/bench_overlay.py`). Core gains `Runtime::clear_label`, `hold_child_sweeps`, `watch_reported` and `unreport_watched`.
 - **Python: `incr.persist`.** `Store.open(backend, build_id=, durability=)` persists inputs (`store.input`), collections (`store.collection`) and keyed collections (`store.keyed_collection`), each with a codec (any object with `encode(obj) -> bytes` and `decode(bytes) -> obj`, kept per store and slot). `store.batch()` appends all its writes as one backend append, so a progress input set in the batch lands with the rows it covers; `store.refresh()` applies what another writer appended, and `store.checkpoint()` compacts. `store.memo_table(...)`, `store.open_memo(backend)`, `memo.get_or_insert` and `ctx.memo` give persistent memoization. A backend is any Python object with `append`, `sync`, `read_from`, `load_snapshot`, `snapshot_id`, `compact` and `writable`, and a memo backend has `lock_checkpoint`, `load`, `read_entry`, `write_generation` and `remove_generation`; `MemoryBackend` and `MemoryMemo` are built in. The exceptions are `PersistError` (a `RuntimeError`) and its subclasses `Busy`, `ReadOnly` and `InvalidCompaction`. A failing backend `append` raises the backend's own exception and leaves the store usable, while a failing `sync` poisons it. Overlays work on a persisted graph and restore the log's view exactly, and while one is open the memo computes fresh and records nothing. Not-ready values are stored under a type tag, so a quarantined row restores as itself.
-- **incr-persist: value context, `EncodeMismatch` and `unlogged_scope`.** Every encode and decode runs inside a `ValueContext` (`Key(name)` or `MemoTable { table, part }`) that a value's serde impl can read, which is how the Python codec is chosen per slot. A memo entry whose key or value does not encode, or does not decode back equal, is recorded as an `EncodeMismatch` (`memo.take_encode_mismatches()`) and left out of the generation. `Store::unlogged_scope` and `unlogged_scope_shared` open a scope whose changes never reach the log and are restored on close; while it is open `set`, `batch`, `delete`, `undeclare`, `checkpoint`, `refresh`, declarations and memo opening or checkpointing are refused.
+- **incr-persist: value context, `EncodeMismatch` and `unlogged_scope`.** Every encode and decode runs inside a `ValueContext` (`Key(name)` or `MemoTable { table, part }`) that a value's serde impl can read, which is how the Python codec is chosen per slot. A memo entry whose key or value does not encode, or does not decode back equal, is recorded as an `EncodeMismatch` (`memo.take_encode_mismatches()`) and left out of the generation. `Store::unlogged_scope` and `unlogged_scope_shared` open a scope whose changes never reach the log and are restored on close; while it is open `set`, `batch`, `delete`, `undeclare`, `checkpoint`, `refresh`, declarations and memo opening or checkpointing are refused. Dropping a scope without closing it, or a close that cannot reach the store's state, poisons the store.
 - **Linux aarch64 wheels.** CI builds and tests manylinux 2_28 aarch64 wheels of `incr-compute` and `incr-concurrent`, and a tagged release publishes the `incr-compute` one. CI also runs on pushes to `ci/**`.
 - **Python: releasing the GIL was evaluated and is not shipped.** With a second Python thread running, a binding that detached during propagation made the writer 36 times slower (busy loop) or 46 percent slower (light thread), because every compute closure re-takes the GIL. `Collection.extend`, `replace` and `KeyedCollection.reconcile` are the way to keep a write short (`examples/python/bench_gil.py`).
 
@@ -31,6 +31,10 @@ All notable changes to this project are documented here. Format roughly follows 
 ### Changed
 
 - **Python: the minimum Rust version of `incr-python` is 1.89.** The binding depends on incr-persist, whose `rust-version` is 1.89, so building incr-compute's Python wheel from source needs Rust 1.89 or newer; CI checks `-p incr-python` on 1.89. The other crates keep 1.88.
+
+### Known limitations
+
+- The known limitations listed under 0.2.0-beta.6 still apply.
 
 ## [0.2.0-beta.6] - 2026-10-29
 
