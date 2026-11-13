@@ -382,3 +382,92 @@ fn shared_bounded_snapshot_cases() {
     bounded_ignores_dead_roots_and_dedups::<Shared>();
     bounded_keeps_edges_outside_the_returned_set::<Shared>();
 }
+
+fn entry(trace: &crate::trace::PropagationTrace, id: u32) -> &crate::trace::NodeTrace {
+    trace
+        .node_traces
+        .iter()
+        .find(|t| t.id.0 == id)
+        .expect("the node has a trace entry")
+}
+
+fn trace_entries_carry_dependencies_and_own_time<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let source = rt.create_input(1_i64);
+    let constant = rt.create_query(|_| 10_i64);
+    let a = rt.create_query(move |r| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        r.get(source) + r.get(constant)
+    });
+    let b = rt.create_query(move |r| r.get(a) * 2);
+    rt.get(b);
+    rt.set(source, 2);
+    let (_, trace) = rt.get_traced(b);
+    let a_entry = entry(&trace, a.slot());
+    let b_entry = entry(&trace, b.slot());
+    assert_eq!(b_entry.dependencies, vec![NodeId(a.slot())]);
+    assert_eq!(a_entry.dependencies, vec![NodeId(source.slot())]);
+    assert!(a_entry.elapsed_ns >= 15_000_000, "{}", a_entry.elapsed_ns);
+    assert!(b_entry.elapsed_ns < a_entry.elapsed_ns);
+}
+
+fn verified_entries_have_no_time<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let source = rt.create_input(1_i64);
+    let parity = rt.create_query(move |r| r.get(source) % 2);
+    let out = rt.create_query(move |r| r.get(parity) + 1);
+    let other = rt.create_query(move |r| r.get(parity) * 10);
+    rt.get(out);
+    rt.get(other);
+    rt.set(source, 3);
+    rt.get(out);
+    let (_, trace) = rt.get_traced(other);
+    let e = entry(&trace, other.slot());
+    assert_eq!(e.action, TraceAction::VerifiedClean);
+    assert_eq!(e.elapsed_ns, 0);
+}
+
+fn compute_stats_count_by_label<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let source = rt.create_input(1_i64);
+    let parity = rt.create_query(move |r| r.get(source) % 2);
+    let out = rt.create_query(move |r| r.get(parity) + 1);
+    rt.set_label(parity.slot(), "parity".to_string());
+    rt.get(out);
+    assert!(rt.compute_stats(false).is_empty());
+    rt.enable_compute_stats(true);
+    rt.set(source, 3);
+    rt.get(out);
+    let stats: std::collections::HashMap<_, _> = rt.compute_stats(false).into_iter().collect();
+    let p = stats[&Some("parity".to_string())];
+    assert_eq!((p.recomputed, p.cutoff, p.verified), (1, 1, 0));
+    assert!(p.elapsed_ns > 0);
+    let o = stats[&None];
+    assert_eq!((o.recomputed, o.verified), (0, 1));
+
+    rt.delete_node(out);
+    rt.delete_node(parity);
+    let stats: std::collections::HashMap<_, _> = rt.compute_stats(true).into_iter().collect();
+    assert_eq!(stats[&Some("parity".to_string())].recomputed, 1);
+    assert_eq!(stats[&None].verified, 1);
+    assert!(rt.compute_stats(false).is_empty());
+
+    rt.enable_compute_stats(false);
+    let again = rt.create_query(move |r| r.get(source) + 1);
+    rt.get(again);
+    assert!(rt.compute_stats(false).is_empty());
+}
+
+#[test]
+fn local_instrumentation_cases() {
+    trace_entries_carry_dependencies_and_own_time::<Local>();
+    verified_entries_have_no_time::<Local>();
+    compute_stats_count_by_label::<Local>();
+}
+
+#[test]
+fn shared_instrumentation_cases() {
+    trace_entries_carry_dependencies_and_own_time::<Shared>();
+    verified_entries_have_no_time::<Shared>();
+    compute_stats_count_by_label::<Shared>();
+}

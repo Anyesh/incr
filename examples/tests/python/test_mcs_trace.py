@@ -53,7 +53,7 @@ def test_trace_entries_keep_id_and_action():
     _, trace = rt.get_traced(total)
 
     for entry in trace["node_traces"]:
-        assert set(entry) == {"id", "action", "label", "value"}
+        assert {"id", "action", "label", "value"} <= set(entry)
 
 
 def test_engine_count_node_shows_its_value():

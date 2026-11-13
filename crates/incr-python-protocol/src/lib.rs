@@ -19,6 +19,7 @@ use std::sync::{Mutex, PoisonError};
 
 use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, RoutingFailed, Runtime};
 
+pub mod inspect;
 pub mod notready;
 #[cfg(feature = "persist")]
 pub mod persist;

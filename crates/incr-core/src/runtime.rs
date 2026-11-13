@@ -1621,11 +1621,16 @@ pub struct Runtime<C: Cells> {
     pub(crate) retractions: OwnLine<<C as Cells>::U64>,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
-    /// `1` when `get_traced` is actively recording; the call that swaps it
-    /// from `0` to `1` owns the trace log until it stores `0`. Checked on every
-    /// `compute_one` via a Relaxed load (~1 ns when disarmed) so the
-    /// non-tracing hot path pays no measurable cost.
-    pub(crate) tracing_armed: <C as Cells>::U8,
+    /// `instrument::TRACE` while `get_traced` records (the call that sets
+    /// it owns the trace log until it clears it) and `instrument::STATS`
+    /// while compute stats count. Checked with one Relaxed load where a
+    /// compute runs or a verification lands, so with both off neither
+    /// path pays more than that.
+    pub(crate) instrument: <C as Cells>::U8,
+    /// Set once either flag was, so a release folds the slot's counts only
+    /// in a runtime that may hold some.
+    pub(crate) instrument_used: <C as Cells>::U8,
+    pub(crate) instrument_state: OrderedLock<crate::instrument::InstrumentState, C>,
     /// The frame budget: a replayable frame's read at this many frames
     /// or more replays instead of nesting.
     pub(crate) max_frames: std::sync::atomic::AtomicU32,
@@ -1845,7 +1850,9 @@ impl<C: Cells> Runtime<C> {
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id,
-            tracing_armed: C::new_u8(0),
+            instrument: C::new_u8(0),
+            instrument_used: C::new_u8(0),
+            instrument_state: OrderedLock::new(LockKind::Instrument, Default::default()),
             max_frames: std::sync::atomic::AtomicU32::new(replay_defaults().0),
             max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
             keep_resolver: cycle::KeepResolver {
@@ -1982,14 +1989,56 @@ impl<C: Cells> Runtime<C> {
     fn park_with_bag(&self, _point: ParkPoint, _bag: &mut Deferred<C>) {}
 
     #[inline(always)]
+    fn instrumented(&self) -> bool {
+        C::u8_load_relaxed(&self.instrument) != 0
+    }
+
+    #[cfg(test)]
     fn tracing_is_armed(&self) -> bool {
-        C::u8_load_relaxed(&self.tracing_armed) == 1
+        C::u8_load_relaxed(&self.instrument) & crate::instrument::TRACE != 0
     }
 
     #[inline(always)]
     fn record_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
-        if self.tracing_is_armed() {
+        if self.instrumented() {
             self.push_trace(id, action);
+        }
+    }
+
+    /// A timer for one run of a compute closure, if a trace or compute
+    /// stats are on.
+    #[inline(always)]
+    pub(crate) fn compute_timer(&self) -> Option<crate::instrument::Timer> {
+        if self.instrumented() {
+            crate::instrument::Timer::start()
+        } else {
+            None
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn record_compute_time(&self, id: NodeId, timer: crate::instrument::Timer) {
+        let ns = timer.stop();
+        let flags = C::u8_load_relaxed(&self.instrument);
+        if flags != 0 {
+            self.instrument_state.write().add_time(flags, id.0, ns);
+        }
+    }
+
+    /// Sets or clears `bit` of the instrumentation flags; returns the
+    /// flags as they were.
+    fn swap_instrument_bit(&self, bit: u8, on: bool) -> u8 {
+        if on {
+            C::u8_store_relaxed(&self.instrument_used, 1);
+        }
+        let mut current = C::u8_load_relaxed(&self.instrument);
+        loop {
+            let next = if on { current | bit } else { current & !bit };
+            match C::u8_compare_exchange(&self.instrument, current, next) {
+                Ok(previous) => return previous,
+                Err(now) => current = now,
+            }
         }
     }
 
@@ -2011,10 +2060,23 @@ impl<C: Cells> Runtime<C> {
     }
 
     fn push_trace_now(&self, id: NodeId, action: crate::trace::TraceAction) {
-        self.inner
-            .write()
-            .trace_log
-            .push(crate::trace::NodeTrace { id, action });
+        let flags = C::u8_load_relaxed(&self.instrument);
+        if flags & crate::instrument::STATS != 0 {
+            self.instrument_state
+                .write()
+                .counts
+                .entry(id.0)
+                .or_default()
+                .count(&action);
+        }
+        if flags & crate::instrument::TRACE != 0 {
+            self.inner.write().trace_log.push(crate::trace::NodeTrace {
+                id,
+                action,
+                dependencies: Vec::new(),
+                elapsed_ns: 0,
+            });
+        }
     }
 
     #[inline]
@@ -3172,8 +3234,13 @@ impl<C: Cells> Runtime<C> {
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
         let observers = inner.observers.take_slot(slot);
-        if !inner.labels.is_empty() {
-            inner.labels.remove(&slot);
+        let label = if inner.labels.is_empty() {
+            None
+        } else {
+            inner.labels.remove(&slot)
+        };
+        if C::u8_load_relaxed(&self.instrument_used) != 0 {
+            self.instrument_state.write().release(slot, label);
         }
         let arena = self.arenas.erased(retired.type_tag);
         inner.free_nodes.push(slot);
@@ -3873,7 +3940,8 @@ impl<C: Cells> Runtime<C> {
         // The trace's counts are read with no dependency.
         self.dep_stack.unrecorded_lookup();
 
-        if C::u8_compare_exchange(&self.tracing_armed, 0, 1).is_err() {
+        if self.swap_instrument_bit(crate::instrument::TRACE, true) & crate::instrument::TRACE != 0
+        {
             panic!("incr-core: get_traced called while another get_traced is in progress");
         }
 
@@ -3883,11 +3951,12 @@ impl<C: Cells> Runtime<C> {
         struct Disarm<'a, C2: Cells>(&'a Runtime<C2>);
         impl<C2: Cells> Drop for Disarm<'_, C2> {
             fn drop(&mut self) {
-                C2::u8_store_release(&self.0.tracing_armed, 0);
+                self.0.swap_instrument_bit(crate::instrument::TRACE, false);
             }
         }
         let disarm = Disarm(self);
         self.inner.write().trace_log.clear();
+        self.instrument_state.write().trace_times.clear();
 
         // std has no clock on wasm32-unknown-unknown and `Instant::now()`
         // panics there, so the trace reports no elapsed time.
@@ -3902,11 +3971,13 @@ impl<C: Cells> Runtime<C> {
 
         self.park(ParkPoint::TraceHandOff);
         // Taken before disarming: the next tracer's CAS clears the log.
-        let node_traces: Vec<crate::trace::NodeTrace> = {
+        let mut node_traces: Vec<crate::trace::NodeTrace> = {
             let mut inner = self.inner.write();
             std::mem::take(&mut inner.trace_log)
         };
+        let times = std::mem::take(&mut self.instrument_state.write().trace_times);
         drop(disarm);
+        self.fill_trace_entries(&mut node_traces, &times);
         self.route_if_queued();
 
         let nodes_recomputed = node_traces
@@ -3973,6 +4044,76 @@ impl<C: Cells> Runtime<C> {
     pub fn label(&self, slot: u32) -> Option<String> {
         self.dep_stack.unrecorded_lookup();
         self.inner.read().labels.get(&slot).cloned()
+    }
+
+    /// Gives each entry its time and the dependencies a reader of the
+    /// trace follows: those the trace holds an entry for, and inputs.
+    fn fill_trace_entries(
+        &self,
+        node_traces: &mut [crate::trace::NodeTrace],
+        times: &std::collections::HashMap<u32, u64, crate::fx::FxBuildHasher>,
+    ) {
+        use crate::trace::TraceAction;
+        let traced: std::collections::HashSet<u32, crate::fx::FxBuildHasher> =
+            node_traces.iter().map(|t| t.id.0).collect();
+        let inner = self.inner.read();
+        for entry in node_traces.iter_mut() {
+            if matches!(entry.action, TraceAction::Recomputed { .. }) {
+                entry.elapsed_ns = times.get(&entry.id.0).copied().unwrap_or(0);
+            }
+            let node = self.nodes.get(entry.id.0);
+            if state::load::<C>(node.state_cell()) == NodeState::Dead {
+                continue;
+            }
+            let mut dependencies = Vec::new();
+            node.for_each_dep(|dep| {
+                let input = inner
+                    .compute_fns
+                    .get(dep.0 as usize)
+                    .is_none_or(|f| f.is_none());
+                if (input || traced.contains(&dep.0)) && !dependencies.contains(&dep) {
+                    dependencies.push(dep);
+                }
+            });
+            entry.dependencies = dependencies;
+        }
+    }
+
+    /// Starts or stops compute stats: per node, the runs that landed a
+    /// value, those cut off, the verifications that found it clean, and
+    /// its closure time. Counts already taken stay until
+    /// [`Self::compute_stats`] resets them.
+    pub fn enable_compute_stats(&self, on: bool) {
+        self.swap_instrument_bit(crate::instrument::STATS, on);
+    }
+
+    /// The compute stats counted so far, summed by node label (`None` for
+    /// unlabelled nodes). A deleted node's counts stay with the label it
+    /// had. `reset` zeroes them.
+    pub fn compute_stats(&self, reset: bool) -> Vec<(Option<String>, crate::trace::ComputeCounts)> {
+        value_code::check();
+        self.dep_stack.unrecorded_lookup();
+        let inner = self.inner.read();
+        let mut state = self.instrument_state.write();
+        let mut by_label: std::collections::HashMap<
+            Option<String>,
+            crate::trace::ComputeCounts,
+            crate::fx::FxBuildHasher,
+        > = Default::default();
+        for (slot, counts) in &state.counts {
+            by_label
+                .entry(inner.labels.get(slot).cloned())
+                .or_default()
+                .add(counts);
+        }
+        for (label, counts) in &state.released {
+            by_label.entry(label.clone()).or_default().add(counts);
+        }
+        if reset {
+            state.counts.clear();
+            state.released.clear();
+        }
+        by_label.into_iter().collect()
     }
 
     /// Structural snapshot of every node. Returns `NodeInfo` with each
@@ -6202,9 +6343,16 @@ impl<C: Cells> Runtime<C> {
                 let compute = unsafe { &*compute };
                 let mut result = match adopted_panic.take() {
                     Some(raised) => Err(self.raise_adopted(raised)),
-                    None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        compute(self, id.0, &ctl)
-                    })),
+                    None => {
+                        let timer = self.compute_timer();
+                        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            compute(self, id.0, &ctl)
+                        }));
+                        if let Some(timer) = timer {
+                            self.record_compute_time(id, timer);
+                        }
+                        ran
+                    }
                 };
                 if !C::SINGLE_THREADED
                     && ctl.has(cycle::DOOMED)

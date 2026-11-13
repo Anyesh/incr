@@ -80,6 +80,51 @@ pub enum TraceAction {
 pub struct NodeTrace {
     pub id: NodeId,
     pub action: TraceAction,
+    /// The nodes this one read that also appear in the trace, as of the
+    /// trace's end.
+    pub dependencies: Vec<NodeId>,
+    /// Time its closure ran during the trace, net of the nodes it computed
+    /// in turn, summed over every run (a retried or speculative run
+    /// included); 0 for a node verified clean, and always 0 on
+    /// wasm32-unknown-unknown.
+    pub elapsed_ns: u64,
+}
+
+/// What compute stats counted for one node or label, from when they were
+/// enabled or last reset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeCounts {
+    /// Runs that landed a value, cut off or not.
+    pub recomputed: u64,
+    /// The `recomputed` runs whose value was equal to the old one.
+    pub cutoff: u64,
+    /// Verifications that found the node clean without running it.
+    pub verified: u64,
+    /// Closure time net of nested computes, over every run including
+    /// retried and speculative ones.
+    pub elapsed_ns: u64,
+}
+
+impl ComputeCounts {
+    /// Adds `other`'s counts to these.
+    pub fn add(&mut self, other: &ComputeCounts) {
+        self.recomputed += other.recomputed;
+        self.cutoff += other.cutoff;
+        self.verified += other.verified;
+        self.elapsed_ns = self.elapsed_ns.saturating_add(other.elapsed_ns);
+    }
+
+    pub(crate) fn count(&mut self, action: &TraceAction) {
+        match action {
+            TraceAction::VerifiedClean => self.verified += 1,
+            TraceAction::Recomputed { value_changed } => {
+                self.recomputed += 1;
+                if !value_changed {
+                    self.cutoff += 1;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

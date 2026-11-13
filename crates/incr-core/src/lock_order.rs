@@ -53,6 +53,9 @@ pub enum LockKind {
     /// A runtime's log of the slots episodes and releases landed, under
     /// which nothing is taken.
     Episodes,
+    /// A runtime's trace times and compute stats, under which nothing is
+    /// taken.
+    Instrument,
 }
 
 impl LockKind {
@@ -76,6 +79,7 @@ impl LockKind {
             LockKind::WatchQueue => 70,
             LockKind::Stashes => 75,
             LockKind::Episodes => 80,
+            LockKind::Instrument => 85,
         }
     }
 }

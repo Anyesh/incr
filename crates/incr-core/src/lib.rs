@@ -39,6 +39,7 @@ pub mod grid_table;
 pub mod handle;
 mod hashed_multiset;
 mod hold;
+mod instrument;
 pub mod lock_order;
 pub mod locks;
 #[cfg(loom)]
@@ -99,8 +100,8 @@ pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
 pub use table::{NodeTable, TableKey};
 pub use trace::{
-    BoundedSnapshot, Direction, GraphQuery, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace,
-    TraceAction,
+    BoundedSnapshot, ComputeCounts, Direction, GraphQuery, NodeInfo, NodeKindInfo, NodeTrace,
+    PropagationTrace, TraceAction,
 };
 pub use value::Value;
 #[doc(hidden)]

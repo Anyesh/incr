@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use incr_compute::{
     Change, DeleteError, ErasedIncr, Incr, IncrCollection, NodeId, NodeTable, PropagationTrace,
-    Runtime, SortedCollection, TraceAction,
+    Runtime, SortedCollection,
 };
 use incr_core::{Local, RoutingFailed, RoutingHold};
 use keyed::{Applied, IndexGuard, KeyCounts, SharedIndex, StagedKeys};
@@ -1665,6 +1665,29 @@ impl PyRuntime {
         self.relabel(id, label)
     }
 
+    /// Starts or stops compute stats, which count per node the runs that
+    /// landed a value, those cut off, the verifications that found it
+    /// clean and its closure time. Off by default.
+    fn enable_compute_stats(&self, on: bool) -> PyResult<()> {
+        self.engine_read(|rt| rt.enable_compute_stats(on))
+    }
+
+    /// `{group: {"recomputed", "cutoff", "verified", "elapsed_ns"}}`
+    /// counted since stats were enabled or last reset, grouped by the
+    /// label up to its first `/` (`None` for unlabelled nodes).
+    /// `recomputed` counts every run that landed, `cutoff` those whose
+    /// value was equal, and `elapsed_ns` closure time net of nested
+    /// computes. `reset=True` zeroes the counts after reading them.
+    #[pyo3(signature = (reset=false))]
+    fn compute_stats(&self, py: Python<'_>, reset: bool) -> PyResult<Py<PyAny>> {
+        let by_label = self.engine_read(|rt| rt.compute_stats(reset))?;
+        Ok(
+            incr_python_protocol::inspect::compute_stats_dict(py, by_label)?
+                .into_any()
+                .unbind(),
+        )
+    }
+
     fn get_traced(&self, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let (val, trace, nodes): (PyValue, PropagationTrace, Vec<TracedNode>) =
             self.engine_read(|rt| {
@@ -1686,22 +1709,9 @@ impl PyRuntime {
 
             let node_traces = pyo3::types::PyList::empty(py);
             for (nt, (label, value)) in trace.node_traces.iter().zip(nodes) {
-                let d = pyo3::types::PyDict::new(py);
-                d.set_item("id", nt.id.0)?;
+                let d = incr_python_protocol::inspect::trace_entry(py, nt)?;
                 d.set_item("label", label)?;
                 d.set_item("value", value)?;
-                d.set_item(
-                    "action",
-                    match &nt.action {
-                        TraceAction::VerifiedClean => "verified_clean",
-                        TraceAction::Recomputed {
-                            value_changed: true,
-                        } => "recomputed_changed",
-                        TraceAction::Recomputed {
-                            value_changed: false,
-                        } => "recomputed_cutoff",
-                    },
-                )?;
                 node_traces.append(d)?;
             }
             trace_dict.set_item("node_traces", node_traces)?;

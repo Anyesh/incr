@@ -7,6 +7,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 
 use incr_compute::{MemoryStats, NodeKind};
+use incr_python_protocol::inspect::label_group;
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -47,10 +48,6 @@ impl Totals {
     }
 }
 
-fn prefix(label: &str) -> &str {
-    label.split('/').next().unwrap_or(label)
-}
-
 /// The dict `Runtime.memory_stats()` returns. `bridges` maps a
 /// collection's version node to the node its `version_node` getter hands
 /// out, so a label set on that node names the collection's state.
@@ -77,7 +74,7 @@ pub(crate) fn stats_dict<'py>(
         by_kind[kind].add(1, node.bytes, refs);
         if let Some(label) = &node.label {
             by_label
-                .entry(prefix(label))
+                .entry(label_group(label))
                 .or_default()
                 .add(1, node.bytes, refs);
         }
@@ -99,7 +96,7 @@ pub(crate) fn stats_dict<'py>(
             .and_then(|n| label_of(n.0).or_else(|| bridges.get(&n.0).and_then(|&b| label_of(b))));
         if let Some(label) = label {
             by_label
-                .entry(prefix(label))
+                .entry(label_group(label))
                 .or_default()
                 .add(0, state.bytes, refs);
         }
