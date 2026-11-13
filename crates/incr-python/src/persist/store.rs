@@ -391,13 +391,16 @@ impl PyStore {
     /// from the pairs the log restores. `key_codec` and `codec` encode the
     /// keys and the rows, under the contracts of `store.input`. Write it
     /// with `store.upsert`, `store.remove`, `store.reconcile` or a
-    /// `store.batch`; its own writes raise.
+    /// `store.batch`; its own writes raise. `label` names the collection's
+    /// group in `graph_summary`, labelling its pair and row nodes.
+    #[pyo3(signature = (key, key_codec, codec, label=None))]
     fn keyed_collection(
         &self,
         py: Python<'_>,
         key: &str,
         key_codec: Py<PyAny>,
         codec: Py<PyAny>,
+        label: Option<String>,
     ) -> PyResult<PyKeyedCollection> {
         let core = self.core_outside_overlay(py)?;
         let slot = Slot::Key(key.to_owned());
@@ -415,6 +418,7 @@ impl PyStore {
                 self.runtime.bind(py).clone().into_any().downcast_into()?,
                 binding.pairs.handle().clone(),
                 Arc::clone(&binding.index),
+                label,
             ),
             Err(e) => {
                 core.registry.unregister(&slot);

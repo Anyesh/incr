@@ -4162,6 +4162,85 @@ impl<C: Cells> Runtime<C> {
         })
     }
 
+    /// The live graph grouped by label: a node count and kind per group
+    /// ([`crate::trace::label_group`] of the label, `None` for unlabelled
+    /// nodes) and the dependency edges between groups, an edge inside one
+    /// group reported as a self edge.
+    ///
+    /// Walks every node under one read of the inner state, so the call
+    /// costs time linear in the node count and holds off anything that
+    /// takes the write side (node creation, deletion, labelling). `set`
+    /// does not take that lock and runs alongside it. Groups reflect the
+    /// graph as of the walk: nodes added or deleted since the previous
+    /// call move the counts on this one.
+    pub fn graph_summary(&self) -> crate::trace::GraphSummary {
+        use crate::trace::{label_group, GraphSummary, GroupEdge, GroupKind, GroupSummary};
+        self.dep_stack.unrecorded_lookup();
+        let inner = self.inner.read();
+        let mut index: std::collections::HashMap<Option<&str>, usize, crate::fx::FxBuildHasher> =
+            Default::default();
+        let mut names: Vec<Option<&str>> = Vec::new();
+        let mut tallies: Vec<(usize, usize)> = Vec::new();
+        let mut edges: std::collections::HashMap<(usize, usize), usize, crate::fx::FxBuildHasher> =
+            Default::default();
+        let mut deps: Vec<NodeId> = Vec::new();
+        for slot in 0..self.nodes.len() {
+            let node = self.nodes.get(slot);
+            if state::load::<C>(node.state_cell()) == NodeState::Dead {
+                continue;
+            }
+            let name = inner.labels.get(&slot).map(|l| label_group(l));
+            let group = *index.entry(name).or_insert_with(|| {
+                names.push(name);
+                tallies.push((0, 0));
+                names.len() - 1
+            });
+            let is_compute = inner
+                .compute_fns
+                .get(slot as usize)
+                .is_some_and(|f| f.is_some());
+            if is_compute {
+                tallies[group].1 += 1;
+            } else {
+                tallies[group].0 += 1;
+            }
+            deps.clear();
+            node.for_each_dep(|d| deps.push(d));
+            for dep in &deps {
+                let dep_name = inner.labels.get(&dep.0).map(|l| label_group(l));
+                let from = *index.entry(dep_name).or_insert_with(|| {
+                    names.push(dep_name);
+                    tallies.push((0, 0));
+                    names.len() - 1
+                });
+                *edges.entry((from, group)).or_insert(0) += 1;
+            }
+        }
+        let groups = names
+            .iter()
+            .zip(&tallies)
+            .filter(|(_, (inputs, computes))| inputs + computes > 0)
+            .map(|(name, &(inputs, computes))| GroupSummary {
+                label: name.map(str::to_owned),
+                kind: match (inputs, computes) {
+                    (_, 0) => GroupKind::Input,
+                    (0, _) => GroupKind::Compute,
+                    _ => GroupKind::Mixed,
+                },
+                nodes: inputs + computes,
+            })
+            .collect();
+        let edges = edges
+            .into_iter()
+            .map(|((from, to), count)| GroupEdge {
+                from: names[from].map(str::to_owned),
+                to: names[to].map(str::to_owned),
+                count,
+            })
+            .collect();
+        GraphSummary { groups, edges }
+    }
+
     /// Bounded, breadth-first structural snapshot; see [`GraphQuery`].
     /// Takes one read of the inner state for the whole walk. Roots that
     /// are dead or out of range are ignored, and repeated roots count once.

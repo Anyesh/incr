@@ -776,7 +776,7 @@ impl PyRuntime {
     /// A query computing `py_func(runtime_ref)`. `fallback(ids)` or a
     /// `Fixpoint` resolves a cycle through it; `replay=True` lets a read
     /// past the frame budget replay instead of nesting.
-    #[pyo3(signature = (py_func, *, fallback=None, fixpoint=None, replay=false))]
+    #[pyo3(signature = (py_func, *, fallback=None, fixpoint=None, replay=false, label=None))]
     fn create_query(
         &self,
         py: Python<'_>,
@@ -784,10 +784,17 @@ impl PyRuntime {
         fallback: Option<Py<PyAny>>,
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
+        label: Option<String>,
     ) -> PyResult<PyNodeId> {
         let opts = query_opts(py, fallback, fixpoint, replay, std::convert::identity)?;
         let f = query_fn(py_func);
-        let node = engine_call(py, &self.inner, || self.inner.create_query_with(f, opts))?;
+        let node = engine_call(py, &self.inner, || {
+            let node = self.inner.create_query_with(f, opts);
+            if let Some(label) = label {
+                self.inner.set_label(node.slot(), label);
+            }
+            node
+        })?;
         Ok(PyNodeId { inner: node })
     }
 
@@ -857,6 +864,23 @@ impl PyRuntime {
         let by_label = engine_call(py, &self.inner, || self.inner.compute_stats(reset))?;
         Ok(
             incr_python_protocol::inspect::compute_stats_dict(py, by_label)?
+                .into_any()
+                .unbind(),
+        )
+    }
+
+    /// `{"groups": [{"label", "kind", "nodes"}], "edges": [{"from", "to",
+    /// "count"}]}` over the live graph, grouped by the label up to its
+    /// first `/` (`None` for unlabelled nodes); `kind` is "input",
+    /// "compute" or "mixed". An edge inside one group has `from == to`.
+    /// One walk of every node under the engine's read lock: it takes time
+    /// linear in the node count and holds off node creation, deletion and
+    /// labelling meanwhile, while `set` runs alongside it.
+    fn graph_summary(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let summary = engine_call(py, &self.inner, || self.inner.graph_summary())?;
+        let none = std::collections::HashMap::new();
+        Ok(
+            incr_python_protocol::inspect::graph_summary_dict(py, summary, &none)?
                 .into_any()
                 .unbind(),
         )

@@ -383,6 +383,129 @@ fn shared_bounded_snapshot_cases() {
     bounded_keeps_edges_outside_the_returned_set::<Shared>();
 }
 
+fn summary_group<'a>(
+    s: &'a crate::trace::GraphSummary,
+    label: Option<&str>,
+) -> &'a crate::trace::GroupSummary {
+    s.groups
+        .iter()
+        .find(|g| g.label.as_deref() == label)
+        .unwrap_or_else(|| panic!("no group {label:?}"))
+}
+
+fn summary_edge(s: &crate::trace::GraphSummary, from: Option<&str>, to: Option<&str>) -> usize {
+    s.edges
+        .iter()
+        .find(|e| e.from.as_deref() == from && e.to.as_deref() == to)
+        .map_or(0, |e| e.count)
+}
+
+fn summary_chain_of_three_groups<C: Cells>() {
+    use crate::trace::GroupKind;
+    let rt: Runtime<C> = Runtime::new();
+    let a1 = rt.create_input(1_i64);
+    let a2 = rt.create_input(2_i64);
+    let b1 = rt.create_query(move |r| r.get(a1) + r.get(a2));
+    let c1 = rt.create_query(move |r| r.get(b1) + 1);
+    rt.set_label(a1.slot(), "a/1".to_string());
+    rt.set_label(a2.slot(), "a/2".to_string());
+    rt.set_label(b1.slot(), "b/1".to_string());
+    rt.set_label(c1.slot(), "c/1".to_string());
+    rt.get(c1);
+    let s = rt.graph_summary();
+    assert_eq!(s.groups.len(), 3);
+    let a = summary_group(&s, Some("a"));
+    assert_eq!((a.nodes, a.kind), (2, GroupKind::Input));
+    let b = summary_group(&s, Some("b"));
+    assert_eq!((b.nodes, b.kind), (1, GroupKind::Compute));
+    assert_eq!(summary_group(&s, Some("c")).nodes, 1);
+    assert_eq!(s.edges.len(), 2);
+    assert_eq!(summary_edge(&s, Some("a"), Some("b")), 2);
+    assert_eq!(summary_edge(&s, Some("b"), Some("c")), 1);
+}
+
+fn summary_reports_self_edges_and_unlabelled<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let a = rt.create_input(1_i64);
+    let b = rt.create_query(move |r| r.get(a) + 1);
+    let c = rt.create_query(move |r| r.get(b) + 1);
+    rt.set_label(a.slot(), "x/in".to_string());
+    rt.set_label(b.slot(), "x/mid".to_string());
+    rt.get(c);
+    let s = rt.graph_summary();
+    assert_eq!(summary_edge(&s, Some("x"), Some("x")), 1);
+    assert_eq!(summary_edge(&s, Some("x"), None), 1);
+    assert_eq!(summary_group(&s, None).nodes, 1);
+    assert_eq!(s.edges.len(), 2);
+}
+
+fn summary_kinds_input_compute_mixed<C: Cells>() {
+    use crate::trace::GroupKind;
+    let rt: Runtime<C> = Runtime::new();
+    let a = rt.create_input(1_i64);
+    let b = rt.create_query(move |r| r.get(a) + 1);
+    let c = rt.create_query(move |r| r.get(b) + 1);
+    rt.set_label(a.slot(), "in/a".to_string());
+    rt.set_label(b.slot(), "mixed/b".to_string());
+    rt.set_label(c.slot(), "mixed/c".to_string());
+    let d = rt.create_input(0_i64);
+    rt.set_label(d.slot(), "mixed/d".to_string());
+    let e = rt.create_query(move |r| r.get(a) + 2);
+    rt.set_label(e.slot(), "comp/e".to_string());
+    let s = rt.graph_summary();
+    assert_eq!(summary_group(&s, Some("in")).kind, GroupKind::Input);
+    assert_eq!(summary_group(&s, Some("comp")).kind, GroupKind::Compute);
+    assert_eq!(summary_group(&s, Some("mixed")).kind, GroupKind::Mixed);
+}
+
+fn summary_counts_follow_adds_and_deletes<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let a = rt.create_input(1_i64);
+    rt.set_label(a.slot(), "src/a".to_string());
+    let mut qs = Vec::new();
+    for i in 0..3 {
+        let q = rt.create_query(move |r| r.get(a) + i);
+        rt.set_label(q.slot(), format!("out/{i}"));
+        rt.get(q);
+        qs.push(q);
+    }
+    let s = rt.graph_summary();
+    assert_eq!(summary_group(&s, Some("out")).nodes, 3);
+    assert_eq!(summary_edge(&s, Some("src"), Some("out")), 3);
+    rt.delete_node(qs.pop().unwrap());
+    let s = rt.graph_summary();
+    assert_eq!(summary_group(&s, Some("out")).nodes, 2);
+    assert_eq!(summary_edge(&s, Some("src"), Some("out")), 2);
+    let extra = rt.create_query(move |r| r.get(a));
+    rt.set_label(extra.slot(), "out/x".to_string());
+    rt.get(extra);
+    let s = rt.graph_summary();
+    assert_eq!(summary_group(&s, Some("out")).nodes, 3);
+    for q in qs {
+        rt.delete_node(q);
+    }
+    rt.delete_node(extra);
+    let s = rt.graph_summary();
+    assert!(s.groups.iter().all(|g| g.label.as_deref() != Some("out")));
+    assert!(s.edges.is_empty());
+}
+
+#[test]
+fn local_graph_summary_cases() {
+    summary_chain_of_three_groups::<Local>();
+    summary_reports_self_edges_and_unlabelled::<Local>();
+    summary_kinds_input_compute_mixed::<Local>();
+    summary_counts_follow_adds_and_deletes::<Local>();
+}
+
+#[test]
+fn shared_graph_summary_cases() {
+    summary_chain_of_three_groups::<Shared>();
+    summary_reports_self_edges_and_unlabelled::<Shared>();
+    summary_kinds_input_compute_mixed::<Shared>();
+    summary_counts_follow_adds_and_deletes::<Shared>();
+}
+
 fn entry(trace: &crate::trace::PropagationTrace, id: u32) -> &crate::trace::NodeTrace {
     trace
         .node_traces

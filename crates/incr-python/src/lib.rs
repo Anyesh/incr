@@ -842,6 +842,10 @@ impl PyCollection {
 /// pair collection too. So an upsert that inserts pays two row `__hash__`
 /// calls, one that replaces pays three (four before 3.14) and one row
 /// `__eq__` against the held row, and one with an `==` row changes nothing.
+///
+/// `label` names the collection's group in `Runtime.graph_summary`: it
+/// labels the pair and row collections' version nodes, and the group
+/// reports the key count as `"keys"`.
 #[pyclass(name = "KeyedCollection", unsendable)]
 struct PyKeyedCollection {
     pairs: IncrCollection<PyValue>,
@@ -927,6 +931,7 @@ impl PyKeyedCollection {
         runtime: Bound<'_, PyRuntime>,
         pairs: Option<IncrCollection<PyValue>>,
         index: Arc<SharedIndex>,
+        label: Option<String>,
     ) -> PyResult<Self> {
         let persisted = pairs.is_some();
         let state = runtime.borrow().state.clone();
@@ -945,6 +950,16 @@ impl PyKeyedCollection {
             }
             overlay.created(rows.version_node().erase());
         });
+        if let Some(label) = label {
+            let rt = runtime.borrow();
+            rt.relabel(pairs.version_node().slot(), label.clone())?;
+            rt.relabel(rows.version_node().slot(), label.clone())?;
+            rt.keyed_labels.borrow_mut().push((
+                Arc::downgrade(&index),
+                label,
+                pairs.version_node().erase(),
+            ));
+        }
         Ok(PyKeyedCollection {
             pairs,
             rows,
@@ -960,8 +975,9 @@ impl PyKeyedCollection {
         runtime: Bound<'_, PyRuntime>,
         pairs: IncrCollection<PyValue>,
         index: Arc<SharedIndex>,
+        label: Option<String>,
     ) -> PyResult<Self> {
-        Self::over(runtime, Some(pairs), index)
+        Self::over(runtime, Some(pairs), index, label)
     }
 
     /// The pair collection a write goes to: this one's, or for a persisted
@@ -992,8 +1008,9 @@ impl PyKeyedCollection {
 #[pymethods]
 impl PyKeyedCollection {
     #[new]
-    fn new(runtime: Bound<'_, PyRuntime>) -> PyResult<Self> {
-        Self::over(runtime, None, Arc::new(SharedIndex::new()))
+    #[pyo3(signature = (runtime, label=None))]
+    fn new(runtime: Bound<'_, PyRuntime>, label: Option<String>) -> PyResult<Self> {
+        Self::over(runtime, None, Arc::new(SharedIndex::new()), label)
     }
 
     /// Hold `row` for `key`: nothing happens if the held row is `==` to
@@ -1238,6 +1255,11 @@ struct PyRuntime {
     /// keyed by the collection's internal version node, so repeated
     /// access and every wrapper of one collection share a single node.
     version_bridges: RefCell<HashMap<Incr<u64>, Incr<PyValue>>>,
+    /// The labelled keyed collections made on this runtime, whose key
+    /// counts `graph_summary` reports under their label's group while
+    /// their pair collection's version node lives (one made in an overlay
+    /// dies at its exit).
+    keyed_labels: RefCell<Vec<(std::sync::Weak<SharedIndex>, String, ErasedIncr)>>,
     state: RtState,
 }
 
@@ -1271,6 +1293,7 @@ impl PyRuntime {
         PyRuntime {
             holder: Holder::Persisted(core),
             version_bridges: RefCell::new(HashMap::new()),
+            keyed_labels: RefCell::new(Vec::new()),
             state: RtState::default(),
         }
     }
@@ -1424,6 +1447,7 @@ impl PyRuntime {
         PyRuntime {
             holder: Holder::Owned(Box::new(Runtime::new())),
             version_bridges: RefCell::new(HashMap::new()),
+            keyed_labels: RefCell::new(Vec::new()),
             state: RtState::default(),
         }
     }
@@ -1604,7 +1628,7 @@ impl PyRuntime {
     /// A query computing `py_func(runtime_ref)`. `fallback(ids)` or a
     /// `Fixpoint` resolves a cycle through it; `replay=True` lets a read
     /// past the frame budget replay instead of nesting.
-    #[pyo3(signature = (py_func, *, fallback=None, fixpoint=None, replay=false))]
+    #[pyo3(signature = (py_func, *, fallback=None, fixpoint=None, replay=false, label=None))]
     fn create_query(
         &self,
         py: Python<'_>,
@@ -1612,11 +1636,15 @@ impl PyRuntime {
         fallback: Option<Py<PyAny>>,
         fixpoint: Option<PyRef<'_, PyFixpoint>>,
         replay: bool,
+        label: Option<String>,
     ) -> PyResult<PyNodeId> {
         let opts = query_opts(py, fallback, fixpoint, replay, |f| self.state.hold(f))?;
         let f = query_fn(self.state.hold(py_func));
         let node = self.engine_read(|rt| rt.create_query_with(f, opts))?;
         self.state.journal(|overlay| overlay.created(node.erase()));
+        if let Some(label) = label {
+            self.relabel(node.slot(), label)?;
+        }
         Ok(PyNodeId { inner: node })
     }
 
@@ -1779,6 +1807,41 @@ impl PyRuntime {
             .map(|(version, bridge)| (version.slot(), bridge.slot()))
             .collect();
         memory::stats_dict(py, &stats, self.state.callables(), &bridges)
+    }
+
+    /// `{"groups": [{"label", "kind", "nodes"}], "edges": [{"from", "to",
+    /// "count"}]}` over the live graph, grouped by the label up to its
+    /// first `/` (`None` for unlabelled nodes); `kind` is "input",
+    /// "compute" or "mixed". An edge inside one group has `from == to`.
+    /// A group a labelled `KeyedCollection` names also has `"keys"`, the
+    /// collection's key count (summed over such collections). Walks every
+    /// node under the engine's read lock, so the cost is linear in the
+    /// node count.
+    fn graph_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use incr_core::StateStats;
+        let mut keyed = self.keyed_labels.borrow_mut();
+        let (summary, alive) = self.engine_read(|rt| {
+            let alive: Vec<bool> = keyed
+                .iter()
+                .map(|(_, _, node)| rt.is_alive(*node))
+                .collect();
+            (rt.graph_summary(), alive)
+        })?;
+        let mut keys: HashMap<String, usize> = HashMap::new();
+        let mut alive = alive.into_iter();
+        keyed.retain(|(index, label, _)| {
+            let live = alive.next().unwrap_or(false);
+            let Some(index) = index.upgrade() else {
+                return false;
+            };
+            if live {
+                *keys
+                    .entry(incr_python_protocol::inspect::label_group(label).to_owned())
+                    .or_default() += index.state_stats().elements;
+            }
+            live
+        });
+        incr_python_protocol::inspect::graph_summary_dict(py, summary, &keys)
     }
 
     /// The lookup node for `key`: an input created as `Pending(key)`, and

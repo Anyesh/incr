@@ -100,8 +100,8 @@ pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
 pub use table::{NodeTable, TableKey};
 pub use trace::{
-    BoundedSnapshot, ComputeCounts, Direction, GraphQuery, NodeInfo, NodeKindInfo, NodeTrace,
-    PropagationTrace, TraceAction,
+    label_group, BoundedSnapshot, ComputeCounts, Direction, GraphQuery, GraphSummary, GroupEdge,
+    GroupKind, GroupSummary, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction,
 };
 pub use value::Value;
 #[doc(hidden)]

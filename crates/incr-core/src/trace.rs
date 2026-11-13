@@ -68,6 +68,53 @@ pub struct BoundedSnapshot {
     pub truncated: bool,
 }
 
+/// The group a label reports under: the label up to its first `/`. A
+/// label with no `/` is its own group. Every label grouping in the
+/// bindings (`graph_summary`, `memory_stats`, `compute_stats`) uses this.
+pub fn label_group(label: &str) -> &str {
+    label.split('/').next().unwrap_or(label)
+}
+
+/// What the nodes of one summary group are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupKind {
+    /// Every node in the group is an input.
+    Input,
+    /// Every node in the group is a compute.
+    Compute,
+    /// The group holds both inputs and computes.
+    Mixed,
+}
+
+/// One label group of a [`GraphSummary`]: `label` is the group name
+/// ([`label_group`] of the node labels), `None` for unlabelled nodes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSummary {
+    pub label: Option<String>,
+    pub kind: GroupKind,
+    pub nodes: usize,
+}
+
+/// Dependency edges from one group to another: `count` is the number of
+/// (dependency, dependent) node pairs whose dependency is in `from` and
+/// whose dependent is in `to`. An edge between two nodes of one group has
+/// `from == to` (a self edge); it is reported, never omitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupEdge {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub count: usize,
+}
+
+/// The graph grouped by label, from [`crate::Runtime::graph_summary`].
+/// Groups and edges come in no particular order; a group or edge with no
+/// live nodes is absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphSummary {
+    pub groups: Vec<GroupSummary>,
+    pub edges: Vec<GroupEdge>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TraceAction {
     /// Node was dirty but its dependencies hadn't actually changed.
