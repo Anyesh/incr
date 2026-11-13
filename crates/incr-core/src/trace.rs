@@ -28,6 +28,46 @@ pub struct NodeInfo {
     pub dependents: Vec<NodeId>,
 }
 
+/// Which edges a bounded graph walk follows from each visited node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// The nodes a node reads.
+    Dependencies,
+    /// The nodes that read a node.
+    Dependents,
+    /// Both.
+    Both,
+}
+
+/// What `Runtime::graph_snapshot_bounded` walks and returns.
+///
+/// The walk is breadth-first from `roots`, ignoring dead nodes. `depth`
+/// counts edges from a root: `Some(0)` visits only the roots, `Some(1)`
+/// adds their direct neighbours in `direction`, `None` is unbounded.
+#[derive(Clone, Debug)]
+pub struct GraphQuery<'a> {
+    pub roots: &'a [NodeId],
+    pub direction: Direction,
+    pub depth: Option<u32>,
+    /// Only visited nodes whose label starts with this are returned
+    /// (unlabelled nodes never match); the walk still passes through the
+    /// others.
+    pub label_prefix: Option<&'a str>,
+    /// Most nodes returned; `truncated` is set when more matched.
+    pub limit: Option<usize>,
+    /// Most nodes visited, returned or not; `truncated` is set when the
+    /// walk stopped on it. Defaults to `limit * 64` when only `limit` is set.
+    pub max_visited: Option<usize>,
+}
+
+/// The nodes a bounded walk returned, in breadth-first order. Each keeps
+/// its full dependency and dependent lists, including ids outside `nodes`.
+#[derive(Clone, Debug)]
+pub struct BoundedSnapshot {
+    pub nodes: Vec<NodeInfo>,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TraceAction {
     /// Node was dirty but its dependencies hadn't actually changed.

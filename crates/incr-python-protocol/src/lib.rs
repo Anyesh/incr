@@ -22,6 +22,7 @@ use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, Routin
 pub mod notready;
 #[cfg(feature = "persist")]
 pub mod persist;
+pub mod snapshot;
 
 /// The exception types of one binding's module.
 pub trait Exceptions {

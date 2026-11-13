@@ -3979,41 +3979,108 @@ impl<C: Cells> Runtime<C> {
     /// node's dependencies (read from inline-7 storage) and dependents
     /// (read from the inner state).
     pub fn graph_snapshot(&self) -> Vec<crate::trace::NodeInfo> {
-        use crate::trace::{NodeInfo, NodeKindInfo};
         self.dep_stack.unrecorded_lookup();
         let inner = self.inner.read();
         let count = self.nodes.len();
         let mut out = Vec::with_capacity(count as usize);
         for slot in 0..count {
-            let node = self.nodes.get(slot);
-            if state::load::<C>(node.state_cell()) == NodeState::Dead {
-                continue;
+            if let Some(info) = self.live_node_info(&inner, slot) {
+                out.push(info);
             }
-            let kind = if inner
-                .compute_fns
-                .get(slot as usize)
-                .is_some_and(|f| f.is_some())
-            {
-                NodeKindInfo::Compute
-            } else {
-                NodeKindInfo::Input
-            };
-            let mut dependencies = Vec::new();
-            node.for_each_dep(|d| dependencies.push(d));
-            let dependents = inner
-                .dependents
-                .get(slot as usize)
-                .map(|l| l.iter().collect())
-                .unwrap_or_default();
-            out.push(NodeInfo {
-                id: NodeId(slot),
-                kind,
-                label: inner.labels.get(&slot).cloned(),
-                dependencies,
-                dependents,
-            });
         }
         out
+    }
+
+    fn live_node_info(&self, inner: &Inner<C>, slot: u32) -> Option<crate::trace::NodeInfo> {
+        use crate::trace::{NodeInfo, NodeKindInfo};
+        let node = self.nodes.get(slot);
+        if state::load::<C>(node.state_cell()) == NodeState::Dead {
+            return None;
+        }
+        let kind = if inner
+            .compute_fns
+            .get(slot as usize)
+            .is_some_and(|f| f.is_some())
+        {
+            NodeKindInfo::Compute
+        } else {
+            NodeKindInfo::Input
+        };
+        let mut dependencies = Vec::new();
+        node.for_each_dep(|d| dependencies.push(d));
+        let dependents = inner
+            .dependents
+            .get(slot as usize)
+            .map(|l| l.iter().collect())
+            .unwrap_or_default();
+        Some(NodeInfo {
+            id: NodeId(slot),
+            kind,
+            label: inner.labels.get(&slot).cloned(),
+            dependencies,
+            dependents,
+        })
+    }
+
+    /// Bounded, breadth-first structural snapshot; see [`GraphQuery`].
+    /// Takes one read of the inner state for the whole walk. Roots that
+    /// are dead or out of range are ignored, and repeated roots count once.
+    pub fn graph_snapshot_bounded(
+        &self,
+        query: &crate::trace::GraphQuery<'_>,
+    ) -> crate::trace::BoundedSnapshot {
+        use crate::trace::{BoundedSnapshot, Direction};
+        self.dep_stack.unrecorded_lookup();
+        let inner = self.inner.read();
+        let count = self.nodes.len();
+        let max_visited = query
+            .max_visited
+            .or_else(|| query.limit.map(|l| l.saturating_mul(64)));
+        let mut seen: std::collections::HashSet<u32, crate::fx::FxBuildHasher> = Default::default();
+        let mut queue = std::collections::VecDeque::new();
+        for root in query.roots {
+            if root.0 < count && seen.insert(root.0) {
+                queue.push_back((root.0, 0_u32));
+            }
+        }
+        let mut nodes = Vec::new();
+        let mut visited = 0_usize;
+        let mut truncated = false;
+        while let Some((slot, depth)) = queue.pop_front() {
+            if max_visited.is_some_and(|m| visited >= m) {
+                truncated = true;
+                break;
+            }
+            let Some(info) = self.live_node_info(&inner, slot) else {
+                continue;
+            };
+            visited += 1;
+            if query.depth.is_none_or(|d| depth < d) {
+                let follow_deps = query.direction != Direction::Dependents;
+                let follow_dependents = query.direction != Direction::Dependencies;
+                let neighbours = follow_deps
+                    .then_some(&info.dependencies)
+                    .into_iter()
+                    .chain(follow_dependents.then_some(&info.dependents))
+                    .flatten();
+                for n in neighbours {
+                    if n.0 < count && seen.insert(n.0) {
+                        queue.push_back((n.0, depth + 1));
+                    }
+                }
+            }
+            let matches = query
+                .label_prefix
+                .is_none_or(|p| info.label.as_deref().is_some_and(|l| l.starts_with(p)));
+            if matches {
+                if query.limit.is_some_and(|l| nodes.len() >= l) {
+                    truncated = true;
+                    break;
+                }
+                nodes.push(info);
+            }
+        }
+        BoundedSnapshot { nodes, truncated }
     }
 
     /// Set a new value on an input node. Bumps revision and marks all

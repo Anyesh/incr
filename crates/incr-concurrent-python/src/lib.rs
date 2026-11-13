@@ -36,8 +36,11 @@ use std::sync::{Arc, Mutex};
 
 use ::incr_concurrent as engine;
 use engine::{
-    DeleteError, Incr, IncrCollection, NodeId, NodeKindInfo, NodeTable, PropagationTrace, Runtime,
-    SortedCollection, TraceAction,
+    DeleteError, Incr, IncrCollection, NodeTable, PropagationTrace, Runtime, SortedCollection,
+    TraceAction,
+};
+use incr_python_protocol::snapshot::{
+    bounded_snapshot_to_py, full_snapshot_to_py, SnapshotRequest,
 };
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, routing_error,
@@ -872,28 +875,40 @@ impl PyRuntime {
         })
     }
 
-    fn graph_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let infos = engine_call(py, &self.inner, || self.inner.graph_snapshot())?;
-        {
-            let result = pyo3::types::PyList::empty(py);
-            for info in &infos {
-                let d = pyo3::types::PyDict::new(py);
-                d.set_item("id", info.id.0)?;
-                d.set_item(
-                    "kind",
-                    match info.kind {
-                        NodeKindInfo::Input => "input",
-                        NodeKindInfo::Compute => "compute",
-                    },
-                )?;
-                d.set_item("label", &info.label)?;
-                let deps: Vec<u32> = info.dependencies.iter().map(|n: &NodeId| n.0).collect();
-                let depts: Vec<u32> = info.dependents.iter().map(|n: &NodeId| n.0).collect();
-                d.set_item("dependencies", deps)?;
-                d.set_item("dependents", depts)?;
-                result.append(d)?;
+    /// The graph as a list of `{"id", "kind", "label", "dependencies",
+    /// "dependents"}` dicts. With any argument given, a breadth-first walk
+    /// from `roots` (node handles or collections) returns
+    /// `{"nodes": [...], "truncated": bool}` instead: `direction` is
+    /// `"dependencies"` (default), `"dependents"` or `"both"`; `depth`
+    /// counts edges from a root; `label_prefix` filters the returned nodes
+    /// while the walk still passes through the others; `limit` caps them.
+    /// Each returned node keeps its full dependency and dependent lists.
+    #[pyo3(signature = (roots=None, *, direction=None, depth=None, label_prefix=None, limit=None))]
+    fn graph_snapshot(
+        &self,
+        py: Python<'_>,
+        roots: Option<Vec<Bound<'_, PyAny>>>,
+        direction: Option<&str>,
+        depth: Option<u32>,
+        label_prefix: Option<String>,
+        limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let request = SnapshotRequest::parse(roots, direction, depth, label_prefix, limit, |o| {
+            o.extract::<PyRef<'_, PyNodeId>>()
+                .ok()
+                .map(|n| n.inner.slot())
+        })?;
+        match request {
+            None => {
+                let infos = engine_call(py, &self.inner, || self.inner.graph_snapshot())?;
+                full_snapshot_to_py(py, &infos)
             }
-            Ok(result.into_any().unbind())
+            Some(request) => {
+                let snap = engine_call(py, &self.inner, || {
+                    self.inner.graph_snapshot_bounded(&request.query())
+                })?;
+                bounded_snapshot_to_py(py, &snap)
+            }
         }
     }
 

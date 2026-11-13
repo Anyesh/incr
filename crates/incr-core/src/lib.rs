@@ -98,7 +98,10 @@ pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
 pub use table::{NodeTable, TableKey};
-pub use trace::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction};
+pub use trace::{
+    BoundedSnapshot, Direction, GraphQuery, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace,
+    TraceAction,
+};
 pub use value::Value;
 #[doc(hidden)]
 pub use value_code::{check_value_code, with_value_code};

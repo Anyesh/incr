@@ -8,7 +8,8 @@ use std::thread;
 
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
-use crate::trace::TraceAction;
+use crate::node::NodeId;
+use crate::trace::{Direction, GraphQuery, TraceAction};
 
 const NESTED: &str = "incr-core: get_traced called while another get_traced is in progress";
 
@@ -202,4 +203,182 @@ fn shared_get_traced_started_during_the_owners_hand_off_keeps_the_owner_trace() 
         .expect("the hand-off park ran");
     assert_eq!(intruded, Err(NESTED.to_string()));
     assert_eq!(recomputed(&rt.get_traced(y).1), 1);
+}
+
+fn ids(snap: &crate::trace::BoundedSnapshot) -> Vec<u32> {
+    snap.nodes.iter().map(|n| n.id.0).collect()
+}
+
+fn query<'a>(roots: &'a [NodeId], direction: Direction) -> GraphQuery<'a> {
+    GraphQuery {
+        roots,
+        direction,
+        depth: None,
+        label_prefix: None,
+        limit: None,
+        max_visited: None,
+    }
+}
+
+/// a0 <- q1 <- q2 <- q3 <- q4: each query reads the one before it.
+fn chain<C: Cells>(rt: &Runtime<C>, len: usize) -> Vec<u32> {
+    let a = rt.create_input(1_i64);
+    let mut slots = vec![a.slot()];
+    let mut prev = a;
+    for _ in 1..len {
+        let p = prev;
+        let q = rt.create_query(move |r| r.get(p) + 1);
+        let _ = rt.get(q);
+        slots.push(q.slot());
+        prev = q;
+    }
+    slots
+}
+
+fn bounded_depth_counts_edges_from_the_root<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let s = chain(&rt, 5);
+    let roots = [NodeId(s[3])];
+    let mut q = query(&roots, Direction::Dependencies);
+    q.depth = Some(0);
+    assert_eq!(ids(&rt.graph_snapshot_bounded(&q)), vec![s[3]]);
+    q.depth = Some(1);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert_eq!(ids(&snap), vec![s[3], s[2]]);
+    assert!(!snap.truncated);
+    assert_eq!(snap.nodes[1].dependencies, vec![NodeId(s[1])]);
+    assert_eq!(snap.nodes[1].dependents, vec![NodeId(s[3])]);
+    q.depth = None;
+    assert_eq!(
+        ids(&rt.graph_snapshot_bounded(&q)),
+        vec![s[3], s[2], s[1], s[0]]
+    );
+}
+
+fn bounded_limit_caps_and_sets_truncated<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let s = chain(&rt, 6);
+    let roots = [NodeId(s[5])];
+    let mut q = query(&roots, Direction::Dependencies);
+    q.limit = Some(3);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert_eq!(ids(&snap), vec![s[5], s[4], s[3]]);
+    assert!(snap.truncated);
+    q.limit = Some(6);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert_eq!(snap.nodes.len(), 6);
+    assert!(!snap.truncated);
+}
+
+fn bounded_label_prefix_filters_but_walks_through<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let s = chain(&rt, 3);
+    rt.set_label(s[0], "a/in".to_string());
+    rt.set_label(s[1], "x/mid".to_string());
+    rt.set_label(s[2], "a/out".to_string());
+    let roots = [NodeId(s[2])];
+    let mut q = query(&roots, Direction::Dependencies);
+    q.label_prefix = Some("a/");
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert_eq!(ids(&snap), vec![s[2], s[0]]);
+    assert!(!snap.truncated);
+    assert_eq!(snap.nodes[0].dependencies, vec![NodeId(s[1])]);
+    rt.clear_label(s[2]);
+    assert_eq!(ids(&rt.graph_snapshot_bounded(&q)), vec![s[0]]);
+}
+
+fn bounded_direction_dependents_and_both<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let s = chain(&rt, 4);
+    let roots = [NodeId(s[1])];
+    let mut q = query(&roots, Direction::Dependents);
+    assert_eq!(ids(&rt.graph_snapshot_bounded(&q)), vec![s[1], s[2], s[3]]);
+    q.direction = Direction::Both;
+    q.depth = Some(1);
+    let got = ids(&rt.graph_snapshot_bounded(&q));
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0], s[1]);
+    assert!(got.contains(&s[0]) && got.contains(&s[2]));
+    q.depth = None;
+    assert_eq!(ids(&rt.graph_snapshot_bounded(&q)).len(), 4);
+}
+
+fn bounded_max_visited_truncates_a_filtered_walk<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let s = chain(&rt, 8);
+    rt.set_label(s[0], "keep".to_string());
+    let roots = [NodeId(s[7])];
+    let mut q = query(&roots, Direction::Dependencies);
+    q.label_prefix = Some("keep");
+    q.max_visited = Some(4);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert!(snap.nodes.is_empty());
+    assert!(snap.truncated);
+    q.max_visited = Some(8);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert_eq!(ids(&snap), vec![s[0]]);
+    assert!(!snap.truncated);
+    let rt: Runtime<C> = Runtime::new();
+    let s = chain(&rt, 70);
+    rt.set_label(s[0], "keep".to_string());
+    let roots = [NodeId(s[69])];
+    let mut q = query(&roots, Direction::Dependencies);
+    q.label_prefix = Some("keep");
+    q.limit = Some(1);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert!(snap.nodes.is_empty(), "limit 1 defaults max_visited to 64");
+    assert!(snap.truncated);
+    q.max_visited = Some(70);
+    assert_eq!(ids(&rt.graph_snapshot_bounded(&q)), vec![s[0]]);
+}
+
+fn bounded_ignores_dead_roots_and_dedups<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let a = rt.create_input(1_i64);
+    let b = rt.create_input(2_i64);
+    let q1 = rt.create_query(move |r| r.get(a) + r.get(b));
+    let _ = rt.get(q1);
+    let roots = [NodeId(q1.slot()), NodeId(q1.slot())];
+    let q = query(&roots, Direction::Dependencies);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert_eq!(snap.nodes.len(), 3);
+    let dead = rt.create_input(3_i64);
+    let dead_slot = dead.slot();
+    rt.delete_node(dead);
+    let roots = [NodeId(dead_slot)];
+    let q = query(&roots, Direction::Both);
+    assert!(rt.graph_snapshot_bounded(&q).nodes.is_empty());
+}
+
+fn bounded_keeps_edges_outside_the_returned_set<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let s = chain(&rt, 4);
+    let roots = [NodeId(s[2])];
+    let mut q = query(&roots, Direction::Dependencies);
+    q.depth = Some(0);
+    let snap = rt.graph_snapshot_bounded(&q);
+    assert_eq!(snap.nodes[0].dependencies, vec![NodeId(s[1])]);
+    assert_eq!(snap.nodes[0].dependents, vec![NodeId(s[3])]);
+}
+
+#[test]
+fn local_bounded_snapshot_cases() {
+    bounded_depth_counts_edges_from_the_root::<Local>();
+    bounded_limit_caps_and_sets_truncated::<Local>();
+    bounded_label_prefix_filters_but_walks_through::<Local>();
+    bounded_direction_dependents_and_both::<Local>();
+    bounded_max_visited_truncates_a_filtered_walk::<Local>();
+    bounded_ignores_dead_roots_and_dedups::<Local>();
+    bounded_keeps_edges_outside_the_returned_set::<Local>();
+}
+
+#[test]
+fn shared_bounded_snapshot_cases() {
+    bounded_depth_counts_edges_from_the_root::<Shared>();
+    bounded_limit_caps_and_sets_truncated::<Shared>();
+    bounded_label_prefix_filters_but_walks_through::<Shared>();
+    bounded_direction_dependents_and_both::<Shared>();
+    bounded_max_visited_truncates_a_filtered_walk::<Shared>();
+    bounded_ignores_dead_roots_and_dedups::<Shared>();
+    bounded_keeps_edges_outside_the_returned_set::<Shared>();
 }
