@@ -1469,9 +1469,9 @@ impl<C: Cells> Live<C> {
         let mut states = Vec::new();
         let mut deps = Vec::new();
         let mut groups = Vec::new();
-        for side in 0..2 {
+        for (side, &queries) in self.queries.iter().enumerate() {
             let rt = w.rt(side);
-            for q in 0..self.queries[side] {
+            for q in 0..queries {
                 let h = w.handle(side, q);
                 let state = if rt.is_alive(h.erased()) {
                     h.state(rt)

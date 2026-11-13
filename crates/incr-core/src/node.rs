@@ -712,12 +712,11 @@ impl<C: Cells> NodeData<C> {
 
     #[inline(always)]
     fn for_each_inline_dep<F: FnMut(NodeId) + ?Sized>(&self, count: u8, f: &mut F) {
-        for i in 0..(count as usize) {
+        for cell in self.inline_deps.iter().take(count as usize) {
             // Acquire pairs with install_deps's Release store of the id,
             // so the scan has happens-before with the id's creation even
             // when the count it read predates the install.
-            let raw = C::u32_load_acquire(&self.inline_deps[i]);
-            f(NodeId(raw));
+            f(NodeId(C::u32_load_acquire(cell)));
         }
     }
 
