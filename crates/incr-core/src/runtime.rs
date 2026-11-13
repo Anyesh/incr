@@ -1993,7 +1993,7 @@ impl<C: Cells> Runtime<C> {
         C::u8_load_relaxed(&self.instrument) != 0
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     fn tracing_is_armed(&self) -> bool {
         C::u8_load_relaxed(&self.instrument) & crate::instrument::TRACE != 0
     }
