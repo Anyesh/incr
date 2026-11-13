@@ -711,12 +711,17 @@ impl<C: Cells> NodeData<C> {
     }
 
     #[inline(always)]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "the indexed loop costs fewer instructions per propagation than a slice or take iterator (icount chain_local/propagate/10)"
+    )]
     fn for_each_inline_dep<F: FnMut(NodeId) + ?Sized>(&self, count: u8, f: &mut F) {
-        for cell in self.inline_deps.iter().take(count as usize) {
+        for i in 0..(count as usize) {
             // Acquire pairs with install_deps's Release store of the id,
             // so the scan has happens-before with the id's creation even
             // when the count it read predates the install.
-            f(NodeId(C::u32_load_acquire(cell)));
+            let raw = C::u32_load_acquire(&self.inline_deps[i]);
+            f(NodeId(raw));
         }
     }
 
