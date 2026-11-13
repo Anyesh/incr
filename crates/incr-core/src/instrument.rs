@@ -13,59 +13,55 @@ type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 pub(crate) const TRACE: u8 = 1;
 pub(crate) const STATS: u8 = 2;
 
-#[cfg(not(loom))]
+/// Per thread, each open timed run's start and the time of the runs
+/// nested in it, so a run's time excludes them and a group's time is not
+/// counted again in the groups that read it.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+type Open = Vec<(std::time::Instant, u64)>;
+
+#[cfg(all(not(loom), not(all(target_arch = "wasm32", target_os = "unknown"))))]
 thread_local! {
-    static NESTED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    static OPEN: RefCell<Open> = const { RefCell::new(Vec::new()) };
 }
 
-#[cfg(loom)]
+#[cfg(all(loom, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 loom::thread_local! {
-    static NESTED: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    static OPEN: RefCell<Open> = RefCell::new(Vec::new());
 }
 
-/// Times one run of a compute closure, net of the runs nested in it on
-/// this thread, so a group's time is not counted again in the groups that
-/// read it.
-pub(crate) struct Timer {
+/// Opens a timed run; `false` on wasm32-unknown-unknown, where std has
+/// no clock, and then [`stop_timer`] must not be called.
+#[cold]
+#[inline(never)]
+pub(crate) fn start_timer() -> bool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    start: std::time::Instant,
+    {
+        OPEN.with(|o| o.borrow_mut().push((std::time::Instant::now(), 0)));
+        true
+    }
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    false
 }
 
-impl Timer {
-    /// `None` on wasm32-unknown-unknown, where std has no clock.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn start() -> Option<Timer> {
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        {
-            NESTED.with(|n| n.borrow_mut().push(0));
-            Some(Timer {
-                start: std::time::Instant::now(),
-            })
-        }
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        None
+/// Closes this thread's innermost timed run and returns its own
+/// nanoseconds.
+pub(crate) fn stop_timer() -> u64 {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        OPEN.with(|o| {
+            let mut o = o.borrow_mut();
+            let Some((start, nested)) = o.pop() else {
+                return 0;
+            };
+            let total = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if let Some(parent) = o.last_mut() {
+                parent.1 = parent.1.saturating_add(total);
+            }
+            total.saturating_sub(nested)
+        })
     }
-
-    /// The run's own nanoseconds.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn stop(self) -> u64 {
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        {
-            let total = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            NESTED.with(|n| {
-                let mut n = n.borrow_mut();
-                let nested = n.pop().unwrap_or(0);
-                if let Some(parent) = n.last_mut() {
-                    *parent = parent.saturating_add(total);
-                }
-                total.saturating_sub(nested)
-            })
-        }
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        0
-    }
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    0
 }
 
 /// What the instrumentation flags have collected. Held under

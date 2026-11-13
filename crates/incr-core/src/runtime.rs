@@ -2005,21 +2005,20 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// A timer for one run of a compute closure, if a trace or compute
-    /// stats are on.
+    /// Starts timing a run of a compute closure if a trace or compute
+    /// stats are on; a `true` return must be matched by
+    /// [`Self::stop_compute_timer`] once the run has returned or unwound
+    /// into its `catch_unwind`. With both off this costs one load and
+    /// branch, and the code around the run is unchanged.
     #[inline(always)]
-    pub(crate) fn compute_timer(&self) -> Option<crate::instrument::Timer> {
-        if self.instrumented() {
-            crate::instrument::Timer::start()
-        } else {
-            None
-        }
+    pub(crate) fn start_compute_timer(&self) -> bool {
+        self.instrumented() && crate::instrument::start_timer()
     }
 
     #[cold]
     #[inline(never)]
-    pub(crate) fn record_compute_time(&self, id: NodeId, timer: crate::instrument::Timer) {
-        let ns = timer.stop();
+    pub(crate) fn stop_compute_timer(&self, id: NodeId) {
+        let ns = crate::instrument::stop_timer();
         let flags = C::u8_load_relaxed(&self.instrument);
         if flags != 0 {
             self.instrument_state.write().add_time(flags, id.0, ns);
@@ -6344,12 +6343,12 @@ impl<C: Cells> Runtime<C> {
                 let mut result = match adopted_panic.take() {
                     Some(raised) => Err(self.raise_adopted(raised)),
                     None => {
-                        let timer = self.compute_timer();
+                        let timed = self.start_compute_timer();
                         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             compute(self, id.0, &ctl)
                         }));
-                        if let Some(timer) = timer {
-                            self.record_compute_time(id, timer);
+                        if timed {
+                            self.stop_compute_timer(id);
                         }
                         ran
                     }

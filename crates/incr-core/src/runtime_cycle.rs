@@ -1197,10 +1197,10 @@ impl<C: Cells> Runtime<C> {
         let compute = unsafe { &*compute };
         let failures = began.unwrap_or_else(cycle_state::failures);
         let first = replay::peek_id();
-        let timer = self.compute_timer();
+        let timed = self.start_compute_timer();
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
-        if let Some(timer) = timer {
-            self.record_compute_time(NodeId(slot), timer);
+        if timed {
+            self.stop_compute_timer(NodeId(slot));
         }
         if !C::SINGLE_THREADED
             && ctl.has(cycle::DOOMED)

@@ -3257,3 +3257,22 @@ over 75 tests (Local rows within 0.03%), scale timing 1.012.
   `rust_eh_personality` +12.1M, `_dl_find_object` -11.8M).
 - Loom: `env -u CARGO_ENCODED_RUSTFLAGS RUSTFLAGS="--cfg loom -D warnings"
   cargo test -p incr-core --release --lib --no-run` rc 0 on `56b5744f`.
+
+## Compute stats and trace timing (beta.8 R5/R6)
+
+- Base `d05705feb` (0.2.0-beta.7) against `mcs-round2` with R4, R5/R6 and the clippy 1.100 fix, each built in its own target directory (two worktrees sharing one target directory resolve the `icount` driver to the same path, so the second run measured the first's binary).
+
+| workload | b7 | branch | delta |
+| --- | ---: | ---: | ---: |
+| `get_clean_local` | 92.0 | 92.0 | 0 |
+| `get_clean_shared` | 190.0 | 190.0 | 0 |
+| `chain_local/propagate/10` | 9,762.0 | 9,828.0 | +66.0 (+0.68%) |
+| `chain_shared/propagate/10` | 26,029.4 | 26,130.4 | +101.0 (+0.39%) |
+| `early_cutoff_local` | 2,155.0 | 2,157.0 | +2.0 |
+| `early_cutoff_shared` | 4,325.4 | 4,331.4 | +6.0 |
+| `diamond_local` | 3,698.0 | 3,721.0 | +23.0 |
+| `diamond_shared` | 9,739.7 | 9,770.7 | +31.0 |
+
+- The rise is the instrumentation flag read before each closure run and the `timed` test after it, about 5 to 10 instructions per recompute; with the read removed the branch measured exactly the base on every Local workload. Clean `get` reaches neither.
+- Two placements cost more and were dropped: an `Option<Timer>` live across the run (+192 on `chain_local/propagate/10`) and a wrapper taking the run as a closure, outside or inside `catch_unwind` (+162, +143), since the closure environment was built on every run. The kept form leaves the code around `catch_unwind` as in the base and keeps the start time in a thread-local.
+- `for_each_inline_dep` keeps its indexed loop with `clippy::needless_range_loop` allowed: the slice and `take` iterator forms clippy 1.100 asks for cost 30 more on `chain_local/propagate/10`, spread over `observed_clean`, `mark_dependents_dirty` and `clean_walk`, which inline it.

@@ -3077,10 +3077,10 @@ impl<C: Cells> Runtime<C> {
             self.dep_stack.push_frame(self.runtime_id, id, &ctl);
             replay::regen_open(self.runtime_id, left);
             value_code::set_bits(value_code::REGEN_BIT, true);
-            let timer = self.compute_timer();
+            let timed = self.start_compute_timer();
             let ran = catch_unwind(AssertUnwindSafe(|| compute(self, id.0, &ctl)));
-            if let Some(timer) = timer {
-                self.record_compute_time(id, timer);
+            if timed {
+                self.stop_compute_timer(id);
             }
             let aborted = value_code::thread_word() & value_code::REGEN_ABORTED != 0;
             value_code::set_bits(value_code::REGEN_BIT | value_code::REGEN_ABORTED, false);
