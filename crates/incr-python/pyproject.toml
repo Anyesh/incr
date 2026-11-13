@@ -11,4 +11,4 @@ license = "Apache-2.0"
 keywords = ["incremental", "computation", "reactive", "dataflow"]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "conformance"]

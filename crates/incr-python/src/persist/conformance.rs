@@ -1,18 +1,19 @@
-//! `incr.persist._conformance`: runs incr-persist's backend conformance
+//! `incr.persist.conformance`: runs incr-persist's backend conformance
 //! cases against Python backend objects. Compiled only with the
-//! `conformance` feature.
+//! `conformance` feature, which the wheels enable.
 //!
-//! A factory object stands in for the Rust harness. Store cases call
-//! `new_log()`, `open(log)`, `open_read_only(log)` (an object or `None`)
-//! and `multi_writer()`; memo cases call `new_store()`, `open(store)` and
-//! `exclusive_lock()`.
+//! A factory object stands in for the Rust harness. Log cases call
+//! `new_log()`, `open(log)`, `open_read_only(log)` (an object or `None`),
+//! `multi_writer()` and, if the factory has it, `fence(log)`; memo cases
+//! call `new_store()`, `open(store)` and `exclusive_lock()`.
 
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 
 use incr_persist::conformance::{self as store_cases, Harness};
 use incr_persist::memo::conformance::{self as memo_cases, MemoHarness};
-use pyo3::exceptions::PyValueError;
+use pyo3::create_exception;
+use pyo3::exceptions::{PyAssertionError, PyValueError};
 use pyo3::prelude::*;
 
 use super::backend::PyBackend;
@@ -60,6 +61,19 @@ impl Harness for StoreFactory {
                 .and_then(|v| v.is_truthy())
                 .unwrap_or_else(|e| panic!("factory.multi_writer raised: {e}"))
         })
+    }
+
+    fn fence(&mut self, log: &Self::Log) -> bool {
+        let has_fence = Python::attach(|py| {
+            self.0
+                .bind(py)
+                .hasattr("fence")
+                .unwrap_or_else(|e| panic!("factory lookup of fence raised: {e}"))
+        });
+        if has_fence {
+            self.call("fence", Some(log));
+        }
+        has_fence
     }
 }
 
@@ -117,6 +131,7 @@ const STORE_CASES: &[Case] = case_table!(
     snapshot_id_names_each_compaction,
     snapshot_id_survives_reopen,
     read_only_handle_sees_the_snapshot_id,
+    fenced_append_lands_nothing,
 );
 
 fn memo_harness(factory: Py<PyAny>) -> MemoFactory {
@@ -145,9 +160,48 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "panic with a non-string payload".to_owned())
 }
 
-/// Runs the cases of `kind` (`"store"` or `"memo"`), or only `case`, with
-/// the GIL released so the cases' own threads can attach. Returns each
-/// case's name mapped to `None` on a pass or the panic message.
+create_exception!(
+    incr.persist.conformance,
+    ConformanceFailure,
+    PyAssertionError,
+    "A backend failed a conformance case; `case` names it."
+);
+
+fn table(kind: &str) -> PyResult<&'static [Case]> {
+    match kind {
+        "store" | "log" => Ok(STORE_CASES),
+        "memo" => Ok(MEMO_CASES),
+        _ => Err(PyValueError::new_err("kind must be 'log' or 'memo'")),
+    }
+}
+
+/// Runs each case on a fresh handle to `factory` with the GIL released, so
+/// the cases' own threads can attach, until one fails if `stop` is set.
+/// Returns each case run mapped to `None` on a pass or the panic message.
+fn run(
+    py: Python<'_>,
+    cases: Vec<&'static Case>,
+    factory: &Py<PyAny>,
+    stop: bool,
+) -> Vec<(&'static str, Option<String>)> {
+    py.detach(|| {
+        let mut outcomes = Vec::with_capacity(cases.len());
+        for (name, case) in cases {
+            let handle = Python::attach(|py| factory.clone_ref(py));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| case(handle)));
+            let failed = outcome.is_err();
+            outcomes.push((*name, outcome.err().map(panic_message)));
+            if stop && failed {
+                break;
+            }
+        }
+        outcomes
+    })
+}
+
+/// Runs the cases of `kind` (`"store"` or `"memo"`), or only `case`.
+/// Returns each case's name mapped to `None` on a pass or the panic
+/// message.
 #[pyfunction]
 #[pyo3(signature = (kind, factory, case=None))]
 fn _conformance(
@@ -156,40 +210,69 @@ fn _conformance(
     factory: Py<PyAny>,
     case: Option<&str>,
 ) -> PyResult<BTreeMap<&'static str, Option<String>>> {
-    let table = match kind {
-        "store" => STORE_CASES,
-        "memo" => MEMO_CASES,
-        _ => return Err(PyValueError::new_err("kind must be 'store' or 'memo'")),
-    };
-    let selected: Vec<&Case> = table
+    let selected: Vec<&Case> = table(kind)?
         .iter()
         .filter(|(name, _)| case.is_none_or(|wanted| wanted == *name))
         .collect();
     if selected.is_empty() {
         return Err(PyValueError::new_err("no such conformance case"));
     }
-    Ok(py.detach(|| {
-        selected
-            .into_iter()
-            .map(|(name, run)| {
-                let handle = Python::attach(|py| factory.clone_ref(py));
-                let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(handle)));
-                (*name, outcome.err().map(panic_message))
-            })
-            .collect()
-    }))
+    Ok(run(py, selected, &factory, false).into_iter().collect())
 }
 
 #[pyfunction]
 fn _conformance_cases(kind: &str) -> PyResult<Vec<&'static str>> {
-    match kind {
-        "store" => Ok(STORE_CASES.iter().map(|(name, _)| *name).collect()),
-        "memo" => Ok(MEMO_CASES.iter().map(|(name, _)| *name).collect()),
-        _ => Err(PyValueError::new_err("kind must be 'store' or 'memo'")),
-    }
+    cases(kind)
 }
 
+/// The names of the `kind` (`"log"` or `"memo"`) cases, in run order.
+#[pyfunction]
+fn cases(kind: &str) -> PyResult<Vec<&'static str>> {
+    Ok(table(kind)?.iter().map(|(name, _)| *name).collect())
+}
+
+fn run_all(py: Python<'_>, kind: &str, factory: Py<PyAny>) -> PyResult<()> {
+    let cases = table(kind)?.iter().collect();
+    for (name, failure) in run(py, cases, &factory, true) {
+        if let Some(message) = failure {
+            let error =
+                ConformanceFailure::new_err(format!("conformance case {name} failed: {message}"));
+            error.value(py).setattr("case", name)?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Runs every log backend case against handles from `factory`, raising
+/// `ConformanceFailure` naming the first case that fails.
+#[pyfunction]
+fn run_log_backend(py: Python<'_>, factory: Py<PyAny>) -> PyResult<()> {
+    run_all(py, "log", factory)
+}
+
+/// Runs every memo backend case against handles from `factory`, raising
+/// `ConformanceFailure` naming the first case that fails.
+#[pyfunction]
+fn run_memo_backend(py: Python<'_>, factory: Py<PyAny>) -> PyResult<()> {
+    run_all(py, "memo", factory)
+}
+
+/// Adds the private per-case entry points to `incr.persist` and creates
+/// `incr.persist.conformance`, registered in `sys.modules`.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = module.py();
     module.add_function(wrap_pyfunction!(_conformance, module)?)?;
-    module.add_function(wrap_pyfunction!(_conformance_cases, module)?)
+    module.add_function(wrap_pyfunction!(_conformance_cases, module)?)?;
+    let public = PyModule::new(py, "conformance")?;
+    public.setattr("__name__", "incr.persist.conformance")?;
+    public.add("ConformanceFailure", py.get_type::<ConformanceFailure>())?;
+    public.add_function(wrap_pyfunction!(run_log_backend, &public)?)?;
+    public.add_function(wrap_pyfunction!(run_memo_backend, &public)?)?;
+    public.add_function(wrap_pyfunction!(cases, &public)?)?;
+    module.add("conformance", &public)?;
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("incr.persist.conformance", &public)?;
+    Ok(())
 }

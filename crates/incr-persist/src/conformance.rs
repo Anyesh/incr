@@ -41,6 +41,15 @@ pub trait Harness {
     /// Whether several writable handles may be open on one log at once.
     /// Cases that need concurrent writers are skipped when this is `false`.
     fn multi_writer(&self) -> bool;
+
+    /// Fences `log` the way an epoch check does: every handle opened
+    /// before the call must fail to append and land nothing, and handles
+    /// opened after it append normally. Returns `false` if the backend has
+    /// no fence, which skips the case that needs one.
+    fn fence(&mut self, log: &Self::Log) -> bool {
+        let _ = log;
+        false
+    }
 }
 
 /// Expands to one `#[test]` per conformance case, each building its harness
@@ -70,6 +79,7 @@ macro_rules! backend_conformance {
             snapshot_id_names_each_compaction,
             snapshot_id_survives_reopen,
             read_only_handle_sees_the_snapshot_id,
+            fenced_append_lands_nothing,
         );
     };
     (@cases $harness:expr; $($case:ident),+ $(,)?) => {
@@ -691,4 +701,39 @@ pub fn read_only_handle_sees_the_snapshot_id<H: Harness>(mut h: H) {
     assert_eq!(reader.snapshot_id().unwrap(), id(second, 3));
     let fresh = h.open_read_only(&log).expect("read-only mode");
     assert_eq!(fresh.snapshot_id().unwrap(), id(second, 3));
+}
+
+/// A handle opened before [`Harness::fence`] fails to append and lands
+/// nothing, and a handle opened after it appends right after the tail.
+pub fn fenced_append_lands_nothing<H: Harness>(mut h: H) {
+    let log = h.new_log();
+    let old = h.open(&log);
+    let first = vec![declare("a"), set("a", 1)];
+    let tail = old.append(&first).unwrap();
+    if !h.fence(&log) {
+        return;
+    }
+    assert!(
+        old.append(&[set("a", 2)]).is_err(),
+        "an append on a fenced handle must fail"
+    );
+    if !h.multi_writer() {
+        drop(old);
+    }
+    let new = h.open(&log);
+    let expected: Vec<_> = positions_of(tail, first.len())
+        .into_iter()
+        .zip(first)
+        .collect();
+    assert_eq!(
+        read_all(&new, Position::ZERO),
+        expected,
+        "a fenced append must land nothing"
+    );
+    let next = new.append(&[set("a", 3)]).unwrap();
+    assert_eq!(
+        read_all(&new, tail),
+        vec![(next, set("a", 3))],
+        "an append after the fence must follow the tail"
+    );
 }
