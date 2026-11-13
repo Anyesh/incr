@@ -721,3 +721,39 @@ fn checkpoint_without_auto_threshold_never_runs_on_its_own() {
     }
     assert!(log.load_snapshot().unwrap().is_none());
 }
+
+#[test]
+fn stats_follow_writes_triggered_checkpoints_and_a_reopen() {
+    let backend = MemoryBackend::new();
+    let options = Options {
+        auto_checkpoint_records: Some(3),
+        ..Options::default()
+    };
+    let store: Store<Local, _> = Store::open(backend.clone(), options.clone()).unwrap();
+    let fresh = store.stats().unwrap();
+    assert_eq!(fresh.snapshot_position, Position::ZERO);
+    assert_eq!(fresh.records_since_checkpoint, 0);
+
+    let x = store.input("x", 0u32).unwrap();
+    store.set(x, 1).unwrap();
+    let before_trigger = store.set(x, 2).unwrap();
+    assert_eq!(store.stats().unwrap().records_since_checkpoint, 3);
+    let after_trigger = store.set(x, 3).unwrap();
+    let stats = store.stats().unwrap();
+    assert_eq!(stats.snapshot_position, before_trigger);
+    assert_eq!(stats.records_since_checkpoint, 1);
+    assert_eq!(stats.position, after_trigger);
+
+    let last = store.set(x, 4).unwrap();
+    drop(store);
+    let again: Store<Local, _> = Store::open(backend, options).unwrap();
+    let reopened = again.stats().unwrap();
+    assert_eq!(reopened.snapshot_position, before_trigger);
+    assert_eq!(reopened.records_since_checkpoint, 2);
+    assert_eq!(reopened.position, last);
+
+    let at = again.checkpoint().unwrap();
+    let checkpointed = again.stats().unwrap();
+    assert_eq!(checkpointed.snapshot_position, at);
+    assert_eq!(checkpointed.records_since_checkpoint, 0);
+}

@@ -72,6 +72,20 @@ pub struct Options {
     pub auto_checkpoint_records: Option<u64>,
 }
 
+/// What [`Store::stats`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StoreStats {
+    /// The last log position the store has applied.
+    pub position: Position,
+    /// The position of the snapshot the store last wrote or crossed,
+    /// [`Position::ZERO`] if none.
+    pub snapshot_position: Position,
+    /// Records applied since that snapshot, the count
+    /// [`Options::auto_checkpoint_records`] compares against.
+    pub records_since_checkpoint: u64,
+}
+
 /// A persisted input: a key in the log bound to an input node of the
 /// store's runtime.
 pub struct Input<T: 'static> {
@@ -199,6 +213,9 @@ struct State<C: Cells> {
     poisoned: bool,
     unlogged: bool,
     since_checkpoint: u64,
+    /// The position of the snapshot this store last wrote or crossed,
+    /// whether or not `snapshot` could name it.
+    snapshot_at: Position,
     logged: LoggedKeys,
     bound: HashMap<String, u32>,
     /// Bindings by id. Ids are never reused, so a handle whose key was
@@ -390,6 +407,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 poisoned: false,
                 unlogged: false,
                 since_checkpoint: 0,
+                snapshot_at: Position::ZERO,
                 logged: LoggedKeys::new(),
                 bound: HashMap::new(),
                 bindings: HashMap::new(),
@@ -737,6 +755,16 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.checkpoint_locked(&mut state)
     }
 
+    /// Where the store stands in its log, without reading the backend.
+    pub fn stats(&self) -> Result<StoreStats> {
+        let state = self.state()?;
+        Ok(StoreStats {
+            position: state.applied,
+            snapshot_position: state.snapshot_at,
+            records_since_checkpoint: state.since_checkpoint,
+        })
+    }
+
     fn checkpoint_locked(&self, state: &mut State<C>) -> Result<Position> {
         loop {
             self.catch_up(state, None)?;
@@ -752,6 +780,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                         state.logged.remove(&key);
                     }
                     state.since_checkpoint = 0;
+                    state.snapshot_at = upto;
                     // The new snapshot is this store's own fold, so it needs
                     // no reconciling. It is the one right after the snapshot
                     // the store accounted for unless another writer compacted
@@ -828,6 +857,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let at = id.map_or(Position::ZERO, |id| id.position);
         self.replace_with(state, at, records)?;
         state.snapshot = id;
+        state.snapshot_at = at;
         self.catch_up(state, None)
     }
 
@@ -1086,6 +1116,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             let since = later.len() as u64;
             self.replace_with(state, applied, snapshot.into_iter().chain(later))?;
             state.snapshot = Some(id);
+            state.snapshot_at = id.position;
             state.since_checkpoint = since;
             return Ok(());
         }
@@ -1137,6 +1168,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         self.replace_with(state, id.position, records)?;
         state.snapshot = Some(id);
+        state.snapshot_at = id.position;
         Ok(())
     }
 

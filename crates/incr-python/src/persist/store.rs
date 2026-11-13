@@ -13,7 +13,7 @@ use incr_persist::{Durability, Input, Options, Store};
 use incr_python_protocol::PyValue;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyString;
+use pyo3::types::{PyDict, PyString};
 
 use super::backend::PyBackend;
 use super::batch::PyBatch;
@@ -175,19 +175,28 @@ impl PyStore {
     /// Opens a store over `backend`, replaying its log. `build_id`, an int
     /// or a str, names the code that computes memoized values; incr hashes
     /// a str to an id. `durability` is `"sync"` (a write is durable when it
-    /// returns) or `"buffered"`.
+    /// returns) or `"buffered"`. With `auto_checkpoint_records=n`, a
+    /// write first checkpoints once `n` records were applied since the last
+    /// snapshot; a failed checkpoint fails that write and leaves the log
+    /// unchanged.
     #[staticmethod]
-    #[pyo3(signature = (backend, *, build_id, durability="sync"))]
+    #[pyo3(signature = (backend, *, build_id, durability="sync", auto_checkpoint_records=None))]
     fn open(
         py: Python<'_>,
         backend: Py<PyAny>,
         build_id: &Bound<'_, PyAny>,
         durability: &str,
+        auto_checkpoint_records: Option<u64>,
     ) -> PyResult<PyStore> {
         let build_id = build_id_of(build_id)?;
+        if auto_checkpoint_records == Some(0) {
+            return Err(PyValueError::new_err(
+                "auto_checkpoint_records must be a positive count or None",
+            ));
+        }
         let options = Options {
             durability: durability_of(durability)?,
-            ..Options::default()
+            auto_checkpoint_records,
         };
         let registry = Rc::new(Registry::default());
         let store = registry.run(py, || Store::open(PyBackend::new(backend), options))?;
@@ -506,6 +515,18 @@ impl PyStore {
         engine_write(core.runtime(), || {
             core.run(py, |store| store.refresh().map(|at| at.0))
         })?
+    }
+
+    /// `position` (the last log position applied), `snapshot_position`
+    /// (the snapshot this store last wrote or crossed, 0 if none) and
+    /// `records_since_checkpoint`, read without touching the backend.
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stats = self.core()?.run(py, |store| store.stats())?;
+        let dict = PyDict::new(py);
+        dict.set_item("position", stats.position.0)?;
+        dict.set_item("snapshot_position", stats.snapshot_position.0)?;
+        dict.set_item("records_since_checkpoint", stats.records_since_checkpoint)?;
+        Ok(dict)
     }
 
     /// Folds the log into a snapshot, compacting it, and returns the
