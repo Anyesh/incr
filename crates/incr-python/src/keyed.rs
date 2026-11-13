@@ -194,6 +194,11 @@ impl KeyIndex {
         self.table.len()
     }
 
+    /// Each held `(key, row)` tuple, in no particular order.
+    pub(crate) fn pairs(&self) -> impl ExactSizeIterator<Item = &Py<PyTuple>> {
+        self.table.iter().map(|(_, pair)| pair)
+    }
+
     pub(crate) fn hash(&self, key: &Bound<'_, PyAny>) -> PyResult<u64> {
         Ok(self.hasher.hash_one(key.hash()?))
     }

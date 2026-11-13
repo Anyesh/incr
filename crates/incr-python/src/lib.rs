@@ -1040,6 +1040,30 @@ impl PyKeyedCollection {
         Ok(self.index()?.len())
     }
 
+    /// A new list of the held keys, in no particular order. Registers no
+    /// dependency, like `get`.
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        self.check_open(py)?;
+        let index = self.index()?;
+        let list = pyo3::types::PyList::empty(py);
+        for pair in index.pairs() {
+            list.append(pair.bind(py).get_item(0)?)?;
+        }
+        Ok(list)
+    }
+
+    /// A new list of the held `(key, row)` tuples, in no particular order.
+    /// Registers no dependency, like `get`.
+    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        self.check_open(py)?;
+        let index = self.index()?;
+        let list = pyo3::types::PyList::empty(py);
+        for pair in index.pairs() {
+            list.append(pair.bind(py))?;
+        }
+        Ok(list)
+    }
+
     /// Make the held rows equal `rows`, a mapping or an iterable of
     /// `(key, row)` pairs (a later pair for a key wins), in one atomic
     /// change. Returns how many keys were `(inserted, replaced, removed)`.
