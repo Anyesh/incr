@@ -7,10 +7,14 @@ import gc
 import pickle
 
 import incr.persist
+import incr_concurrent.persist
 import pytest
 from test_mcs_persist_conformance import DictBackend, DictLogState, EpochMismatch
 
-PACKAGES = [pytest.param(incr.persist, id="local")]
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
 
 
 @pytest.fixture(params=PACKAGES)
@@ -80,6 +84,7 @@ class Graph:
     with two keys."""
 
     def __init__(self, persist, backend, seed=True):
+        backend.tail_moved = persist.TailMoved
         codec = PickleCodec()
         self.store = persist.Store.open(backend, build_id=1)
         self.rt = self.store.runtime

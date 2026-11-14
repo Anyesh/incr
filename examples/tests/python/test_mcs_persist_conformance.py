@@ -43,6 +43,11 @@ class DictLogState:
 
 
 class DictBackend:
+    """`tail_moved` is the `TailMoved` class of the package whose store this
+    backend serves."""
+
+    tail_moved = persist.TailMoved
+
     def __init__(self, state, writable=True):
         self.state = state
         self._writable = writable
@@ -61,7 +66,7 @@ class DictBackend:
             raise ReadOnly("handle is read-only")
         with self.state.lock:
             if self.state.tail != after:
-                raise persist.TailMoved(f"tail is {self.state.tail}, not {after}")
+                raise self.tail_moved(f"tail is {self.state.tail}, not {after}")
             for record in records:
                 self.state.tail += 1
                 self.state.records.append((self.state.tail, record))

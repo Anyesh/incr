@@ -7,9 +7,13 @@ import importlib
 import pickle
 
 import incr.persist
+import incr_concurrent.persist
 import pytest
 
-PACKAGES = [pytest.param(incr.persist, id="local")]
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
 
 
 @pytest.fixture(params=PACKAGES)

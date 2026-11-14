@@ -27,6 +27,7 @@
 //! different thread trips over the resulting Failed node it gets a
 //! `RuntimeError` carrying the engine's message instead.
 
+mod keyed;
 mod persist;
 
 use pyo3::marker::Ungil;
@@ -41,13 +42,21 @@ use ::incr_concurrent as engine;
 use engine::{
     DeleteError, Incr, IncrCollection, NodeTable, PropagationTrace, Runtime, SortedCollection,
 };
+use incr_python_persist::ready;
+use incr_python_persist::state::RtState;
+use incr_python_protocol::notready::{
+    PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
+};
 use incr_python_protocol::snapshot::{
     bounded_snapshot_to_py, full_snapshot_to_py, SnapshotRequest,
 };
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, routing_error,
-    try_read, Exceptions, PyFixpoint, PyValue,
+    try_read, Exceptions, PyFixpoint, PyKey, PyValue,
 };
+
+use keyed::PyKeyedCollection;
+use persist::{SharedBinding, Signal};
 
 pyo3::create_exception!(
     incr_concurrent,
@@ -97,22 +106,34 @@ fn engine_call<R: Ungil>(
 /// a `RuntimeRef` that is invalidated when it returns.
 fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 'static {
     move |rt: &Runtime| -> PyValue {
-        Python::attach(|py| {
-            let rt_ref = Py::new(
-                py,
-                PyRuntimeRef {
-                    ptr: Cell::new(rt as *const _),
-                },
-            )
-            .unwrap();
-            // Invalidates the ref when the callback returns or unwinds, so
-            // one the callback kept never reaches a dropped runtime.
-            let _guard = InvalidateRef(rt_ref.bind(py).clone());
-            in_runtime(rt, || {
-                PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
-            })
+        with_ref(rt, |py, rt_ref, missing| {
+            ready::call_query::<Signal, _>(py, rt, &py_func, rt_ref, missing)
         })
     }
+}
+
+/// `call(py, ctx, missing)` with a `RuntimeRef` over `rt`, the running
+/// query's, that is invalidated when `call` returns or unwinds, and the
+/// count of missing contributions its reads add to.
+fn with_ref(
+    rt: &Runtime,
+    call: impl FnOnce(Python<'_>, Py<PyAny>, &Cell<u64>) -> Py<PyAny>,
+) -> PyValue {
+    Python::attach(|py| {
+        let missing = Cell::new(0);
+        let rt_ref = Py::new(
+            py,
+            PyRuntimeRef {
+                ptr: Cell::new(rt as *const _),
+                missing: &missing,
+            },
+        )
+        .unwrap();
+        let _guard = InvalidateRef(rt_ref.bind(py).clone());
+        in_runtime(rt, || {
+            PyValue(call(py, rt_ref.clone_ref(py).into_any(), &missing))
+        })
+    })
 }
 
 /// Typed node handle exposed to Python. Wraps `Incr<PyValue>`.
@@ -202,6 +223,9 @@ struct PyObserverId {
 #[pyclass(name = "RuntimeRef", unsendable)]
 struct PyRuntimeRef {
     ptr: Cell<*const Runtime>,
+    /// The missing contributions of the `Incomplete` values the running
+    /// query read, valid while `ptr` is non-null.
+    missing: *const Cell<u64>,
 }
 
 struct InvalidateRef<'py>(Bound<'py, PyRuntimeRef>);
@@ -226,6 +250,14 @@ impl PyRuntimeRef {
         // so the lifetime is guaranteed to outlive the callback.
         Ok(unsafe { &*ptr })
     }
+
+    /// The runtime and the running query's missing count.
+    fn rt_and_missing(&self) -> PyResult<(&Runtime, &Cell<u64>)> {
+        let rt = self.rt()?;
+        // SAFETY: `rt` succeeded, so the query whose frame owns the count
+        // is still running.
+        Ok((rt, unsafe { &*self.missing }))
+    }
 }
 
 // Every method releases the GIL, because a read may wait on a node
@@ -234,17 +266,70 @@ impl PyRuntimeRef {
 // frames as an exception instead of a foreign panic.
 #[pymethods]
 impl PyRuntimeRef {
+    /// The node's value. A `NotReady` value makes this query's value that
+    /// value; an `Incomplete` one gives its `value` and makes this query's
+    /// value `Incomplete`, with every `missing` it read added up.
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
-        let rt = self.rt()?;
+        let (rt, missing) = self.rt_and_missing()?;
         let val: PyValue = engine_call(py, rt, || rt.get(node.inner))?;
-        Ok(val.0)
+        ready::read::<Signal>(py, val.0, missing)
     }
 
     /// Like `get`, but a cycle that leaves the node without a value
     /// raises `CycleError` as an ordinary exception the query may catch.
     fn try_get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        let (rt, missing) = self.rt_and_missing()?;
+        let val = try_read::<Exc>(engine_call(py, rt, || rt.try_get(node.inner))?)?;
+        ready::read::<Signal>(py, val, missing)
+    }
+
+    /// `(value, status)` as `Runtime.get_with_status` gives them, with
+    /// neither rule of `get` applied.
+    fn get_status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let rt = self.rt()?;
-        try_read::<Exc>(engine_call(py, rt, || rt.try_get(node.inner))?)
+        let val: PyValue = engine_call(py, rt, || rt.get(node.inner))?;
+        Ok(ready::with_status(py, val.0))
+    }
+
+    /// The row `kc` holds for `key`, or `None`, read as `get` reads a node,
+    /// with a dependency on that key alone: the query reruns when a write
+    /// changes this key's row, inserts it or removes it, and not for other
+    /// keys. Raises `ValueError` for a keyed collection of another runtime.
+    fn get_key(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let (rt, missing) = self.rt_and_missing()?;
+        let row = key_row(py, rt, &kc, key)?.unwrap_or_else(|| py.None());
+        ready::read::<Signal>(py, row, missing)
+    }
+
+    /// `(row, status)` for `kc`'s `key` as `get_status` gives them, read
+    /// with the dependency of `get_key`; `(None, None)` for an absent key.
+    fn get_key_status(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Py<PyAny>,
+    ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        let rt = self.rt()?;
+        let row = key_row(py, rt, &kc, key)?.unwrap_or_else(|| py.None());
+        Ok(ready::with_status(py, row))
+    }
+
+    /// The value of `table`'s entry for `key` (see `Store.memo_table`),
+    /// restored from the memo or computed, read as `get` reads a node.
+    fn memo(
+        &self,
+        py: Python<'_>,
+        table: PyRef<'_, persist::PyMemoTable>,
+        key: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let (rt, missing) = self.rt_and_missing()?;
+        let val = table.value_of(py, rt, PyValue(key))?;
+        ready::read::<Signal>(py, val.0, missing)
     }
 
     /// The input child named `key` of this query, created with `init()`
@@ -275,6 +360,20 @@ impl PyRuntimeRef {
         let node = engine_call(py, rt, || rt.child_query_with(key, f, opts))?;
         Ok(PyNodeId { inner: node })
     }
+}
+
+/// `kc`'s row for `key` on `rt`, or `None`, read with a dependency on that
+/// key alone when a query of `rt` is running.
+fn key_row(
+    py: Python<'_>,
+    rt: &Runtime,
+    kc: &PyKeyedCollection,
+    key: Py<PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let (source, label) = kc.key_source(rt)?;
+    let key = PyKey(key);
+    let row = engine_call(py, rt, || source.get_key(rt, &key, label))?;
+    Ok(row.map(|row| row.0))
 }
 
 /// A map from keys to nodes of one runtime. Key `__eq__` and `__hash__`
@@ -361,14 +460,31 @@ struct PyCollection {
     bridges: Arc<VersionBridges>,
 }
 
+impl PyCollection {
+    /// Raises for a collection a store persists, which only the store
+    /// writes.
+    fn check_writable(&self) -> PyResult<()> {
+        if let RtRef::Store(core) = &self.rt {
+            if core.collection_of(self.inner.version_node().slot()).is_ok() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "collection is persisted: write it with store.insert, store.delete, store.replace or store.extend",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[pymethods]
 impl PyCollection {
     fn insert(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        self.check_writable()?;
         let v = PyValue(value);
         engine_call(py, &self.rt, || self.inner.insert(&self.rt, v))
     }
 
     fn delete(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<bool> {
+        self.check_writable()?;
         let v = PyValue(value);
         engine_call(py, &self.rt, || self.inner.delete(&self.rt, &v))
     }
@@ -666,10 +782,11 @@ impl Deref for RtRef {
     }
 }
 
-#[pyclass(name = "Runtime")]
+#[pyclass(name = "Runtime", frozen)]
 struct PyRuntime {
     inner: RtRef,
     bridges: Arc<VersionBridges>,
+    state: RtState<SharedBinding>,
 }
 
 const _: () = {
@@ -689,6 +806,7 @@ impl PyRuntime {
         PyRuntime {
             inner: RtRef::Store(core),
             bridges: Arc::default(),
+            state: RtState::default(),
         }
     }
 }
@@ -700,6 +818,7 @@ impl PyRuntime {
         PyRuntime {
             inner: RtRef::Own(Arc::new(Runtime::new())),
             bridges: Arc::default(),
+            state: RtState::default(),
         }
     }
 
@@ -720,17 +839,44 @@ impl PyRuntime {
         Ok(PyNodeId { inner: node })
     }
 
+    /// The node's value; an `Incomplete` value gives its `value` (see
+    /// `get_with_status`).
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let val: PyValue = engine_call(py, &self.inner, || self.inner.get(node.inner))?;
-        Ok(val.0)
+        Ok(ready::unwrapped(py, val.0))
+    }
+
+    /// `(value, status)`: the value `get` returns, and `None`, the
+    /// `NotReady` value, or the `Incomplete` value.
+    fn get_with_status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        let val: PyValue = engine_call(py, &self.inner, || self.inner.get(node.inner))?;
+        Ok(ready::with_status(py, val.0))
+    }
+
+    /// The status `get_with_status` gives.
+    fn status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        Ok(self.get_with_status(py, node)?.1)
+    }
+
+    /// The row `kc` holds for `key`, or `None`, read outside a query: it
+    /// creates nothing and registers no dependency. Raises `ValueError` for
+    /// a keyed collection of another runtime.
+    fn get_key(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Py<PyAny>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        key_row(py, &self.inner, &kc, key)
     }
 
     /// Like `get`, but a cycle that leaves the node without a value raises
     /// `CycleError` as an ordinary exception.
     fn try_get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
-        try_read::<Exc>(engine_call(py, &self.inner, || {
+        let val = try_read::<Exc>(engine_call(py, &self.inner, || {
             self.inner.try_get(node.inner)
-        })?)
+        })?)?;
+        Ok(ready::unwrapped(py, val))
     }
 
     fn set(&self, py: Python<'_>, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
@@ -1009,6 +1155,16 @@ fn incr_concurrent(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCollection>()?;
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
+    m.add_class::<PyKeyedCollection>()?;
+    m.add(
+        "_NotReadySignal",
+        m.py().get_type::<persist::_NotReadySignal>(),
+    )?;
+    m.add_class::<PyNotReady>()?;
+    m.add_class::<PyPending>()?;
+    m.add_class::<PyLookupFailed>()?;
+    m.add_class::<PyUnavailable>()?;
+    m.add_class::<PyIncomplete>()?;
     persist::register(m)?;
     Ok(())
 }

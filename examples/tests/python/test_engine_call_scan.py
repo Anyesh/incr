@@ -18,7 +18,7 @@ ENGINE_CALL = re.compile(
     r"|\bcore\.(run|write|declare_keyed)\("
 )
 # Handle accessors that take no lock, and PyO3's own methods on `Py<_>`.
-ALLOWED = {"slot", "hash", "bind", "clone_ref", "borrow", "borrow_mut"}
+ALLOWED = {"slot", "hash", "bind", "clone_ref", "borrow", "borrow_mut", "version_node"}
 # A routing hold only bumps a counter and runs no user code, and neither
 # does the sweep hold or taking the creators it kept (they only mark nodes
 # to rerun). The last three are methods of a backend object that

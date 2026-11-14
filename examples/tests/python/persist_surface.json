@@ -951,7 +951,7 @@
     "signature": "(self, /)"
    },
    "close": {
-    "doc": "Closes the store and its runtime: every later call on either raises.",
+    "doc": "Closes the store: every later store call raises. A Local store\ncloses its runtime too; a Shared store's runtime stays open with\nthe values it holds, since other threads may be reading it.",
     "kind": "method_descriptor",
     "signature": "(self, /)"
    },

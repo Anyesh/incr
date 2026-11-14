@@ -473,7 +473,9 @@ macro_rules! persist_classes {
                 self.core_outside_overlay(py)?.checkpoint(py)
             }
 
-            /// Closes the store and its runtime: every later call on either raises.
+            /// Closes the store: every later store call raises. A Local store
+            /// closes its runtime too; a Shared store's runtime stays open with
+            /// the values it holds, since other threads may be reading it.
             fn close(&self, py: Python<'_>) -> PyResult<()> {
                 <$rt as FullStoreRuntime<$b>>::close_store_runtime(self.runtime.bind(py))?;
                 let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner).take();

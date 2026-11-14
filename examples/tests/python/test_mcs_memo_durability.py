@@ -7,9 +7,13 @@ Shared run can add `incr_concurrent.persist` to `PACKAGES`."""
 import json
 
 import incr.persist
+import incr_concurrent.persist
 import pytest
 
-PACKAGES = [pytest.param(incr.persist, id="local")]
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
 
 STATS = {
     "entries",
@@ -63,6 +67,14 @@ class Graph:
 
     def unsaved(self):
         return self.memo.stats()["unsaved_entries"]
+
+
+@pytest.fixture
+def triggered_by_writes(persist):
+    """Skips Shared, whose checkpoint thread runs a due checkpoint at some
+    point after the compute that made it due, not after the next write."""
+    if persist is not incr.persist:
+        pytest.skip("a Shared memo's checkpoint thread runs the trigger")
 
 
 @pytest.fixture
@@ -122,7 +134,9 @@ def test_max_bytes_above_the_live_entries_evicts_nothing(persist, backends):
     assert graph.calls == []
 
 
-def test_unsaved_entries_never_pass_the_trigger_by_more_than_one_unit(persist, backends):
+def test_unsaved_entries_never_pass_the_trigger_by_more_than_one_unit(
+    triggered_by_writes, persist, backends
+):
     trigger, per_unit = 10, 4
     graph = Graph(persist, *backends, checkpoint_after_entries=trigger)
     k = 0
@@ -136,7 +150,9 @@ def test_unsaved_entries_never_pass_the_trigger_by_more_than_one_unit(persist, b
     assert graph.memo.stats()["entries"] >= k - trigger - per_unit
 
 
-def test_a_read_never_checkpoints_and_checkpoint_if_due_does(persist, backends):
+def test_a_read_never_checkpoints_and_checkpoint_if_due_does(
+    triggered_by_writes, persist, backends
+):
     graph = Graph(persist, *backends, checkpoint_after_entries=10)
     assert graph.memo.checkpoint_if_due() is None
     for k in range(30):
@@ -158,7 +174,7 @@ def test_checkpoint_if_due_without_a_trigger_returns_none(persist, backends):
 
 
 @pytest.mark.parametrize("write", ["set", "insert", "upsert", "on_exit", "on_write"])
-def test_each_logged_write_checks_the_trigger(persist, backends, write):
+def test_each_logged_write_checks_the_trigger(triggered_by_writes, persist, backends, write):
     graph = Graph(persist, *backends, checkpoint_after_entries=5)
     rows = graph.store.collection("rows", CountingCodec())
     kc = graph.store.keyed_collection("kc", CountingCodec(), CountingCodec())
@@ -179,7 +195,9 @@ def test_each_logged_write_checks_the_trigger(persist, backends, write):
     assert graph.memo.stats()["entries"] == 5
 
 
-def test_a_triggered_checkpoint_encodes_in_proportion_to_the_new_entries(persist, backends):
+def test_a_triggered_checkpoint_encodes_in_proportion_to_the_new_entries(
+    triggered_by_writes, persist, backends
+):
     base, new = 20_000, 1_000
     graph = Graph(persist, *backends)
     for k in range(base):
@@ -195,7 +213,9 @@ def test_a_triggered_checkpoint_encodes_in_proportion_to_the_new_entries(persist
     assert new <= graph.keys.encoded <= 3 * new
 
 
-def test_a_crash_between_triggered_checkpoints_loses_only_the_unsaved(persist, backends):
+def test_a_crash_between_triggered_checkpoints_loses_only_the_unsaved(
+    triggered_by_writes, persist, backends
+):
     graph = Graph(persist, *backends, checkpoint_after_entries=10)
     for unit in range(1, 6):
         graph.store.set(graph.tick, unit)
@@ -257,7 +277,9 @@ def failing(persist):
     return graph, memo_backend
 
 
-def test_a_failed_triggered_checkpoint_leaves_the_write_returning_once(failing):
+def test_a_failed_triggered_checkpoint_leaves_the_write_returning_once(
+    triggered_by_writes, failing
+):
     graph, memo_backend = failing
     position = graph.store.stats()["position"]
     assert graph.store.set(graph.tick, 1) is None
@@ -268,7 +290,7 @@ def test_a_failed_triggered_checkpoint_leaves_the_write_returning_once(failing):
     assert memo_backend.writes == 1
 
 
-def test_a_failed_triggered_checkpoint_waits_for_a_new_compute(failing):
+def test_a_failed_triggered_checkpoint_waits_for_a_new_compute(triggered_by_writes, failing):
     graph, memo_backend = failing
     graph.store.set(graph.tick, 1)
     graph.store.set(graph.tick, 2)
@@ -283,14 +305,18 @@ def test_a_failed_triggered_checkpoint_waits_for_a_new_compute(failing):
     assert stats["auto_checkpoint_errors"] == 1
 
 
-def test_reconcile_returns_its_counts_when_the_triggered_checkpoint_fails(failing):
+def test_reconcile_returns_its_counts_when_the_triggered_checkpoint_fails(
+    triggered_by_writes, failing
+):
     graph, _ = failing
     kc = graph.store.keyed_collection("kc", CountingCodec(), CountingCodec())
     assert graph.store.reconcile(kc, {"a": 1, "b": 2}) == (2, 0, 0)
     assert graph.memo.stats()["auto_checkpoint_errors"] == 1
 
 
-def test_an_on_write_batch_commits_when_the_triggered_checkpoint_fails(failing):
+def test_an_on_write_batch_commits_when_the_triggered_checkpoint_fails(
+    triggered_by_writes, failing
+):
     graph, _ = failing
     position = graph.store.stats()["position"]
     with graph.store.batch(apply="on_write") as b:
@@ -300,7 +326,7 @@ def test_an_on_write_batch_commits_when_the_triggered_checkpoint_fails(failing):
     assert graph.store.runtime.get(graph.tick) == 2
 
 
-def test_explicit_checkpoints_still_raise(failing):
+def test_explicit_checkpoints_still_raise(triggered_by_writes, failing):
     graph, _ = failing
     with pytest.raises(OSError, match="memo disk full"):
         graph.memo.checkpoint_if_due()

@@ -9,14 +9,26 @@ import pickle
 import time
 
 import incr.persist
+import incr_concurrent.persist
 import pytest
 
-PACKAGES = [pytest.param(incr.persist, id="local")]
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
 
 
 @pytest.fixture(params=PACKAGES)
 def persist(request):
     return request.param
+
+
+@pytest.fixture
+def with_overlay(persist):
+    """Skips Shared, whose `rt.overlay()` raises: it has no isolation for
+    an overlay's candidate values."""
+    if persist is not incr.persist:
+        pytest.skip("rt.overlay() raises on Shared")
 
 
 @pytest.fixture
@@ -177,7 +189,7 @@ def test_a_persisted_keyed_collection_after_reopen(persist):
     assert rt.get_key(kc, "a") == 11
 
 
-def test_a_reader_sees_an_overlay_upsert_and_nothing_is_logged(persist):
+def test_a_reader_sees_an_overlay_upsert_and_nothing_is_logged(with_overlay, persist):
     store = open_store(persist, persist.MemoryBackend())
     kc = declare(store)
     store.upsert(kc, "a", 1)
@@ -192,7 +204,7 @@ def test_a_reader_sees_an_overlay_upsert_and_nothing_is_logged(persist):
     assert store.stats()["position"] == position
 
 
-def test_a_plain_reader_sees_an_overlay_upsert_and_its_undo(pkg):
+def test_a_plain_reader_sees_an_overlay_upsert_and_its_undo(with_overlay, pkg):
     rt = pkg.Runtime()
     kc = pkg.KeyedCollection(rt)
     kc.upsert("a", 1)
