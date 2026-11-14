@@ -526,8 +526,7 @@ macro_rules! persist_classes {
                 _traceback: Option<&Bound<'_, PyAny>>,
             ) -> PyResult<bool> {
                 if exc_type.is_some() {
-                    let core = self.store.bind(py).borrow().core().ok();
-                    self.batch()?.abandon(py, core.as_deref())?;
+                    self.batch()?.abandon(py)?;
                 } else {
                     let core = batch_core(&self.store, py)?;
                     self.batch()?.exit(py, &core)?;

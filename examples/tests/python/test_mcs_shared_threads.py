@@ -320,3 +320,33 @@ def test_memo_calls_from_python_threads_while_the_checkpoint_thread_runs_finish(
     assert not any(thread.is_alive() for thread in pollers + computers)
     assert errors == []
     store.close()
+
+
+class UserError(Exception):
+    pass
+
+
+def test_abandoning_an_on_write_batch_raises_the_blocks_exception_not_a_stored_routing_failure(
+    watchdog,
+):
+    store = Store.open(MemoryBackend(), build_id=1)
+    codec = PickleCodec()
+    rows = store.collection("rows", codec)
+
+    def key(row):
+        if row == "bad":
+            raise UserError("no key")
+        return row
+
+    rt = store.runtime
+    store.insert(rows, "ok")
+    count = rows.group_by(key).get_group("ok").count()
+    assert rt.get(count) == 1
+    with pytest.raises(UserError, match="the block"):
+        with store.batch(apply="on_write") as b:
+            b.insert(rows, "bad")
+            raise UserError("the block")
+    with pytest.raises(RuntimeError, match="routing failed"):
+        rt.node_count()
+    with pytest.raises(PersistError):
+        store.insert(rows, "ok")

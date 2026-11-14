@@ -120,10 +120,12 @@ impl<B: PyBinding> Batch<B> {
 
     /// Ends the block after it raised: an `on_write` batch drops its staged
     /// batch, which poisons the store, since its writes are in the runtime
-    /// and never reach the log. `core` is the store when it is still open,
-    /// to drop the batch as an engine call; a closed store's batch drops
-    /// through the binding's `drop_detached`.
-    pub fn abandon(&mut self, py: Python<'_>, core: Option<&StoreCore<B>>) -> PyResult<()>
+    /// and never reach the log. The drop goes through the binding's
+    /// `drop_detached` and no engine call, so it never raises a `group_by`
+    /// routing failure an earlier call stored in place of the block's own
+    /// exception; the failure stays for the next engine call, as on a
+    /// Local runtime.
+    pub fn abandon(&mut self, py: Python<'_>) -> PyResult<()>
     where
         B::Task<Staged<B>>: Send,
     {
@@ -132,17 +134,11 @@ impl<B: PyBinding> Batch<B> {
         self.raised = true;
         match &mut self.writes {
             Writes::Collected(pending) => drop(std::mem::take(pending)),
-            Writes::Staged(staged) => match (staged.take(), core) {
-                (Some(batch), Some(core)) => {
-                    let batch = carry::<B, _>(batch);
-                    core.write(py, move |_, _| {
-                        drop(batch.into_inner());
-                        Ok(())
-                    })?;
+            Writes::Staged(staged) => {
+                if let Some(batch) = staged.take() {
+                    B::drop_detached(py, batch);
                 }
-                (Some(batch), None) => B::drop_detached(py, batch),
-                (None, _) => {}
-            },
+            }
         }
         Ok(())
     }
