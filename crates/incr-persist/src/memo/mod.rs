@@ -30,6 +30,10 @@ mod snapshot;
 mod sqlite;
 mod table_core;
 
+/// Values a checkpoint clones, encodes or maps inside one hold of the
+/// store's value scope; between batches other threads take its lock.
+pub(crate) const VALUE_BATCH: usize = 256;
+
 pub use backend::{EncodedEntry, MemoBackend};
 pub use checkpoint::{
     write_checkpoint, CheckpointInput, CheckpointStats, CheckpointTimes, Checkpointed,
