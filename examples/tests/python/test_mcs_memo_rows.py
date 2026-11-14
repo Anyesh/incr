@@ -43,7 +43,9 @@ class Graph:
 
     def __init__(self, persist, log, memo_backend):
         self.store = persist.Store.open(log, build_id="b1")
-        self.shifts = self.store.keyed_collection("shifts", PickleCodec(), PickleCodec())
+        self.shifts = self.store.keyed_collection(
+            "shifts", PickleCodec(), PickleCodec()
+        )
         self.calls = []
 
         def price(ctx, key):
@@ -60,9 +62,15 @@ class Graph:
             self.calls.append(("total", key))
             return ctx.memo(self.price, key)
 
-        self.price = self.store.memo_table("price", 1, PickleCodec(), PickleCodec(), price)
-        self.status = self.store.memo_table("status", 1, PickleCodec(), PickleCodec(), status)
-        self.total = self.store.memo_table("total", 1, PickleCodec(), PickleCodec(), total)
+        self.price = self.store.memo_table(
+            "price", 1, PickleCodec(), PickleCodec(), price
+        )
+        self.status = self.store.memo_table(
+            "status", 1, PickleCodec(), PickleCodec(), status
+        )
+        self.total = self.store.memo_table(
+            "total", 1, PickleCodec(), PickleCodec(), total
+        )
         self.memo = self.store.open_memo(memo_backend)
 
     def read(self, table, key):
@@ -96,7 +104,9 @@ def test_an_entry_verifies_after_another_key_changes(persist, backends):
     assert graph.calls == []
 
 
-def test_an_entry_whose_key_changed_runs_once_and_cuts_off_an_equal_value(persist, backends):
+def test_an_entry_whose_key_changed_runs_once_and_cuts_off_an_equal_value(
+    persist, backends
+):
     graph = seeded(persist, backends, {"a": (1, "x")})
     assert graph.read(graph.total, "a") == 1
     graph.memo.checkpoint()
@@ -111,7 +121,9 @@ def test_an_entry_whose_key_changed_runs_once_and_cuts_off_an_equal_value(persis
     assert sorted(graph.calls) == [("price", "a"), ("total", "a")]
 
 
-def test_an_absent_key_verifies_while_absent_and_runs_once_it_appears(persist, backends):
+def test_an_absent_key_verifies_while_absent_and_runs_once_it_appears(
+    persist, backends
+):
     graph = seeded(persist, backends, {"a": (1,)})
     assert graph.read(graph.price, "z") is None
     graph.memo.checkpoint()
@@ -162,3 +174,33 @@ def test_entries_reading_only_rows_restore_without_running_after_a_log_checkpoin
     graph = reopen(persist, graph, backends)
     assert [graph.read(graph.total, k) for k in rows] == list(rows)
     assert graph.calls == []
+
+
+def test_a_labelled_memo_tables_entries_are_one_group(persist, backends):
+    log, memo_backend = backends
+    store = persist.Store.open(log, build_id="b1")
+    rt = store.runtime
+    double = store.memo_table(
+        "double",
+        1,
+        PickleCodec(),
+        PickleCodec(),
+        lambda ctx, key: key * 2,
+        label="prices",
+    )
+    total = store.memo_table(
+        "total",
+        1,
+        PickleCodec(),
+        PickleCodec(),
+        lambda ctx, key: ctx.memo(double, key) + 1,
+    )
+    memo = store.open_memo(memo_backend)
+    assert rt.get(memo.get_or_insert(total, 3)) == 7
+    assert rt.get(memo.get_or_insert(double, 4)) == 8
+    entry = memo.get_or_insert(double, 3)
+    assert rt.get(entry) == 6
+
+    groups = {g["label"]: g for g in rt.graph_summary()["groups"]}
+    assert groups["prices"]["nodes"] == 2
+    assert rt.graph_snapshot(roots=[entry], depth=0)["nodes"][0]["label"] == "prices/3"

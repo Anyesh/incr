@@ -346,7 +346,13 @@ macro_rules! persist_classes {
             /// on whichever thread computes the entry, so it must be thread-safe,
             /// as the codecs must. Bump `version` when it
             /// changes meaning: entries are kept only while the name and version
-            /// match. Declare every table before `store.open_memo`.
+            /// match. Declare every table before `store.open_memo`. With `label`,
+            /// each entry's node is labelled `<label>/<str(key)>` when first
+            /// reached through `memo.get_or_insert` or `ctx.memo`, as a keyed
+            /// collection labels its per-key inputs, so `graph_summary` and
+            /// `compute_stats` group the table's entries under `label`; each such
+            /// call then also runs `str(key)`.
+            #[pyo3(signature = (name, version, key_codec, codec, func, *, label=None))]
             fn memo_table(
                 slf: &Bound<'_, Self>,
                 name: &str,
@@ -354,6 +360,7 @@ macro_rules! persist_classes {
                 key_codec: Py<PyAny>,
                 codec: Py<PyAny>,
                 func: Py<PyAny>,
+                label: Option<String>,
             ) -> PyResult<PyMemoTable> {
                 let py = slf.py();
                 let store = slf.borrow();
@@ -366,6 +373,7 @@ macro_rules! persist_classes {
                     key_codec,
                     codec,
                     func,
+                    label.as_deref(),
                     store.maker(py),
                 )?;
                 Ok(PyMemoTable {

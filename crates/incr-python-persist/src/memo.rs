@@ -32,15 +32,34 @@ pub type OpenMemo<B> = Memo<<B as PyBinding>::C, PyBackend<<B as PyBinding>::Exc
 /// a failed open makes the builder again. A leaf lock: no Python runs
 /// under it.
 #[derive(Clone)]
-pub struct TableHandle(Arc<Mutex<MemoTable<PyValue, PyValue>>>);
+pub struct TableHandle {
+    table: Arc<Mutex<MemoTable<PyValue, PyValue>>>,
+    /// The `label` its entries' nodes get as `<label>/<str(key)>`.
+    label: Option<Arc<str>>,
+}
 
 impl TableHandle {
     fn get(&self) -> MemoTable<PyValue, PyValue> {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn set(&self, table: MemoTable<PyValue, PyValue>) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = table;
+        *self.table.lock().unwrap_or_else(PoisonError::into_inner) = table;
+    }
+
+    /// The label of `key`'s entry node, read with the GIL so the label
+    /// can be set under the store lock with no Python code; `None` for
+    /// an unlabelled table or a key whose `__str__` raises, which is
+    /// reported as unraisable.
+    fn entry_label(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> Option<String> {
+        let label = self.label.as_deref()?;
+        match key.str() {
+            Ok(text) => Some(format!("{label}/{text}")),
+            Err(e) => {
+                e.write_unraisable(py, Some(key));
+                None
+            }
+        }
     }
 }
 
@@ -220,6 +239,7 @@ impl<B: PyBinding> MemoCore<B> {
         key_codec: Py<PyAny>,
         codec: Py<PyAny>,
         func: Py<PyAny>,
+        label: Option<&str>,
         make: impl FnOnce(Py<PyAny>) -> MemoFn<B::C>,
     ) -> PyResult<TableHandle> {
         let _declaring = core.declare_lock(py)?;
@@ -256,7 +276,10 @@ impl<B: PyBinding> MemoCore<B> {
             let builder = builder.get_or_insert_with(|| MemoBuilder::new(default_options(core)));
             let table = builder.table::<PyValue, PyValue>(name, version);
             builder.define(table, f);
-            TableHandle(Arc::new(Mutex::new(table)))
+            TableHandle {
+                table: Arc::new(Mutex::new(table)),
+                label: label.map(Arc::from),
+            }
         };
         self.decls().push(MemoDecl {
             name: name.to_owned(),
@@ -329,11 +352,16 @@ where
         }
         let table = handle.get();
         let registry = core.registry();
+        let label = handle.entry_label(py, key.0.bind(py));
         let value = restoring(core, py, || {
             B::write(py, core.store(), move |store, _| {
                 registry.scoped(|| {
                     let node = memo.into_inner().get_or_insert(table, key);
-                    store.runtime().get(node)
+                    let rt = store.runtime();
+                    if let Some(label) = label.filter(|_| rt.label(node.slot()).is_none()) {
+                        rt.set_label(node.slot(), label);
+                    }
+                    rt.get(node)
                 })
             })
         })?;
@@ -392,9 +420,17 @@ where
         let memo = carry::<B, _>(self.memo()?);
         let table = handle.get();
         let registry = core.registry();
+        let label = handle.entry_label(py, key.bind(py));
         let node = restoring(core, py, || {
-            B::read(py, core.store(), move |_, _| {
-                registry.scoped(|| memo.into_inner().get_or_insert(table, PyValue(key)))
+            B::read(py, core.store(), move |store, _| {
+                registry.scoped(|| {
+                    let node = memo.into_inner().get_or_insert(table, PyValue(key));
+                    let rt = store.runtime();
+                    if let Some(label) = label.filter(|_| rt.label(node.slot()).is_none()) {
+                        rt.set_label(node.slot(), label);
+                    }
+                    node
+                })
             })
         })?;
         drop(core.registry().take_failure());
