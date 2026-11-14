@@ -32,6 +32,7 @@ All notable changes to this project are documented here. Format roughly follows 
 - **Keyed writes from inside a compute are refused**, on any compute running on the thread, not only the keyed collection's own.
 - **The memo's auto-checkpoint thread skips an open unlogged scope or staged batch**, and on Shared the skipped checkpoint runs as soon as the last of them closes, with no further compute; a close that follows no skipped checkpoint wakes nothing.
 - **Replacing a row runs two row `__eq__` calls** instead of one.
+- **A keyed write that a replay could not match raises `ValueError`.** When a held row is not `==` to its own decoded copy (one holding a float NaN, or an object compared by identity) and its codec now encodes it to bytes other than the logged ones (a set pickled under another hash seed), a write that would remove it raises `ValueError` naming the collection and key, logs nothing and leaves the store usable, because a reopen could not match the removal and would keep the old row. Use a codec that encodes such rows canonically.
 - **Python: writes through a keyed collection's `collection` raise** on both packages; write with `upsert`, `remove`, `reconcile` or a batch, which keep the key index and the log in step.
 - **Python: `get_traced` on Shared returns an `Incomplete` value's value**, as `get` does and as Local did.
 - **Python: `Runtime.overlay()` is not available on Shared.** `incr_concurrent` raises `RuntimeError` from `rt.overlay()` until an isolated overlay exists.
@@ -55,7 +56,6 @@ Figures: to be filled from the release benchmark run.
 - **Non-canonical codecs can rank two-pair keys differently across processes.** A codec that encodes equal values to different bytes can rank two pairs of one key differently in two processes.
 - **Overlay is not available on Shared.** See Changed.
 - **On Shared a reader can see a key as absent during a persisted replace.** A replace is applied record by record, so a read between its `Remove` and `Insert` finds no row.
-- **A row unequal to its own decoded copy, under a codec that encodes it two ways, can leave its old row held.** For a row holding a float NaN and a set pickled under another hash seed, a replace or remove followed by a reopen can keep the old pair, and a read may return it. Use a codec that encodes such rows canonically, or rows equal to their decoded copy. beta.7 had the same behaviour for hashable rows.
 - **Shared collection operators do not apply the NotReady rules**, and Shared has no lookups and no `Collection.extend` or `replace`; these are Local only, as in beta.7.
 - **Compute stats cost about 1.8 times a run on a trivial chain when enabled** (50 nodes), because each compute is timed.
 - **`Store::checkpoint` reports one stall**, with no split between the fold, the compaction and the reload.
