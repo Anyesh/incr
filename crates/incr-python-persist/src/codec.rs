@@ -19,6 +19,7 @@
 //! through the user codec, so a `row`, `key`, `reason` or `value` is
 //! whatever the codec handles.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -177,9 +178,16 @@ impl<E: PersistExceptions> Registry<E> {
 
     fn stash(&self, err: PyErr) -> String {
         let message = Python::attach(|py| err.value(py).to_string());
-        self.failures()
-            .entry(std::thread::current().id())
-            .or_insert(err);
+        let mut failures = self.failures();
+        let duplicate = match failures.entry(std::thread::current().id()) {
+            Entry::Occupied(_) => Some(err),
+            Entry::Vacant(slot) => {
+                slot.insert(err);
+                None
+            }
+        };
+        drop(failures);
+        drop(duplicate);
         message
     }
 

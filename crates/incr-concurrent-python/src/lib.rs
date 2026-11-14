@@ -723,6 +723,13 @@ impl PyRuntime {
     }
 
     fn set(&self, py: Python<'_>, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
+        if let RtRef::Store(core) = &self.inner {
+            if core.is_persisted_input(node.inner.slot()) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "input is persisted: write it with store.set(node, value)",
+                ));
+            }
+        }
         let v = PyValue(value);
         engine_call(py, &self.inner, || self.inner.set(node.inner, v))
     }

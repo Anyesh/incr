@@ -89,3 +89,15 @@ def test_a_closed_store_refuses_calls():
     store.close()
     with pytest.raises(RuntimeError, match="store is closed"):
         store.set(node, 1)
+
+
+def test_the_runtime_refuses_to_set_a_persisted_input():
+    log = MemoryBackend()
+    store = Store.open(log, build_id="v1")
+    node = store.input("k", 0, PickleCodec())
+    with pytest.raises(RuntimeError, match="input is persisted"):
+        store.runtime.set(node, 9)
+    assert store.runtime.get(node) == 0
+    plain = store.runtime.create_input(1)
+    store.runtime.set(plain, 2)
+    assert store.runtime.get(plain) == 2
