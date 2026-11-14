@@ -35,7 +35,8 @@ pub use record::{Kind, Record};
 pub use sqlite::{SqliteBackend, SqliteDurability, SqliteOptions};
 pub use store::{
     Batch, Durability, Input, KeyRef, Options, Origin, PendingWrite, PersistValue,
-    PersistedCollection, PersistedKeyed, Store, StoreStats, SubscriptionId, UnloggedScope,
+    PersistedCollection, PersistedKeyed, StagedBatch, Store, StoreStats, SubscriptionId,
+    UnloggedScope,
 };
 pub use value_context::{
     current_value_context, enter_value_context, EncodeMismatch, MemoPart, ValueContext,

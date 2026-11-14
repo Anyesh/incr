@@ -27,7 +27,7 @@ pub struct UnloggedScope<'s, C: Cells, B: Backend> {
     closed: bool,
 }
 
-enum StoreRef<'s, C: Cells, B: Backend> {
+pub(super) enum StoreRef<'s, C: Cells, B: Backend> {
     Borrowed(&'s Store<C, B>),
     Shared(Arc<Store<C, B>>),
 }

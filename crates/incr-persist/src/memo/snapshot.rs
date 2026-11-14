@@ -26,6 +26,9 @@ impl<C: MemoCells> CoreRef<C> {
         if self.deps.unlogged() {
             return Err(Error::UnloggedScopeOpen);
         }
+        if self.deps.staged() {
+            return Err(Error::StagedBatchOpen);
+        }
         let _checkpoint = self.lock_checkpoint();
         let mut bag = Deferred::new();
         let (snaps, moved) = {
