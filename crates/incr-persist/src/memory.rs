@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
+use crate::{Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 /// A log held in process memory.
 ///
@@ -34,6 +34,13 @@ impl Log {
         };
         let index = (after.0 + 1).saturating_sub(first.0);
         index.min(self.records.len() as u64) as usize
+    }
+
+    fn push(&mut self, records: Vec<Record>) -> Position {
+        let first = self.tail.0 + 1;
+        self.tail = Position(self.tail.0 + records.len() as u64);
+        self.records.extend((first..).map(Position).zip(records));
+        self.tail
     }
 }
 
@@ -82,11 +89,7 @@ impl Backend for MemoryBackend {
     fn append(&self, records: &[Record]) -> Result<Position> {
         self.require_writable()?;
         let owned = records.to_vec();
-        let mut log = self.lock();
-        let first = log.tail.0 + 1;
-        log.records.extend((first..).map(Position).zip(owned));
-        log.tail = Position(log.tail.0 + records.len() as u64);
-        Ok(log.tail)
+        Ok(self.lock().push(owned))
     }
 
     fn sync(&self, _upto: Position) -> Result<()> {
@@ -135,7 +138,23 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
+    fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {
+        Some(self)
+    }
+
     fn writable(&self) -> bool {
         self.writable
+    }
+}
+
+impl ConditionalAppend for MemoryBackend {
+    fn append_at(&self, after: Position, records: &[Record]) -> Result<Position> {
+        self.require_writable()?;
+        let owned = records.to_vec();
+        let mut log = self.lock();
+        if log.tail != after {
+            return Err(Error::TailMoved { after });
+        }
+        Ok(log.push(owned))
     }
 }

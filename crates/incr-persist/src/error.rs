@@ -109,6 +109,27 @@ pub enum Error {
     #[error("keyed collection {key:?} kept changing under other writers: refresh and retry")]
     KeyedContention { key: String },
 
+    /// [`ConditionalAppend::append_at`](crate::ConditionalAppend::append_at)
+    /// found the log's tail somewhere other than `after`, and wrote nothing.
+    #[error("the log's tail is no longer at position {after}")]
+    TailMoved { after: Position },
+
+    /// A store operation other than the batch's own writes was attempted
+    /// while a [`StagedBatch`](crate::StagedBatch) is open on the store, or
+    /// a second one was opened. Commit or drop the batch first.
+    #[error("a staged batch is open on this store; commit it before this call")]
+    StagedBatchOpen,
+
+    /// A [`StagedBatch`](crate::StagedBatch) was written to after its
+    /// commit was attempted, or committed again after it landed.
+    #[error("the staged batch has been committed or awaits retry; it takes no more writes")]
+    StagedBatchClosed,
+
+    /// [`Store::staged_batch`](crate::Store::staged_batch) was called on a
+    /// backend without a [`ConditionalAppend`](crate::ConditionalAppend).
+    #[error("the backend has no conditional append, which a staged batch needs")]
+    ConditionalAppendUnsupported,
+
     /// `BuildId::CurrentExe` could not read the running executable.
     #[error("cannot fingerprint the running executable for the memo build id")]
     BuildIdUnavailable(#[source] std::io::Error),

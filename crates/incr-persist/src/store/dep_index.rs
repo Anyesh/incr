@@ -55,6 +55,10 @@ pub(crate) struct DepIndex {
     /// neither restores nor checkpoints, because its fingerprints describe
     /// the logged state while the runtime holds something else.
     unlogged: AtomicBool,
+    /// Set while a staged batch is open on the store: a memo then refuses
+    /// to checkpoint, because the runtime holds writes the log may never
+    /// receive.
+    staged: AtomicBool,
 }
 
 #[derive(Default)]
@@ -75,6 +79,14 @@ impl DepIndex {
 
     pub(super) fn set_unlogged(&self, open: bool) {
         self.unlogged.store(open, Ordering::Release);
+    }
+
+    pub(crate) fn staged(&self) -> bool {
+        self.staged.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_staged(&self, open: bool) {
+        self.staged.store(open, Ordering::Release);
     }
 
     // Poisoning is ignored: a mapped write that panics marks the one key it
