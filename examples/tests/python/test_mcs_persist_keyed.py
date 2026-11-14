@@ -447,23 +447,6 @@ def test_keyed_ops_in_one_batch_across_two_collections_and_a_plain_input():
     assert again.runtime.get(again.input("progress", 0, PickleCodec())) == 4
 
 
-def test_a_batch_reports_staged_counts_per_keyed_collection():
-    store = open_store(MemoryBackend())
-    first = declare(store, "first")
-    second = declare(store, "second")
-    store.reconcile(first, {"a": 1, "b": 2})
-    with store.batch() as b:
-        b.upsert(second, "x", 1)
-        b.upsert(first, "a", 10)
-        b.upsert(second, "y", 2)
-        b.remove(first, "b")
-        b.upsert(first, "c", 3)
-        assert b.counts(first) == (1, 1, 1)
-        assert b.counts(second) == (2, 0, 0)
-    assert (first.get("a"), first.get("b"), first.get("c")) == (10, None, 3)
-    assert (second.get("x"), second.get("y")) == (1, 2)
-
-
 def test_a_keyed_collection_reopens_with_one_pair_after_an_overtaken_upsert():
     backend = MemoryBackend()
     leader = open_store(backend)

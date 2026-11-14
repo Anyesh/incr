@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 
 use super::keyed::Pending;
 use super::store::PyStore;
-use crate::{engine_write, KeyCounts, PyCollection, PyKeyedCollection, PyNodeId};
+use crate::{engine_write, PyCollection, PyKeyedCollection, PyNodeId};
 
 #[derive(PartialEq)]
 enum Phase {
@@ -152,14 +152,5 @@ impl PyBatch {
         self.open()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
         self.pending.reconcile(py, &core, &kc, rows)
-    }
-
-    /// How many of `kc`'s keys the keyed writes collected so far give a
-    /// row they lacked, give another row, and leave without a row, as
-    /// `(inserted, replaced, removed)`.
-    fn counts(&self, py: Python<'_>, kc: PyRef<'_, PyKeyedCollection>) -> PyResult<KeyCounts> {
-        self.open()?;
-        let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.counts(py, &core, &kc)
     }
 }
