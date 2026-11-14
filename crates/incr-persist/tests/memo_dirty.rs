@@ -42,6 +42,7 @@ both!(
     evicted_entries_are_dirtied_again_and_a_reopen_recomputes_them,
     a_failed_checkpoint_leaves_its_entries_unsaved,
     a_checkpoint_with_nothing_fresh_writes_nothing,
+    a_cutoff_recompute_keeps_the_bytes_its_clean_dependents_name,
 );
 
 const BUILD: u128 = 0xd1;
@@ -401,4 +402,51 @@ fn a_checkpoint_with_nothing_fresh_writes_nothing<C: MemoCells>() {
         (1, 1, 1)
     );
     assert_eq!(generation_id(&backends), id);
+}
+
+/// `parent(k) = child(k).v + y`, `child(k) = k * (x % 2)` with a value
+/// that re-encodes differently each time. Moving `x` from 3 to 5 reruns
+/// the child to an equal value, which cuts the parent off; the parent's
+/// stored dep names the child's stored fp, so the checkpoint keeps the
+/// child's stored bytes and a reopen reuses both.
+fn a_cutoff_recompute_keeps_the_bytes_its_clean_dependents_name<C: MemoCells>() {
+    let backends = Backends::new();
+    let open = || {
+        let store = backends.store::<C>();
+        let x = store.input("x", 3_u64).unwrap();
+        let (xh, runs) = (x.handle(), Arc::new(AtomicUsize::new(0)));
+        let mut builder = MemoBuilder::new(options());
+        let child = builder.table::<u32, Noisy>("child", 1);
+        let parent = builder.table::<u32, u64>("parent", 1);
+        let counter = Arc::clone(&runs);
+        builder.define(child, move |ctx, &k| {
+            counter.fetch_add(1, SeqCst);
+            Noisy {
+                v: u64::from(k) * (ctx.rt().get(xh) % 2),
+                noise: 0,
+            }
+        });
+        let counter = Arc::clone(&runs);
+        builder.define(parent, move |ctx, &k| {
+            counter.fetch_add(1, SeqCst);
+            ctx.get(child, k).v + 10
+        });
+        let memo = builder.open(&store, backends.memo.clone()).unwrap();
+        let read = memo.get_or_insert(parent, 2);
+        (store, x, memo, read, runs)
+    };
+    {
+        let (store, x, memo, read, runs) = open();
+        assert_eq!(memo.runtime().get(read), 12);
+        memo.checkpoint().unwrap();
+        store.set(x, 5).unwrap();
+        assert_eq!(memo.runtime().get(read), 12);
+        assert_eq!(runs.load(SeqCst), 3);
+        assert_eq!(memo.checkpoint().unwrap().written, 2);
+    }
+    let (store, x, memo, read, runs) = open();
+    store.set(x, 5).unwrap();
+    assert_eq!(memo.runtime().get(read), 12);
+    assert_eq!(runs.load(SeqCst), 0);
+    assert_eq!(memo.stats().reused, 2);
 }

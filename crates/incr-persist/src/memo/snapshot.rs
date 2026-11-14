@@ -61,7 +61,7 @@ impl<C: MemoCells> CoreRef<C> {
             // A node that landed again since its `inspect`, which only a
             // write around the store allows, may have dependents inspected
             // over its new value; dropping it drops them as unmapped.
-            let (snaps, moved): (Vec<_>, Vec<_>) = snaps
+            let (mut snaps, moved): (Vec<_>, Vec<_>) = snaps
                 .into_iter()
                 .partition(|snap| changed_at_erased(rt, snap.handle) == Some(snap.stamp));
             {
@@ -74,6 +74,13 @@ impl<C: MemoCells> CoreRef<C> {
                         }
                     }
                 }
+            }
+            for snap in &mut snaps {
+                snap.seeded = state
+                    .seed_info
+                    .get(&snap.handle)
+                    .filter(|&&(_, stamp)| stamp == snap.stamp)
+                    .map(|&(fp, _)| fp);
             }
             let is_dirty = |handle: &ErasedIncr| dirty.iter().any(|t| t.contains_key(handle));
             // A clean entry has not run since it was written or seeded,
@@ -118,7 +125,13 @@ impl<C: MemoCells> CoreRef<C> {
             })
             .collect();
         let mut mismatches = Vec::new();
-        let found = fresh(snaps, &mut keys, &clean, &mut mismatches);
+        let index = self.index();
+        let stored = |table: u32, key: &[u8], fp: u128| {
+            let entry = index.read(&*self.backend, table, key).ok()??;
+            (fingerprint(&entry.value) == fp).then_some(entry.value)
+        };
+        let found = fresh(snaps, &mut keys, &clean, &stored, &mut mismatches);
+        drop(index);
         drop((keys, clean));
         let snapshot = started.elapsed();
         if found.entries.is_empty() {
@@ -220,11 +233,14 @@ struct Found {
 /// allows: encoded and decoding back equal, not in a cycle group, and
 /// every dep mapped. A query dep maps to another snapshot entry, whose
 /// value's fingerprint it records, or to a clean entry, whose stored
-/// fingerprint it records.
+/// fingerprint it records. An entry that recomputed to a value equal to
+/// its stored one but encodes to other bytes keeps the bytes `stored`
+/// finds at its seeded fp, which clean dependents in the base name.
 fn fresh(
     snaps: Vec<Snap>,
     keys: &mut HashMap<ErasedIncr, KeyOf>,
     clean: &HashMap<ErasedIncr, Clean>,
+    stored: &dyn Fn(u32, &[u8], u128) -> Option<Vec<u8>>,
     mismatches: &mut Vec<EncodeMismatch>,
 ) -> Found {
     let mut note = |r: Result<Vec<u8>, EncodeMismatch>| match r {
@@ -239,6 +255,12 @@ fn fresh(
         .map(|snap| {
             let key = note(keys.remove(&snap.handle)?.key.encode())?;
             let value = note(snap.value.encode())?;
+            let value = match snap.seeded {
+                Some(fp) if fingerprint(&value) != fp => {
+                    stored(snap.table, &key, fp).unwrap_or(value)
+                }
+                _ => value,
+            };
             Some((key, value))
         })
         .collect();

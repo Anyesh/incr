@@ -41,6 +41,9 @@ pub(crate) struct Snap {
     pub(crate) mark: u64,
     /// The node's `changed_at` when `inspect` read it.
     pub(crate) stamp: u64,
+    /// The fp the entry was last written or seeded with, if it has kept
+    /// that stamp since: its value still equals those stored bytes.
+    pub(crate) seeded: Option<u128>,
     pub(crate) deps: Vec<LiveDep>,
     pub(crate) in_group: bool,
     pub(crate) value: Box<dyn Encode>,
@@ -320,6 +323,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
             handle,
             mark,
             stamp: seen.changed_at,
+            seeded: None,
             deps,
             in_group: seen.in_group,
             value: Box::new(Part {
