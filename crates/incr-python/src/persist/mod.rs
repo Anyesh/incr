@@ -21,6 +21,7 @@ use incr_persist::Error;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
+pub(crate) use keyed::PyPersistedKeyed;
 pub(crate) use memo::PyMemoTable;
 pub(crate) use scope::OverlayScope;
 pub(crate) use store::StoreCore;
@@ -64,6 +65,9 @@ pub(crate) fn persist_error(py: Python<'_>, error: Error) -> PyErr {
     match error {
         Error::Busy => return Busy::new_err(error.to_string()),
         Error::ReadOnly => return ReadOnly::new_err(error.to_string()),
+        Error::KeyedContention { .. } => {
+            return pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+        }
         Error::InvalidCompaction {
             upto,
             snapshot_at,

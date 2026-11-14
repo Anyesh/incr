@@ -16,10 +16,8 @@ doc = false
 conformance = ["incr-persist/backend-tests"]
 
 [dependencies]
-hashbrown = { version = "=0.17.1", default-features = false }
 incr_compute = { package = "incr-compute", version = "=0.2.0-beta.7", path = "../incr-compute" }
 incr-core.workspace = true
 incr-persist = { path = "../incr-persist" }
 incr-python-protocol = { path = "../incr-python-protocol", features = ["persist"] }
-postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }

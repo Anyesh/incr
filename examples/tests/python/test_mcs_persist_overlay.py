@@ -12,23 +12,6 @@ class PickleCodec:
         return pickle.loads(data)
 
 
-class FlakyDecode(PickleCodec):
-    """Raises the second time it decodes the same bytes: the store decodes
-    a foreign record first, so the binding's own decode of it fails."""
-
-    def __init__(self):
-        self.seen = {}
-        self.raised = 0
-        self.armed = True
-
-    def decode(self, data):
-        self.seen[data] = self.seen.get(data, 0) + 1
-        if self.armed and self.seen[data] == 2:
-            self.raised += 1
-            raise RuntimeError("second decode refused")
-        return super().decode(data)
-
-
 class Poison:
     armed = False
 
@@ -499,18 +482,40 @@ def test_a_standby_write_that_catches_up_other_keys_changes_nothing_else():
     assert settled(leader, kc_leader, standby, kc_standby) == [(2, [1, 2]), (2, [1, 2])]
 
 
-def test_the_index_is_rebuilt_when_applying_a_foreign_record_fails():
+class ReadsTheCollection:
+    """A key whose `__hash__` reads the keyed collection it is written to."""
+
+    kc = None
+
+    def __init__(self, name):
+        self.name = name
+
+    def __hash__(self):
+        ReadsTheCollection.kc.get("a")
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return self is other
+
+    def __reduce__(self):
+        return (ReadsTheCollection, (self.name,))
+
+
+def test_a_key_method_reading_the_collection_during_an_upsert_raises_and_writes_nothing():
     backend = MemoryBackend()
     leader = Store.open(backend, build_id=1)
     standby = Store.open(backend, build_id=1)
     kc_leader = keyed(leader)
-    flaky = FlakyDecode()
-    kc_standby = keyed(standby, codec=flaky)
+    kc_standby = keyed(standby)
     leader.upsert(kc_leader, "a", 1)
     leader.upsert(kc_leader, "b", 2)
+    tail = leader.stats()["position"]
+    ReadsTheCollection.kc = kc_standby
+    with pytest.raises(RuntimeError, match="key or row method"):
+        standby.upsert(kc_standby, ReadsTheCollection("c"), 3)
+    assert leader.refresh() == tail
+    assert len(kc_standby) == 0
     standby.refresh()
-    assert flaky.raised == 1
-    flaky.armed = False
     assert (kc_standby.get("a"), kc_standby.get("b"), len(kc_standby)) == (1, 2, 2)
     standby.upsert(kc_standby, "a", 5)
     assert len(kc_standby) == 2
@@ -611,7 +616,7 @@ class Probe:
         return (Probe, (self.name,))
 
 
-def standby_whose_drain_hits_a_held_index():
+def standby_refusing_a_store_call_from_a_key_method():
     backend = MemoryBackend()
     leader = Store.open(backend, build_id=1)
     standby = Store.open(backend, build_id=1)
@@ -620,20 +625,25 @@ def standby_whose_drain_hits_a_held_index():
     other = keyed(standby, "b")
     standby.upsert(held, Probe("x"), 1)
     leader.upsert(kc_leader, "y", 2)
+    tail = leader.stats()["position"]
     Probe.hook = lambda: standby.upsert(other, "new", 1)
-    with pytest.raises(RuntimeError, match="during an operation"):
+    with pytest.raises(RuntimeError, match="key or row method"):
         held.get(Probe("probe"))
+    assert leader.refresh() == tail
     return standby, held, other
 
 
-def test_a_drain_error_after_the_append_leaves_the_index_holding_the_logged_keys():
-    standby, held, other = standby_whose_drain_hits_a_held_index()
-    assert (other.get("new"), len(other)) == (1, 1)
-    assert rows_of(standby.runtime, other.collection) == [1]
+def test_a_store_call_from_a_key_method_during_a_read_raises_and_writes_nothing():
+    standby, held, other = standby_refusing_a_store_call_from_a_key_method()
+    assert (other.get("new"), len(other)) == (None, 0)
+    assert rows_of(standby.runtime, other.collection) == []
+    assert len(held) == 1
 
 
-def test_an_index_a_failed_drain_left_behind_is_rebuilt_by_the_next_store_call():
-    standby, held, other = standby_whose_drain_hits_a_held_index()
+def test_a_refused_store_call_leaves_the_next_refresh_to_apply_other_writers_rows():
+    standby, held, other = standby_refusing_a_store_call_from_a_key_method()
     standby.refresh()
     assert (held.get("y"), len(held)) == (2, 2)
     assert rows_of(standby.runtime, held.collection) == [1, 2]
+    standby.upsert(other, "new", 1)
+    assert (other.get("new"), len(other)) == (1, 1)

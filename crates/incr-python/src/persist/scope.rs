@@ -12,10 +12,10 @@ use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 
 use super::backend::PyBackend;
-use super::keyed::PyPersistedCollection;
+use super::keyed::PyPersistedKeyed;
 use super::persist_error;
-use super::store::StoreCore;
-use crate::{PyCollection, PyKeyedCollection, PyNodeId};
+use super::store::{PyPersistedCollection, StoreCore};
+use crate::{PersistedCore, PyCollection, PyNodeId};
 
 /// An open [`UnloggedScope`] with the writable handles it gave out.
 /// Dropping it without [`Self::close`] poisons the store.
@@ -54,9 +54,10 @@ impl OverlayScope {
         self.writable(&persisted)
     }
 
-    pub(crate) fn pairs(&mut self, kc: &PyKeyedCollection) -> PyResult<IncrCollection<PyValue>> {
-        let binding = self.core.keyed_of(kc)?;
-        self.writable(&binding.pairs)
+    pub(crate) fn keyed(&self, persisted: &PyPersistedKeyed) -> PyResult<PersistedCore> {
+        self.scope
+            .keyed(persisted)
+            .map_err(|e| Python::attach(|py| persist_error(py, e)))
     }
 
     fn writable(&mut self, persisted: &PyPersistedCollection) -> PyResult<IncrCollection<PyValue>> {

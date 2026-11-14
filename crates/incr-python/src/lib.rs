@@ -28,7 +28,6 @@
 //! runtime first.)
 
 mod elements;
-mod keyed;
 mod lookups;
 mod memory;
 mod overlay;
@@ -42,7 +41,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
 use incr_compute::{
     Change, DeleteError, ErasedIncr, Incr, IncrCollection, NodeId, NodeTable, PropagationTrace,
@@ -50,8 +49,8 @@ use incr_compute::{
 };
 use incr_core::{Local, RoutingFailed};
 use incr_core::{PairOp, StateStats};
-use keyed::{IndexGuard, KeyCounts, KeyIndex, SharedIndex, StagedKeys};
 use overlay::{Born, Undo};
+use persist::PyPersistedKeyed;
 use state::{PyCallable, RtState};
 
 use incr_python_protocol::notready::{
@@ -854,14 +853,23 @@ impl PyCollection {
 #[pyclass(name = "KeyedCollection", unsendable)]
 struct PyKeyedCollection {
     kind: KeyedKind,
-    pairs: IncrCollection<PyValue>,
     rows: IncrCollection<PyValue>,
     rt: Py<PyRuntime>,
     born: Born,
 }
 
+/// A keyed collection whose pairs are `(key, row)` tuples, read by rank `R`.
+type PyKeyedCore<R> = incr_core::KeyedCollection<PyKey, PyValue, Local, PyValue, R>;
+
 /// A keyed collection whose pairs are `(key, row)` tuples.
-pub(crate) type CoreKeyed = incr_core::KeyedCollection<PyKey, PyValue, Local, PyValue>;
+pub(crate) type CoreKeyed = PyKeyedCore<()>;
+
+/// The runtime collection behind a persisted keyed collection, whose pairs
+/// are ranked by the fingerprint of their logged bytes.
+pub(crate) type PersistedCore = PyKeyedCore<u128>;
+
+/// How many keys an operation inserted, gave a new row, and removed.
+pub(crate) type KeyCounts = (usize, usize, usize);
 
 /// A labelled keyed collection's index, label and pair version node.
 type KeyedLabel = (Weak<dyn StateStats>, String, ErasedIncr);
@@ -869,8 +877,8 @@ type KeyedLabel = (Weak<dyn StateStats>, String, ErasedIncr);
 enum KeyedKind {
     Plain(CoreKeyed),
     /// A keyed collection a store persists, which only the store writes,
-    /// with the index that follows its pair collection.
-    Persisted(Arc<SharedIndex>),
+    /// but for an overlay through its unlogged scope.
+    Persisted(PyPersistedKeyed),
 }
 
 impl OnRuntime for PyKeyedCollection {
@@ -883,26 +891,21 @@ impl OnRuntime for PyKeyedCollection {
     }
 }
 
-fn index_in_use() -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(
-        "KeyedCollection used from a key or row method during an operation on it",
-    )
-}
-
-fn key_counts(change: &incr_core::KeyedChange<PyKey>) -> KeyCounts {
-    let counts = change.counts;
+pub(crate) fn key_counts(counts: incr_core::KeyCounts) -> KeyCounts {
     (counts.inserted, counts.replaced, counts.removed)
 }
 
 impl PyKeyedCollection {
-    /// The persisted index, refused to a key or row method that calls back
-    /// into this collection while an operation on it runs.
-    fn index(index: &SharedIndex) -> PyResult<IndexGuard<'_>> {
-        index.try_borrow_mut().ok_or_else(index_in_use)
+    /// The handle the store persisting this collection knows it by.
+    pub(crate) fn persisted_handle(&self) -> Option<&PyPersistedKeyed> {
+        match &self.kind {
+            KeyedKind::Plain(_) => None,
+            KeyedKind::Persisted(persisted) => Some(persisted),
+        }
     }
 
-    /// The index lives in this object, not the engine, so a read that only
-    /// consults it must ask the runtime whether it is closed.
+    /// A read that only consults state outside the engine must ask the
+    /// runtime whether it is closed.
     fn check_open(&self, py: Python<'_>) -> PyResult<()> {
         self.check_alive()?;
         self.rt.bind(py).borrow().rt().map(drop)
@@ -917,25 +920,27 @@ impl PyKeyedCollection {
         pyerr_boundary::<Exc, _>(|| in_runtime(rt, f))
     }
 
-    /// Runs `write`, a write of the core collection, given a journal in an
-    /// overlay, and journals the pair ops it records so the exit can apply
+    /// Runs `write` on `keyed`, given a journal in an overlay, and journals
+    /// the pair ops it records as `undo` of them, so the exit can apply
     /// their inverses.
-    fn write_core(
+    fn write_core<R: Ord + Copy + Default + Send + Sync + 'static>(
         &self,
         py: Python<'_>,
-        keyed: &CoreKeyed,
+        keyed: &PyKeyedCore<R>,
+        undo: fn(PyKeyedCore<R>, Vec<PairOp<PyValue, R>>) -> Undo,
         write: impl FnOnce(
-            Option<&mut Vec<PairOp<PyValue, ()>>>,
+            &PyKeyedCore<R>,
+            Option<&mut Vec<PairOp<PyValue, R>>>,
         ) -> PyResult<incr_core::KeyedChange<PyKey>>,
     ) -> PyResult<KeyCounts> {
         let state = self.state(py);
         let mut ops = Vec::new();
         let journal = state.overlay_active().then_some(&mut ops);
-        let change = write(journal)?;
+        let change = write(keyed, journal)?;
         if !ops.is_empty() {
-            state.journal(|overlay| overlay.push(Undo::Keyed(keyed.clone(), ops)));
+            state.journal(|overlay| overlay.push(undo(keyed.clone(), ops)));
         }
-        Ok(key_counts(&change))
+        Ok(key_counts(change.counts))
     }
 
     /// Makes the wrapper over a new keyed collection's pair and row
@@ -967,32 +972,24 @@ impl PyKeyedCollection {
         }
         Ok(PyKeyedCollection {
             kind,
-            pairs,
             rows,
             rt: runtime.unbind(),
             born: state.born(),
         })
     }
 
-    /// A keyed collection over the pair collection a store persists.
+    /// A keyed collection over one a store persists.
     pub(crate) fn persisted(
         runtime: Bound<'_, PyRuntime>,
-        pairs: IncrCollection<PyValue>,
-        index: Arc<SharedIndex>,
+        persisted: PyPersistedKeyed,
         label: Option<String>,
     ) -> PyResult<Self> {
-        let rows = runtime.borrow().engine_read(|rt| {
-            let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(or_stash(pair.0.bind(py).get_item(1)).unbind()))
-            });
-            let weak: Weak<SharedIndex> = Arc::downgrade(&index);
-            rt.register_state(Some(rows.version_node().erase()), weak);
-            rows
-        })?;
-        let stats: Weak<SharedIndex> = Arc::downgrade(&index);
+        let pairs = persisted.pairs();
+        let rows = persisted.rows().clone();
+        let stats: Weak<incr_core::KeyIndex<PyValue, u128, Local>> = persisted.index_weak();
         Self::wrap(
             runtime,
-            KeyedKind::Persisted(index),
+            KeyedKind::Persisted(persisted),
             pairs,
             rows,
             stats,
@@ -1000,65 +997,23 @@ impl PyKeyedCollection {
         )
     }
 
-    /// The pair collection a persisted keyed collection's write goes to,
-    /// which only the store writes: the unlogged handle an overlay's scope
-    /// gives out.
-    fn persisted_pairs_for_write(&self, py: Python<'_>) -> PyResult<IncrCollection<PyValue>> {
+    /// The writable collection behind `persisted`, which only an overlay's
+    /// unlogged scope gives out: outside one, the store writes it.
+    fn unlogged(&self, py: Python<'_>, persisted: &PyPersistedKeyed) -> PyResult<PersistedCore> {
+        self.check_alive()?;
         self.state(py)
-            .journal_with(|overlay| overlay.writable_pairs(self))
+            .journal_with(|overlay| overlay.writable_keyed(persisted))
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(
                     "keyed collection is persisted: write it with store.upsert, store.remove, store.reconcile or a store.batch",
                 )
             })?
     }
-
-    /// Runs `stage` and applies what it staged to a persisted keyed
-    /// collection and its index, journalling both in an overlay. The index
-    /// is held for writing under a routing hold, since routing runs key
-    /// functions that may use the index.
-    fn write_persisted(
-        &self,
-        py: Python<'_>,
-        shared: &Arc<SharedIndex>,
-        stage: impl FnOnce(&KeyIndex, &mut StagedKeys) -> PyResult<()>,
-    ) -> PyResult<KeyCounts> {
-        self.check_alive()?;
-        let pairs = self.persisted_pairs_for_write(py)?;
-        let runtime = self.rt.bind(py).borrow();
-        let rt = runtime.rt()?;
-        let routing = rt.hold_routing_suppressed();
-        let mut index = shared
-            .try_borrow_for_write(routing)
-            .ok_or_else(index_in_use)?;
-        let mut staged = StagedKeys::default();
-        stage(&index, &mut staged)?;
-        let state = &runtime.state;
-        let mut steps = Vec::new();
-        let journaling = state.overlay_active();
-        let (counts, applied) = index.apply_staged(
-            py,
-            staged,
-            |changes| engine_write(rt, || pairs.apply(rt, changes)),
-            journaling.then_some(&mut steps),
-        )?;
-        if journaling && !applied.is_empty() {
-            state.journal(|overlay| {
-                overlay.push(Undo::PersistedKeyed {
-                    pairs: pairs.clone(),
-                    index: Arc::clone(shared),
-                    applied,
-                    steps,
-                });
-            });
-        }
-        Ok(counts)
-    }
 }
 
 /// The pairs of `rows`, a mapping or an iterable of `(key, row)` pairs,
 /// read whole before any key or row method runs.
-fn reconcile_pairs(rows: &Bound<'_, PyAny>) -> PyResult<Vec<(PyKey, PyValue)>> {
+pub(crate) fn reconcile_pairs(rows: &Bound<'_, PyAny>) -> PyResult<Vec<(PyKey, PyValue)>> {
     let pairs = if rows.hasattr("items")? {
         rows.call_method0("items")?
     } else {
@@ -1089,135 +1044,109 @@ impl PyKeyedCollection {
     /// it, otherwise the pair is replaced or inserted.
     fn upsert(&self, py: Python<'_>, key: Py<PyAny>, row: Py<PyAny>) -> PyResult<()> {
         match &self.kind {
-            KeyedKind::Plain(keyed) => self
-                .write_core(py, keyed, |journal| {
+            KeyedKind::Plain(keyed) => self.write_core(py, keyed, Undo::Keyed, |k, journal| {
+                self.engine_write(py, |rt| {
+                    k.upsert_journaled(rt, PyKey(key), PyValue(row), journal)
+                })
+            }),
+            KeyedKind::Persisted(persisted) => self.write_core(
+                py,
+                &self.unlogged(py, persisted)?,
+                Undo::PersistedKeyed,
+                |k, journal| {
                     self.engine_write(py, |rt| {
-                        keyed.upsert_journaled(rt, PyKey(key), PyValue(row), journal)
+                        k.upsert_journaled(rt, PyKey(key), PyValue(row), journal)
                     })
-                })
-                .map(drop),
-            KeyedKind::Persisted(shared) => self
-                .write_persisted(py, shared, |index, staged| {
-                    staged
-                        .stage(index, key.bind(py), Some(row.bind(py)))
-                        .map(drop)
-                })
-                .map(drop),
+                },
+            ),
         }
+        .map(drop)
     }
 
     /// Remove `key`'s pair. Raises `KeyError` if no row is held for it.
     fn remove(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<()> {
-        let absent = || pyo3::exceptions::PyKeyError::new_err(key.clone_ref(py));
-        match &self.kind {
-            KeyedKind::Plain(keyed) => {
-                let target = PyKey(key.clone_ref(py));
-                let (_, _, removed) = self.write_core(py, keyed, |journal| {
-                    self.engine_write(py, |rt| keyed.remove_journaled(rt, &target, journal))
-                })?;
-                if removed == 0 {
-                    return Err(absent());
-                }
-                Ok(())
-            }
-            KeyedKind::Persisted(shared) => self
-                .write_persisted(py, shared, |index, staged| {
-                    if staged.stage(index, key.bind(py), None)? {
-                        Ok(())
-                    } else {
-                        Err(absent())
-                    }
-                })
-                .map(drop),
+        let target = PyKey(key.clone_ref(py));
+        let (_, _, removed) = match &self.kind {
+            KeyedKind::Plain(keyed) => self.write_core(py, keyed, Undo::Keyed, |k, journal| {
+                self.engine_write(py, |rt| k.remove_journaled(rt, &target, journal))
+            }),
+            KeyedKind::Persisted(persisted) => self.write_core(
+                py,
+                &self.unlogged(py, persisted)?,
+                Undo::PersistedKeyed,
+                |k, journal| self.engine_write(py, |rt| k.remove_journaled(rt, &target, journal)),
+            ),
+        }?;
+        if removed == 0 {
+            return Err(pyo3::exceptions::PyKeyError::new_err(key));
         }
+        Ok(())
     }
 
     /// The row held for `key`, or `None`.
     fn get(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
-        match &self.kind {
-            KeyedKind::Plain(keyed) => {
-                let row = self.read_core(py, || keyed.row(&PyKey(key)))?;
-                Ok(row.map(|row| row.0))
-            }
-            KeyedKind::Persisted(shared) => {
-                self.check_open(py)?;
-                let row = Self::index(shared)?.row(key.bind(py))?;
-                Ok(row.map(Bound::unbind))
-            }
-        }
+        let key = PyKey(key);
+        let row = match &self.kind {
+            KeyedKind::Plain(keyed) => self.read_core(py, || keyed.row(&key)),
+            KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.row(&key)),
+        }?;
+        Ok(row.map(|row| row.0))
     }
 
     fn __contains__(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<bool> {
+        let key = PyKey(key);
         match &self.kind {
-            KeyedKind::Plain(keyed) => self.read_core(py, || keyed.contains(&PyKey(key))),
-            KeyedKind::Persisted(shared) => {
-                self.check_open(py)?;
-                Ok(Self::index(shared)?.row(key.bind(py))?.is_some())
-            }
+            KeyedKind::Plain(keyed) => self.read_core(py, || keyed.contains(&key)),
+            KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.contains(&key)),
         }
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
         match &self.kind {
             KeyedKind::Plain(keyed) => self.read_core(py, || keyed.len()),
-            KeyedKind::Persisted(shared) => {
-                self.check_open(py)?;
-                Ok(Self::index(shared)?.len())
-            }
+            KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.len()),
         }
     }
 
     /// A new list of the held keys, in no particular order. Registers no
     /// dependency, like `get`.
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
-        match &self.kind {
-            KeyedKind::Plain(keyed) => {
-                let keys = self.read_core(py, || keyed.keys())?;
-                pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
-            }
-            KeyedKind::Persisted(shared) => {
-                self.check_open(py)?;
-                let index = Self::index(shared)?;
-                let keys = index
-                    .pairs()
-                    .map(|pair| pair.bind(py).get_item(0))
-                    .collect::<PyResult<Vec<_>>>()?;
-                pyo3::types::PyList::new(py, keys)
-            }
-        }
+        let keys = match &self.kind {
+            KeyedKind::Plain(keyed) => self.read_core(py, || keyed.keys()),
+            KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.keys()),
+        }?;
+        pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
     }
 
     /// A new list of the held `(key, row)` tuples, in no particular order.
     /// Registers no dependency, like `get`.
     fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
-        match &self.kind {
-            KeyedKind::Plain(keyed) => {
-                let items = self.read_core(py, || keyed.items())?;
-                pyo3::types::PyList::new(py, items.into_iter().map(|pair| pair.0))
-            }
-            KeyedKind::Persisted(shared) => {
-                self.check_open(py)?;
-                let index = Self::index(shared)?;
-                pyo3::types::PyList::new(py, index.pairs().map(|pair| pair.bind(py)))
-            }
-        }
+        let items = match &self.kind {
+            KeyedKind::Plain(keyed) => self.read_core(py, || keyed.items()),
+            KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.items()),
+        }?;
+        pyo3::types::PyList::new(py, items.into_iter().map(|pair| pair.0))
     }
 
     /// Make the held rows equal `rows`, a mapping or an iterable of
     /// `(key, row)` pairs (a later pair for a key wins), in one atomic
     /// change. Returns how many keys were `(inserted, replaced, removed)`.
     fn reconcile(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<KeyCounts> {
+        self.check_open(py)?;
         match &self.kind {
             KeyedKind::Plain(keyed) => {
-                self.check_open(py)?;
                 let pairs = reconcile_pairs(rows)?;
-                self.write_core(py, keyed, |journal| {
-                    self.engine_write(py, |rt| keyed.reconcile_journaled(rt, pairs, journal))
+                self.write_core(py, keyed, Undo::Keyed, |k, journal| {
+                    self.engine_write(py, |rt| k.reconcile_journaled(rt, pairs, journal))
                 })
             }
-            KeyedKind::Persisted(shared) => self.write_persisted(py, shared, |index, staged| {
-                staged.stage_reconcile(index, rows)
-            }),
+            KeyedKind::Persisted(persisted) => {
+                let keyed = self.unlogged(py, persisted)?;
+                let pairs = reconcile_pairs(rows)?;
+                self.write_core(py, &keyed, Undo::PersistedKeyed, |k, journal| {
+                    self.engine_write(py, |rt| k.reconcile_journaled(rt, pairs, journal))
+                })
+            }
         }
     }
 

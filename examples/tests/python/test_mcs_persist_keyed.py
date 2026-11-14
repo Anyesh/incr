@@ -447,6 +447,24 @@ def test_keyed_ops_in_one_batch_across_two_collections_and_a_plain_input():
     assert again.runtime.get(again.input("progress", 0, PickleCodec())) == 4
 
 
+def test_a_keyed_collection_reopens_with_one_pair_after_an_overtaken_upsert():
+    backend = MemoryBackend()
+    leader = open_store(backend)
+    standby = open_store(backend)
+    kc_leader = declare(leader)
+    kc_standby = declare(standby)
+    leader.upsert(kc_leader, "k", 1)
+    standby.upsert(kc_standby, "k", 2)
+    assert (len(kc_standby), kc_standby.get("k")) == (1, 2)
+    standby.close()
+    leader.close()
+
+    again = open_store(backend)
+    kc = declare(again)
+    assert (len(kc), kc.get("k")) == (1, 2)
+    assert rows_of(again.runtime, kc.collection) == [2]
+
+
 def test_refresh_returns_the_position_applied_through():
     backend = MemoryBackend()
     leader = open_store(backend)

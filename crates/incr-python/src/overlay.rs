@@ -7,16 +7,14 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use incr_compute::{Change, ErasedIncr, Incr, IncrCollection, Runtime};
 use incr_core::PairOp;
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 
-use crate::keyed::{KeyStep, SharedIndex};
-use crate::persist::OverlayScope;
-use crate::{engine_read, CoreKeyed, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
+use crate::persist::{OverlayScope, PyPersistedKeyed};
+use crate::{engine_read, CoreKeyed, PersistedCore, PyCollection, PyNodeId, PyRuntime};
 
 /// Set when the overlay that created an object ends, after which the
 /// object's nodes are gone and every use of it raises.
@@ -40,12 +38,8 @@ pub(crate) enum Undo {
     /// The pair ops a plain keyed collection's write journalled, undone
     /// by applying their inverses newest first.
     Keyed(CoreKeyed, Vec<PairOp<PyValue, ()>>),
-    PersistedKeyed {
-        pairs: IncrCollection<PyValue>,
-        index: Arc<SharedIndex>,
-        applied: Vec<Change<PyValue>>,
-        steps: Vec<KeyStep>,
-    },
+    /// The same for a persisted keyed collection's unlogged writes.
+    PersistedKeyed(PersistedCore, Vec<PairOp<PyValue, u128>>),
     Label(u32, Option<String>),
 }
 
@@ -100,11 +94,11 @@ impl Overlay {
             .collection(collection)
     }
 
-    pub(crate) fn writable_pairs(
+    pub(crate) fn writable_keyed(
         &mut self,
-        kc: &PyKeyedCollection,
-    ) -> PyResult<IncrCollection<PyValue>> {
-        self.persist.as_mut().ok_or_else(no_scope)?.pairs(kc)
+        persisted: &PyPersistedKeyed,
+    ) -> PyResult<PersistedCore> {
+        self.persist.as_ref().ok_or_else(no_scope)?.keyed(persisted)
     }
 
     pub(crate) fn created(&mut self, node: ErasedIncr) {
@@ -143,19 +137,13 @@ impl Overlay {
                         None,
                     );
                 }
-                Undo::PersistedKeyed {
-                    pairs,
-                    index,
-                    applied,
-                    steps,
-                } => {
-                    pairs.apply(rt, inverse(applied));
-                    let mut guard = index.try_borrow_mut().ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err(
-                            "KeyedCollection index in use at overlay exit",
-                        )
-                    })?;
-                    Python::attach(|py| guard.undo(py, &steps));
+                Undo::PersistedKeyed(keyed, ops) => {
+                    keyed.apply_pairs_with(
+                        rt,
+                        ops.into_iter().rev().map(PairOp::inverse),
+                        &mut (),
+                        None,
+                    );
                 }
                 Undo::Label(slot, Some(old)) => rt.set_label(slot, old),
                 Undo::Label(slot, None) => rt.clear_label(slot),

@@ -17,11 +17,11 @@ enum Phase {
 
 /// The writes collected inside `with store.batch() as b:`.
 ///
-/// Keyed writes read and write a map of staged keys before the committed
-/// index, so `b.upsert` twice on one key, or `b.upsert` then `b.remove`,
+/// Keyed writes compose per key against the rows each key held when first
+/// staged, so `b.upsert` twice on one key, or `b.upsert` then `b.remove`,
 /// leave exactly the final pair, and `b.remove` raises `KeyError` for a
-/// key neither held nor staged. The index takes the staged keys only once
-/// the append has landed.
+/// key neither held nor staged. The collection takes the staged keys only
+/// once the append has landed.
 #[pyclass(name = "Batch", module = "incr.persist", unsendable)]
 pub(crate) struct PyBatch {
     store: Py<PyStore>,
@@ -124,23 +124,23 @@ impl PyBatch {
         &mut self,
         py: Python<'_>,
         kc: PyRef<'_, PyKeyedCollection>,
-        key: Bound<'_, PyAny>,
-        row: Bound<'_, PyAny>,
+        key: Py<PyAny>,
+        row: Py<PyAny>,
     ) -> PyResult<()> {
         self.open()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.upsert(&core, &kc, &key, &row)
+        self.pending.upsert(py, &core, &kc, key, row)
     }
 
     fn remove(
         &mut self,
         py: Python<'_>,
         kc: PyRef<'_, PyKeyedCollection>,
-        key: Bound<'_, PyAny>,
+        key: Py<PyAny>,
     ) -> PyResult<()> {
         self.open()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.remove(&core, &kc, &key)
+        self.pending.remove(py, &core, &kc, key)
     }
 
     fn reconcile(
@@ -151,6 +151,6 @@ impl PyBatch {
     ) -> PyResult<()> {
         self.open()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.reconcile(&core, &kc, rows)
+        self.pending.reconcile(py, &core, &kc, rows)
     }
 }

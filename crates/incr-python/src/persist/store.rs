@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use incr_core::Local;
 use incr_persist::memo::{fingerprint, Memo, MemoBuilder};
-use incr_persist::{Durability, Input, Options, Store};
-use incr_python_protocol::PyValue;
+use incr_persist::{Durability, Input, Options, PersistedCollection, Store};
+use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
@@ -18,11 +18,12 @@ use pyo3::types::{PyDict, PyString};
 use super::backend::PyBackend;
 use super::batch::PyBatch;
 use super::codec::{PairCodec, Registry, Slot};
-use super::keyed::{Following, KeyedBinding, Pending, PyPersistedCollection};
+use super::keyed::Pending;
 use super::memo::{self, PyMemo, PyMemoTable};
-use crate::keyed::KeyCounts;
 use crate::overlay::Born;
-use crate::{engine_write, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
+use crate::{engine_write, KeyCounts, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
+
+pub(super) type PyPersistedCollection = PersistedCollection<PyValue, Local>;
 
 /// What the store's Python objects share: the incr-persist store with the
 /// runtime it owns, the codecs of its slots, and the persisted nodes the
@@ -36,8 +37,6 @@ pub(crate) struct StoreCore {
     pub(super) memo: OnceCell<Memo<Local, PyBackend>>,
     inputs: RefCell<HashMap<u32, Input<PyValue>>>,
     collections: RefCell<HashMap<u32, PyPersistedCollection>>,
-    pub(super) keyed: RefCell<Vec<Rc<KeyedBinding>>>,
-    pub(super) following: RefCell<Option<Following>>,
 }
 
 impl StoreCore {
@@ -81,25 +80,13 @@ impl StoreCore {
         }
     }
 
-    /// Runs a store call, then applies the records it queued for the keyed
-    /// collections. A failure of that is the call's own when the call
-    /// succeeded, else its cause.
+    /// Runs a store call with the store's codecs active.
     pub(super) fn run<R>(
         &self,
         py: Python<'_>,
         f: impl FnOnce(&Store<Local, PyBackend>) -> incr_persist::Result<R>,
     ) -> PyResult<R> {
-        let result = self.registry.run(py, || f(&self.store));
-        let drained = self.registry.scoped(|| self.drain(py));
-        match (result, drained) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(drain)) => Err(drain),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(drain)) => {
-                error.set_cause(py, Some(drain));
-                Err(error)
-            }
-        }
+        self.registry.run(py, || f(&self.store))
     }
 }
 
@@ -213,8 +200,6 @@ impl PyStore {
             memo: OnceCell::new(),
             inputs: RefCell::default(),
             collections: RefCell::default(),
-            keyed: RefCell::default(),
-            following: RefCell::default(),
         });
         let runtime = Py::new(py, PyRuntime::persisted(Rc::clone(&core)))?;
         Ok(PyStore {
@@ -387,8 +372,8 @@ impl PyStore {
     }
 
     /// Declares the keyed collection `key`: a `KeyedCollection` over a
-    /// persisted collection of `(key, row)` pairs, whose index is rebuilt
-    /// from the pairs the log restores. `key_codec` and `codec` encode the
+    /// persisted collection of `(key, row)` pairs, holding the pairs the
+    /// log restores. `key_codec` and `codec` encode the
     /// keys and the rows, under the contracts of `store.input`. Write it
     /// with `store.upsert`, `store.remove`, `store.reconcile` or a
     /// `store.batch`; its own writes raise. `label` names the collection's
@@ -411,15 +396,16 @@ impl PyStore {
         }
         let pairs = Py::new(py, PairCodec::new(key_codec, codec))?;
         core.registry.register(slot.clone(), pairs.into_any())?;
-        let declared = engine_write(core.runtime(), || core.declare_keyed(py, key))
-            .and_then(|declared| declared);
+        let declared = engine_write(core.runtime(), || {
+            core.run(py, |store| {
+                store.keyed_collection::<PyKey, PyValue, PyValue>(key)
+            })
+        })
+        .and_then(|declared| declared);
         match declared {
-            Ok(binding) => PyKeyedCollection::persisted(
-                self.runtime.bind(py).clone().into_any().downcast_into()?,
-                binding.pairs.handle().clone(),
-                Arc::clone(&binding.index),
-                label,
-            ),
+            Ok(persisted) => {
+                PyKeyedCollection::persisted(self.runtime.bind(py).clone(), persisted, label)
+            }
             Err(e) => {
                 core.registry.unregister(&slot);
                 Err(e)
@@ -433,12 +419,12 @@ impl PyStore {
         &self,
         py: Python<'_>,
         kc: PyRef<'_, PyKeyedCollection>,
-        key: Bound<'_, PyAny>,
-        row: Bound<'_, PyAny>,
+        key: Py<PyAny>,
+        row: Py<PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
         let mut pending = Pending::default();
-        pending.upsert(&core, &kc, &key, &row)?;
+        pending.upsert(py, &core, &kc, key, row)?;
         engine_write(core.runtime(), || core.write(py, pending))?
     }
 
@@ -448,11 +434,11 @@ impl PyStore {
         &self,
         py: Python<'_>,
         kc: PyRef<'_, PyKeyedCollection>,
-        key: Bound<'_, PyAny>,
+        key: Py<PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
         let mut pending = Pending::default();
-        pending.remove(&core, &kc, &key)?;
+        pending.remove(py, &core, &kc, key)?;
         engine_write(core.runtime(), || core.write(py, pending))?
     }
 
@@ -467,8 +453,8 @@ impl PyStore {
     ) -> PyResult<KeyCounts> {
         let core = self.core_outside_overlay(py)?;
         let mut pending = Pending::default();
-        pending.reconcile(&core, &kc, rows)?;
-        let counts = pending.counts();
+        pending.reconcile(py, &core, &kc, rows)?;
+        let counts = pending.counts(py, &core, &kc)?;
         engine_write(core.runtime(), || core.write(py, pending))??;
         Ok(counts)
     }
