@@ -374,6 +374,7 @@ macro_rules! persist_classes {
                 Ok(PyBatch {
                     store: slf.clone().unbind(),
                     batch: Mutex::new($crate::batch::Batch::new(apply)),
+                    opener: std::thread::current().id(),
                 })
             }
 
@@ -495,14 +496,23 @@ macro_rules! persist_classes {
         /// collection takes the staged keys only once the append has landed. In
         /// an `on_write` batch each write applies at once, and `b.remove` raises
         /// `KeyError` for a key holding no row at that point.
+        ///
+        /// A batch is used only on the thread that called `store.batch()`: a
+        /// call from another thread raises `RuntimeError`.
         #[pyclass(name = "Batch", module = $module, $($flag),*)]
         pub(crate) struct PyBatch {
             store: Py<PyStore>,
             batch: Mutex<$crate::batch::Batch<$b>>,
+            opener: std::thread::ThreadId,
         }
 
         impl PyBatch {
             fn batch(&self) -> PyResult<MutexGuard<'_, $crate::batch::Batch<$b>>> {
+                if std::thread::current().id() != self.opener {
+                    return Err(PyRuntimeError::new_err(
+                        "a batch is used only on the thread that opened it",
+                    ));
+                }
                 match self.batch.try_lock() {
                     Ok(batch) => Ok(batch),
                     Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),

@@ -688,7 +688,7 @@
   "bases": [
    "object"
   ],
-  "doc": "The writes of a `with store.batch() as b:` block; see `Store.batch`.\n\nIn an `on_exit` batch keyed writes compose per key against the rows\neach key held when first staged, so `b.upsert` twice on one key, or\n`b.upsert` then `b.remove`, leave exactly the final pair, and\n`b.remove` raises `KeyError` for a key neither held nor staged; the\ncollection takes the staged keys only once the append has landed. In\nan `on_write` batch each write applies at once, and `b.remove` raises\n`KeyError` for a key holding no row at that point.",
+  "doc": "The writes of a `with store.batch() as b:` block; see `Store.batch`.\n\nIn an `on_exit` batch keyed writes compose per key against the rows\neach key held when first staged, so `b.upsert` twice on one key, or\n`b.upsert` then `b.remove`, leave exactly the final pair, and\n`b.remove` raises `KeyError` for a key neither held nor staged; the\ncollection takes the staged keys only once the append has landed. In\nan `on_write` batch each write applies at once, and `b.remove` raises\n`KeyError` for a key holding no row at that point.\n\nA batch is used only on the thread that called `store.batch()`: a\ncall from another thread raises `RuntimeError`.",
   "members": {
    "__enter__": {
     "doc": null,
