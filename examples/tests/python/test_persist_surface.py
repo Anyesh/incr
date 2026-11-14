@@ -37,9 +37,20 @@ def _signature(obj):
         return None
 
 
+SLOT_KINDS = {"wrapper_descriptor", "method-wrapper"}
+
+
+def _doc(raw, kind):
+    if kind in SLOT_KINDS:
+        return None
+    if isinstance(raw, (staticmethod, classmethod)):
+        return raw.__func__.__doc__
+    return getattr(raw, "__doc__", None)
+
+
 def _member(raw, bound):
     kind = type(raw).__name__
-    entry = {"kind": kind, "doc": getattr(raw, "__doc__", None)}
+    entry = {"kind": kind, "doc": _doc(raw, kind)}
     if callable(bound) and not isinstance(raw, (property,)):
         entry["signature"] = _signature(bound)
     return entry

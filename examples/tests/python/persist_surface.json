@@ -84,37 +84,37 @@
   "doc": "`value` computed with `missing` contributions left out because they\nwere not ready. Through queries `missing` counts contributions: a query\nreading two totals that both miss one element reports 2. A collection\ntotal counts distinct elements.",
   "members": {
    "__eq__": {
-    "doc": "Return self==value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ge__": {
-    "doc": "Return self>=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__gt__": {
-    "doc": "Return self>value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__hash__": {
-    "doc": "Return hash(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
    "__le__": {
-    "doc": "Return self<=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__lt__": {
-    "doc": "Return self<value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ne__": {
-    "doc": "Return self!=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
@@ -124,7 +124,7 @@
     "signature": "(*args, **kwargs)"
    },
    "__repr__": {
-    "doc": "Return repr(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
@@ -146,12 +146,12 @@
   "doc": "Rows by key: a collection of `(key, row)` pairs holding at most one row\nper key, with keys matched as a dict matches them. `collection` is the\nrows as a `Collection`, for the operators.\n\nRows need not be hashable: a pair hashes its key alone, and a row is\nunchanged when it is `==` to the held one, so an upsert of `{\"a\": True}`\nover `{\"a\": 1}` changes nothing. An upsert that replaces runs four row\n`__eq__` (two against the held row, two in the pair log, where the old\nand new pair share the key's hash) and one with an `==` row runs one\nand changes nothing. `collection` and operators over it still hash\nrows: once read, it hashes each added or removed row once, so a\ncollection of unhashable rows raises `TypeError` there. Writes through\n`collection` raise `RuntimeError`; write with `upsert`, `remove` and\n`reconcile`.\n\nKey and row methods run as value code: one that calls into incr during\nan operation on the collection raises `RuntimeError`, which the\noperation raises, changing nothing.\n\nA key read with `ctx.get_key` has a version input node. When a write\nleaves a key with no row and no query reading it, its node is deleted,\nso memory follows the keys held or read, not every key ever read.\n\n`label` names the collection's group in `Runtime.graph_summary`: it\nlabels the pair and row collections' version nodes, and the group\nreports the key count as `\"keys\"`.",
   "members": {
    "__contains__": {
-    "doc": "Return bool(key in self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, key, /)"
    },
    "__len__": {
-    "doc": "Return len(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
@@ -204,37 +204,37 @@
   "doc": "A lookup that failed for `reason`.",
   "members": {
    "__eq__": {
-    "doc": "Return self==value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ge__": {
-    "doc": "Return self>=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__gt__": {
-    "doc": "Return self>value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__hash__": {
-    "doc": "Return hash(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
    "__le__": {
-    "doc": "Return self<=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__lt__": {
-    "doc": "Return self<value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ne__": {
-    "doc": "Return self!=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
@@ -244,7 +244,7 @@
     "signature": "(*args, **kwargs)"
    },
    "__repr__": {
-    "doc": "Return repr(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
@@ -308,37 +308,37 @@
   "doc": "A result still being fetched, for `key` when it came from a lookup.",
   "members": {
    "__eq__": {
-    "doc": "Return self==value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ge__": {
-    "doc": "Return self>=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__gt__": {
-    "doc": "Return self>value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__hash__": {
-    "doc": "Return hash(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
    "__le__": {
-    "doc": "Return self<=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__lt__": {
-    "doc": "Return self<value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ne__": {
-    "doc": "Return self!=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
@@ -348,7 +348,7 @@
     "signature": "(*args, **kwargs)"
    },
    "__repr__": {
-    "doc": "Return repr(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
@@ -629,37 +629,37 @@
   "doc": "A value withheld for `reason`. As a collection element, `row` is the\nelement it stands in for: keyed operators key on it, and `map` and\n`filter` apply to it.",
   "members": {
    "__eq__": {
-    "doc": "Return self==value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ge__": {
-    "doc": "Return self>=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__gt__": {
-    "doc": "Return self>value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__hash__": {
-    "doc": "Return hash(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
    "__le__": {
-    "doc": "Return self<=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__lt__": {
-    "doc": "Return self<value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
    "__ne__": {
-    "doc": "Return self!=value.",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, value, /)"
    },
@@ -669,7 +669,7 @@
     "signature": "(*args, **kwargs)"
    },
    "__repr__": {
-    "doc": "Return repr(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
@@ -795,7 +795,7 @@
   "doc": "A memo table of a store: pass it to `memo.get_or_insert` and\n`ctx.memo`.",
   "members": {
    "__repr__": {
-    "doc": "Return repr(self).",
+    "doc": null,
     "kind": "wrapper_descriptor",
     "signature": "(self, /)"
    },
@@ -991,7 +991,7 @@
     "signature": "(self, /, name, version, key_codec, codec, func, *, label=None)"
    },
    "open": {
-    "doc": "Convert a function to be a static method.\n\nA static method does not receive an implicit first argument.\nTo declare a static method, use this idiom:\n\n     class C:\n         @staticmethod\n         def f(arg1, arg2, argN):\n             ...\n\nIt can be called either on the class (e.g. C.f()) or on an instance\n(e.g. C().f()). Both the class and the instance are ignored, and\nneither is passed implicitly as the first argument to the method.\n\nStatic methods in Python are similar to those found in Java or C++.\nFor a more advanced concept, see the classmethod builtin.",
+    "doc": "Opens a store over `backend`, replaying its log. `build_id`, an int\nor a str, names the code that computes memoized values; incr hashes\na str to an id. `durability` is `\"sync\"` (a write is durable when it\nreturns) or `\"buffered\"`. With `auto_checkpoint_records=n`, a\nwrite first checkpoints once `n` records were applied since the last\nsnapshot; a failed checkpoint fails that write and leaves the log\nunchanged.",
     "kind": "staticmethod",
     "signature": "(backend, *, build_id, durability='sync', auto_checkpoint_records=None)"
    },
