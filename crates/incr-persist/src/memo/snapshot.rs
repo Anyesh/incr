@@ -192,7 +192,7 @@ impl<C: MemoCells> CoreRef<C> {
                     Fate::Unkept => {
                         unsaveable += 1;
                         for (table, handle, key) in &origin.clean {
-                            dirty.lost(*table, *handle, key.clone());
+                            self.lost(*table, *handle, key.clone());
                         }
                     }
                     Fate::Oversized => unsaveable += 1,
@@ -206,7 +206,7 @@ impl<C: MemoCells> CoreRef<C> {
                 continue;
             };
             if let Ok(Some(handle)) = t.probe_bytes(rt, key, &mut bag) {
-                self.dirty.lost(*table, handle, key.clone());
+                self.dirty.evicted(*table, handle, key.clone());
             }
         }
         state.stats.unsaveable = unsaveable;

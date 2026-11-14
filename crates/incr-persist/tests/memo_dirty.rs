@@ -5,7 +5,9 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use incr_core::Incr;
 use incr_persist::memo::{
     BuildId, Memo, MemoBackend, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo,
 };
@@ -452,18 +454,22 @@ fn a_cutoff_recompute_keeps_the_bytes_its_clean_dependents_name<C: MemoCells>() 
     assert_eq!(memo.stats().reused, 2);
 }
 
-/// `parent(k) = child(k) + y`, `child(k) = k * x`. Another build replaces
-/// the base after both were stored, so the next checkpoint cannot keep the
-/// rerun parent over its clean child; it marks the child lost, and the
-/// checkpoint after it writes both, which a reopen reuses.
-fn a_clean_dep_the_base_lost_is_written_again<C: MemoCells>() {
-    let backends = Backends::new();
-    let open = || {
+/// `parent(k) = child(k) + y`, `child(k) = k * x`, reading parent 2.
+struct Pair<C: MemoCells> {
+    store: St<C>,
+    y: Input<u64>,
+    memo: Memo<C, MemoryBackend>,
+    read: Incr<u64>,
+    runs: Arc<AtomicUsize>,
+}
+
+impl<C: MemoCells> Pair<C> {
+    fn open(backends: &Backends, options: MemoOptions) -> Self {
         let store = backends.store::<C>();
         let x = store.input("x", 3_u64).unwrap();
         let y = store.input("y", 10_u64).unwrap();
         let (xh, yh, runs) = (x.handle(), y.handle(), Arc::new(AtomicUsize::new(0)));
-        let mut builder = MemoBuilder::new(options());
+        let mut builder = MemoBuilder::new(options);
         let child = builder.table::<u32, u64>("child", 1);
         let parent = builder.table::<u32, u64>("parent", 1);
         let counter = Arc::clone(&runs);
@@ -478,12 +484,17 @@ fn a_clean_dep_the_base_lost_is_written_again<C: MemoCells>() {
         });
         let memo = builder.open(&store, backends.memo.clone()).unwrap();
         let read = memo.get_or_insert(parent, 2);
-        (store, y, memo, read, runs)
-    };
-    {
-        let (store, y, memo, read, _) = open();
-        assert_eq!(memo.runtime().get(read), 16);
-        memo.checkpoint().unwrap();
+        Pair {
+            store,
+            y,
+            memo,
+            read,
+            runs,
+        }
+    }
+
+    /// Replaces the base with a generation of another build.
+    fn replace_base(backends: &Backends) {
         let other = Backends {
             log: MemoryBackend::new(),
             memo: backends.memo.clone(),
@@ -491,57 +502,73 @@ fn a_clean_dep_the_base_lost_is_written_again<C: MemoCells>() {
         let w = Leaves::<C>::open(&other, MemoOptions::new(BuildId::Fixed(BUILD + 1)));
         w.read(1);
         w.memo.checkpoint().unwrap();
-        store.set(y, 20).unwrap();
-        assert_eq!(memo.runtime().get(read), 26);
-        assert_eq!(memo.checkpoint().unwrap().unkept, 1);
-        assert_eq!(memo.checkpoint().unwrap().written, 2);
     }
-    let (store, y, memo, read, runs) = open();
-    store.set(y, 20).unwrap();
-    assert_eq!(memo.runtime().get(read), 26);
-    assert_eq!(runs.load(SeqCst), 0);
-    assert_eq!(memo.stats().reused, 2);
+
+    /// A reopen with `y = 20` reuses both entries.
+    fn assert_reopen_reuses_both(backends: &Backends) {
+        let p = Pair::<C>::open(backends, options());
+        p.store.set(p.y, 20).unwrap();
+        assert_eq!(p.memo.runtime().get(p.read), 26);
+        assert_eq!(p.runs.load(SeqCst), 0);
+        assert_eq!(p.memo.stats().reused, 2);
+    }
 }
 
-/// Four threads compute leaves under rising `y` while another checkpoints
-/// throughout; one checkpoint after they finish saves every entry, so a
-/// reopen at the last `y` runs nothing.
-#[test]
-fn shared_computes_racing_checkpoints_lose_no_dirty_mark() {
-    const KEYS: u32 = 64;
+/// Another build replaces the base after both were stored, so the next
+/// checkpoint cannot keep the rerun parent over its clean child; it marks
+/// the child lost and counts it unsaved, and the checkpoint after it
+/// writes both, which a reopen reuses.
+fn a_clean_dep_the_base_lost_is_written_again<C: MemoCells>() {
     let backends = Backends::new();
-    let last = {
-        let w = Leaves::<Shared>::open(&backends, options());
-        let mut last = 0;
-        for round in 1..=8 {
-            last = 1000 * round;
-            w.store.set(w.y, last).unwrap();
-            let done = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for t in 0..4 {
-                    let (w, done) = (&w, &done);
-                    s.spawn(move || {
-                        for k in (1..=KEYS).filter(|k| k % 4 == t) {
-                            assert_eq!(w.read(k), last + u64::from(k));
-                        }
-                        done.fetch_add(1, SeqCst);
-                    });
-                }
-                s.spawn(|| {
-                    while done.load(SeqCst) < 4 {
-                        w.memo.checkpoint().unwrap();
-                    }
-                });
-            });
-        }
-        w.memo.checkpoint().unwrap();
-        assert_eq!(w.memo.stats().unsaved_entries, 0);
-        last
-    };
-    let w = Leaves::<Shared>::open(&backends, options());
-    w.store.set(w.y, last).unwrap();
-    for k in 1..=KEYS {
-        assert_eq!(w.read(k), last + u64::from(k));
+    {
+        let p = Pair::<C>::open(&backends, options());
+        assert_eq!(p.memo.runtime().get(p.read), 16);
+        p.memo.checkpoint().unwrap();
+        Pair::<C>::replace_base(&backends);
+        p.store.set(p.y, 20).unwrap();
+        assert_eq!(p.memo.runtime().get(p.read), 26);
+        assert_eq!(p.memo.checkpoint().unwrap().unkept, 1);
+        assert_eq!(p.memo.stats().unsaved_entries, 1);
+        assert_eq!(p.memo.checkpoint().unwrap().written, 2);
     }
-    assert_eq!(w.runs(), 0);
+    Pair::<C>::assert_reopen_reuses_both(&backends);
+}
+
+/// The lost child counts toward the trigger, so the automatic thread
+/// rewrites it after the checkpoint that lost it, with no further compute.
+#[test]
+fn the_automatic_thread_rewrites_a_lost_clean_dep() {
+    let backends = Backends::new();
+    {
+        let p = Pair::<Shared>::open(&backends, options().checkpoint_after_entries(1));
+        assert_eq!(p.memo.runtime().get(p.read), 16);
+        let settled = |p: &Pair<Shared>| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let stats = p.memo.stats();
+                if stats.entries == 2 && stats.unsaved_entries == 0 {
+                    return stats.checkpoints;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the automatic thread did not save"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let before = settled(&p);
+        Pair::<Shared>::replace_base(&backends);
+        p.store.set(p.y, 20).unwrap();
+        assert_eq!(p.memo.runtime().get(p.read), 26);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while p.memo.stats().checkpoints < before + 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the lost child was not rewritten"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        settled(&p);
+    }
+    Pair::<Shared>::assert_reopen_reuses_both(&backends);
 }

@@ -105,9 +105,16 @@ impl Dirty {
         }
     }
 
-    /// Keeps `handle` dirty without counting it as unsaved: an entry the
-    /// backend lost rather than one that computed.
-    pub(crate) fn lost(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) {
+    /// Marks a clean entry the backend lost dirty and counts it as unsaved,
+    /// as a compute would; returns the unsaved count after it.
+    pub(crate) fn lost(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) -> u64 {
+        let key: KeyPart = Arc::new(Encoded(key));
+        self.computed(table, handle, &key)
+    }
+
+    /// Keeps `handle` dirty without counting it as unsaved: an entry a
+    /// checkpoint evicted, which may be evicted again at every checkpoint.
+    pub(crate) fn evicted(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) {
         self.shard(handle)
             .marks
             .entry(handle)
@@ -245,13 +252,25 @@ mod tests {
         let marks = dirty.attempt(|_| true, &mut Vec::new());
         assert_eq!(dirty.unsaved(), 0);
         assert_eq!(dirty.computed(0, h[0], &key()), 1);
-        dirty.lost(0, h[2], Vec::new());
+        dirty.evicted(0, h[2], Vec::new());
         assert_eq!(dirty.unsaved(), 1);
         drop(dirty.saved(h[0], mark(&marks, h[0]).mark));
         drop(dirty.saved(h[1], mark(&marks, h[1]).mark));
         let left = dirty.attempt(|_| true, &mut Vec::new());
         assert_eq!(left.len(), 2);
         assert!(left.iter().any(|r| r.handle == h[0]) && left.iter().any(|r| r.handle == h[2]));
+    }
+
+    #[test]
+    fn a_lost_entry_counts_once_until_the_next_attempt() {
+        let (_rt, h) = handles(2);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        dirty.attempt(|_| true, &mut Vec::new());
+        assert_eq!(dirty.lost(0, h[1], Vec::new()), 1);
+        assert_eq!(dirty.lost(0, h[1], Vec::new()), 1);
+        assert_eq!(dirty.lost(0, h[0], Vec::new()), 2);
+        assert_eq!(dirty.attempt(|_| true, &mut Vec::new()).len(), 2);
     }
 
     #[test]
@@ -273,7 +292,7 @@ mod tests {
         let (_rt, h) = handles(2);
         let dirty = Dirty::new();
         dirty.computed(0, h[0], &key());
-        dirty.lost(0, h[1], Vec::new());
+        dirty.evicted(0, h[1], Vec::new());
         let marks = dirty.attempt(|_| true, &mut Vec::new());
         dirty.carry(&mark(&marks, h[0]));
         dirty.carry(&mark(&marks, h[1]));
