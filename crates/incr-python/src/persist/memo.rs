@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 
 use super::store::PyStore;
 use super::StoreCore;
-use crate::state::{PyCallable, RtState};
+use crate::state::{LocalState, PyCallable, RtState};
 use incr_python_persist::ready;
 
 use crate::{InvalidateRef, PyNodeId, PyRuntimeRef};
@@ -59,7 +59,7 @@ fn memo_fn(
 
 /// The memo closure maker of a store whose runtime state is `state`.
 fn maker(state: RtState) -> impl Fn(Py<PyAny>) -> MemoFn<Local> {
-    move |func| Box::new(memo_fn(state.hold(func)))
+    move |func| Box::new(memo_fn(state.callable(func)))
 }
 
 pub(super) fn declare_table(

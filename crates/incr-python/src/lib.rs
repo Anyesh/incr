@@ -49,7 +49,7 @@ use incr_core::{Local, RoutingFailed};
 use incr_core::{PairOp, StateStats};
 use overlay::{Born, Undo};
 use persist::PyPersistedKeyed;
-use state::{PyCallable, RtState};
+use state::{LocalState, PyCallable, RtState};
 
 use incr_python_persist::ready::{self, _NotReadySignal};
 use incr_python_protocol::notready::{
@@ -399,8 +399,8 @@ impl PyRuntimeRef {
         replay: bool,
     ) -> PyResult<PyNodeId> {
         let (rt, callables) = self.rt_and_state()?;
-        let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
-        let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
+        let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.callable(f))?;
+        let (key, f) = (PyValue(key), query_fn(callables.callable(f)));
         let node = engine_in_query(rt, || rt.child_query_with(key, f, opts))?;
         Ok(PyNodeId { inner: node })
     }
@@ -454,8 +454,8 @@ impl PyNodeTable {
             .borrow()
             .forbid_in_overlay("NodeTable.get_or_insert_query")?;
         let callables = self.state(py);
-        let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.hold(f))?;
-        let (key, f) = (PyValue(key), query_fn(callables.hold(f)));
+        let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.callable(f))?;
+        let (key, f) = (PyValue(key), query_fn(callables.callable(f)));
         let node = self.engine_read(py, |rt| {
             self.inner.get_or_insert_query_with(rt, key, f, opts)
         })?;
@@ -627,7 +627,7 @@ impl PyCollection {
     }
 
     fn filter(&self, py: Python<'_>, predicate: Py<PyAny>) -> PyResult<PyCollection> {
-        let predicate = self.state(py).hold(predicate);
+        let predicate = self.state(py).callable(predicate);
         let filtered = self.engine_read(py, |rt| {
             self.inner.filter(rt, move |val: &PyValue| -> bool {
                 Python::attach(|py| {
@@ -641,7 +641,7 @@ impl PyCollection {
     }
 
     fn map(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyCollection> {
-        let func = self.state(py).hold(func);
+        let func = self.state(py).callable(func);
         let mapped = self.engine_read(py, |rt| {
             self.inner.map(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| {
@@ -680,7 +680,7 @@ impl PyCollection {
     /// element is, counting each not-ready element once and each
     /// `Incomplete` element's `missing`.
     fn reduce(&self, py: Python<'_>, fold_fn: Py<PyAny>) -> PyResult<PyNodeId> {
-        let fold_fn = self.state(py).hold(fold_fn);
+        let fold_fn = self.state(py).callable(fold_fn);
         let node = self.engine_read(py, |rt| {
             self.inner.reduce(rt, move |values: &[PyValue]| -> PyValue {
                 Python::attach(|py| {
@@ -711,7 +711,7 @@ impl PyCollection {
         combine: Py<PyAny>,
     ) -> PyResult<PyNodeId> {
         let callables = self.state(py);
-        let (lift, combine) = (callables.hold(lift), callables.hold(combine));
+        let (lift, combine) = (callables.callable(lift), callables.callable(combine));
         let lifted_identity = identity.clone_ref(py);
         let node = self.engine_read(py, |rt| {
             self.inner.aggregate(
@@ -738,7 +738,7 @@ impl PyCollection {
     }
 
     fn sort_by_key(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PySortedCollection> {
-        let key_fn = self.state(py).hold(key_fn);
+        let key_fn = self.state(py).callable(key_fn);
         let sorted = self.engine_read(py, |rt| {
             self.inner.sort_by_key(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| {
@@ -759,7 +759,7 @@ impl PyCollection {
     }
 
     fn group_by(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PyGroupedCollection> {
-        let key_fn = self.state(py).hold(key_fn);
+        let key_fn = self.state(py).callable(key_fn);
         let grouped = self.engine_read(py, |rt| {
             self.inner.group_by(rt, move |val: &PyValue| -> PyValue {
                 Python::attach(|py| {
@@ -787,7 +787,7 @@ impl PyCollection {
         right_key: Py<PyAny>,
     ) -> PyResult<PyCollection> {
         let callables = self.state(py);
-        let (left_key, right_key) = (callables.hold(left_key), callables.hold(right_key));
+        let (left_key, right_key) = (callables.callable(left_key), callables.callable(right_key));
         let (joined_node, mapped) = self.engine_read(py, |rt| {
             let joined = self.inner.join(
                 rt,
@@ -1651,7 +1651,7 @@ impl PyRuntime {
     /// value changed since the last firing.
     fn observe(&self, node: PyNodeId, callback: Py<PyAny>) -> PyResult<PyObserverId> {
         self.forbid_in_overlay("observe")?;
-        let callback = self.state.hold(callback);
+        let callback = self.state.callable(callback);
         let id = self.engine_read(|rt| {
             rt.observe(node.inner, move |v: &PyValue| {
                 Python::attach(|py| {
@@ -1687,8 +1687,8 @@ impl PyRuntime {
         replay: bool,
         label: Option<String>,
     ) -> PyResult<PyNodeId> {
-        let opts = query_opts(py, fallback, fixpoint, replay, |f| self.state.hold(f))?;
-        let f = query_fn(self.state.hold(py_func));
+        let opts = query_opts(py, fallback, fixpoint, replay, |f| self.state.callable(f))?;
+        let f = query_fn(self.state.callable(py_func));
         let node = self.engine_read(|rt| rt.create_query_with(f, opts))?;
         self.state.journal(|overlay| overlay.created(node.erase()));
         if let Some(label) = label {

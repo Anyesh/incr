@@ -19,6 +19,7 @@ mod memory;
 pub mod overlay;
 pub mod ready;
 pub mod scope;
+pub mod state;
 pub mod store;
 
 #[doc(hidden)]
