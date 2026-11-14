@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use incr_persist::memo::{BuildId, MemoBuilder, MemoOptions, MemoryMemo};
 use incr_persist::{MemoryBackend, Options, PersistedKeyed, Shared, Store, ValueScope};
 
+/// The memo module's batch size: each batch of entries takes about five
+/// holds (one to encode, one to inspect, three to map its row deps).
+const BATCH: usize = 256;
+
 struct ScopeMarker;
 
 static HOLDS: AtomicUsize = AtomicUsize::new(0);
@@ -104,7 +108,7 @@ fn an_automatic_checkpoint_runs_its_value_code_in_a_few_holds() {
     assert_eq!(OUTSIDE.load(Ordering::SeqCst), 0);
     assert!(HELD.load(Ordering::SeqCst) >= 6 * entries as usize);
     assert!(
-        HOLDS.load(Ordering::SeqCst) <= checkpoints * entries as usize / 50,
+        HOLDS.load(Ordering::SeqCst) <= checkpoints * (entries as usize).div_ceil(BATCH) * 6,
         "{} holds for {checkpoints} checkpoints of {entries} entries",
         HOLDS.load(Ordering::SeqCst)
     );

@@ -211,8 +211,8 @@ pub fn inspect<T: Value, C: Cells>(rt: &Runtime<C>, q: Incr<T>) -> Option<Inspec
 /// call of `stretch`, which must run its argument exactly once on this
 /// thread (a binding takes its value-code lock around it). The stretch
 /// holds no engine lock. A value read but refused by the second read goes
-/// to `bag`. Panics inside a compute of `rt`, or if `stretch` does not run
-/// its argument.
+/// to `bag`. `stretch` is not called when no query is Clean. Panics inside
+/// a compute of `rt`, or if `stretch` does not run its argument.
 pub fn inspect_many<T: Value, C: Cells>(
     rt: &Runtime<C>,
     qs: &[Incr<T>],

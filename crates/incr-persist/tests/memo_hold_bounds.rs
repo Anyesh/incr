@@ -135,3 +135,66 @@ fn a_thousand_row_deps_map_in_bounded_holds() {
     let most = MOST_IN_A_HOLD.load(Ordering::SeqCst);
     assert!(most <= 512, "{most} value calls in one hold");
 }
+
+/// A hold that runs no value call was taken for nothing. Every entry in
+/// the tests below has a key and a value that some hold encodes, so an
+/// empty hold is a mapping or inspect hold that had no value to cover.
+fn assert_no_hold_was_empty() {
+    let empty = EMPTY_HOLDS.load(Ordering::SeqCst);
+    assert_eq!(empty, 0, "{empty} holds ran no value call");
+}
+
+/// Entries read only queries, so none maps a row dep, while a collection
+/// is declared and one of its keys has a version input: the row source
+/// finds no row for any dep and takes no hold.
+#[test]
+fn query_deps_next_to_a_keyed_collection_take_no_mapping_hold() {
+    let fx = fixture();
+    fx.store
+        .reconcile(&fx.rows, (0..4).map(|k| (Probe(k), Probe(k))))
+        .unwrap();
+    let read = fx.rows.clone();
+    let reader = fx
+        .store
+        .runtime()
+        .create_query(move |rt| read.get_key(rt, &Probe(0)));
+    fx.store.runtime().get(reader);
+    assert!(fx.rows.version_input(&Probe(0)).is_some());
+    let mut tables = None;
+    let memo = open(&fx, |builder| {
+        let leaf = builder.table::<Probe, Probe>("leaf", 1);
+        let top = builder.table::<Probe, Probe>("top", 1);
+        builder.define(leaf, |_, k: &Probe| Probe(k.0 + 1));
+        builder.define(top, move |ctx, k: &Probe| ctx.get(leaf, Probe(k.0)));
+        tables = Some(top);
+    });
+    for k in 0..4 {
+        let node = memo.get_or_insert(tables.unwrap(), Probe(k));
+        memo.runtime().get(node);
+    }
+    memo.checkpoint().unwrap();
+    assert_no_hold_was_empty();
+}
+
+/// Every entry of the batch was invalidated after it ran, so the
+/// checkpoint's inspect finds none Clean and takes no hold.
+#[test]
+fn a_batch_of_dirty_entries_takes_no_inspect_hold() {
+    let fx = fixture();
+    let mut table = None;
+    let memo = open(&fx, |builder| {
+        let entry = builder.table::<Probe, Probe>("entry", 1);
+        builder.define(entry, |ctx, k: &Probe| {
+            Probe(k.0.wrapping_add(ctx.external("n") as u32))
+        });
+        table = Some(entry);
+    });
+    memo.set_external("n", 1);
+    for k in 0..4 {
+        let node = memo.get_or_insert(table.unwrap(), Probe(k));
+        memo.runtime().get(node);
+    }
+    memo.set_external("n", 2);
+    memo.checkpoint().unwrap();
+    assert_no_hold_was_empty();
+}

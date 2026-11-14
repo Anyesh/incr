@@ -185,7 +185,7 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let mut values: Vec<Option<T>> = Vec::with_capacity(qs.len());
-        stretch(&mut || {
+        let mut read_values = || {
             values.clear();
             values.extend(qs.iter().zip(&first).map(|(q, first)| {
                 first.as_ref()?;
@@ -201,7 +201,12 @@ impl<C: Cells> Runtime<C> {
                 let arena = self.arenas.tagged_arena::<T>(type_tag)?;
                 value_code::run(|| arena.try_read(arena_slot))
             }));
-        });
+        };
+        if first.iter().any(Option::is_some) {
+            stretch(&mut read_values);
+        } else {
+            values.extend(qs.iter().map(|_| None));
+        }
         assert_eq!(
             values.len(),
             qs.len(),

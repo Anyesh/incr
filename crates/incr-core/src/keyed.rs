@@ -1432,7 +1432,7 @@ where
     /// the version map, with every key cloned inside the one call of
     /// `stretch`, which must run its argument exactly once on this thread
     /// (a binding takes its value-code lock around it). Panics if it does
-    /// not.
+    /// not. `stretch` is not called when no handle is a version input.
     pub fn keys_of_versions(
         &self,
         handles: &[ErasedIncr],
@@ -1443,6 +1443,9 @@ where
             return handles.iter().map(|_| None).collect();
         }
         let map = self.versions.map.read();
+        if !handles.iter().any(|h| map.by_handle.contains_key(h)) {
+            return handles.iter().map(|_| None).collect();
+        }
         let mut keys = Vec::with_capacity(handles.len());
         stretch(&mut || {
             keys.clear();
