@@ -67,7 +67,7 @@ pub(crate) fn map_live<C: Cells>(
     for (collection, rows) in map.all_rows() {
         if let Some(row) = rows_of::<C>(rows).live_row(dep) {
             return match (row, trusted(map, collection)) {
-                (Ok((key_bytes, fp)), true) => LiveDep::Stored(StoredDep::Row {
+                (Ok(Some((key_bytes, fp))), true) => LiveDep::Stored(StoredDep::Row {
                     collection: collection.to_owned(),
                     key_bytes,
                     fp,

@@ -931,6 +931,31 @@ fn a_key_read_before_the_memo_opens_still_maps<C: MemoCells>() {
     assert_eq!(p.memo.stats().reused, 1);
 }
 
+/// A scope's upsert and its undo by another upsert leave the key's row
+/// as logged but at the default rank, which no logged pair has; an entry
+/// reading it must not checkpoint as reading the logged row, or a later
+/// logged removal would leave it verified against an absent key.
+fn a_row_restored_in_a_scope_at_the_default_rank_does_not_checkpoint<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    {
+        let p = Priced::<C>::open(&log, &memo);
+        p.store.upsert(&p.kc, 1, s("a")).unwrap();
+        let rt = p.store.runtime();
+        let scope = p.store.unlogged_scope().unwrap();
+        let overlay = scope.keyed(&p.kc).unwrap();
+        overlay.upsert(rt, 1, s("b"));
+        overlay.upsert(rt, 1, s("a"));
+        scope.close().unwrap();
+        assert_eq!(p.kc.row(&1), Some(s("a")));
+        assert_eq!(p.read(1), Some(s("a")));
+        p.memo.checkpoint().unwrap();
+        p.store.remove(&p.kc, &1).unwrap();
+    }
+    let p = Priced::<C>::open(&log, &memo);
+    assert_eq!(p.read(1), None);
+    assert_eq!(p.runs(), 1);
+}
+
 macro_rules! memo_local_and_shared {
     ($($name:ident),* $(,)?) => {
         $(
@@ -953,4 +978,5 @@ memo_local_and_shared!(
     row_deps_verify_after_reopen_while_rows_match,
     a_changed_row_reruns_and_a_removed_key_runs_after_reopen,
     a_key_read_before_the_memo_opens_still_maps,
+    a_row_restored_in_a_scope_at_the_default_rank_does_not_checkpoint,
 );

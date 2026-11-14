@@ -23,17 +23,19 @@ const REPAIR_ROUNDS: usize = 3;
 type Core<K, V, C, P> = KeyedCollection<K, V, C, P, u128>;
 type Ranked<P> = (P, u128);
 
-/// The fingerprint a [`StoredDep::Row`](crate::memo::StoredDep::Row)
-/// stores for a key holding no row.
-pub(crate) const ABSENT_ROW_FP: u128 = 0;
+/// The rank `KeyedCollection::upsert` and `reconcile` give a pair, which
+/// an unlogged scope's writes leave behind: no logged bytes back it.
+const UNLOGGED_RANK: u128 = 0;
 
 /// What a memo maps of a keyed collection's `get_key` reads. A row's
 /// fingerprint is the rank of the pair read for its key: the fingerprint
-/// of the bytes that pair was applied from.
+/// of the bytes that pair was applied from, `None` for a key holding no
+/// row.
 pub(crate) trait RowSource<C: Cells>: Send + Sync {
     /// For a version input of this collection, its key's bytes and its
-    /// row's fingerprint; `None` for any other node.
-    fn live_row(&self, dep: ErasedIncr) -> Option<Result<(Vec<u8>, u128)>>;
+    /// row's fingerprint, or `Ok(None)` when its row is not a logged one;
+    /// `None` for any other node.
+    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<(Vec<u8>, Option<u128>)>>>;
 
     /// The version input of the key `key_bytes` encode, created if no read
     /// created it; `None` when they do not decode. Takes the version lock,
@@ -43,7 +45,7 @@ pub(crate) trait RowSource<C: Cells>: Send + Sync {
     /// The version input of the key `key_bytes` encode and whether its
     /// row's fingerprint is `fp`; `None` when it has none or they do not
     /// decode.
-    fn stored_row(&self, key_bytes: &[u8], fp: u128) -> Option<(ErasedIncr, bool)>;
+    fn stored_row(&self, key_bytes: &[u8], fp: Option<u128>) -> Option<(ErasedIncr, bool)>;
 }
 
 /// A [`RowSource`] as a `DepIndex` holds it, behind `Any`.
@@ -94,8 +96,13 @@ where
     C: Cells,
     P: Pair<K, V> + PersistValue,
 {
-    fn row_fp(&self, key: &K) -> u128 {
-        self.keyed.read_rank(key).unwrap_or(ABSENT_ROW_FP)
+    /// The fingerprint of `key`'s row, `Some(None)` for no row, and `None`
+    /// for a row an unlogged write left at [`UNLOGGED_RANK`].
+    fn row_fp(&self, key: &K) -> Option<Option<u128>> {
+        match self.keyed.read_rank(key) {
+            Some(UNLOGGED_RANK) => None,
+            rank => Some(rank),
+        }
     }
 
     fn decode_key(&self, key_bytes: &[u8]) -> Option<K> {
@@ -110,9 +117,12 @@ where
     C: Cells,
     P: Pair<K, V> + PersistValue,
 {
-    fn live_row(&self, dep: ErasedIncr) -> Option<Result<(Vec<u8>, u128)>> {
+    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<(Vec<u8>, Option<u128>)>>> {
         let key = self.keyed.key_of_version(dep)?;
-        Some(encode(&self.key, &key).map(|bytes| (bytes, self.row_fp(&key))))
+        let Some(fp) = self.row_fp(&key) else {
+            return Some(Ok(None));
+        };
+        Some(encode(&self.key, &key).map(|bytes| Some((bytes, fp))))
     }
 
     fn prepare(&self, rt: &Runtime<C>, key_bytes: &[u8]) -> Option<ErasedIncr> {
@@ -120,10 +130,10 @@ where
         Some(self.keyed.version_input_or_create(rt, &key).erase())
     }
 
-    fn stored_row(&self, key_bytes: &[u8], fp: u128) -> Option<(ErasedIncr, bool)> {
+    fn stored_row(&self, key_bytes: &[u8], fp: Option<u128>) -> Option<(ErasedIncr, bool)> {
         let key = self.decode_key(key_bytes)?;
         let handle = self.keyed.version_input(&key)?;
-        Some((handle.erase(), self.row_fp(&key) == fp))
+        Some((handle.erase(), self.row_fp(&key) == Some(fp)))
     }
 }
 

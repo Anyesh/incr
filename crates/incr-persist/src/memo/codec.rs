@@ -77,11 +77,11 @@ pub enum StoredDep {
     /// One key of a Store keyed collection, read through `get_key`:
     /// `key_bytes` encode the key under the collection's key, and `fp` is
     /// the fingerprint of the bytes the pair read for it was applied from,
-    /// or a constant for a key holding no row.
+    /// `None` for a key holding no row.
     Row {
         collection: String,
         key_bytes: Vec<u8>,
-        fp: u128,
+        fp: Option<u128>,
     },
 }
 
