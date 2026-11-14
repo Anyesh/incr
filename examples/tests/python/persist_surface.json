@@ -1,0 +1,1034 @@
+{
+ "incr.Collection": {
+  "bases": [
+   "object"
+  ],
+  "doc": null,
+  "members": {
+   "aggregate": {
+    "doc": "Incrementally maintained monoid fold: `lift` maps an element into\nthe aggregate domain, `combine` merges two aggregates, `identity`\nis the unit. O(log n) per change; see the Rust docs for the\nassociativity contract.\nNot-ready elements are left out and counted as for `reduce`, and\n`lift` and `combine` never see a not-ready or `Incomplete` value.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, identity, lift, combine)"
+   },
+   "count": {
+    "doc": "The number of ready elements, `Incomplete` with the number of\nnot-ready and `Incomplete` elements when there are any.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "delete": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, value)"
+   },
+   "extend": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, rows)"
+   },
+   "filter": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, predicate)"
+   },
+   "group_by": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, key_fn)"
+   },
+   "insert": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, value)"
+   },
+   "join": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, right, left_key, right_key)"
+   },
+   "map": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, func)"
+   },
+   "reduce": {
+    "doc": "`fold_fn` of the list of rows, with not-ready elements left out\nand an `Incomplete` element's `value` in; `Incomplete` when any\nelement is, counting each not-ready element once and each\n`Incomplete` element's `missing`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, fold_fn)"
+   },
+   "replace": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, old, new)"
+   },
+   "snapshot_len": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "sort_by_key": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, key_fn)"
+   },
+   "version_node": {
+    "doc": "",
+    "kind": "getset_descriptor"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.Incomplete": {
+  "bases": [
+   "object"
+  ],
+  "doc": "`value` computed with `missing` contributions left out because they\nwere not ready. Through queries `missing` counts contributions: a query\nreading two totals that both miss one element reports 2. A collection\ntotal counts distinct elements.",
+  "members": {
+   "__eq__": {
+    "doc": "Return self==value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ge__": {
+    "doc": "Return self>=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__gt__": {
+    "doc": "Return self>value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__hash__": {
+    "doc": "Return hash(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "__le__": {
+    "doc": "Return self<=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__lt__": {
+    "doc": "Return self<value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ne__": {
+    "doc": "Return self!=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "__repr__": {
+    "doc": "Return repr(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "missing": {
+    "doc": "",
+    "kind": "getset_descriptor"
+   },
+   "value": {
+    "doc": "",
+    "kind": "member_descriptor"
+   }
+  },
+  "signature": "(value, missing)"
+ },
+ "incr.KeyedCollection": {
+  "bases": [
+   "object"
+  ],
+  "doc": "Rows by key: a collection of `(key, row)` pairs holding at most one row\nper key, with keys matched as a dict matches them. `collection` is the\nrows as a `Collection`, for the operators.\n\nRows must be hashable. A change hashes each added pair's row in the pair\ncollection, and each added or removed row again in `collection`'s output\nstaging, which also runs one row `__eq__` per removed row; before Python\n3.14, which caches a tuple's hash, a removed pair's row is hashed in the\npair collection too. So an upsert that inserts pays two row `__hash__`\ncalls, one that replaces pays three (four before 3.14) and two row\n`__eq__` against the held row, and one with an `==` row changes nothing.\n\nKey and row methods run as value code: one that calls into incr during\nan operation on the collection raises `RuntimeError`, which the\noperation raises, changing nothing.\n\n`label` names the collection's group in `Runtime.graph_summary`: it\nlabels the pair and row collections' version nodes, and the group\nreports the key count as `\"keys\"`.",
+  "members": {
+   "__contains__": {
+    "doc": "Return bool(key in self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, key, /)"
+   },
+   "__len__": {
+    "doc": "Return len(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "collection": {
+    "doc": "",
+    "kind": "getset_descriptor"
+   },
+   "get": {
+    "doc": "The row held for `key`, or `None`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key)"
+   },
+   "items": {
+    "doc": "A new list of the held `(key, row)` tuples, in no particular order.\nRegisters no dependency, like `get`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "keys": {
+    "doc": "A new list of the held keys, in no particular order. Registers no\ndependency, like `get`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "reconcile": {
+    "doc": "Make the held rows equal `rows`, a mapping or an iterable of\n`(key, row)` pairs (a later pair for a key wins), in one atomic\nchange. Returns how many keys were `(inserted, replaced, removed)`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, rows)"
+   },
+   "remove": {
+    "doc": "Remove `key`'s pair. Raises `KeyError` if no row is held for it.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key)"
+   },
+   "upsert": {
+    "doc": "Hold `row` for `key`: nothing happens if the held row is `==` to\nit, otherwise the pair is replaced or inserted.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key, row)"
+   }
+  },
+  "signature": "(runtime, label=None)"
+ },
+ "incr.LookupFailed": {
+  "bases": [
+   "NotReady"
+  ],
+  "doc": "A lookup that failed for `reason`.",
+  "members": {
+   "__eq__": {
+    "doc": "Return self==value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ge__": {
+    "doc": "Return self>=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__gt__": {
+    "doc": "Return self>value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__hash__": {
+    "doc": "Return hash(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "__le__": {
+    "doc": "Return self<=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__lt__": {
+    "doc": "Return self<value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ne__": {
+    "doc": "Return self!=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "__repr__": {
+    "doc": "Return repr(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "key": {
+    "doc": "",
+    "kind": "member_descriptor"
+   },
+   "reason": {
+    "doc": "",
+    "kind": "member_descriptor"
+   }
+  },
+  "signature": "(reason, key=None)"
+ },
+ "incr.NotReady": {
+  "bases": [
+   "object"
+  ],
+  "doc": "The base of every value standing for a result that is not ready.",
+  "members": {},
+  "signature": "()"
+ },
+ "incr.Overlay": {
+  "bases": [
+   "object"
+  ],
+  "doc": "`with rt.overlay() as ov:` runs candidate changes against the live\ngraph and puts the base graph back exactly on exit, also when the body\nraises. Mutations journal their inverse; operations that cannot be\nundone raise inside the block. Inverses re-run user `Hash` and `Eq`, so\nthose must be deterministic and must not raise; if one does, the\nruntime is poisoned and only `close` still works. A restored collection\nmay hold its elements in another order, so `aggregate` combines must be\nassociative and commutative, `sort_by_key` output is exact up to the\norder among equal keys, and `group_by` keeps a group a candidate\nemptied or created.",
+  "members": {
+   "__enter__": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "__exit__": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, _exc_type=None, _exc=None, _tb=None)"
+   },
+   "get": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "get_with_status": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "set": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, node, value)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.Pending": {
+  "bases": [
+   "NotReady"
+  ],
+  "doc": "A result still being fetched, for `key` when it came from a lookup.",
+  "members": {
+   "__eq__": {
+    "doc": "Return self==value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ge__": {
+    "doc": "Return self>=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__gt__": {
+    "doc": "Return self>value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__hash__": {
+    "doc": "Return hash(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "__le__": {
+    "doc": "Return self<=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__lt__": {
+    "doc": "Return self<value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ne__": {
+    "doc": "Return self!=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "__repr__": {
+    "doc": "Return repr(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "key": {
+    "doc": "",
+    "kind": "member_descriptor"
+   }
+  },
+  "signature": "(key=None)"
+ },
+ "incr.Runtime": {
+  "bases": [
+   "object"
+  ],
+  "doc": "",
+  "members": {
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "close": {
+    "doc": "Drop the engine and everything it holds: values, closures and the\nPython objects they capture. Every later call on this runtime or an\nobject derived from it raises. Refused while a call on it is running,\nand for the runtime of a store, which `store.close()` closes.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "compute_stats": {
+    "doc": "`{group: {\"recomputed\", \"cutoff\", \"verified\", \"elapsed_ns\"}}`\ncounted since stats were enabled or last reset, grouped by the\nlabel up to its first `/` (`None` for unlabelled nodes).\n`recomputed` counts every run that landed, `cutoff` those whose\nvalue was equal, and `elapsed_ns` closure time net of nested\ncomputes. `reset=True` zeroes the counts after reading them.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, reset=False)"
+   },
+   "create_collection": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "create_input": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, value)"
+   },
+   "create_lookup": {
+    "doc": "The lookup node for `key`: an input created as `Pending(key)`, and\nqueued for `drain_pending_lookups`, the first time `key` is asked\nfor here or through `RuntimeRef.lookup`. No query owns it, so it\nkeeps its value when the queries reading it stop.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key)"
+   },
+   "create_query": {
+    "doc": "A query computing `py_func(runtime_ref)`. `fallback(ids)` or a\n`Fixpoint` resolves a cycle through it; `replay=True` lets a read\npast the frame budget replay instead of nesting.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, py_func, *, fallback=None, fixpoint=None, replay=False, label=None)"
+   },
+   "create_table": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "delete_node": {
+    "doc": "Delete a node and recycle its slot. Every surviving handle to it\nraises on use. The node must have no dependents.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "delete_with_dependents": {
+    "doc": "Delete the node, every node that depends on it (transitively)\nand every node an operator created for them. Returns how many\nnodes were deleted; 0 if the node was already gone. A query that\nhas never run is not reached, and raises as stale on first use.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "drain_dirtied_watched": {
+    "doc": "The watched nodes a change moved off Clean since the last drain,\neach once, in the order the changes reached them. A node deleted\nsince is left out.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "drain_pending_lookups": {
+    "doc": "The keys queued since the last drain whose lookup is still\n`Pending`, each once.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "enable_compute_stats": {
+    "doc": "Starts or stops compute stats, which count per node the runs that\nlanded a value, those cut off, the verifications that found it\nclean and its closure time. Off by default.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, on)"
+   },
+   "fail_lookup": {
+    "doc": "Set `key`'s lookup to `LookupFailed(reason, key)`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key, reason)"
+   },
+   "get": {
+    "doc": "The node's value: a `NotReady` value as stored, and an `Incomplete`\nvalue's `value`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "get_traced": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "get_with_status": {
+    "doc": "`(value, status)`: the value `get` returns, and `None`, the\n`NotReady` value, or the `Incomplete` value.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "graph_snapshot": {
+    "doc": "The graph as a list of `{\"id\", \"kind\", \"label\", \"dependencies\",\n\"dependents\"}` dicts. With any argument given, a breadth-first walk\nfrom `roots` (node handles or collections) returns\n`{\"nodes\": [...], \"truncated\": bool}` instead: `direction` is\n`\"dependencies\"` (default), `\"dependents\"` or `\"both\"`; `depth`\ncounts edges from a root; `label_prefix` filters the returned nodes\nwhile the walk still passes through the others; `limit` caps them.\nEach returned node keeps its full dependency and dependent lists.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, roots=None, *, direction=None, depth=None, label_prefix=None, limit=None)"
+   },
+   "graph_summary": {
+    "doc": "`{\"groups\": [{\"label\", \"kind\", \"nodes\"}], \"edges\": [{\"from\", \"to\",\n\"count\"}]}` over the live graph, grouped by the label up to its\nfirst `/` (`None` for unlabelled nodes); `kind` is \"input\",\n\"compute\" or \"mixed\". An edge inside one group has `from == to`.\nA group a labelled `KeyedCollection` names also has `\"keys\"`, the\ncollection's key count (summed over such collections). Walks every\nnode under the engine's read lock, so the cost is linear in the\nnode count.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "is_alive": {
+    "doc": "True while the node exists in this runtime. False after it is\ndeleted, and for a node from another runtime.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "memory_stats": {
+    "doc": "Memory held by this runtime: `{\"bytes\", \"nodes\", \"py_refs\",\n\"by_kind\", \"by_label\"}`. `bytes` estimates what the engine holds from\nsizes and capacities (node slots, values' own slots, closures' captures,\ndependency lists, labels, collection logs and operator state); the\nPython objects themselves are not in it. `py_refs` counts the\nreferences the engine holds to Python objects: node values,\ncollection elements and logged changes, operator state, keyed\nindexes, and every callable handed to it, but not the engine's own\ncopies of a `window`'s windows. `by_kind` splits nodes into \"input\",\n\"query\" and \"collection\" (a collection's version node), and puts all\ncollection and operator state under \"collection\". `by_label` totals\nlabelled nodes by the label up to its first `/`, with a collection's\nstate under the label of its `version_node`; callables are not\nattributed to labels. Walks the whole graph; nothing is counted\nbetween calls.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "node_count": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "observe": {
+    "doc": "Register `callback` to fire on `stabilize()` whenever the node's\nvalue changed since the last firing.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node, callback)"
+   },
+   "overlay": {
+    "doc": "Run candidate changes against the live graph and put it back\nexactly on exit; see `Overlay`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "resolve_lookups": {
+    "doc": "Set each lookup to its value, from a mapping or an iterable of\n`(key, value)` pairs, creating the ones not asked for yet. Not\natomic: if a key's `__hash__` or `__eq__` raises, the keys before it\nare set.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, values)"
+   },
+   "retry_lookups": {
+    "doc": "Set each key's lookup back to `Pending(key)` and queue it again.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, keys)"
+   },
+   "set": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, node, value)"
+   },
+   "set_label": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, node, label)"
+   },
+   "set_label_by_id": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, id, label)"
+   },
+   "set_max_frames": {
+    "doc": "The frame budget past which a replayable query's read replays.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, n)"
+   },
+   "set_max_stack_bytes": {
+    "doc": "A stack budget in bytes beside the frame budget; 0 turns it off.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, n)"
+   },
+   "set_placeholder": {
+    "doc": "The value a replayed read returns in place of the node it wanted.\nSet once per runtime.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, value)"
+   },
+   "stabilize": {
+    "doc": "Bring observed nodes up to date and fire callbacks for changed\nvalues.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "status": {
+    "doc": "The status `get_with_status` gives.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "try_delete_node": {
+    "doc": "Delete the node and the nodes it owns only if none of them has a\ndependent. Raises `HasDependentsError` (deleting nothing) if one\ndoes, and `KeyError` if the node is not alive.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "try_get": {
+    "doc": "Like `get`, but a cycle that leaves the node without a value raises\n`CycleError` as an ordinary exception.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "unobserve": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, id)"
+   },
+   "unwatch": {
+    "doc": "Stop reporting the node, and drop its pending report.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "watch": {
+    "doc": "Report the node through `drain_dirtied_watched()` whenever a change\nmoves it off Clean. A node that has no current value when watched\nis reported at once.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.RuntimeRef": {
+  "bases": [
+   "object"
+  ],
+  "doc": "Read-only runtime handle passed to query closures. The pointer is\nnulled out after the callback returns to make stale captures fail\nloudly rather than silently corrupt memory.",
+  "members": {
+   "child_input": {
+    "doc": "The input child named `key` of this query, created with `init()`\nthe first time this query asks for it. Children this query stops\nasking for are deleted when it next lands.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key, init)"
+   },
+   "child_query": {
+    "doc": "The query child named `key`, created with `f` the first time, like\n`child_input`; the options apply only when the call creates it.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key, f, *, fallback=None, fixpoint=None, replay=False)"
+   },
+   "get": {
+    "doc": "The node's value. A `NotReady` value makes this query's value that\nvalue; an `Incomplete` one gives its `value` and makes this query's\nvalue `Incomplete`, with every `missing` it read added up.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "get_status": {
+    "doc": "`(value, status)` as `Runtime.get_with_status` gives them, with\nneither rule of `get` applied.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   },
+   "lookup": {
+    "doc": "The value of `key`'s lookup (see `Runtime.create_lookup`), read as\n`get` reads a node: `Pending` makes this query's value `Pending`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key)"
+   },
+   "memo": {
+    "doc": "The value of `table`'s entry for `key` (see `Store.memo_table`),\nrestored from the memo or computed, read as `get` reads a node.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, table, key)"
+   },
+   "try_get": {
+    "doc": "Like `get`, but a cycle that leaves the node without a value\nraises `CycleError` as an ordinary exception the query may catch.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.Unavailable": {
+  "bases": [
+   "NotReady"
+  ],
+  "doc": "A value withheld for `reason`. As a collection element, `row` is the\nelement it stands in for: keyed operators key on it, and `map` and\n`filter` apply to it.",
+  "members": {
+   "__eq__": {
+    "doc": "Return self==value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ge__": {
+    "doc": "Return self>=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__gt__": {
+    "doc": "Return self>value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__hash__": {
+    "doc": "Return hash(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "__le__": {
+    "doc": "Return self<=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__lt__": {
+    "doc": "Return self<value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__ne__": {
+    "doc": "Return self!=value.",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, value, /)"
+   },
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "__repr__": {
+    "doc": "Return repr(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "reason": {
+    "doc": "",
+    "kind": "member_descriptor"
+   },
+   "row": {
+    "doc": "",
+    "kind": "member_descriptor"
+   }
+  },
+  "signature": "(reason, row=None)"
+ },
+ "incr.persist.Batch": {
+  "bases": [
+   "object"
+  ],
+  "doc": "The writes collected inside `with store.batch() as b:`.\n\nKeyed writes compose per key against the rows each key held when first\nstaged, so `b.upsert` twice on one key, or `b.upsert` then `b.remove`,\nleave exactly the final pair, and `b.remove` raises `KeyError` for a\nkey neither held nor staged. The collection takes the staged keys only\nonce the append has landed.",
+  "members": {
+   "__enter__": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "__exit__": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, exc_type, _exc, _traceback)"
+   },
+   "delete": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, collection, row)"
+   },
+   "insert": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, collection, row)"
+   },
+   "reconcile": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, rows)"
+   },
+   "remove": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, key)"
+   },
+   "replace": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, collection, old, new)"
+   },
+   "set": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, node, value)"
+   },
+   "upsert": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, key, row)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.persist.Busy": {
+  "bases": [
+   "PersistError"
+  ],
+  "doc": "Another handle holds the memo checkpoint lock or has written a newer generation: the checkpoint wrote nothing and can be retried.",
+  "members": {},
+  "signature": null
+ },
+ "incr.persist.InvalidCompaction": {
+  "bases": [
+   "PersistError"
+  ],
+  "doc": "`compact(upto, ..)` was given an `upto` below the snapshot position or beyond the tail; constructed as `InvalidCompaction(upto, snapshot_at, tail)`.",
+  "members": {},
+  "signature": null
+ },
+ "incr.persist.Memo": {
+  "bases": [
+   "object"
+  ],
+  "doc": "An open memo: `memo.get_or_insert(table, key)` gives an entry's node, and\n`memo.checkpoint()` writes the live entries to the backend.",
+  "members": {
+   "checkpoint": {
+    "doc": "Writes every live entry whose dependencies are persisted to the\nbackend as the next generation, and returns how many it `written`,\n`merged` from the previous generation, `evicted` and so on. Raises\n`Busy` when another handle is checkpointing. Raises `ValueError`\nnaming the table when an entry's key or value did not round-trip\nthrough its codec: the generation was still written, without that\nentry, which is recomputed on the next run.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "get_or_insert": {
+    "doc": "The node of `table`'s entry for `key`: the live one, or one restored\nfrom the memo, or a new one. Read it with `runtime.get`. Inside an\noverlay it computes fresh and records nothing, so no candidate value\nis restored from the memo or reaches it.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, table, key)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.persist.MemoTable": {
+  "bases": [
+   "object"
+  ],
+  "doc": "A memo table of a store: pass it to `memo.get_or_insert` and\n`ctx.memo`.",
+  "members": {
+   "__repr__": {
+    "doc": "Return repr(self).",
+    "kind": "wrapper_descriptor",
+    "signature": "(self, /)"
+   },
+   "name": {
+    "doc": "",
+    "kind": "getset_descriptor"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.persist.MemoryBackend": {
+  "bases": [
+   "object"
+  ],
+  "doc": "A log held in process memory: the reference implementation of the\nbackend protocol, for tests and development. Stores opened on the same\nobject share its log; `read_only()` gives a handle that cannot write.",
+  "members": {
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "append": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, records)"
+   },
+   "compact": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, upto, folded)"
+   },
+   "load_snapshot": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "read_from": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, after)"
+   },
+   "read_only": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "snapshot_id": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "sync": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, upto)"
+   },
+   "writable": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.persist.MemoryMemo": {
+  "bases": [
+   "object"
+  ],
+  "doc": "A memo store held in process memory: the reference implementation of\nthe memo backend protocol, for tests and development. Stores opened on\nthe same object share its generations.",
+  "members": {
+   "__new__": {
+    "doc": "Create and return a new object.  See help(type) for accurate signature.",
+    "kind": "builtin_function_or_method",
+    "signature": "(*args, **kwargs)"
+   },
+   "load": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "lock_checkpoint": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "read_entry": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, generation, item)"
+   },
+   "remove_generation": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, generation)"
+   },
+   "write_generation": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, base, generation, header, entries)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.persist.MemoryMemoGuard": {
+  "bases": [
+   "object"
+  ],
+  "doc": null,
+  "members": {
+   "release": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.persist.PersistError": {
+  "bases": [
+   "RuntimeError"
+  ],
+  "doc": "A store or backend failure that no Python exception describes better.",
+  "members": {},
+  "signature": null
+ },
+ "incr.persist.ReadOnly": {
+  "bases": [
+   "PersistError"
+  ],
+  "doc": "A write reached a handle opened read-only.",
+  "members": {},
+  "signature": null
+ },
+ "incr.persist.Store": {
+  "bases": [
+   "object"
+  ],
+  "doc": "Persisted inputs and collections over a backend, and the runtime that\nreads them.\n\n`store.input(key, default, codec)` and `store.collection(key, codec)`\ndeclare a key and return its node or `Collection`; `codec` is any object\nwith `encode(obj) -> bytes` and `decode(bytes) -> obj`. Two contracts\nbind it: `decode(encode(x)) == x`, and `encode` is deterministic (equal\nvalues give equal bytes), since fingerprints hash the bytes. A codec\nneed not know `Pending`, `LookupFailed`, `Unavailable` or `Incomplete`:\nthose persist as themselves, and only their `row`, `value`, `key` and\n`reason` go through the codec. A value written to a slot with no codec\nraises, naming the slot.\n\nPersisted nodes are written through the store (`store.set`,\n`store.insert`, ...); `runtime.set` and a persisted collection's own\n`insert`, `delete`, `extend` and `replace` raise `RuntimeError`.",
+  "members": {
+   "batch": {
+    "doc": "Starts a batch: `with store.batch() as b:` collects `b.set`,\n`b.insert`, `b.delete`, `b.replace`, `b.upsert`, `b.remove` and\n`b.reconcile`, and on leaving the block appends them all as one\nrun, so a restore sees all of them or none. A block that raises\nwrites nothing.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "checkpoint": {
+    "doc": "Folds the log into a snapshot, compacting it, and returns the\nposition the snapshot covers.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "close": {
+    "doc": "Closes the store and its runtime: every later call on either raises.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "collection": {
+    "doc": "Declares the collection `key`, which starts with its logged elements,\nand returns it as a `Collection`. Write it with `store.insert`,\n`store.delete`, `store.replace` and `store.extend`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key, codec)"
+   },
+   "delete": {
+    "doc": "Removes one occurrence of `row` from a persisted collection. Removing\nan absent row is logged and changes nothing.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, collection, row)"
+   },
+   "extend": {
+    "doc": "Appends every row of `rows` in one logged step.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, collection, rows)"
+   },
+   "input": {
+    "doc": "Declares the input `key`, which starts at its logged value or else at\n`default`, and returns its node. Write it with `store.set`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key, default, codec)"
+   },
+   "insert": {
+    "doc": "Appends one occurrence of `row` to a persisted collection.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, collection, row)"
+   },
+   "keyed_collection": {
+    "doc": "Declares the keyed collection `key`: a `KeyedCollection` over a\npersisted collection of `(key, row)` pairs, holding the pairs the\nlog restores. `key_codec` and `codec` encode the\nkeys and the rows, under the contracts of `store.input`. Write it\nwith `store.upsert`, `store.remove`, `store.reconcile` or a\n`store.batch`; its own writes raise. `label` names the collection's\ngroup in `graph_summary`, labelling its pair and row nodes.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key, key_codec, codec, label=None)"
+   },
+   "memo_table": {
+    "doc": "Declares the memo table `name`, whose entries `func(ctx, key)`\ncomputes, and returns it. `ctx` is the `RuntimeRef` queries receive,\nand `ctx.memo(table, key)` reads another entry as a dependency.\n`key_codec` and `codec` encode the keys and the values under the\ncontracts of `store.input`, and `func` must be a pure function of\nits key and what it reads through `ctx`. Bump `version` when it\nchanges meaning: entries are kept only while the name and version\nmatch. Declare every table before `store.open_memo`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, name, version, key_codec, codec, func)"
+   },
+   "open": {
+    "doc": "Convert a function to be a static method.\n\nA static method does not receive an implicit first argument.\nTo declare a static method, use this idiom:\n\n     class C:\n         @staticmethod\n         def f(arg1, arg2, argN):\n             ...\n\nIt can be called either on the class (e.g. C.f()) or on an instance\n(e.g. C().f()). Both the class and the instance are ignored, and\nneither is passed implicitly as the first argument to the method.\n\nStatic methods in Python are similar to those found in Java or C++.\nFor a more advanced concept, see the classmethod builtin.",
+    "kind": "staticmethod",
+    "signature": "(backend, *, build_id, durability='sync', auto_checkpoint_records=None)"
+   },
+   "open_memo": {
+    "doc": "Opens the memo over `backend`, an object that implements the memo\nbackend protocol (see `incr.persist.MemoryMemo`), and loads its\ncurrent generation. Entries written under another `build_id`, or by\na table of another name, version or type, are ignored.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, backend)"
+   },
+   "reconcile": {
+    "doc": "Makes a persisted keyed collection hold exactly `rows`, as\n`KeyedCollection.reconcile` does, in one logged step. Returns how\nmany keys were `(inserted, replaced, removed)`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, rows)"
+   },
+   "refresh": {
+    "doc": "Applies the records other writers appended since this store last\nread the log, across a compaction too, and returns the position it\nhas applied through.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "remove": {
+    "doc": "Removes `key`'s pair from a persisted keyed collection. Raises\n`KeyError` if no row is held for it.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, key)"
+   },
+   "replace": {
+    "doc": "Removes one occurrence of `old`, if present, and inserts `new`, as\none logged step.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, collection, old, new)"
+   },
+   "runtime": {
+    "doc": "The runtime that reads the store's nodes. Close the store, not the\nruntime.",
+    "kind": "getset_descriptor"
+   },
+   "set": {
+    "doc": "Sets a persisted input: the value is logged, then applied.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, node, value)"
+   },
+   "stats": {
+    "doc": "`position` (the last log position applied), `snapshot_position`\n(the snapshot this store last wrote or crossed, 0 if none) and\n`records_since_checkpoint`, read without touching the backend.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "upsert": {
+    "doc": "Holds `row` for `key` in a persisted keyed collection, as\n`KeyedCollection.upsert` does, logging the change.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, key, row)"
+   }
+  },
+  "signature": "()"
+ },
+ "incr.persist._conformance": {
+  "doc": "Runs the cases of `kind` (`\"store\"` or `\"memo\"`), or only `case`.\nReturns each case's name mapped to `None` on a pass or the panic\nmessage.",
+  "signature": "(kind, factory, case=None)"
+ },
+ "incr.persist._conformance_cases": {
+  "doc": null,
+  "signature": "(kind)"
+ },
+ "incr.persist.conformance.ConformanceFailure": {
+  "doc": "A backend failed a conformance case; `case` names it.",
+  "signature": null
+ },
+ "incr.persist.conformance.cases": {
+  "doc": "The names of the `kind` (`\"log\"` or `\"memo\"`) cases, in run order.",
+  "signature": "(kind)"
+ },
+ "incr.persist.conformance.run_log_backend": {
+  "doc": "Runs every log backend case against handles from `factory`, raising\n`ConformanceFailure` naming the first case that fails.",
+  "signature": "(factory)"
+ },
+ "incr.persist.conformance.run_memo_backend": {
+  "doc": "Runs every memo backend case against handles from `factory`, raising\n`ConformanceFailure` naming the first case that fails.",
+  "signature": "(factory)"
+ }
+}
