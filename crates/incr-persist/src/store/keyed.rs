@@ -7,8 +7,9 @@ use std::sync::{Arc, Weak};
 
 use incr_core::persist_hooks::Deferred;
 use incr_core::{
-    with_value_code, Cells, DeleteError, ErasedIncr, Incr, IncrCollection, KeyCounts, KeyIndex,
-    KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp, Runtime, Shared, Value,
+    find_element, with_value_code, Cells, DeleteError, ElementRank, ErasedIncr, Incr,
+    IncrCollection, KeyCounts, KeyIndex, KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp,
+    Runtime, Shared, Value,
 };
 
 use super::binding::{decode, encode, Binding};
@@ -618,6 +619,24 @@ impl<K, P> StagedKey<K, P> {
             .map(|(pair, _)| pair)
     }
 
+    /// [`Self::target`] with the rank it holds once applied: a held
+    /// pair's own, a new pair's the fingerprint of its encoding under
+    /// `key`.
+    fn ranked_target(&self, key: &str) -> Result<Option<(&P, u128)>>
+    where
+        P: PersistValue,
+    {
+        Ok(match &self.next {
+            Next::Held => self
+                .held
+                .iter()
+                .min_by_key(|(_, rank)| *rank)
+                .map(|(pair, rank)| (pair, *rank)),
+            Next::Row(pair) => Some((pair, fp_of(&encode(key, pair)?))),
+            Next::Gone => None,
+        })
+    }
+
     /// The single pair the key is staged to hold, or `None` when it is
     /// staged to hold nothing.
     fn target(&self) -> Option<&P> {
@@ -787,11 +806,12 @@ where
             if !checked {
                 continue;
             }
-            let target = staged.target();
+            let target = staged.ranked_target(&key)?;
             let held = self.keyed.keyed.held_pairs(&staged.key);
             let keep = with_value_code(|| {
-                target.and_then(|target| held.iter().position(|(pair, _)| pair == target))
+                target.and_then(|target| find_element(held.iter().map(|(p, r)| (p, *r)), target))
             });
+            let target = target.map(|(pair, _)| pair);
             if let (Some(target), None) = (target, keep) {
                 fixes.push(insert_record(&key, target)?);
             }
@@ -875,8 +895,8 @@ fn element_ops<P: PersistValue>(key: &str, elements: &Elements) -> Result<Vec<Pa
     Ok(ops)
 }
 
-/// The ranked multiset `ops` build from nothing, a removal taking an
-/// `==` pair of its rank if one is held, else any `==` pair.
+/// The ranked multiset `ops` build from nothing, a removal taking the
+/// held pair [`find_element`] names, as the index's own replay does.
 fn fold_ops<P: Eq>(ops: Vec<PairOp<P, u128>>) -> Vec<Ranked<P>> {
     let mut held: Vec<Ranked<P>> = Vec::new();
     with_value_code(|| {
@@ -884,10 +904,7 @@ fn fold_ops<P: Eq>(ops: Vec<PairOp<P, u128>>) -> Vec<Ranked<P>> {
             match op {
                 PairOp::Insert(pair, rank) => held.push((pair, rank)),
                 PairOp::Remove(pair, rank) => {
-                    let found = held
-                        .iter()
-                        .position(|(p, r)| *r == rank && *p == pair)
-                        .or_else(|| held.iter().position(|(p, _)| *p == pair));
+                    let found = find_element(held.iter().map(|(p, r)| (p, *r)), (&pair, rank));
                     if let Some(at) = found {
                         held.swap_remove(at);
                     }
@@ -896,6 +913,33 @@ fn fold_ops<P: Eq>(ops: Vec<PairOp<P, u128>>) -> Vec<Ranked<P>> {
         }
     });
     held
+}
+
+/// Counts of ranked pairs by element: by rank when the rank identifies
+/// the element, else by the pair at that rank, so pairs that are one
+/// element by their rank match even when they are not `==`.
+struct ElementCounts<'a, P> {
+    by_rank: HashMap<u128, usize>,
+    by_pair: HashMap<(&'a P, u128), usize>,
+}
+
+impl<P> Default for ElementCounts<'_, P> {
+    fn default() -> Self {
+        ElementCounts {
+            by_rank: HashMap::new(),
+            by_pair: HashMap::new(),
+        }
+    }
+}
+
+impl<'a, P: Hash + Eq> ElementCounts<'a, P> {
+    fn entry(&mut self, (pair, rank): &'a Ranked<P>) -> &mut usize {
+        if rank.identifies() {
+            self.by_rank.entry(*rank).or_default()
+        } else {
+            self.by_pair.entry((pair, *rank)).or_default()
+        }
+    }
 }
 
 impl<K, V, C, P> KeyedBinding<K, V, C, P>
@@ -968,20 +1012,21 @@ where
     ) -> Result<()> {
         let current = self.keyed.ranked_pairs();
         let (removed, inserted) = with_value_code(|| {
-            let mut have: HashMap<&Ranked<P>, usize> = HashMap::new();
+            let mut have = ElementCounts::default();
             for ranked in &current {
-                *have.entry(ranked).or_default() += 1;
+                *have.entry(ranked) += 1;
             }
             let mut inserted = Vec::new();
             for ranked in &target {
-                match have.get_mut(ranked) {
-                    Some(n) if *n > 0 => *n -= 1,
+                match have.entry(ranked) {
+                    n if *n > 0 => *n -= 1,
                     _ => inserted.push(ranked.clone()),
                 }
             }
             let mut removed = Vec::new();
             for ranked in &current {
-                if let Some(n) = have.get_mut(ranked).filter(|n| **n > 0) {
+                let n = have.entry(ranked);
+                if *n > 0 {
                     *n -= 1;
                     removed.push(ranked.clone());
                 }

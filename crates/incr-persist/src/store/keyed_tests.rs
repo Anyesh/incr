@@ -61,6 +61,10 @@ local_and_shared!(
     delete_and_forget_rerun_key_readers,
     a_scope_write_and_its_undo_rerun_key_readers,
     undeclare_is_refused_while_a_query_reads_a_key,
+    an_identity_compared_row_replaced_then_reopened_holds_one_pair,
+    a_snapshot_converge_keeps_identity_compared_rows_and_reruns_no_reader,
+    an_overtaken_identity_compared_write_repairs_to_one_pair,
+    a_re_encoded_row_replaced_then_reopened_holds_one_pair,
 );
 
 fn open<C: Cells, B: Backend>(backend: B) -> Store<C, B> {
@@ -1096,4 +1100,186 @@ fn row_dep_key_drops_run_outside_every_hold<C: MemoCells>() {
     let (all, held) = DROPS.get();
     assert!(all > checkpointed, "the restore dropped no key");
     assert_eq!(held, 0, "{held} of {all} key drops ran under a hold");
+}
+
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// A row equal only to its own copies, as a decoded NaN-holding or
+/// identity-compared Python row is equal to nothing but itself.
+#[derive(Clone, Debug)]
+struct Ident {
+    value: String,
+    id: usize,
+}
+
+impl Ident {
+    fn new(value: &str) -> Self {
+        Ident {
+            value: s(value),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl PartialEq for Ident {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Ident {}
+
+impl std::hash::Hash for Ident {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+impl Serialize for Ident {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ident {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Ident::new(&value))
+    }
+}
+
+type IdentKc<C> = PersistedKeyed<u32, Ident, C>;
+
+fn ident_rows<C: Cells, B: Backend>(store: &Store<C, B>, kc: &IdentKc<C>) -> Vec<(u32, String)> {
+    sorted(
+        kc.pairs()
+            .values(store.runtime())
+            .into_iter()
+            .map(|(k, row)| (k, row.value))
+            .collect(),
+    )
+}
+
+fn an_identity_compared_row_replaced_then_reopened_holds_one_pair<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: IdentKc<C> = a.keyed_collection("k").unwrap();
+    a.upsert(&ka, 1, Ident::new("a")).unwrap();
+    a.upsert(&ka, 1, Ident::new("b")).unwrap();
+    assert_eq!(ident_rows(&a, &ka), [pair(1, "b")]);
+    drop((ka, a));
+
+    let b = open::<C, _>(log.clone());
+    let kb: IdentKc<C> = b.keyed_collection("k").unwrap();
+    assert_eq!(ident_rows(&b, &kb), [pair(1, "b")]);
+    b.checkpoint().unwrap();
+    b.upsert(&kb, 1, Ident::new("c")).unwrap();
+    drop((kb, b));
+
+    let c = open::<C, _>(log.clone());
+    let kc: IdentKc<C> = c.keyed_collection("k").unwrap();
+    assert_eq!(ident_rows(&c, &kc), [pair(1, "c")]);
+    assert_eq!(kc.row(&1).map(|row| row.value), Some(s("c")));
+}
+
+fn a_snapshot_converge_keeps_identity_compared_rows_and_reruns_no_reader<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: IdentKc<C> = a.keyed_collection("k").unwrap();
+    let b = open::<C, _>(log.clone());
+    let kb: IdentKc<C> = b.keyed_collection("k").unwrap();
+    a.upsert(&ka, 1, Ident::new("a")).unwrap();
+    a.upsert(&ka, 2, Ident::new("b")).unwrap();
+    b.refresh().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&runs);
+    let captured = Captured(kb.clone());
+    let reader = b.runtime().create_query(move |rt| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        captured.get().get_key(rt, &1).map(|row| row.value)
+    });
+    assert_eq!(b.runtime().get(reader), Some(s("a")));
+
+    a.upsert(&ka, 2, Ident::new("c")).unwrap();
+    a.checkpoint().unwrap();
+    b.refresh().unwrap();
+
+    assert_eq!(ident_rows(&b, &kb), [pair(1, "a"), pair(2, "c")]);
+    assert_eq!(b.runtime().get(reader), Some(s("a")));
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}
+
+fn an_overtaken_identity_compared_write_repairs_to_one_pair<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: IdentKc<C> = a.keyed_collection("k").unwrap();
+    let b = open::<C, _>(log.clone());
+    let kb: IdentKc<C> = b.keyed_collection("k").unwrap();
+    a.upsert(&ka, 1, Ident::new("x")).unwrap();
+    b.refresh().unwrap();
+
+    let mut pending = PendingWrite::new();
+    pending.upsert(&kb, 1, Ident::new("b"));
+    a.upsert(&ka, 1, Ident::new("a")).unwrap();
+    let before = records(&log).len();
+    b.write_pending(pending).unwrap();
+
+    assert_eq!(
+        records(&log)[before..],
+        [rem(1, "x"), ins(1, "b"), rem(1, "a")]
+    );
+    assert_eq!(ident_rows(&b, &kb), [pair(1, "b")]);
+    drop((ka, kb, a, b));
+    let c = open::<C, _>(log.clone());
+    let kc: IdentKc<C> = c.keyed_collection("k").unwrap();
+    assert_eq!(ident_rows(&c, &kc), [pair(1, "b")]);
+}
+
+static ENCODES: AtomicUsize = AtomicUsize::new(0);
+
+/// A row whose every encoding differs, as a Python set re-encoded under a
+/// new hash seed may, compared by value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Noisy(String);
+
+impl Serialize for Noisy {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        (&self.0, ENCODES.fetch_add(1, Ordering::Relaxed)).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Noisy {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        <(String, usize)>::deserialize(deserializer).map(|(value, _)| Noisy(value))
+    }
+}
+
+fn a_re_encoded_row_replaced_then_reopened_holds_one_pair<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: PersistedKeyed<u32, Noisy, C> = a.keyed_collection("k").unwrap();
+    a.upsert(&ka, 1, Noisy(s("a"))).unwrap();
+    a.upsert(&ka, 1, Noisy(s("b"))).unwrap();
+    assert_eq!(ka.items(), [(1, Noisy(s("b")))]);
+    drop((ka, a));
+
+    let b = open::<C, _>(log.clone());
+    let kb: PersistedKeyed<u32, Noisy, C> = b.keyed_collection("k").unwrap();
+    assert_eq!(kb.pairs().values(b.runtime()), [(1, Noisy(s("b")))]);
+    b.checkpoint().unwrap();
+    b.upsert(&kb, 1, Noisy(s("c"))).unwrap();
+    drop((kb, b));
+
+    let c = open::<C, _>(log.clone());
+    let kc: PersistedKeyed<u32, Noisy, C> = c.keyed_collection("k").unwrap();
+    assert_eq!(kc.pairs().values(c.runtime()), [(1, Noisy(s("c")))]);
 }
