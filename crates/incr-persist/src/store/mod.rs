@@ -20,6 +20,7 @@ use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, Logg
 pub use collection::PersistedCollection;
 pub use keyed::{PendingWrite, PersistedKeyed};
 pub use scope::UnloggedScope;
+pub use staged::StagedBatch;
 
 mod binding;
 mod collection;
@@ -36,6 +37,10 @@ mod scope;
 #[cfg(test)]
 #[path = "scope_tests.rs"]
 mod scope_tests;
+mod staged;
+#[cfg(test)]
+#[path = "staged_tests.rs"]
+mod staged_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -73,7 +78,9 @@ pub struct Options {
     /// the store has applied `n` records since it last checkpointed or
     /// caught up across a compaction. The checkpoint runs before the write
     /// appends anything, so its failure fails the write and leaves the log
-    /// unchanged. `None`, the default, compacts only on explicit calls.
+    /// unchanged. A [`StagedBatch`] runs a due checkpoint when it opens, so
+    /// none falls between its records, and its commit never triggers one.
+    /// `None`, the default, compacts only on explicit calls.
     pub auto_checkpoint_records: Option<u64>,
 }
 
@@ -217,6 +224,9 @@ struct State<C: Cells> {
     snapshot: Option<SnapshotId>,
     poisoned: bool,
     unlogged: bool,
+    /// Set while a [`StagedBatch`] is open, whose writes are applied but
+    /// not yet appended.
+    staged: bool,
     since_checkpoint: u64,
     /// The position of the snapshot this store last wrote or crossed,
     /// whether or not `snapshot` could name it.
@@ -325,9 +335,26 @@ impl<C: Cells, B: Backend> Batch<'_, C, B> {
 }
 
 impl<C: Cells> State<C> {
+    /// Marks the store poisoned, for its memo too, and closes the staged
+    /// flag a staged batch left: nothing will commit.
+    fn poison(&mut self) {
+        self.poisoned = true;
+        if let Some(deps) = &self.deps {
+            deps.set_poisoned();
+            if self.staged {
+                deps.set_staged(false);
+            }
+        }
+        self.staged = false;
+    }
+
+    /// Fails while an unlogged scope or a staged batch is open, during
+    /// which the runtime holds changes the log has not received.
     fn refuse_in_scope(&self) -> Result<()> {
         if self.unlogged {
             Err(Error::UnloggedScopeOpen)
+        } else if self.staged {
+            Err(Error::StagedBatchOpen)
         } else {
             Ok(())
         }
@@ -411,6 +438,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 snapshot: None,
                 poisoned: false,
                 unlogged: false,
+                staged: false,
                 since_checkpoint: 0,
                 snapshot_at: Position::ZERO,
                 logged: LoggedKeys::new(),
@@ -676,6 +704,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         f: impl FnMut(Position, &Record, Origin) + Send + 'static,
     ) -> Result<SubscriptionId> {
         let mut state = self.state()?;
+        if state.staged {
+            return Err(Error::StagedBatchOpen);
+        }
         let id = SubscriptionId(state.next_subscription);
         state.next_subscription += 1;
         state.subscribers.push((id, Box::new(f)));
@@ -813,7 +844,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 Err(e @ (Error::InvalidCompaction { .. } | Error::ReadOnly)) => return Err(e),
                 Err(e) => {
                     if self.resync(state).is_err() {
-                        state.poisoned = true;
+                        state.poison();
                     }
                     return Err(e);
                 }
@@ -948,11 +979,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// and a collection insert is not idempotent.
     fn write(&self, state: &mut State<C>, records: Vec<Record>) -> Result<Position> {
         state.refuse_in_scope()?;
-        if let Some(threshold) = self.options.auto_checkpoint_records {
-            if state.since_checkpoint >= threshold {
-                self.checkpoint_locked(state)?;
-            }
-        }
+        self.checkpoint_if_due(state)?;
         let last = self.backend.append(&records)?;
         let landed = (|| {
             if self.options.durability == Durability::Sync {
@@ -963,9 +990,37 @@ impl<C: Cells, B: Backend> Store<C, B> {
         match landed {
             Ok(()) => Ok(last),
             Err(e) => {
-                state.poisoned = true;
+                state.poison();
                 Err(e)
             }
+        }
+    }
+
+    /// Applies `record` as a staged write and keeps it in `run`. A failed
+    /// apply poisons the store, since earlier staged writes are already in
+    /// the runtime.
+    fn apply_staged(
+        &self,
+        state: &mut State<C>,
+        record: Record,
+        run: &mut Vec<Record>,
+    ) -> Result<()> {
+        if let Err(e) = self.apply(state, record.clone()) {
+            state.poison();
+            return Err(e);
+        }
+        run.push(record);
+        Ok(())
+    }
+
+    /// Runs [`Store::checkpoint`] when [`Options::auto_checkpoint_records`]
+    /// is due, before anything is appended.
+    fn checkpoint_if_due(&self, state: &mut State<C>) -> Result<()> {
+        match self.options.auto_checkpoint_records {
+            Some(threshold) if state.since_checkpoint >= threshold => {
+                self.checkpoint_locked(state).map(drop)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1209,7 +1264,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         for key in &keys {
             let sink = notify.then_some(&mut changes);
             if let Err(e) = self.replace_key(state, key, logged.get_mut(key), sink) {
-                state.poisoned = true;
+                state.poison();
                 return Err(e);
             }
         }

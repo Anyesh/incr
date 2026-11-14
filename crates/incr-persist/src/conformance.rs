@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::thread;
 
-use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, SnapshotId};
+use crate::{Backend, ConditionalAppend, Error, Kind, Position, ReadOutcome, Record, SnapshotId};
 
 /// Creates logs and opens handles onto them for the suite.
 pub trait Harness {
@@ -80,6 +80,9 @@ macro_rules! backend_conformance {
             snapshot_id_survives_reopen,
             read_only_handle_sees_the_snapshot_id,
             fenced_append_lands_nothing,
+            append_at_a_stale_position_writes_nothing,
+            racing_append_at_one_position_lands_exactly_one,
+            append_at_right_after_compacting_to_the_tail_lands,
         );
     };
     (@cases $harness:expr; $($case:ident),+ $(,)?) => {
@@ -736,4 +739,132 @@ pub fn fenced_append_lands_nothing<H: Harness>(mut h: H) {
         vec![(next, set("a", 3))],
         "an append after the fence must follow the tail"
     );
+}
+
+fn assert_tail_moved(result: crate::Result<Position>, after: Position) {
+    match result {
+        Err(Error::TailMoved { after: reported }) => assert_eq!(reported, after),
+        other => {
+            panic!("append_at({after}) on a moved tail must fail with TailMoved, got {other:?}")
+        }
+    }
+}
+
+fn conditional<B: Backend>(backend: &B) -> Option<&dyn ConditionalAppend> {
+    backend.conditional_append()
+}
+
+/// `append_at` lands its run only right after the tail it names: below
+/// or beyond the tail it fails with [`Error::TailMoved`] and the log is
+/// unchanged. Skipped for backends without [`ConditionalAppend`].
+pub fn append_at_a_stale_position_writes_nothing<H: Harness>(mut h: H) {
+    let log = h.new_log();
+    let backend = h.open(&log);
+    let Some(append_at) = conditional(&backend) else {
+        return;
+    };
+    let tail = backend.append(&[declare("a"), set("a", 1)]).unwrap();
+    let before = read_all(&backend, Position::ZERO);
+    let stale = Position(tail.0 - 1);
+    assert_tail_moved(append_at.append_at(stale, &[set("a", 2)]), stale);
+    let beyond = Position(tail.0 + 1);
+    assert_tail_moved(append_at.append_at(beyond, &[set("a", 3)]), beyond);
+    assert_tail_moved(append_at.append_at(stale, &[]), stale);
+    assert_eq!(
+        read_all(&backend, Position::ZERO),
+        before,
+        "a refused append_at must land nothing"
+    );
+    assert_eq!(append_at.append_at(tail, &[]).unwrap(), tail);
+    let run = vec![set("a", 4), set("a", 5)];
+    let last = append_at.append_at(tail, &run).unwrap();
+    assert_eq!(last, Position(tail.0 + 2));
+    let expected: Vec<_> = positions_of(last, run.len()).into_iter().zip(run).collect();
+    assert_eq!(read_all(&backend, tail), expected);
+    assert_eq!(
+        backend.append(&[set("a", 6)]).unwrap(),
+        Position(last.0 + 1)
+    );
+}
+
+const APPEND_AT_ROUNDS: u8 = 50;
+
+/// Two handles calling `append_at` with the same position at once, the
+/// late retry racing a delayed first attempt, land exactly one run.
+/// Skipped for single-writer backends and those without
+/// [`ConditionalAppend`].
+pub fn racing_append_at_one_position_lands_exactly_one<H: Harness>(mut h: H) {
+    if !h.multi_writer() {
+        return;
+    }
+    let log = h.new_log();
+    let handles: Vec<_> = (0..2).map(|_| h.open(&log)).collect();
+    if conditional(&handles[0]).is_none() {
+        return;
+    }
+    let mut tail = Position::ZERO;
+    for round in 0..APPEND_AT_ROUNDS {
+        let barrier = std::sync::Barrier::new(handles.len());
+        let results: Vec<_> = thread::scope(|s| {
+            let joins: Vec<_> = handles
+                .iter()
+                .enumerate()
+                .map(|(writer, backend)| {
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        let run = writer_batch(writer as u8, round);
+                        let append_at = conditional(backend).expect("every handle has it");
+                        barrier.wait();
+                        (append_at.append_at(tail, &run), run)
+                    })
+                })
+                .collect();
+            joins.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        let mut landed = None;
+        for (result, run) in results {
+            match result {
+                Ok(last) => {
+                    assert!(landed.is_none(), "two runs landed at position {tail}");
+                    landed = Some((last, run));
+                }
+                Err(e) => assert_tail_moved(Err(e), tail),
+            }
+        }
+        let (last, run) = landed.expect("one of the racing runs must land");
+        let expected: Vec<_> = positions_of(last, run.len()).into_iter().zip(run).collect();
+        assert_eq!(Position(tail.0 + expected.len() as u64), last);
+        assert_eq!(read_all(&handles[1], tail), expected);
+        tail = last;
+    }
+}
+
+/// After `compact(upto = tail)` the log holds no records, and the tail is
+/// still the compacted position, so `append_at` there lands; a backend
+/// that derived its tail from log rows alone would refuse it. Skipped for
+/// backends without [`ConditionalAppend`].
+pub fn append_at_right_after_compacting_to_the_tail_lands<H: Harness>(mut h: H) {
+    let log = h.new_log();
+    let backend = h.open(&log);
+    let Some(append_at) = conditional(&backend) else {
+        return;
+    };
+    let tail = backend
+        .append(&[declare("a"), set("a", 1), set("a", 2)])
+        .unwrap();
+    backend
+        .compact(tail, vec![declare("a"), set("a", 2)])
+        .unwrap();
+    assert_tail_moved(
+        append_at.append_at(Position(tail.0 - 1), &[set("a", 3)]),
+        Position(tail.0 - 1),
+    );
+    let last = append_at.append_at(tail, &[set("a", 4)]).unwrap();
+    assert_eq!(last, Position(tail.0 + 1));
+    assert_eq!(read_all(&backend, tail), vec![(last, set("a", 4))]);
+    drop(backend);
+    let reopened = h.open(&log);
+    let append_at = conditional(&reopened).expect("a reopened handle has it");
+    let next = append_at.append_at(last, &[set("a", 5)]).unwrap();
+    assert_eq!(next, Position(last.0 + 1));
 }

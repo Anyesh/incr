@@ -197,6 +197,9 @@ where
 
 type PlainOp<C> = Box<dyn FnOnce(&State<C>, &Runtime<C>) -> Result<Record>>;
 
+pub(super) type WriteRun<'a, C> =
+    dyn FnMut(&mut State<C>, Vec<Record>) -> Result<(Position, bool)> + 'a;
+
 /// Writes collected over any number of calls, appended as one run by
 /// [`Store::write_pending`]: plain records in the order added, then each
 /// keyed collection's staged keys in the order first staged.
@@ -1022,9 +1025,22 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// store usable with every record it appended applied. Other errors
     /// behave as for [`Store::batch`].
     pub fn write_pending(&self, pending: PendingWrite<C>) -> Result<Position> {
-        let PendingWrite { ops, stages } = pending;
         let mut locked = self.state()?;
-        let state = &mut *locked;
+        self.write_pending_with(&mut locked, pending, &mut |state, records| {
+            self.write_counted(state, records)
+        })
+    }
+
+    /// [`Store::write_pending`] with the store locked, handing each run of
+    /// records to `write`, which returns the position it reached and
+    /// whether it applied records not in the run.
+    pub(super) fn write_pending_with(
+        &self,
+        state: &mut State<C>,
+        pending: PendingWrite<C>,
+        write: &mut WriteRun<'_, C>,
+    ) -> Result<Position> {
+        let PendingWrite { ops, stages } = pending;
         let mut records = Vec::new();
         for op in ops {
             records.push(op(state, &self.runtime)?);
@@ -1040,12 +1056,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let mut last = state.applied;
         let mut overtaken = stale;
         if !records.is_empty() {
-            let (at, foreign) = self.write_counted(state, records)?;
+            let (at, foreign) = write(state, records)?;
             last = at;
             overtaken |= foreign;
         }
         if overtaken {
-            if let Some(at) = self.repair(state, &stages)? {
+            if let Some(at) = self.repair(state, &stages, write)? {
                 last = at;
             }
         }
@@ -1118,6 +1134,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         &self,
         state: &mut State<C>,
         stages: &[Box<dyn Stage<C>>],
+        write: &mut WriteRun<'_, C>,
     ) -> Result<Option<Position>> {
         let mut last = None;
         for round in 0..=REPAIR_ROUNDS {
@@ -1136,7 +1153,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             if round == REPAIR_ROUNDS {
                 return Err(Error::KeyedContention { key });
             }
-            let (at, foreign) = self.write_counted(state, fixes)?;
+            let (at, foreign) = write(state, fixes)?;
             last = Some(at);
             if !foreign {
                 return Ok(last);

@@ -757,3 +757,52 @@ fn stats_follow_writes_triggered_checkpoints_and_a_reopen() {
     assert_eq!(checkpointed.snapshot_position, at);
     assert_eq!(checkpointed.records_since_checkpoint, 0);
 }
+
+fn a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records<C: Cells>() {
+    let backend = MemoryBackend::new();
+    let options = Options {
+        auto_checkpoint_records: Some(3),
+        ..Options::default()
+    };
+    let store: Store<C, _> = Store::open(backend.clone(), options).unwrap();
+    let x = store.input("x", 0u32).unwrap();
+    store.set(x, 1).unwrap();
+    let due = store.set(x, 2).unwrap();
+    assert_eq!(store.stats().unwrap().records_since_checkpoint, 3);
+
+    let mut staged = store.staged_batch().unwrap();
+    let opened = store.stats().unwrap();
+    assert_eq!(opened.snapshot_position, due, "the trigger fires on open");
+    assert_eq!(opened.records_since_checkpoint, 0);
+    for value in 3..8 {
+        staged.set(x, value).unwrap();
+    }
+    let last = staged.commit().unwrap();
+    drop(staged);
+
+    let stats = store.stats().unwrap();
+    assert_eq!(stats.snapshot_position, due, "no checkpoint inside the run");
+    assert_eq!(stats.records_since_checkpoint, 5);
+    assert_eq!(stats.position, last);
+    let (at, snapshot) = backend.load_snapshot().unwrap().expect("a snapshot");
+    assert_eq!(at, due);
+    assert!(snapshot.contains(&Record::Set {
+        key: "x".into(),
+        value: enc(&2u32),
+    }));
+    assert_eq!(records_after(&backend, due).len(), 5);
+
+    let next = store.set(x, 8).unwrap();
+    assert_eq!(store.stats().unwrap().snapshot_position, last);
+    assert_eq!(store.stats().unwrap().position, next);
+}
+
+#[test]
+fn a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records_local() {
+    a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records::<Local>();
+}
+
+#[test]
+fn a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records_shared() {
+    a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records::<Shared>();
+}

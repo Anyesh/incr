@@ -11,7 +11,7 @@ use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 
-use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
+use crate::{Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 const SCHEMA_VERSION: i64 = 2;
 
@@ -189,28 +189,7 @@ impl SqliteBackend {
 
 impl Backend for SqliteBackend {
     fn append(&self, records: &[Record]) -> Result<Position> {
-        self.require_writable()?;
-        if records.is_empty() {
-            return tail(&self.lock().conn);
-        }
-        let encoded = records
-            .iter()
-            .map(Record::encode)
-            .collect::<Result<Vec<_>>>()?;
-        let mut inner = self.lock();
-        let tx = inner.begin_write()?;
-        let mut last = sql_position(tail(&tx)?);
-        {
-            let mut insert = tx
-                .prepare_cached("INSERT INTO log (pos, rec) VALUES (?1, ?2)")
-                .map_err(sql)?;
-            for rec in &encoded {
-                last += 1;
-                insert.execute(params![last, rec]).map_err(sql)?;
-            }
-        }
-        tx.commit().map_err(sql)?;
-        position(last)
+        self.append_run(None, records)
     }
 
     fn sync(&self, _upto: Position) -> Result<()> {
@@ -293,6 +272,10 @@ impl Backend for SqliteBackend {
         )
         .map_err(sql)?;
         tx.commit().map_err(sql)
+    }
+
+    fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {
+        Some(self)
     }
 
     fn writable(&self) -> bool {
@@ -616,6 +599,49 @@ fn sql_position(at: Position) -> i64 {
 
 pub(crate) fn sql(error: rusqlite::Error) -> Error {
     Error::Backend(Box::new(error))
+}
+
+impl ConditionalAppend for SqliteBackend {
+    fn append_at(&self, after: Position, records: &[Record]) -> Result<Position> {
+        self.append_run(Some(after), records)
+    }
+}
+
+impl SqliteBackend {
+    /// Appends `records` in one write transaction, first checking, when
+    /// `after` is given, that the tail is still there.
+    fn append_run(&self, after: Option<Position>, records: &[Record]) -> Result<Position> {
+        self.require_writable()?;
+        if records.is_empty() {
+            let at = tail(&self.lock().conn)?;
+            return match after {
+                Some(after) if after != at => Err(Error::TailMoved { after }),
+                _ => Ok(at),
+            };
+        }
+        let encoded = records
+            .iter()
+            .map(Record::encode)
+            .collect::<Result<Vec<_>>>()?;
+        let mut inner = self.lock();
+        let tx = inner.begin_write()?;
+        let at = tail(&tx)?;
+        if let Some(after) = after.filter(|after| *after != at) {
+            return Err(Error::TailMoved { after });
+        }
+        let mut last = sql_position(at);
+        {
+            let mut insert = tx
+                .prepare_cached("INSERT INTO log (pos, rec) VALUES (?1, ?2)")
+                .map_err(sql)?;
+            for rec in &encoded {
+                last += 1;
+                insert.execute(params![last, rec]).map_err(sql)?;
+            }
+        }
+        tx.commit().map_err(sql)?;
+        position(last)
+    }
 }
 
 #[cfg(test)]
