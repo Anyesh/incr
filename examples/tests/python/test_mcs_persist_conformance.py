@@ -10,7 +10,7 @@ import threading
 import incr
 import incr.persist as persist
 import pytest
-from incr.persist import Busy, InvalidCompaction, ReadOnly, Store
+from incr.persist import Store
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,18 +43,17 @@ class DictLogState:
 
 
 class DictBackend:
-    """`tail_moved` is the `TailMoved` class of the package whose store this
-    backend serves."""
+    """`persist` is the persist module of the package whose store this
+    backend serves, whose exceptions it raises."""
 
-    tail_moved = persist.TailMoved
-
-    def __init__(self, state, writable=True):
+    def __init__(self, state, writable=True, persist=persist):
         self.state = state
         self._writable = writable
+        self.persist = persist
 
     def append(self, records):
         if not self._writable:
-            raise ReadOnly("handle is read-only")
+            raise self.persist.ReadOnly("handle is read-only")
         with self.state.lock:
             for record in records:
                 self.state.tail += 1
@@ -63,10 +62,10 @@ class DictBackend:
 
     def append_at(self, after, records):
         if not self._writable:
-            raise ReadOnly("handle is read-only")
+            raise self.persist.ReadOnly("handle is read-only")
         with self.state.lock:
             if self.state.tail != after:
-                raise self.tail_moved(f"tail is {self.state.tail}, not {after}")
+                raise self.persist.TailMoved(f"tail is {self.state.tail}, not {after}")
             for record in records:
                 self.state.tail += 1
                 self.state.records.append((self.state.tail, record))
@@ -96,11 +95,11 @@ class DictBackend:
 
     def compact(self, upto, records):
         if not self._writable:
-            raise ReadOnly("handle is read-only")
+            raise self.persist.ReadOnly("handle is read-only")
         with self.state.lock:
             floor = self.state.snapshot[0] if self.state.snapshot else 0
             if upto < floor or upto > self.state.tail:
-                raise InvalidCompaction(upto, floor, self.state.tail)
+                raise self.persist.InvalidCompaction(upto, floor, self.state.tail)
             self.state.records = [(at, r) for at, r in self.state.records if at > upto]
             self.state.snapshot = (upto, list(records))
             self.state.generation += 1
@@ -110,14 +109,17 @@ class DictBackend:
 
 
 class DictLogFactory:
+    def __init__(self, persist=persist):
+        self.persist = persist
+
     def new_log(self):
         return DictLogState()
 
     def open(self, log):
-        return DictBackend(log)
+        return DictBackend(log, persist=self.persist)
 
     def open_read_only(self, log):
-        return DictBackend(log, writable=False)
+        return DictBackend(log, writable=False, persist=self.persist)
 
     def multi_writer(self):
         return True
@@ -138,10 +140,11 @@ class SqliteLog:
         insert or ignore into meta values ('epoch', 0);
     """
 
-    def __init__(self, path, writable=True, epoch=None):
+    def __init__(self, path, writable=True, epoch=None, persist=persist):
         self.path = path
         self._writable = writable
         self.epoch = epoch
+        self.persist = persist
         self.local = threading.local()
         self.db().executescript(self.SCHEMA)
 
@@ -173,7 +176,7 @@ class SqliteLog:
 
     def append(self, records):
         if not self._writable:
-            raise ReadOnly("handle is read-only")
+            raise self.persist.ReadOnly("handle is read-only")
 
         def body(db):
             if self.epoch is not None and self._meta(db, "epoch") != self.epoch:
@@ -189,14 +192,14 @@ class SqliteLog:
 
     def append_at(self, after, records):
         if not self._writable:
-            raise ReadOnly("handle is read-only")
+            raise self.persist.ReadOnly("handle is read-only")
 
         def body(db):
             if self.epoch is not None and self._meta(db, "epoch") != self.epoch:
                 raise EpochMismatch(f"epoch {self.epoch} is no longer current")
             tail = self._meta(db, "tail")
             if tail != after:
-                raise persist.TailMoved(f"tail is {tail}, not {after}")
+                raise self.persist.TailMoved(f"tail is {tail}, not {after}")
             for record in records:
                 tail += 1
                 db.execute("insert into log values (?, ?)", (tail, record))
@@ -245,13 +248,13 @@ class SqliteLog:
 
     def compact(self, upto, records):
         if not self._writable:
-            raise ReadOnly("handle is read-only")
+            raise self.persist.ReadOnly("handle is read-only")
 
         def body(db):
             floor = self._meta(db, "snap_pos")
             tail = self._meta(db, "tail")
             if upto < floor or upto > tail:
-                raise InvalidCompaction(upto, floor, tail)
+                raise self.persist.InvalidCompaction(upto, floor, tail)
             db.execute("delete from log where pos <= ?", (upto,))
             db.execute("delete from snap")
             for idx, record in enumerate(records):
@@ -269,7 +272,8 @@ class SqliteLog:
 
 
 class SqliteLogFactory:
-    def __init__(self):
+    def __init__(self, persist=persist):
+        self.persist = persist
         self.dir = tempfile.TemporaryDirectory()
         self.count = 0
 
@@ -278,10 +282,10 @@ class SqliteLogFactory:
         return os.path.join(self.dir.name, f"log{self.count}.db")
 
     def open(self, log):
-        return SqliteLog(log)
+        return SqliteLog(log, persist=self.persist)
 
     def open_read_only(self, log):
-        return SqliteLog(log, writable=False)
+        return SqliteLog(log, writable=False, persist=self.persist)
 
     def multi_writer(self):
         return True
@@ -305,13 +309,14 @@ class DictMemoGuard:
 
 
 class DictMemo:
-    def __init__(self, state):
+    def __init__(self, state, persist=persist):
         self.state = state
+        self.persist = persist
 
     def lock_checkpoint(self):
         with self.state.lock:
             if self.state.locked:
-                raise Busy("checkpoint lock held")
+                raise self.persist.Busy("checkpoint lock held")
             self.state.locked = True
             for gen in [g for g in self.state.generations if g != self.state.current]:
                 del self.state.generations[gen]
@@ -333,7 +338,7 @@ class DictMemo:
     def write_generation(self, base, generation, header, entries):
         with self.state.lock:
             if self.state.current != base:
-                raise Busy("another handle wrote a generation")
+                raise self.persist.Busy("another handle wrote a generation")
             items = [
                 (table, key_hash, loc, len(frame))
                 for loc, (table, key_hash, frame) in enumerate(entries)
@@ -349,11 +354,14 @@ class DictMemo:
 
 
 class DictMemoFactory:
+    def __init__(self, persist=persist):
+        self.persist = persist
+
     def new_store(self):
         return DictMemoState()
 
     def open(self, store):
-        return DictMemo(store)
+        return DictMemo(store, persist=self.persist)
 
     def exclusive_lock(self):
         return True
@@ -368,8 +376,9 @@ class SqliteMemoGuard:
 
 
 class SqliteMemo:
-    def __init__(self, path):
+    def __init__(self, path, persist=persist):
         self.path = path
+        self.persist = persist
         self.local = threading.local()
         self.db().executescript(
             """
@@ -399,7 +408,7 @@ class SqliteMemo:
         db.execute("begin immediate")
         try:
             if db.execute("select 1 from meta where k = 'lock'").fetchone():
-                raise Busy("checkpoint lock held")
+                raise self.persist.Busy("checkpoint lock held")
             db.execute("insert into meta values ('lock', 1)")
             current = self._current(db)
             db.execute("delete from items where gen is not ?", (current,))
@@ -444,7 +453,7 @@ class SqliteMemo:
         db.execute("begin immediate")
         try:
             if self._current(db) != base:
-                raise Busy("another handle wrote a generation")
+                raise self.persist.Busy("another handle wrote a generation")
             db.execute("insert into gens values (?, ?)", (generation, header))
             items = []
             for loc, (table, key_hash, frame) in enumerate(entries):
@@ -469,7 +478,8 @@ class SqliteMemo:
 
 
 class SqliteMemoFactory:
-    def __init__(self):
+    def __init__(self, persist=persist):
+        self.persist = persist
         self.dir = tempfile.TemporaryDirectory()
         self.count = 0
 
@@ -478,7 +488,7 @@ class SqliteMemoFactory:
         return os.path.join(self.dir.name, f"memo{self.count}.db")
 
     def open(self, store):
-        return SqliteMemo(store)
+        return SqliteMemo(store, persist=self.persist)
 
     def exclusive_lock(self):
         return True

@@ -336,7 +336,7 @@ jobs:
           source .ci-venv/bin/activate
           pip install maturin pytest
           maturin develop --release --features conformance --manifest-path crates/incr-python/Cargo.toml
-          maturin develop --release --manifest-path crates/incr-concurrent-python/Cargo.toml
+          maturin develop --release --features conformance --manifest-path crates/incr-concurrent-python/Cargo.toml
           python -m pytest examples/tests/python/ -q -rs
 
   wheel-linux-aarch64:

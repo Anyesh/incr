@@ -84,7 +84,7 @@ class Graph:
     with two keys."""
 
     def __init__(self, persist, backend, seed=True):
-        backend.tail_moved = persist.TailMoved
+        backend.persist = persist
         codec = PickleCodec()
         self.store = persist.Store.open(backend, build_id=1)
         self.rt = self.store.runtime

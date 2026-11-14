@@ -10,6 +10,7 @@ import pathlib
 
 import incr
 import incr.persist
+import incr_concurrent.persist
 
 EXPECTED = pathlib.Path(__file__).with_name("persist_surface.json")
 
@@ -77,6 +78,11 @@ def _surface():
             for member in sorted(dir(obj)):
                 if not member.startswith("__"):
                     surface[f"{key}.{member}"] = _function(getattr(obj, member))
+    conformance = incr_concurrent.persist.conformance
+    for member in sorted(dir(conformance)):
+        if not member.startswith("__"):
+            key = f"incr_concurrent.persist.conformance.{member}"
+            surface[key] = _function(getattr(conformance, member))
     for name in TOUCHED_INCR_CLASSES:
         surface[f"incr.{name}"] = _class(getattr(incr, name))
     return surface

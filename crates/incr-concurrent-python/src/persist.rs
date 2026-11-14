@@ -31,6 +31,17 @@ mod memory {
     incr_python_persist::memory_classes!(Exceptions, "incr_concurrent.persist");
 }
 
+#[cfg(feature = "conformance")]
+mod conformance {
+    use super::Exceptions;
+
+    incr_python_persist::conformance_functions!(
+        Exceptions,
+        incr_concurrent.persist.conformance,
+        "incr_concurrent.persist.conformance"
+    );
+}
+
 /// Store calls release the GIL like every engine call here: the store
 /// mutex and the engine's locks run Python (backend methods, codecs,
 /// value equality) under them, so a thread waiting on one with the GIL
@@ -207,6 +218,8 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<classes::PyBatch>()?;
     module.add_class::<classes::PyMemo>()?;
     module.add_class::<PyMemoTable>()?;
+    #[cfg(feature = "conformance")]
+    conformance::register_conformance(&module)?;
     incr_python_persist::codec::install_hook::<Exceptions>();
     parent.add("persist", &module)?;
     py.import("sys")?

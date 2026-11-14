@@ -1073,5 +1073,21 @@
  "incr.persist.conformance.run_memo_backend": {
   "doc": "Runs every memo backend case against handles from `factory`, raising\n`ConformanceFailure` naming the first case that fails.",
   "signature": "(factory)"
+ },
+ "incr_concurrent.persist.conformance.ConformanceFailure": {
+  "doc": "A backend failed a conformance case; `case` names it.",
+  "signature": null
+ },
+ "incr_concurrent.persist.conformance.cases": {
+  "doc": "The names of the `kind` (`\"log\"` or `\"memo\"`) cases, in run order.",
+  "signature": "(kind)"
+ },
+ "incr_concurrent.persist.conformance.run_log_backend": {
+  "doc": "Runs every log backend case against handles from `factory`, raising\n`ConformanceFailure` naming the first case that fails.",
+  "signature": "(factory)"
+ },
+ "incr_concurrent.persist.conformance.run_memo_backend": {
+  "doc": "Runs every memo backend case against handles from `factory`, raising\n`ConformanceFailure` naming the first case that fails.",
+  "signature": "(factory)"
  }
 }
