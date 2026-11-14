@@ -19,6 +19,7 @@
 //! through the user codec, so a `row`, `key`, `reason` or `value` is
 //! whatever the codec handles.
 
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -265,9 +266,48 @@ fn encode_key<E: PersistExceptions>(py: Python<'_>, key: &PyKey) -> Result<Vec<u
 fn decode_key<E: PersistExceptions>(py: Python<'_>, bytes: &[u8]) -> Result<PyKey, String> {
     let registry = active::<E>()?;
     let codec = key_codec_for(py, &registry)?;
-    unframe(py, &codec, bytes)
-        .map(PyKey)
-        .map_err(|e| registry.stash(e))
+    let key = unframe(py, &codec, bytes).map_err(|e| registry.stash(e))?;
+    note_key(py, &key);
+    Ok(PyKey(key))
+}
+
+thread_local! {
+    /// The keys decoded on this thread while a [`capture_keys`] runs, with
+    /// the key of the keyed collection each belongs to.
+    static CAPTURED: RefCell<Option<Vec<(String, PyKey)>>> = const { RefCell::new(None) };
+}
+
+fn note_key(py: Python<'_>, key: &Py<PyAny>) {
+    CAPTURED.with(|captured| {
+        if let Some(keys) = captured.borrow_mut().as_mut() {
+            if let Some(ValueContext::Key(collection)) = current_value_context() {
+                keys.push((collection, PyKey(key.clone_ref(py))));
+            }
+        }
+    });
+}
+
+/// Puts back the capture a [`capture_keys`] replaced, also on unwind.
+struct Restore(Option<Vec<(String, PyKey)>>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let outer = self.0.take();
+        CAPTURED.with(|captured| *captured.borrow_mut() = outer);
+    }
+}
+
+/// Runs `f` and returns its result with the keyed collections' keys
+/// decoded on this thread while it ran, each with the key of its
+/// collection. The caller drops the keys outside every store lock.
+pub fn capture_keys<R>(f: impl FnOnce() -> R) -> (R, Vec<(String, PyKey)>) {
+    let restore = Restore(CAPTURED.with(|captured| captured.replace(Some(Vec::new()))));
+    let result = f();
+    let keys = CAPTURED
+        .with(|captured| captured.take())
+        .unwrap_or_default();
+    drop(restore);
+    (result, keys)
 }
 
 fn user_encode(py: Python<'_>, codec: &Py<PyAny>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {

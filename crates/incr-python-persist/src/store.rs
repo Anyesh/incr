@@ -66,6 +66,9 @@ pub struct StoreCore<B: PyBinding> {
     build_id: u128,
     inputs: Mutex<HashMap<u32, Input<PyValue>>>,
     collections: Mutex<HashMap<u32, Collection<B>>>,
+    /// The labelled keyed collections by key, with their labels. A leaf
+    /// lock.
+    labelled: Mutex<HashMap<String, (Keyed<B>, String)>>,
     declaring: DeclareLock,
 }
 
@@ -113,6 +116,7 @@ impl<B: PyBinding> StoreCore<B> {
             build_id,
             inputs: Mutex::default(),
             collections: Mutex::default(),
+            labelled: Mutex::default(),
             declaring: DeclareLock::default(),
         })
     }
@@ -399,6 +403,7 @@ where
         key: &str,
         key_codec: Py<PyAny>,
         codec: Py<PyAny>,
+        label: Option<&str>,
     ) -> PyResult<Keyed<B>> {
         let _declaring = self.declare_lock(py)?;
         let slot = Slot::Key(key.to_owned());
@@ -416,7 +421,59 @@ where
                     .map(carry::<B, _>)
             })
         })?;
-        Ok(persisted.into_inner())
+        let persisted = persisted.into_inner();
+        if let Some(label) = label {
+            self.labelled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key.to_owned(), (persisted.clone(), label.to_owned()));
+        }
+        Ok(persisted)
+    }
+
+    /// Whether a keyed collection of this store has a label.
+    pub fn has_labelled_keys(&self) -> bool {
+        !self
+            .labelled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Labels `<label>/<str(key)>` the version input of each of `keys`, a
+    /// collection key and one of its keys as [`crate::codec::capture_keys`]
+    /// gives them, that belongs to a labelled keyed collection and has one.
+    /// A failure to label is reported as unraisable.
+    pub fn label_keys(&self, py: Python<'_>, keys: Vec<(String, PyKey)>)
+    where
+        B::Task<Vec<(Keyed<B>, String, PyKey)>>: Send,
+    {
+        let mut unlabelled = Vec::new();
+        let mut targets = Vec::new();
+        {
+            let labelled = self.labelled.lock().unwrap_or_else(PoisonError::into_inner);
+            for (collection, key) in keys {
+                match labelled.get(&collection) {
+                    Some((keyed, label)) => targets.push((keyed.clone(), label.clone(), key)),
+                    None => unlabelled.push(key),
+                }
+            }
+        }
+        drop(unlabelled);
+        if targets.is_empty() {
+            return;
+        }
+        let targets = carry::<B, _>(targets);
+        let labelled = B::write(py, &self.store, move |store, _| {
+            for (keyed, label, key) in targets.into_inner() {
+                if let Some(handle) = keyed.version_input(&key) {
+                    crate::classes::label_key(store.runtime(), handle.slot(), &label, &key);
+                }
+            }
+        });
+        if let Err(e) = labelled {
+            e.write_unraisable(py, None);
+        }
     }
 }
 

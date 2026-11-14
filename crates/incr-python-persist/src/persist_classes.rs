@@ -299,7 +299,7 @@ macro_rules! persist_classes {
                 label: Option<String>,
             ) -> PyResult<<$rt as FullStoreRuntime<$b>>::Keyed> {
                 let core = self.core_outside_overlay(py)?;
-                let persisted = core.keyed_collection(py, key, key_codec, codec)?;
+                let persisted = core.keyed_collection(py, key, key_codec, codec, label.as_deref())?;
                 <$rt as FullStoreRuntime<$b>>::keyed(self.runtime.bind(py), persisted, label)
             }
 

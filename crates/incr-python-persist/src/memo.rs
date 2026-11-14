@@ -11,15 +11,15 @@ use incr_persist::memo::{
     BuildId, CheckpointStats, Memo, MemoBuilder, MemoCtx, MemoOptions, MemoStats, MemoTable,
 };
 use incr_persist::{Error, MemoPart};
-use incr_python_protocol::PyValue;
+use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::backend::PyBackend;
 use crate::binding::{carry, Carry, PyBinding};
-use crate::codec::Slot;
+use crate::codec::{capture_keys, Slot};
 use crate::memo_backend::PyMemoBackend;
-use crate::store::StoreCore;
+use crate::store::{Keyed, StoreCore};
 
 /// The closure the engine runs for a memo table of a `C` runtime.
 pub type MemoFn<C> = Box<dyn Fn(&MemoCtx<'_, C>, &PyValue) -> PyValue + Send + Sync + 'static>;
@@ -285,11 +285,28 @@ impl<B: PyBinding> MemoCore<B> {
     }
 }
 
+/// Runs `restore`, a memo call that may restore entries, then labels the
+/// per-key nodes of labelled keyed collections it created.
+fn restoring<B: PyBinding, R>(core: &StoreCore<B>, py: Python<'_>, restore: impl FnOnce() -> R) -> R
+where
+    B::Task<Keyed<B>>: Send,
+    B::Task<Vec<(Keyed<B>, String, PyKey)>>: Send,
+{
+    if !core.has_labelled_keys() {
+        return restore();
+    }
+    let (result, keys) = capture_keys(restore);
+    core.label_keys(py, keys);
+    result
+}
+
 impl<B: PyBinding> MemoCore<B>
 where
     B::Task<MemoBuilder<B::C>>: Send,
     B::Task<OpenMemo<B>>: Send,
     for<'a> B::Task<&'a OpenMemo<B>>: Send,
+    B::Task<Keyed<B>>: Send,
+    B::Task<Vec<(Keyed<B>, String, PyKey)>>: Send,
 {
     /// `key`'s value in the table `handle` names, restored from the memo or
     /// computed, read as a dependency of whatever query is running on `rt`,
@@ -312,10 +329,12 @@ where
         }
         let table = handle.get();
         let registry = core.registry();
-        let value = B::write(py, core.store(), move |store, _| {
-            registry.scoped(|| {
-                let node = memo.into_inner().get_or_insert(table, key);
-                store.runtime().get(node)
+        let value = restoring(core, py, || {
+            B::write(py, core.store(), move |store, _| {
+                registry.scoped(|| {
+                    let node = memo.into_inner().get_or_insert(table, key);
+                    store.runtime().get(node)
+                })
             })
         })?;
         drop(core.registry().take_failure());
@@ -373,8 +392,10 @@ where
         let memo = carry::<B, _>(self.memo()?);
         let table = handle.get();
         let registry = core.registry();
-        let node = B::read(py, core.store(), move |_, _| {
-            registry.scoped(|| memo.into_inner().get_or_insert(table, PyValue(key)))
+        let node = restoring(core, py, || {
+            B::read(py, core.store(), move |_, _| {
+                registry.scoped(|| memo.into_inner().get_or_insert(table, PyValue(key)))
+            })
         })?;
         drop(core.registry().take_failure());
         Ok(node)

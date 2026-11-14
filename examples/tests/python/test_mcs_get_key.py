@@ -276,3 +276,33 @@ def test_published_240k_keys_one_upsert_reruns_one_reader(pkg, capsys):
             f"one upsert {(upserted - first_read) * 1e6:.0f}us, "
             f"reread of every reader {reread - upserted:.3f}s"
         )
+
+
+def test_a_labelled_persisted_collection_labels_the_key_nodes_a_memo_restore_creates(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
+    calls = []
+
+    def open_graph():
+        store = open_store(persist, log)
+        kc = declare(store, label="shifts")
+
+        def hours(ctx, key):
+            calls.append(key)
+            return ctx.get_key(kc, key) * 2
+
+        table = store.memo_table("hours", 1, PickleCodec(), PickleCodec(), hours)
+        return store, kc, table, store.open_memo(memo_backend)
+
+    store, kc, table, memo = open_graph()
+    store.upsert(kc, "a", 4)
+    assert store.runtime.get(memo.get_or_insert(table, "a")) == 8
+    memo.checkpoint()
+    store.close()
+
+    calls.clear()
+    store, kc, table, memo = open_graph()
+    entry = memo.get_or_insert(table, "a")
+    assert store.runtime.get(entry) == 8
+    assert calls == []
+    snapshot = store.runtime.graph_snapshot(roots=[entry], depth=1, label_prefix="shifts/")
+    assert [n["label"] for n in snapshot["nodes"]] == ["shifts/a"]

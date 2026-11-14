@@ -124,7 +124,9 @@ impl<B: PyBinding> KeyedSource<'_, B> {
     }
 }
 
-fn label_key<C: Cells>(rt: &Runtime<C>, slot: u32, label: &str, key: &PyKey) {
+/// Labels `slot` `<label>/<str(key)>`; a key whose `__str__` raises leaves
+/// it unlabelled and the error is reported as unraisable.
+pub(crate) fn label_key<C: Cells>(rt: &Runtime<C>, slot: u32, label: &str, key: &PyKey) {
     let text = Python::attach(|py| match key.0.bind(py).str() {
         Ok(text) => Some(text.to_string()),
         Err(e) => {
