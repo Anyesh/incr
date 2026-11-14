@@ -1,0 +1,718 @@
+//! [`persist_classes!`](crate::persist_classes): the persistence pyclasses,
+//! written once for both packages.
+
+/// Defines a package's persistence classes in the calling module, which
+/// must hold nothing else, under the Python module path `$module`, with
+/// the pyclass flags `$flag` (such as `unsendable` or `frozen`).
+///
+/// `minimal` defines `PyStore` with `open`, `runtime`, `input`, `set` and
+/// `close` only, for a package whose runtime implements
+/// [`StoreRuntime`](crate::classes::StoreRuntime): its store holds no memo
+/// and its close leaves the runtime open. `full` defines `PyStore` with
+/// every method, `PyBatch`, `PyMemo`, `PyMemoTable` and `PyOverlay`, for a
+/// runtime that implements
+/// [`FullStoreRuntime`](crate::classes::FullStoreRuntime); its close also
+/// closes the runtime. The package registers the classes itself.
+#[macro_export]
+macro_rules! persist_classes {
+    (minimal, binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        use $crate::classes::StoreRuntime;
+        use $crate::pyo3::exceptions::PyRuntimeError;
+        use $crate::pyo3::prelude::*;
+
+        /// Persisted inputs over a backend, and the runtime that reads them.
+        ///
+        /// `store.input(key, default, codec)` declares a key and returns its node;
+        /// `codec` is any object with `encode(obj) -> bytes` and
+        /// `decode(bytes) -> obj`. Two contracts bind it: `decode(encode(x)) == x`,
+        /// and `encode` is deterministic (equal values give equal bytes), since
+        /// fingerprints hash the bytes. A codec runs on whichever thread writes or
+        /// replays, so it must be thread-safe. Write persisted inputs with
+        /// `store.set`; read them through `store.runtime`.
+        #[pyclass(name = "Store", module = $module, $($flag),*)]
+        pub(crate) struct PyStore {
+            core: Mutex<Option<Arc<$crate::store::StoreCore<$b>>>>,
+            runtime: Py<$rt>,
+        }
+
+        impl PyStore {
+            fn new(core: Arc<$crate::store::StoreCore<$b>>, runtime: Py<$rt>) -> Self {
+                PyStore {
+                    core: Mutex::new(Some(core)),
+                    runtime,
+                }
+            }
+
+            fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
+                let core = self
+                    .core
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                    .ok_or_else(|| PyRuntimeError::new_err("store is closed"))?;
+                self.runtime.bind(py).borrow().check_store_call()?;
+                Ok(core)
+            }
+        }
+
+        $crate::persist_classes!(@store_methods $b, $rt, {
+            /// Closes the store: later store calls raise `RuntimeError`. The
+            /// runtime keeps the values it holds.
+            fn close(&self) {
+                let closed = self
+                    .core
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                drop(closed);
+            }
+        });
+    };
+
+    (full, binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use $crate::classes::{key_counts, keyed_of, reconcile_pairs, FullStoreRuntime, KeyCounts, StoreRuntime};
+        use $crate::incr_core::Runtime;
+        use $crate::keyed::Pending;
+        use $crate::memo::{MemoCore, TableHandle};
+        use $crate::pyo3::exceptions::{PyRuntimeError, PyValueError};
+        use $crate::pyo3::prelude::*;
+        use $crate::pyo3::types::PyDict;
+        use $crate::incr_python_protocol::PyValue;
+
+        /// Persisted inputs and collections over a backend, and the runtime that
+        /// reads them.
+        ///
+        /// `store.input(key, default, codec)` and `store.collection(key, codec)`
+        /// declare a key and return its node or `Collection`; `codec` is any object
+        /// with `encode(obj) -> bytes` and `decode(bytes) -> obj`. Two contracts
+        /// bind it: `decode(encode(x)) == x`, and `encode` is deterministic (equal
+        /// values give equal bytes), since fingerprints hash the bytes. A codec
+        /// need not know `Pending`, `LookupFailed`, `Unavailable` or `Incomplete`:
+        /// those persist as themselves, and only their `row`, `value`, `key` and
+        /// `reason` go through the codec. A value written to a slot with no codec
+        /// raises, naming the slot.
+        ///
+        /// Persisted nodes are written through the store (`store.set`,
+        /// `store.insert`, ...); `runtime.set` and a persisted collection's own
+        /// `insert`, `delete`, `extend` and `replace` raise `RuntimeError`.
+        #[pyclass(name = "Store", module = $module, $($flag),*)]
+        pub(crate) struct PyStore {
+            core: Option<Arc<$crate::store::StoreCore<$b>>>,
+            memo: MemoCore<$b>,
+            runtime: Py<$rt>,
+        }
+
+        const _: () = assert!(std::mem::align_of::<PyStore>() <= 16);
+
+        impl PyStore {
+            fn new(core: Arc<$crate::store::StoreCore<$b>>, runtime: Py<$rt>) -> Self {
+                PyStore {
+                    core: Some(core),
+                    memo: MemoCore::default(),
+                    runtime,
+                }
+            }
+
+            fn core(&self) -> PyResult<&Arc<$crate::store::StoreCore<$b>>> {
+                self.core
+                    .as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
+            }
+
+            /// The core of a store whose runtime is usable: a runtime poisoned by
+            /// a failed overlay restore refuses every store call, since a
+            /// checkpoint would fold the half-restored collections.
+            fn core_live(&self, py: Python<'_>) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
+                let core = Arc::clone(self.core()?);
+                self.runtime.bind(py).borrow().rt()?;
+                Ok(core)
+            }
+
+            fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
+                self.runtime.bind(py).borrow().check_store_call()?;
+                self.core_live(py)
+            }
+
+            fn maker(&self, py: Python<'_>) -> impl Fn(Py<PyAny>) -> $crate::memo::MemoFn<<$b as $crate::binding::PyBinding>::C> {
+                let state = self.runtime.bind(py).borrow().state().clone();
+                move |func| <$rt as FullStoreRuntime<$b>>::memo_fn(&state, func)
+            }
+        }
+
+        $crate::persist_classes!(@store_methods $b, $rt, {
+            /// Declares the collection `key`, which starts with its logged elements,
+            /// and returns it as a `Collection`. Write it with `store.insert`,
+            /// `store.delete`, `store.replace` and `store.extend`.
+            fn collection(
+                &self,
+                py: Python<'_>,
+                key: &str,
+                codec: Option<Py<PyAny>>,
+            ) -> PyResult<<$rt as FullStoreRuntime<$b>>::Collection> {
+                let core = self.core_outside_overlay(py)?;
+                let persisted = core.collection(py, key, codec)?;
+                Ok(<$rt as FullStoreRuntime<$b>>::collection(
+                    self.runtime.bind(py),
+                    persisted.handle().clone(),
+                ))
+            }
+
+            /// Appends one occurrence of `row` to a persisted collection.
+            fn insert(
+                &self,
+                py: Python<'_>,
+                collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
+                row: Py<PyAny>,
+            ) -> PyResult<()> {
+                let core = self.core_outside_overlay(py)?;
+                let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
+                core.insert(py, persisted, row)
+            }
+
+            /// Removes one occurrence of `row` from a persisted collection. Removing
+            /// an absent row is logged and changes nothing.
+            fn delete(
+                &self,
+                py: Python<'_>,
+                collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
+                row: Py<PyAny>,
+            ) -> PyResult<()> {
+                let core = self.core_outside_overlay(py)?;
+                let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
+                core.delete(py, persisted, row)
+            }
+
+            /// Removes one occurrence of `old`, if present, and inserts `new`, as
+            /// one logged step.
+            fn replace(
+                &self,
+                py: Python<'_>,
+                collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
+                old: Py<PyAny>,
+                new: Py<PyAny>,
+            ) -> PyResult<()> {
+                let core = self.core_outside_overlay(py)?;
+                let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
+                core.replace(py, persisted, old, new)
+            }
+
+            /// Appends every row of `rows` in one logged step.
+            fn extend(
+                &self,
+                py: Python<'_>,
+                collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
+                rows: &Bound<'_, PyAny>,
+            ) -> PyResult<()> {
+                let core = self.core_outside_overlay(py)?;
+                let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
+                core.extend(py, persisted, rows)
+            }
+
+            /// Declares the keyed collection `key`: a `KeyedCollection` over a
+            /// persisted collection of `(key, row)` pairs, holding the pairs the
+            /// log restores. `key_codec` and `codec` encode the
+            /// keys and the rows, under the contracts of `store.input`. Write it
+            /// with `store.upsert`, `store.remove`, `store.reconcile` or a
+            /// `store.batch`; its own writes raise. `label` names the collection's
+            /// group in `graph_summary`, labelling its pair and row nodes.
+            #[pyo3(signature = (key, key_codec, codec, label=None))]
+            fn keyed_collection(
+                &self,
+                py: Python<'_>,
+                key: &str,
+                key_codec: Py<PyAny>,
+                codec: Py<PyAny>,
+                label: Option<String>,
+            ) -> PyResult<<$rt as FullStoreRuntime<$b>>::Keyed> {
+                let core = self.core_outside_overlay(py)?;
+                let persisted = core.keyed_collection(py, key, key_codec, codec)?;
+                <$rt as FullStoreRuntime<$b>>::keyed(self.runtime.bind(py), persisted, label)
+            }
+
+            /// Holds `row` for `key` in a persisted keyed collection, as
+            /// `KeyedCollection.upsert` does, logging the change.
+            fn upsert(
+                &self,
+                py: Python<'_>,
+                kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
+                key: Py<PyAny>,
+                row: Py<PyAny>,
+            ) -> PyResult<()> {
+                let core = self.core_outside_overlay(py)?;
+                let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
+                let mut pending = Pending::default();
+                pending.upsert(py, &core, &keyed, key, row)?;
+                core.write_pending(py, pending)
+            }
+
+            /// Removes `key`'s pair from a persisted keyed collection. Raises
+            /// `KeyError` if no row is held for it.
+            fn remove(
+                &self,
+                py: Python<'_>,
+                kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
+                key: Py<PyAny>,
+            ) -> PyResult<()> {
+                let core = self.core_outside_overlay(py)?;
+                let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
+                let mut pending = Pending::default();
+                pending.remove(py, &core, &keyed, key)?;
+                core.write_pending(py, pending)
+            }
+
+            /// Makes a persisted keyed collection hold exactly `rows`, as
+            /// `KeyedCollection.reconcile` does, in one logged step. Returns how
+            /// many keys were `(inserted, replaced, removed)`.
+            fn reconcile(
+                &self,
+                py: Python<'_>,
+                kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
+                rows: &Bound<'_, PyAny>,
+            ) -> PyResult<KeyCounts> {
+                let core = self.core_outside_overlay(py)?;
+                let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
+                let mut pending = Pending::default();
+                pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)?;
+                let counts = key_counts(pending.counts(&keyed));
+                core.write_pending(py, pending)?;
+                Ok(counts)
+            }
+
+            /// Starts a batch: `with store.batch() as b:` collects `b.set`,
+            /// `b.insert`, `b.delete`, `b.replace`, `b.upsert`, `b.remove` and
+            /// `b.reconcile`, and on leaving the block appends them all as one
+            /// run, so a restore sees all of them or none. A block that raises
+            /// writes nothing.
+            fn batch(slf: &Bound<'_, Self>) -> PyResult<PyBatch> {
+                let py = slf.py();
+                slf.try_borrow()?.core_outside_overlay(py)?;
+                Ok(PyBatch {
+                    store: slf.clone().unbind(),
+                    batch: $crate::batch::Batch::default(),
+                })
+            }
+
+            /// Declares the memo table `name`, whose entries `func(ctx, key)`
+            /// computes, and returns it. `ctx` is the `RuntimeRef` queries receive,
+            /// and `ctx.memo(table, key)` reads another entry as a dependency.
+            /// `key_codec` and `codec` encode the keys and the values under the
+            /// contracts of `store.input`, and `func` must be a pure function of
+            /// its key and what it reads through `ctx`. Bump `version` when it
+            /// changes meaning: entries are kept only while the name and version
+            /// match. Declare every table before `store.open_memo`.
+            fn memo_table(
+                slf: &Bound<'_, Self>,
+                name: &str,
+                version: u32,
+                key_codec: Py<PyAny>,
+                codec: Py<PyAny>,
+                func: Py<PyAny>,
+            ) -> PyResult<PyMemoTable> {
+                let py = slf.py();
+                let store = slf.try_borrow()?;
+                let core = store.core_outside_overlay(py)?;
+                let handle = store.memo.declare_table(
+                    &core,
+                    py,
+                    name,
+                    version,
+                    key_codec,
+                    codec,
+                    func,
+                    store.maker(py),
+                )?;
+                Ok(PyMemoTable {
+                    store: slf.clone().unbind(),
+                    name: name.to_owned(),
+                    handle,
+                })
+            }
+
+            /// Opens the memo over `backend`, an object that implements the memo
+            /// backend protocol (see `incr.persist.MemoryMemo`), and loads its
+            /// current generation. Entries written under another `build_id`, or by
+            /// a table of another name, version or type, are ignored.
+            fn open_memo(slf: &Bound<'_, Self>, backend: Py<PyAny>) -> PyResult<PyMemo> {
+                let py = slf.py();
+                let store = slf.try_borrow()?;
+                let core = store.core_outside_overlay(py)?;
+                store.memo.open(&core, py, backend, store.maker(py))?;
+                Ok(PyMemo {
+                    store: slf.clone().unbind(),
+                })
+            }
+
+            /// Applies the records other writers appended since this store last
+            /// read the log, across a compaction too, and returns the position it
+            /// has applied through.
+            fn refresh(&self, py: Python<'_>) -> PyResult<u64> {
+                self.core_outside_overlay(py)?.refresh(py)
+            }
+
+            /// `position` (the last log position applied), `snapshot_position`
+            /// (the snapshot this store last wrote or crossed, 0 if none) and
+            /// `records_since_checkpoint`, read without touching the backend.
+            fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+                let stats = self.core()?.stats(py)?;
+                let dict = PyDict::new(py);
+                dict.set_item("position", stats.position.0)?;
+                dict.set_item("snapshot_position", stats.snapshot_position.0)?;
+                dict.set_item("records_since_checkpoint", stats.records_since_checkpoint)?;
+                Ok(dict)
+            }
+
+            /// Folds the log into a snapshot, compacting it, and returns the
+            /// position the snapshot covers.
+            fn checkpoint(&self, py: Python<'_>) -> PyResult<u64> {
+                self.core_outside_overlay(py)?.checkpoint(py)
+            }
+
+            /// Closes the store and its runtime: every later call on either raises.
+            fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+                let py = slf.py();
+                let runtime = slf.try_borrow()?.runtime.clone_ref(py);
+                <$rt as FullStoreRuntime<$b>>::close_store_runtime(runtime.bind(py))?;
+                let (core, memo) = {
+                    let mut store = slf.try_borrow_mut()?;
+                    (store.core.take(), std::mem::take(&mut store.memo))
+                };
+                drop(memo);
+                drop(core);
+                Ok(())
+            }
+        });
+
+        /// The writes collected inside `with store.batch() as b:`.
+        ///
+        /// Keyed writes compose per key against the rows each key held when first
+        /// staged, so `b.upsert` twice on one key, or `b.upsert` then `b.remove`,
+        /// leave exactly the final pair, and `b.remove` raises `KeyError` for a
+        /// key neither held nor staged. The collection takes the staged keys only
+        /// once the append has landed.
+        #[pyclass(name = "Batch", module = $module, $($flag),*)]
+        pub(crate) struct PyBatch {
+            store: Py<PyStore>,
+            batch: $crate::batch::Batch<$b>,
+        }
+
+        fn batch_core(store: &Py<PyStore>, py: Python<'_>) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
+            store.bind(py).borrow().core_outside_overlay(py)
+        }
+
+        #[pymethods]
+        impl PyBatch {
+            fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
+                slf.try_borrow_mut()?.batch.enter()?;
+                Ok(slf)
+            }
+
+            #[pyo3(signature = (exc_type, _exc, _traceback))]
+            fn __exit__(
+                &mut self,
+                py: Python<'_>,
+                exc_type: Option<&Bound<'_, PyAny>>,
+                _exc: Option<&Bound<'_, PyAny>>,
+                _traceback: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<bool> {
+                let pending = self.batch.exit()?;
+                if exc_type.is_none() {
+                    batch_core(&self.store, py)?.write_pending(py, pending)?;
+                }
+                Ok(false)
+            }
+
+            fn set(&mut self, py: Python<'_>, node: <$rt as StoreRuntime<$b>>::Node, value: Py<PyAny>) -> PyResult<()> {
+                let pending = self.batch.pending()?;
+                let core = batch_core(&self.store, py)?;
+                pending.set(&core, <$rt as StoreRuntime<$b>>::node_inner(&node), value)
+            }
+
+            fn insert(
+                &mut self,
+                py: Python<'_>,
+                collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
+                row: Py<PyAny>,
+            ) -> PyResult<()> {
+                let pending = self.batch.pending()?;
+                let core = batch_core(&self.store, py)?;
+                pending.insert(&core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
+            }
+
+            fn delete(
+                &mut self,
+                py: Python<'_>,
+                collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
+                row: Py<PyAny>,
+            ) -> PyResult<()> {
+                let pending = self.batch.pending()?;
+                let core = batch_core(&self.store, py)?;
+                pending.delete(&core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
+            }
+
+            fn replace(
+                &mut self,
+                py: Python<'_>,
+                collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
+                old: Py<PyAny>,
+                new: Py<PyAny>,
+            ) -> PyResult<()> {
+                let pending = self.batch.pending()?;
+                let core = batch_core(&self.store, py)?;
+                pending.replace(&core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), old, new)
+            }
+
+            fn upsert(
+                &mut self,
+                py: Python<'_>,
+                kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
+                key: Py<PyAny>,
+                row: Py<PyAny>,
+            ) -> PyResult<()> {
+                let pending = self.batch.pending()?;
+                let core = batch_core(&self.store, py)?;
+                let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
+                pending.upsert(py, &core, &keyed, key, row)
+            }
+
+            fn remove(
+                &mut self,
+                py: Python<'_>,
+                kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
+                key: Py<PyAny>,
+            ) -> PyResult<()> {
+                let pending = self.batch.pending()?;
+                let core = batch_core(&self.store, py)?;
+                let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
+                pending.remove(py, &core, &keyed, key)
+            }
+
+            fn reconcile(
+                &mut self,
+                py: Python<'_>,
+                kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
+                rows: &Bound<'_, PyAny>,
+            ) -> PyResult<()> {
+                let pending = self.batch.pending()?;
+                let core = batch_core(&self.store, py)?;
+                let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
+                pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)
+            }
+        }
+
+        /// A memo table of a store: pass it to `memo.get_or_insert` and
+        /// `ctx.memo`.
+        #[pyclass(name = "MemoTable", module = $module, $($flag),*)]
+        pub(crate) struct PyMemoTable {
+            store: Py<PyStore>,
+            name: String,
+            handle: TableHandle,
+        }
+
+        const _: () = assert!(std::mem::align_of::<PyMemoTable>() <= 16);
+
+        impl PyMemoTable {
+            /// `key`'s value, restored from the memo or computed, read as a
+            /// dependency of whatever query is running on `rt`.
+            pub(crate) fn value_of(
+                &self,
+                py: Python<'_>,
+                rt: &Runtime<<$b as $crate::binding::PyBinding>::C>,
+                key: PyValue,
+            ) -> PyResult<PyValue> {
+                let store = self.store.bind(py).try_borrow()?;
+                let core = store.core()?;
+                store.memo.value_of(core, rt, &self.name, &self.handle, key)
+            }
+        }
+
+        #[pymethods]
+        impl PyMemoTable {
+            #[getter]
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            fn __repr__(&self) -> String {
+                format!("MemoTable({:?})", self.name)
+            }
+        }
+
+        /// An open memo: `memo.get_or_insert(table, key)` gives an entry's node, and
+        /// `memo.checkpoint()` writes the live entries to the backend.
+        #[pyclass(name = "Memo", module = $module, $($flag),*)]
+        pub(crate) struct PyMemo {
+            store: Py<PyStore>,
+        }
+
+        const _: () = assert!(std::mem::align_of::<PyMemo>() <= 16);
+
+        #[pymethods]
+        impl PyMemo {
+            /// The node of `table`'s entry for `key`: the live one, or one restored
+            /// from the memo, or a new one. Read it with `runtime.get`. Inside an
+            /// overlay it computes fresh and records nothing, so no candidate value
+            /// is restored from the memo or reaches it.
+            fn get_or_insert(
+                &self,
+                py: Python<'_>,
+                table: PyRef<'_, PyMemoTable>,
+                key: Py<PyAny>,
+            ) -> PyResult<<$rt as StoreRuntime<$b>>::Node> {
+                let core = self.store.bind(py).try_borrow()?.core_live(py)?;
+                if !table.store.is(&self.store) {
+                    return Err(PyValueError::new_err(format!(
+                        "memo table '{}' belongs to another store",
+                        table.name
+                    )));
+                }
+                let store = self.store.bind(py).try_borrow()?;
+                let inner = store.memo.get_or_insert(&core, py, &table.handle, key)?;
+                Ok(<$rt as StoreRuntime<$b>>::node(inner))
+            }
+
+            /// Writes every live entry whose dependencies are persisted to the
+            /// backend as the next generation, and returns how many it `written`,
+            /// `merged` from the previous generation, `evicted` and so on. Raises
+            /// `Busy` when another handle is checkpointing. Raises `ValueError`
+            /// naming the table when an entry's key or value did not round-trip
+            /// through its codec: the generation was still written, without that
+            /// entry, which is recomputed on the next run.
+            fn checkpoint(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, usize>> {
+                let core = self.store.bind(py).try_borrow()?.core_outside_overlay(py)?;
+                self.store.bind(py).try_borrow()?.memo.checkpoint(&core, py)
+            }
+        }
+
+        /// `with rt.overlay() as ov:` runs candidate changes against the live
+        /// graph and puts the base graph back exactly on exit, also when the body
+        /// raises. Mutations journal their inverse; operations that cannot be
+        /// undone raise inside the block. Inverses re-run user `Hash` and `Eq`, so
+        /// those must be deterministic and must not raise; if one does, the
+        /// runtime is poisoned and only `close` still works. A restored collection
+        /// may hold its elements in another order, so `aggregate` combines must be
+        /// associative and commutative, `sort_by_key` output is exact up to the
+        /// order among equal keys, and `group_by` keeps a group a candidate
+        /// emptied or created.
+        #[pyclass(name = "Overlay", $($flag),*)]
+        pub(crate) struct PyOverlay {
+            rt: Py<$rt>,
+        }
+
+        impl PyOverlay {
+            pub(crate) fn new(rt: Py<$rt>) -> Self {
+                PyOverlay { rt }
+            }
+        }
+
+        #[pymethods]
+        impl PyOverlay {
+            fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+                $crate::classes::enter_overlay::<$b, $rt>(slf.py(), &slf.rt.bind(slf.py()).borrow())?;
+                Ok(slf)
+            }
+
+            #[pyo3(signature = (_exc_type=None, _exc=None, _tb=None))]
+            fn __exit__(
+                &self,
+                py: Python<'_>,
+                _exc_type: Option<Py<PyAny>>,
+                _exc: Option<Py<PyAny>>,
+                _tb: Option<Py<PyAny>>,
+            ) -> PyResult<bool> {
+                $crate::classes::exit_overlay::<$b, $rt>(py, self.rt.bind(py))?;
+                Ok(false)
+            }
+
+            fn set(&self, py: Python<'_>, node: <$rt as StoreRuntime<$b>>::Node, value: Py<PyAny>) -> PyResult<()> {
+                FullStoreRuntime::<$b>::set(&*self.rt.bind(py).borrow(), node, value)
+            }
+
+            fn get(&self, py: Python<'_>, node: <$rt as StoreRuntime<$b>>::Node) -> PyResult<Py<PyAny>> {
+                FullStoreRuntime::<$b>::get(&*self.rt.bind(py).borrow(), py, node)
+            }
+
+            fn get_with_status(
+                &self,
+                py: Python<'_>,
+                node: <$rt as StoreRuntime<$b>>::Node,
+            ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+                FullStoreRuntime::<$b>::get_with_status(&*self.rt.bind(py).borrow(), py, node)
+            }
+        }
+    };
+
+    (@store_methods $b:ty, $rt:ty, { $($extra:tt)* }) => {
+        #[pymethods]
+        impl PyStore {
+            /// Opens a store over `backend`, replaying its log. `build_id`, an int
+            /// or a str, names the code that computes memoized values; incr hashes
+            /// a str to an id. `durability` is `"sync"` (a write is durable when it
+            /// returns) or `"buffered"`. With `auto_checkpoint_records=n`, a
+            /// write first checkpoints once `n` records were applied since the last
+            /// snapshot; a failed checkpoint fails that write and leaves the log
+            /// unchanged.
+            #[staticmethod]
+            #[pyo3(signature = (backend, *, build_id, durability="sync", auto_checkpoint_records=None))]
+            fn open(
+                py: Python<'_>,
+                backend: Py<PyAny>,
+                build_id: &Bound<'_, PyAny>,
+                durability: &str,
+                auto_checkpoint_records: Option<u64>,
+            ) -> PyResult<PyStore> {
+                #[allow(
+                    clippy::arc_with_non_send_sync,
+                    reason = "the store core is reached through `Arc` in both packages; a Local one stays on its runtime's thread"
+                )]
+                let core = Arc::new($crate::store::StoreCore::<$b>::open(
+                    py,
+                    backend,
+                    build_id,
+                    durability,
+                    auto_checkpoint_records,
+                )?);
+                let runtime = Py::new(py, <$rt as StoreRuntime<$b>>::of_store(Arc::clone(&core)))?;
+                Ok(PyStore::new(core, runtime))
+            }
+
+            /// The runtime that reads the store's nodes. Close the store, not the
+            /// runtime.
+            #[getter]
+            fn runtime(&self, py: Python<'_>) -> Py<$rt> {
+                self.runtime.clone_ref(py)
+            }
+
+            /// Declares the input `key`, which starts at its logged value or else at
+            /// `default`, and returns its node. Write it with `store.set`.
+            fn input(
+                &self,
+                py: Python<'_>,
+                key: &str,
+                default: Py<PyAny>,
+                codec: Option<Py<PyAny>>,
+            ) -> PyResult<<$rt as StoreRuntime<$b>>::Node> {
+                let core = self.core_outside_overlay(py)?;
+                let inner = core.input(py, key, default, codec)?;
+                Ok(<$rt as StoreRuntime<$b>>::node(inner))
+            }
+
+            /// Sets a persisted input: the value is logged, then applied.
+            fn set(
+                &self,
+                py: Python<'_>,
+                node: <$rt as StoreRuntime<$b>>::Node,
+                value: Py<PyAny>,
+            ) -> PyResult<()> {
+                let core = self.core_outside_overlay(py)?;
+                core.set(py, <$rt as StoreRuntime<$b>>::node_inner(&node), value)
+            }
+
+            $($extra)*
+        }
+    };
+}

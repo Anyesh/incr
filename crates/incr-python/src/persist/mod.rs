@@ -6,10 +6,9 @@
 //! log. Values cross to bytes through [`codec`], one user codec per
 //! persisted key.
 
-mod batch;
 mod memo;
 mod memory;
-mod store;
+mod runtime;
 
 use std::sync::Arc;
 
@@ -18,11 +17,10 @@ use incr_python_persist::binding::{Carry, CoreStore, Detached, PyBinding};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-pub(crate) use memo::PyMemoTable;
+pub(crate) use classes::{PyMemoTable, PyOverlay};
 
 pub(crate) type StoreCore = incr_python_persist::store::StoreCore<LocalBinding>;
 pub(crate) type PyPersistedKeyed = incr_python_persist::store::Keyed<LocalBinding>;
-pub(crate) type OverlayScope = incr_python_persist::scope::OverlayScope<LocalBinding>;
 
 incr_python_persist::persist_exceptions!(Exceptions, incr.persist);
 incr_python_persist::not_ready_signal!(Signal, incr);
@@ -74,6 +72,19 @@ impl<T> Carry<T> for LocalTask<T> {
 // which may run a task on another thread, can receive one.
 unsafe impl<T> Send for LocalTask<T> {}
 
+mod classes {
+    use super::LocalBinding;
+    use crate::PyRuntime;
+
+    incr_python_persist::persist_classes!(
+        full,
+        binding = LocalBinding,
+        runtime = PyRuntime,
+        module = "incr.persist",
+        flags = [unsendable]
+    );
+}
+
 #[cfg(feature = "conformance")]
 mod conformance {
     use super::Exceptions;
@@ -99,10 +110,10 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<memory::PyMemoryBackend>()?;
     module.add_class::<memory::PyMemoryMemo>()?;
     module.add_class::<memory::PyMemoryMemoGuard>()?;
-    module.add_class::<memo::PyMemo>()?;
-    module.add_class::<memo::PyMemoTable>()?;
-    module.add_class::<store::PyStore>()?;
-    module.add_class::<batch::PyBatch>()?;
+    module.add_class::<classes::PyMemo>()?;
+    module.add_class::<classes::PyMemoTable>()?;
+    module.add_class::<classes::PyStore>()?;
+    module.add_class::<classes::PyBatch>()?;
     #[cfg(feature = "conformance")]
     conformance::register_conformance(&module)?;
     incr_python_persist::codec::install_hook::<Exceptions>();

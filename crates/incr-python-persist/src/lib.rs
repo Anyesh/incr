@@ -9,6 +9,7 @@
 pub mod backend;
 pub mod batch;
 pub mod binding;
+pub mod classes;
 pub mod codec;
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -17,13 +18,18 @@ pub mod memo;
 pub mod memo_backend;
 mod memory;
 pub mod overlay;
+mod persist_classes;
 pub mod ready;
 pub mod scope;
 pub mod state;
 pub mod store;
 
 #[doc(hidden)]
+pub use incr_core;
+#[doc(hidden)]
 pub use incr_persist;
+#[doc(hidden)]
+pub use incr_python_protocol;
 #[doc(hidden)]
 pub use pyo3;
 

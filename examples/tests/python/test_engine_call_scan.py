@@ -60,6 +60,8 @@ ENTRIES = {
     "engine_read": "engine_read",
     "engine_in_query": "engine_read",
     "engine_write": "engine_write",
+    "read_on": "engine_read",
+    "write_on": "engine_write",
 }
 
 
@@ -206,25 +208,31 @@ def local_violations(text, helper_texts=()):
     return problems
 
 
+# The persistence pyclasses are written once in incr-python-persist by
+# `persist_classes!`, and Local registers them.
 LOCAL_SOURCES = [
-    p.relative_to(LOCAL).as_posix()
-    for p in sorted(LOCAL.rglob("*.rs"))
+    p.relative_to(CRATES).as_posix()
+    for p in [*sorted(LOCAL.rglob("*.rs")), SHARED / "persist_classes.rs"]
     if method_blocks(p.read_text())
 ]
 
 
 def test_the_local_scan_covers_the_files_with_pymethods():
-    assert {"lib.rs", "overlay.rs", "persist/store.rs", "persist/memo.rs"} <= set(
-        LOCAL_SOURCES
-    )
+    assert {
+        "incr-python/src/lib.rs",
+        "incr-python-persist/src/persist_classes.rs",
+    } <= set(LOCAL_SOURCES)
 
 
 @pytest.mark.parametrize("source", LOCAL_SOURCES)
 def test_every_local_engine_call_goes_through_the_entry_its_kind_needs(source):
-    text = (LOCAL / source).read_text()
-    others = [p.read_text() for p in sorted(LOCAL.rglob("*.rs")) if p != LOCAL / source]
-    shared = [p.read_text() for p in sorted(SHARED.rglob("*.rs"))]
-    problems = local_violations(text, others + shared)
+    text = (CRATES / source).read_text()
+    others = [
+        p.read_text()
+        for p in [*sorted(LOCAL.rglob("*.rs")), *sorted(SHARED.rglob("*.rs"))]
+        if p != CRATES / source
+    ]
+    problems = local_violations(text, others)
     assert not problems, "\n".join(problems)
 
 

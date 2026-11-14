@@ -47,6 +47,7 @@ use incr_compute::{
 };
 use incr_core::{Local, RoutingFailed};
 use incr_core::{PairOp, StateStats};
+use incr_python_persist::classes::{key_counts, reconcile_pairs, KeyCounts};
 use overlay::{Born, Undo};
 use persist::PyPersistedKeyed;
 use state::{LocalState, PyCallable, RtState};
@@ -867,9 +868,6 @@ pub(crate) type CoreKeyed = PyKeyedCore<()>;
 /// are ranked by the fingerprint of their logged bytes.
 pub(crate) type PersistedCore = PyKeyedCore<u128>;
 
-/// How many keys an operation inserted, gave a new row, and removed.
-pub(crate) type KeyCounts = (usize, usize, usize);
-
 /// A labelled keyed collection's index, label and pair version node.
 type KeyedLabel = (Weak<dyn StateStats>, String, ErasedIncr);
 
@@ -888,10 +886,6 @@ impl OnRuntime for PyKeyedCollection {
     fn check_alive(&self) -> PyResult<()> {
         self.born.check()
     }
-}
-
-pub(crate) fn key_counts(counts: incr_core::KeyCounts) -> KeyCounts {
-    (counts.inserted, counts.replaced, counts.removed)
 }
 
 impl PyKeyedCollection {
@@ -1008,23 +1002,6 @@ impl PyKeyedCollection {
                 )
             })?
     }
-}
-
-/// The pairs of `rows`, a mapping or an iterable of `(key, row)` pairs,
-/// read whole before any key or row method runs.
-pub(crate) fn reconcile_pairs(rows: &Bound<'_, PyAny>) -> PyResult<Vec<(PyKey, PyValue)>> {
-    let pairs = if rows.hasattr("items")? {
-        rows.call_method0("items")?
-    } else {
-        rows.clone()
-    };
-    pairs
-        .try_iter()?
-        .map(|pair| {
-            let (key, row): (Py<PyAny>, Py<PyAny>) = pair?.extract()?;
-            Ok((PyKey(key), PyValue(row)))
-        })
-        .collect()
 }
 
 #[pymethods]
@@ -1523,10 +1500,8 @@ impl PyRuntime {
 
     /// Run candidate changes against the live graph and put it back
     /// exactly on exit; see `Overlay`.
-    fn overlay(slf: &Bound<'_, Self>) -> overlay::PyOverlay {
-        overlay::PyOverlay {
-            rt: slf.clone().unbind(),
-        }
+    fn overlay(slf: &Bound<'_, Self>) -> persist::PyOverlay {
+        persist::PyOverlay::new(slf.clone().unbind())
     }
 
     fn create_input(&self, value: Py<PyAny>) -> PyResult<PyNodeId> {
@@ -1981,7 +1956,7 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntimeRef>()?;
     m.add_class::<PyFixpoint>()?;
     m.add_class::<PyNodeTable>()?;
-    m.add_class::<overlay::PyOverlay>()?;
+    m.add_class::<persist::PyOverlay>()?;
     m.add_class::<PyCollection>()?;
     m.add_class::<PyKeyedCollection>()?;
     m.add_class::<PySortedCollection>()?;
