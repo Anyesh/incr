@@ -342,15 +342,44 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         committed: CommittedBatch<T>,
         dispose: impl FnOnce(),
     ) -> Vec<Change<T>> {
-        let routers = committed
-            .version
-            .is_some_and(|version| rt.set_unrouted(self.version_node, version));
-        drop(committed.unused);
-        committed.displaced.release(&self.log);
-        dispose();
+        let CommittedBatch {
+            version,
+            applied,
+            unused,
+            displaced,
+        } = committed;
+        self.publish_version(rt, version, || {
+            drop(unused);
+            displaced.release(&self.log);
+            dispose();
+        });
+        applied
+    }
+
+    /// [`Self::publish_batch`] that drops nothing: the batch's unused
+    /// values go to `unused` and what it displaced to `displaced`, for a
+    /// caller that drops them once user `Drop` may run.
+    pub(crate) fn publish_batch_keeping(
+        &self,
+        rt: &Runtime<C>,
+        committed: CommittedBatch<T>,
+        unused: &mut Vec<T>,
+        displaced: &mut Vec<Displaced<T>>,
+    ) -> Vec<Change<T>> {
+        unused.extend(committed.unused);
+        committed.displaced.keep_into(displaced);
+        self.publish_version(rt, committed.version, || {});
+        committed.applied
+    }
+
+    /// Sets `version`, when given, then runs `between`, then routes a
+    /// `group_by` the set reached.
+    #[inline(always)]
+    fn publish_version(&self, rt: &Runtime<C>, version: Option<u64>, between: impl FnOnce()) {
+        let routers = version.is_some_and(|version| rt.set_unrouted(self.version_node, version));
+        between();
         if routers {
             rt.route_queued();
         }
-        committed.applied
     }
 }

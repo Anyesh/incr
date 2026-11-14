@@ -63,6 +63,7 @@ use crate::value_code;
 #[path = "collection_apply.rs"]
 mod apply;
 pub use apply::Change;
+pub(crate) use apply::StagedBatch;
 
 #[path = "collection_partition.rs"]
 mod partition;

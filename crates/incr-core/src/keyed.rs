@@ -18,7 +18,7 @@ use std::mem;
 use std::sync::{Arc, Weak};
 
 use crate::cells::Cells;
-use crate::collection::{Change, IncrCollection};
+use crate::collection::{Change, Displaced, IncrCollection, StagedBatch};
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::lock_order::LockKind;
@@ -801,6 +801,31 @@ where
     }
 }
 
+/// What keyed writes let go, from [`KeyedCollection::apply_pairs_keeping`]:
+/// their ops, staged pairs and keys they did not use, pairs they displaced
+/// and the key index's dropped pairs. Dropping it runs their `Drop`.
+pub struct KeyedSpent<K, V, P, R = ()> {
+    ops: Vec<PairOp<P, R>>,
+    stages: Vec<KeyStage<K, V, P, R>>,
+    batches: Vec<StagedBatch<P>>,
+    unused: Vec<P>,
+    displaced: Vec<Displaced<P>>,
+    pairs: Vec<(P, R)>,
+}
+
+impl<K, V, P, R> Default for KeyedSpent<K, V, P, R> {
+    fn default() -> Self {
+        Self {
+            ops: Vec::new(),
+            stages: Vec::new(),
+            batches: Vec::new(),
+            unused: Vec::new(),
+            displaced: Vec::new(),
+            pairs: Vec::new(),
+        }
+    }
+}
+
 type StageOps<'s, K, V, P, R> =
     dyn Fn(&mut KeyStage<K, V, P, R>, &KeyTable<P, R>, &RandomState) + 's;
 
@@ -959,12 +984,58 @@ where
         change
     }
 
+    /// [`Self::apply_pairs_with`] that drops nothing a write lets go: the
+    /// staged pairs and keys it did not use, the pairs it displaced and
+    /// the index's dropped pairs move into `keep`, for a caller that runs
+    /// their `Drop` once it may, such as after releasing a lock user code
+    /// must not run under. Version set and routing are as in
+    /// [`Self::apply_pairs_with`].
+    pub fn apply_pairs_keeping<S: RepSink<P>>(
+        &self,
+        rt: &Runtime<C>,
+        ops: impl IntoIterator<Item = PairOp<P, R>>,
+        sink: &mut S,
+        journal: Option<&mut Vec<PairOp<P, R>>>,
+        keep: &mut KeyedSpent<K, V, P, R>,
+    ) -> KeyedChange<K> {
+        let ops: Vec<PairOp<P, R>> = ops.into_iter().collect();
+        let (change, steps) = self.write_keeping(
+            rt,
+            sink,
+            journal.is_some(),
+            &|stage, table, hasher| {
+                for op in &ops {
+                    stage.apply(table, hasher, op);
+                }
+            },
+            Some(keep),
+        );
+        if let Some(journal) = journal {
+            journal.extend(steps);
+        }
+        keep.ops.extend(ops);
+        change
+    }
+
     fn write<S: RepSink<P>>(
         &self,
         rt: &Runtime<C>,
         sink: &mut S,
         journal: bool,
         stage_ops: &StageOps<'_, K, V, P, R>,
+    ) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
+        self.write_keeping(rt, sink, journal, stage_ops, None)
+    }
+
+    /// Without `keep`, drops what the write lets go after the version set
+    /// and before routing, and a failed attempt's stage at once.
+    fn write_keeping<S: RepSink<P>>(
+        &self,
+        rt: &Runtime<C>,
+        sink: &mut S,
+        journal: bool,
+        stage_ops: &StageOps<'_, K, V, P, R>,
+        mut keep: Option<&mut KeyedSpent<K, V, P, R>>,
     ) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
         refuse_value_code();
         let index = &*self.index;
@@ -979,12 +1050,22 @@ where
                 })
             };
             if stage.is_empty() {
-                return stage.outcome(stage.epoch);
+                let outcome = stage.outcome(stage.epoch);
+                if let Some(keep) = keep {
+                    keep.stages.push(stage);
+                }
+                return outcome;
             }
             let batch = self.pairs.stage_batch(changes);
             let mut log = self.pairs.log.write();
             let mut table = index.table.write();
             if C::u64_load_relaxed(&index.epoch) != stage.epoch {
+                drop(table);
+                drop(log);
+                if let Some(keep) = keep.as_deref_mut() {
+                    keep.stages.push(stage);
+                    keep.batches.push(batch);
+                }
                 continue;
             }
             let committed = log.apply_batch(batch, false, sink);
@@ -995,8 +1076,22 @@ where
             drop(table);
             drop(log);
             let outcome = stage.outcome(epoch);
-            self.pairs
-                .publish_batch(rt, committed, move || drop((dropped, stage)));
+            match keep {
+                Some(keep) => {
+                    self.pairs.publish_batch_keeping(
+                        rt,
+                        committed,
+                        &mut keep.unused,
+                        &mut keep.displaced,
+                    );
+                    keep.pairs.extend(dropped);
+                    keep.stages.push(stage);
+                }
+                None => {
+                    self.pairs
+                        .publish_batch(rt, committed, move || drop((dropped, stage)));
+                }
+            }
             return outcome;
         }
     }
@@ -1044,6 +1139,26 @@ where
 
     pub fn epoch(&self) -> u64 {
         self.index.epoch()
+    }
+
+    /// A copy of every pair held for `key`, with its rank, in bucket order.
+    pub fn held_pairs(&self, key: &K) -> Vec<(P, R)> {
+        self.read(
+            |table, hasher| match table.find_key(hasher.hash_one(key), key) {
+                Some(s) => table.bucket(s).pairs().to_vec(),
+                None => Vec::new(),
+            },
+        )
+    }
+
+    /// A copy of every pair held, with its rank, in no particular order.
+    pub fn ranked_pairs(&self) -> Vec<(P, R)> {
+        self.read(|table, _| {
+            table
+                .buckets()
+                .flat_map(|(_, b)| b.pairs().iter().cloned())
+                .collect()
+        })
     }
 }
 

@@ -796,3 +796,58 @@ fn model_matches<C: Cells>() {
         run_steps::<C>(steps);
     });
 }
+
+thread_local! {
+    static TRACKED_DROPS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Tracked(u32);
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        TRACKED_DROPS.set(TRACKED_DROPS.get() + 1);
+    }
+}
+
+#[test]
+fn apply_pairs_keeping_drops_nothing_until_the_kept_value_drops() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = KeyedCollection::<u32, Tracked, crate::Local, (u32, Tracked), u8>::new(&rt);
+    kc.apply_pairs_with(
+        &rt,
+        [
+            PairOp::Insert((1, Tracked(1)), 0),
+            PairOp::Insert((2, Tracked(2)), 0),
+        ],
+        &mut (),
+        None,
+    );
+    let mut keep = KeyedSpent::default();
+    TRACKED_DROPS.set(0);
+    kc.apply_pairs_keeping(
+        &rt,
+        [
+            PairOp::Remove((1, Tracked(1)), 0),
+            PairOp::Insert((1, Tracked(3)), 0),
+            PairOp::Remove((2, Tracked(2)), 0),
+            PairOp::Remove((9, Tracked(9)), 0),
+        ],
+        &mut (),
+        None,
+        &mut keep,
+    );
+    kc.apply_pairs_keeping(
+        &rt,
+        [PairOp::Remove((9, Tracked(9)), 0)],
+        &mut (),
+        None,
+        &mut keep,
+    );
+    assert_eq!(TRACKED_DROPS.get(), 0);
+    assert!(!kc.contains(&2));
+    assert_eq!(kc.row(&1), Some(Tracked(3)));
+    TRACKED_DROPS.set(0);
+    drop(keep);
+    assert!(TRACKED_DROPS.get() >= 4, "{} dropped", TRACKED_DROPS.get());
+}

@@ -88,7 +88,9 @@ pub use fx::{FxBuildHasher, FxHasher};
 pub use generic_arena::GenericArena;
 pub use grid_table::{GridKey, GridTable};
 pub use handle::{ErasedIncr, Incr, RuntimeId};
-pub use keyed::{KeyCounts, KeyIndex, KeyTable, KeyedChange, KeyedCollection, Pair, PairOp};
+pub use keyed::{
+    KeyCounts, KeyIndex, KeyTable, KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp,
+};
 pub use locks::{LocalLock, Lock};
 pub use memory::{
     Held, MemoryStats, NodeKind, NodeMemory, StateKind, StateMemory, StateStats, ValueType,
