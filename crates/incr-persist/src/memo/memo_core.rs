@@ -32,8 +32,8 @@ pub struct MemoStats {
     pub corrupt: u64,
     /// Checkpoints that wrote a generation.
     pub checkpoints: u64,
-    /// Automatic checkpoints that failed with an error other than `Busy`,
-    /// or panicked.
+    /// Automatic checkpoints that failed with an error other than `Busy` or
+    /// an open unlogged scope or staged batch, or panicked.
     pub auto_checkpoint_errors: u64,
     /// Generations a checkpoint replaced but could not remove.
     pub stale_generations: u64,

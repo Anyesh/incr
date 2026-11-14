@@ -4,8 +4,9 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use incr_persist::memo::{BuildId, MemoBuilder, MemoCells, MemoOptions, MemoryMemo};
+use incr_persist::memo::{BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoryMemo};
 use incr_persist::{
     Backend, Cells, ConditionalAppend, Error, Local, MemoryBackend, Options, Origin, PendingWrite,
     Position, ReadOutcome, Record, Shared, SnapshotId, Store,
@@ -492,6 +493,56 @@ fn a_shared_staged_batch_keeps_the_store_alive<C: Cells>() {
     drop(staged);
     assert!(weak.upgrade().is_none());
     assert_eq!(log_after(&log, Position(last.0 - 1)).len(), 1);
+}
+
+type SharedMemo = (
+    Arc<Store<Shared, MemoryBackend>>,
+    Memo<Shared, MemoryBackend>,
+);
+
+fn shared_memo_store_with_auto_checkpoint() -> SharedMemo {
+    let store = Arc::new(open::<Shared, _>(MemoryBackend::new()));
+    let x = store.input("x", 1_u64).unwrap();
+    let xh = x.handle();
+    let mut builder =
+        MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0xb1d)).auto_checkpoint_secs(1));
+    let scaled = builder.table::<u32, u64>("scaled", 1);
+    builder.define(scaled, move |ctx, k| ctx.rt().get(xh) * u64::from(*k));
+    let memo = builder.open(&store, MemoryMemo::new()).unwrap();
+    let q = memo.get_or_insert(scaled, 3);
+    assert_eq!(memo.runtime().get(q), 3);
+    (store, memo)
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn the_auto_checkpoint_skips_a_staged_batch_without_counting_an_error() {
+    let (store, memo) = shared_memo_store_with_auto_checkpoint();
+    let staged = store.staged_batch().unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    let stats = memo.stats();
+    assert_eq!(stats.auto_checkpoint_errors, 0);
+    assert_eq!(stats.checkpoints, 0);
+    drop(staged);
+}
+
+#[test]
+fn the_auto_checkpoint_skips_an_unlogged_scope_without_counting_an_error() {
+    let (store, memo) = shared_memo_store_with_auto_checkpoint();
+    let scope = store.unlogged_scope().unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(memo.stats().auto_checkpoint_errors, 0);
+    scope.close().unwrap();
+    wait_until("no automatic checkpoint ran after the scope closed", || {
+        memo.stats().checkpoints > 0
+    });
 }
 
 macro_rules! both {
