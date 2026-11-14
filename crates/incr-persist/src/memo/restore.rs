@@ -97,7 +97,7 @@ impl<C: MemoCells> CoreRef<C> {
         #[cfg(test)]
         park(Park::BeforeSeed);
         let (handle, seeded) = t.seed(self, rt, key, &entry.value, &deps, reuse, &base, bag);
-        record(state, handle.erase(), entry, &base, seeded);
+        record(state, t.index, handle.erase(), entry, &base, seeded);
         handle
     }
 }
@@ -137,6 +137,7 @@ fn corrupt(state: &mut MemoState) {
 
 fn record(
     state: &mut MemoState,
+    table: u32,
     handle: ErasedIncr,
     entry: &Entry,
     base: &SeedBase,
@@ -147,6 +148,7 @@ fn record(
             state
                 .seed_info
                 .insert(handle, (fingerprint(&entry.value), base.w0));
+            state.seed_keys.insert(handle, (table, entry.key.clone()));
             match reuse {
                 Reuse::IfUnchanged => state.stats.reused += 1,
                 Reuse::RecomputeFirst => state.stats.revalidated += 1,
@@ -341,7 +343,7 @@ impl<C: MemoCells> Walk<'_, C> {
         );
         match seeded {
             Some((handle, seeded)) => {
-                record(state, handle, entry, base, seeded);
+                record(state, visit.table, handle, entry, base, seeded);
                 self.visits[id].handle = Some(handle);
             }
             None => corrupt(state),

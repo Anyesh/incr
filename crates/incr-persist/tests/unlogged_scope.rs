@@ -152,11 +152,11 @@ fn a_memo_lookup_in_a_scope_computes_the_candidate_and_records_nothing() {
     let q = memo.get_or_insert(count, 0);
     assert_eq!(rt.get(q), 3);
     assert_eq!(runs.load(SeqCst), 1);
-    assert_eq!(memo.stats(), MemoStats::default());
+    assert_eq!(restores(&memo.stats()), restores(&MemoStats::default()));
     handle.delete(rt, &3);
     scope.close().unwrap();
     assert_eq!(rt.get(q), 2);
-    assert_eq!(memo.stats(), MemoStats::default());
+    assert_eq!(restores(&memo.stats()), restores(&MemoStats::default()));
 }
 
 fn a_memo_entry_over_a_touched_input_survives_a_checkpoint_after_close<C: MemoCells>() {
@@ -382,3 +382,9 @@ both!(
     a_closed_scope_does_not_poison,
     a_scope_over_a_foreign_handle_fails,
 );
+
+/// The restore counters, without the gauges of what the backend holds.
+fn restores(stats: &MemoStats) -> (u64, u64, u64, u64, u64) {
+    let s = stats;
+    (s.reused, s.revalidated, s.cold, s.corrupt, s.checkpoints)
+}

@@ -15,6 +15,7 @@ mod checkpoint;
 mod codec;
 #[cfg(feature = "backend-tests")]
 pub mod conformance;
+mod dirty;
 mod file;
 mod generation;
 mod handle;
@@ -31,7 +32,8 @@ mod table_core;
 
 pub use backend::{EncodedEntry, MemoBackend};
 pub use checkpoint::{
-    write_checkpoint, CheckpointInput, CheckpointStats, Checkpointed, DEFAULT_MAX_BYTES,
+    write_checkpoint, CheckpointInput, CheckpointStats, CheckpointTimes, Checkpointed,
+    DEFAULT_MAX_BYTES,
 };
 pub use codec::*;
 pub use file::{FileMemo, FileMemoGuard};

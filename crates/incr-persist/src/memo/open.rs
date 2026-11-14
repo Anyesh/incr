@@ -1,14 +1,14 @@
 use std::any::{type_name, Any};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use incr_core::{check_value_code, Incr, Runtime, Shared};
 
 use super::handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
-use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats};
+use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats, Wake};
 use super::options::MemoOptions;
 use super::table_core::{ErasedTable, TableCore};
 use super::{CheckpointStats, GenId, Generation, MemoBackend, TableDesc};
@@ -129,12 +129,13 @@ impl<C: MemoCells> MemoBuilder<C> {
             deps,
             rt.create_table(),
             self.options.max_bytes,
+            self.options.checkpoint_after_entries,
             index,
         )));
-        let auto = self
-            .options
-            .auto_checkpoint_secs
-            .map(|secs| AutoCheckpoint::start(store, &core, Duration::from_secs(secs)));
+        let every = self.options.auto_checkpoint_secs.map(Duration::from_secs);
+        let triggered = self.options.checkpoint_after_entries.is_some();
+        let auto = (!C::SINGLE_THREADED && (every.is_some() || triggered))
+            .then(|| AutoCheckpoint::start(store, &core, every));
         Ok(Memo {
             store: Arc::clone(store),
             core,
@@ -198,14 +199,30 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
 
     /// Writes every live entry whose deps all map into the next
     /// generation, merged with the current one and evicted down to
-    /// `max_bytes`. `Err(Busy)` if another handle is checkpointing.
+    /// `max_bytes`. Writes nothing, and reports
+    /// [`CheckpointStats::unchanged`], when no entry computed since it was
+    /// last saved can be saved. `Err(Busy)` if another handle is
+    /// checkpointing.
     pub fn checkpoint(&self) -> Result<CheckpointStats> {
         self.core.checkpoint(self.runtime())
     }
 
+    /// [`Self::checkpoint`] when
+    /// [`MemoOptions::checkpoint_after_entries`](super::MemoOptions::checkpoint_after_entries)
+    /// entries are unsaved; `Ok(None)` otherwise, and always when no
+    /// trigger is set. For after a write or a read-only rebuild, so the
+    /// stall lands where the caller chooses.
+    pub fn checkpoint_if_due(&self) -> Result<Option<CheckpointStats>> {
+        check_value_code();
+        if !self.core.checkpoint_due() {
+            return Ok(None);
+        }
+        self.checkpoint().map(Some)
+    }
+
     pub fn stats(&self) -> MemoStats {
         check_value_code();
-        self.core.lock_memo().stats.clone()
+        self.core.stats()
     }
 
     /// The entries checkpoints left out since the last call because their
@@ -227,16 +244,18 @@ impl<C: MemoCells, B: Backend> Drop for Memo<C, B> {
 }
 
 struct AutoCheckpoint {
-    stop: Arc<(Mutex<bool>, Condvar)>,
+    wake: Arc<Wake>,
     thread: JoinHandle<()>,
 }
 
 impl AutoCheckpoint {
-    /// Only called for `Shared`, which `open` checks.
+    /// Only called for `Shared`, which `open` checks. Checkpoints every
+    /// `every` and whenever the trigger makes one due, skipping a turn with
+    /// nothing unsaved.
     fn start<C: MemoCells, B: Backend + 'static>(
         store: &Arc<Store<C, B>>,
         core: &CoreRef<C>,
-        every: Duration,
+        every: Option<Duration>,
     ) -> Self {
         let store: Box<dyn Any> = Box::new(Arc::clone(store));
         let core: Box<dyn Any> = Box::new(core.clone());
@@ -246,22 +265,15 @@ impl AutoCheckpoint {
         ) else {
             unreachable!("incr-persist: automatic checkpoints are Shared-only");
         };
-        let stop = Arc::new((Mutex::new(false), Condvar::new()));
-        let signal = Arc::clone(&stop);
+        let wake = Arc::clone(&core.wake);
         let thread = thread::spawn(move || loop {
-            let (stopped, wake) = &*signal;
-            let stopped = wake
-                .wait_timeout_while(
-                    stopped.lock().unwrap_or_else(PoisonError::into_inner),
-                    every,
-                    |stopped| !*stopped,
-                )
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-            if *stopped {
+            core.wake.arm();
+            if core.wake.wait(every) {
                 return;
             }
-            drop(stopped);
+            if core.dirty.unsaved() == 0 {
+                continue;
+            }
             // A panic in a key's or value's code fails this checkpoint, not
             // the thread, so later intervals still run.
             match catch_unwind(AssertUnwindSafe(|| core.checkpoint(store.runtime()))) {
@@ -271,13 +283,11 @@ impl AutoCheckpoint {
                 Ok(Err(_)) | Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
             }
         });
-        AutoCheckpoint { stop, thread }
+        AutoCheckpoint { wake, thread }
     }
 
     fn stop(self) {
-        let (stopped, wake) = &*self.stop;
-        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        wake.notify_all();
+        self.wake.stop();
         if let Err(payload) = self.thread.join() {
             if !thread::panicking() {
                 resume_unwind(payload);

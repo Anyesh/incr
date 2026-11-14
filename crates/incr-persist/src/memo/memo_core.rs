@@ -1,13 +1,17 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
 use incr_core::{Cells, ErasedIncr, Incr, Local, NodeTable, Runtime, Shared};
 
-use super::table_core::ErasedTable;
+use super::dirty::Dirty;
+
+use super::table_core::{ErasedTable, KeyPart};
 use super::{
     decode_entry, key_hash, write_checkpoint, CheckpointInput, Checkpointed, Entry, GenId,
     Generation, IndexItem, MemoBackend, TableDesc,
@@ -16,9 +20,27 @@ use crate::store::dep_index::{DepIndex, External};
 use crate::value_context::EncodeMismatch;
 use crate::Result;
 
-/// Restores and checkpoints by count, since the memo opened.
+/// Restores and checkpoints by count since the memo opened, and what the
+/// backend holds and lacks now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoStats {
+    /// Entries in the current generation.
+    pub entries: u64,
+    /// The current generation's summed entry frame lengths, the size
+    /// `max_bytes` bounds.
+    pub bytes: u64,
+    /// Entries computed since the last checkpoint attempt that no
+    /// checkpoint has saved. Entries left dirty by an earlier checkpoint,
+    /// unsaveable or evicted, are not counted until they compute again.
+    pub unsaved_entries: u64,
+    /// Entries the last checkpoint found but could not save: a dep that
+    /// maps to nothing or to an entry not kept, a cycle group, a key or
+    /// value that does not round-trip, or a frame too large. They stay
+    /// dirty, so every checkpoint tries them again.
+    pub unsaveable: u64,
+    /// Entries the last checkpoint evicted to fit `max_bytes`. Live ones
+    /// are dirty again, and a reopen recomputes the others.
+    pub evicted_last_checkpoint: u64,
     /// Entries seeded to verify without running when their deps are
     /// unchanged.
     pub reused: u64,
@@ -68,6 +90,8 @@ pub(crate) struct IndexGen {
     /// every table when the build differs.
     to_gen: Vec<Option<u32>>,
     to_live: HashMap<u32, u32>,
+    /// The generation's [`Generation::entry_bytes`].
+    pub(crate) bytes: u64,
 }
 
 impl IndexGen {
@@ -87,6 +111,7 @@ impl IndexGen {
             .filter_map(|(live, gen)| Some((((*gen)?), live as u32)))
             .collect();
         IndexGen {
+            bytes: generation.entry_bytes(),
             generation,
             to_gen,
             to_live,
@@ -142,6 +167,10 @@ pub(crate) struct MemoState {
     /// and the stamp it seeded at. A removed or recycled node never matches
     /// a live handle; checkpoints prune them.
     pub(crate) seed_info: HashMap<ErasedIncr, (u128, u64)>,
+    /// Per node in `seed_info`, its live table and stored key bytes.
+    pub(crate) seed_keys: HashMap<ErasedIncr, (u32, Vec<u8>)>,
+    /// `seed_info`'s length after checkpoints last pruned it.
+    pub(crate) pruned_at: usize,
     pub(crate) stats: MemoStats,
     pub(crate) mismatches: Vec<EncodeMismatch>,
 }
@@ -167,6 +196,96 @@ pub(crate) struct MemoCore<C: MemoCells> {
     checkpoint: Mutex<()>,
     memo: Mutex<MemoState>,
     index: RwLock<Arc<IndexGen>>,
+    pub(crate) dirty: Dirty,
+    /// `MemoOptions::checkpoint_after_entries`.
+    pub(crate) trigger: Option<u64>,
+    pub(crate) wake: Arc<Wake>,
+}
+
+/// What the automatic-checkpoint thread waits on. A leaf lock outside the
+/// lock order.
+pub(crate) struct Wake {
+    state: Mutex<Waking>,
+    cond: Condvar,
+    /// Set while a compute that finds the trigger reached may wake the
+    /// thread; the first one to do so clears it, and the thread sets it
+    /// again before each wait.
+    armed: AtomicBool,
+}
+
+impl Default for Wake {
+    fn default() -> Self {
+        Wake {
+            state: Mutex::default(),
+            cond: Condvar::new(),
+            armed: AtomicBool::new(true),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Waking {
+    stop: bool,
+    due: bool,
+}
+
+impl Wake {
+    fn lock(&self) -> MutexGuard<'_, Waking> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn due(&self) {
+        self.lock().due = true;
+        self.cond.notify_all();
+    }
+
+    /// Lets the next compute that finds the trigger reached wake the
+    /// thread.
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// [`Self::due`] once per [`Self::arm`].
+    fn due_once(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.due();
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        self.lock().stop = true;
+        self.cond.notify_all();
+    }
+
+    /// Waits until a checkpoint is due, `every` has passed, or a stop:
+    /// `true` for a stop. `None` waits without an interval.
+    pub(crate) fn wait(&self, every: Option<Duration>) -> bool {
+        let deadline = every.map(|every| Instant::now() + every);
+        let mut waking = self.lock();
+        loop {
+            if waking.stop {
+                return true;
+            }
+            if std::mem::take(&mut waking.due) {
+                return false;
+            }
+            waking = match deadline {
+                None => self
+                    .cond
+                    .wait(waking)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(deadline) => {
+                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                        return false;
+                    };
+                    self.cond
+                        .wait_timeout(waking, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
+        }
+    }
 }
 
 impl<C: MemoCells> MemoCore<C> {
@@ -180,6 +299,7 @@ impl<C: MemoCells> MemoCore<C> {
         deps: Arc<DepIndex>,
         externals: NodeTable<String, u128, C>,
         max_bytes: u64,
+        trigger: Option<u64>,
         index: IndexGen,
     ) -> Self {
         MemoCore {
@@ -194,6 +314,9 @@ impl<C: MemoCells> MemoCore<C> {
             checkpoint: Mutex::new(()),
             memo: Mutex::new(MemoState::default()),
             index: RwLock::new(Arc::new(index)),
+            dirty: Dirty::new(),
+            trigger,
+            wake: Arc::default(),
         }
     }
 
@@ -212,6 +335,33 @@ impl<C: MemoCells> MemoCore<C> {
         Ordered::take(LockKind::Memo, || {
             self.memo.lock().unwrap_or_else(PoisonError::into_inner)
         })
+    }
+
+    /// Records that `table`'s entry `handle` computed, and wakes the
+    /// automatic-checkpoint thread when a checkpoint is due. A count that
+    /// reached the trigger without a compute, carried or left by a failed
+    /// checkpoint, wakes it at the next compute.
+    pub(crate) fn computed(&self, table: u32, handle: ErasedIncr, key: &KeyPart) {
+        let unsaved = self.dirty.computed(table, handle, key);
+        if self.trigger.is_some_and(|trigger| unsaved >= trigger) {
+            self.wake.due_once();
+        }
+    }
+
+    /// Whether `checkpoint_after_entries` entries are unsaved.
+    pub(crate) fn checkpoint_due(&self) -> bool {
+        self.trigger
+            .is_some_and(|trigger| self.dirty.unsaved() >= trigger)
+    }
+
+    /// The stats with what the backend holds and lacks now.
+    pub(crate) fn stats(&self) -> MemoStats {
+        let mut stats = self.lock_memo().stats.clone();
+        let index = self.index();
+        stats.entries = index.generation.items().len() as u64;
+        stats.bytes = index.bytes;
+        stats.unsaved_entries = self.dirty.unsaved();
+        stats
     }
 
     pub(crate) fn index(&self) -> Arc<IndexGen> {
