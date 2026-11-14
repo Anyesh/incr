@@ -204,7 +204,9 @@ impl<B: PyBinding> MemoCore<B> {
     }
 
     /// Declares the memo table `name` with its codecs, whose entries the
-    /// closure `make(func)` computes. Raises before `open_memo` only.
+    /// closure `make(func)` computes. Raises after `open_memo` has started.
+    /// Holds the store's declare lock, as [`Self::open`] does, so a
+    /// declaration and an open never interleave.
     #[expect(
         clippy::too_many_arguments,
         reason = "the Python method's arguments, passed through"
@@ -220,6 +222,7 @@ impl<B: PyBinding> MemoCore<B> {
         func: Py<PyAny>,
         make: impl FnOnce(Py<PyAny>) -> MemoFn<B::C>,
     ) -> PyResult<TableHandle> {
+        let _declaring = core.declare_lock(py)?;
         if self.is_open() {
             return Err(PyRuntimeError::new_err(
                 "memo_table must be called before open_memo",
@@ -322,7 +325,7 @@ where
     /// Opens the memo over the Python memo `backend` with `options`,
     /// loading its current generation. The builder is made from the
     /// declarations with `make`, so a later open can succeed after a
-    /// failed one.
+    /// failed one. Holds the store's declare lock.
     pub fn open(
         &self,
         core: &StoreCore<B>,
@@ -331,6 +334,7 @@ where
         options: OpenOptions,
         make: impl Fn(Py<PyAny>) -> MemoFn<B::C>,
     ) -> PyResult<()> {
+        let _declaring = core.declare_lock(py)?;
         if self.is_open() {
             return Err(PyRuntimeError::new_err("the memo is already open"));
         }

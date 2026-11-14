@@ -128,3 +128,36 @@ def test_dropping_an_open_on_write_batch_poisons_the_store(watchdog):
     gc.collect()
     with pytest.raises(PersistError):
         store.set(price, 2)
+
+
+class SlowLoadMemo(SlowMemo):
+    def load(self):
+        self.started.set()
+        self.release.wait(10)
+        return self.inner.load()
+
+
+def test_a_memo_table_declared_while_the_memo_opens_raises(watchdog):
+    store = Store.open(MemoryBackend(), build_id=1)
+    store.memo_table("sq", 1, PickleCodec(), PickleCodec(), lambda ctx, k: k * k)
+    memo_backend = SlowLoadMemo()
+    opener = threading.Thread(target=store.open_memo, args=(memo_backend,))
+    opener.start()
+    assert memo_backend.started.wait(10)
+    outcome = {}
+
+    def declare():
+        try:
+            outcome["table"] = store.memo_table(
+                "cube", 1, PickleCodec(), PickleCodec(), lambda ctx, k: k**3
+            )
+        except RuntimeError as e:
+            outcome["error"] = e
+
+    declarer = threading.Thread(target=declare)
+    declarer.start()
+    time.sleep(0.2)
+    memo_backend.release.set()
+    opener.join(10)
+    declarer.join(10)
+    assert "open_memo" in str(outcome.get("error"))
