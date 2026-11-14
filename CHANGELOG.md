@@ -2,6 +2,55 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.8] - Unreleased
+
+### Added
+
+- **Python: read one key of a keyed collection with a dependency on that key (R1).** `ctx.get_key(kc, key)` returns the row or `None` for an absent key, `ctx.get_key_status(kc, key)` returns `(row, status)`, and `rt.get_key(kc, key)` is the same read outside a query. A reader depends on its key only: upserting another key, or an equal row, recomputes nothing, and upserting or removing the key recomputes the reader, including a reader of an absent key. It works on a persisted keyed collection after a reopen, with no key declared by the caller, and inside an overlay. Core gains `KeyedCollection` with a key index under its own leaf lock (`LockKind::KeyIndex`), `Pair` and `PairOp`, the `get_key` family, and `KeyedSpent` with `apply_pairs_keeping`, which hands back the rows and key copies a write would drop so they are dropped outside the locks.
+- **Python: `kc.keys()` and `kc.items()` (R9).** Each returns a snapshot of the current keys (or key and row pairs) in any order, with no dependency registered; changing the collection while iterating a snapshot does not raise, and a persisted collection lists its restored keys after a reopen.
+- **Python: `store.batch(apply="on_write")` (R2).** The writes of the block apply to the runtime as they are made, so a read inside the block sees them, and the backend still gets one append holding every record of the block, in write order, at exit. The default stays `apply="on_exit"`. If the append raises, the batch keeps its records, `b.retry()` appends them once, and the store refuses other writes until the retry lands or the store is closed. An exception raised inside the block poisons the store, since its writes were applied: reopen it. A conditional append that finds the tail moved raises `incr.persist.TailMoved`, and a Python backend may offer `append_at` for it. Rust gains `ConditionalAppend`, `append_at` and `Error::TailMoved`, staged batches that apply writes at once and append them at commit, `PendingWrite` with `write_pending`, and `Error::KeyedContention`. An auto-checkpoint that is due runs before the batch's append, never between its records.
+- **Python: memo durability owned by incr (R3).** `store.open_memo(backend, max_bytes=, checkpoint_after_entries=)` sets the eviction bound and makes incr checkpoint after that many unsaved entries. `memo.stats()` returns `{"entries", "bytes", "unsaved_entries", "unsaveable", "evicted_last_checkpoint"}` without touching the backend, and `memo.checkpoint_if_due()` runs a checkpoint when the trigger has been reached (for after a read-only rebuild, since reads never checkpoint) and returns `None` when none is due. A checkpoint writes only the entries that are fresh since the base generation and carries the rest from it, so its cost follows the change and not the tenant. Rust gains `checkpoint_after_entries`, `checkpoint_if_due`, the new `MemoStats` fields and `CheckpointTimes` (`snapshot`, `merge` and `write` durations of the last checkpoint).
+- **Python: log checkpoint trigger and stats (R11).** `Store.open(backend, build_id=, auto_checkpoint_records=n)` checkpoints the log on the write that follows `n` records, and `store.stats()` returns `{"position", "snapshot_position", "records_since_checkpoint"}`.
+- **Python: memo entries that read single keys (R10).** A `ctx.get_key` inside a memo function is stored as a dependency on the collection, the key bytes and the row's fingerprint (`StoredDep::Row` in incr-persist), so after a reopen the entry verifies without running while its keys are unchanged, and runs once, cutting off if its value is equal, when one of them changed. A memo entry that read an absent key verifies while the key stays absent.
+- **Python: backend conformance (R8).** `incr.persist.conformance.run_log_backend(factory)` and `run_memo_backend(factory)` run the cases the built-in backends pass against your backend and raise `ConformanceFailure` naming the first failed case (`conformance.cases(kind)` lists the names). The argument is a factory object, not the bare callable the request asked for: log cases call `new_log()`, `open(log)`, `open_read_only(log)`, `multi_writer()` and, if the factory has it, `fence(log)`; memo cases call `new_store()`, `open(store)` and `exclusive_lock()`. The wheels now enable the `conformance` feature.
+- **Python: bounded `graph_snapshot` (R4).** `rt.graph_snapshot(roots=, direction=, depth=, label_prefix=, limit=)` walks from the roots (`direction` is `"dependencies"`, `"dependents"` or `"both"`), returns `{"nodes": [...], "truncated": bool}`, keeps edges that leave the returned set as ids, and walks through nodes the label prefix excludes without returning them. Called with no arguments it behaves as before. Core gains `graph_snapshot_bounded` and `GraphQuery`.
+- **Python: compute stats (R5).** `rt.enable_compute_stats(True)` turns on per-node counters, and `rt.compute_stats(reset=False)` returns `{group: {"recomputed", "cutoff", "verified", "elapsed_ns"}}` grouped by the label up to its first `/`, with unlabelled nodes under `None`. A recompute that returns an equal value counts under `cutoff`. Core gains the per-label counters and `label_group`, the grouping rule for the label up to its first `/`.
+- **Python: `rt.graph_summary()` (R7).** It returns `{"groups": [{"label", "kind", "nodes"}], "edges": [{"from", "to", "count"}]}` grouped by `label_group`, where `kind` is `"input"`, `"compute"` or `"mixed"`, unlabelled nodes are under `None`, and a keyed collection's group also carries `"keys"`. Core gains `graph_summary`.
+- **Python: trace entries carry edges and time (R6).** Each `node_traces` entry gains `"dependencies"` (ids of the nodes it read, those inside the trace) and `"elapsed_ns"` (zero for a node verified clean). `TraceAction` and the existing keys are unchanged; core's `NodeTrace` gains `dependencies` and `elapsed_ns`.
+- **Core: `try_delete_nodes`.** It deletes a set of nodes as one unit and refuses it, with nothing deleted, if a node outside the set depends on one inside it.
+- **incr-persist: persisted keyed collections on the core keyed collection, `ValueScope`.** A persisted keyed collection restores into the core index, and its per-key readers rerun on every write path (a write, a catch-up, a snapshot replace and a repair). A binding gives the store a `ValueScope` in `Options`, which every thread that encodes or decodes enters (including the memo's automatic checkpoint thread), so a Python codec is found from any thread.
+- **Shared persistence from Python.** `incr_concurrent.persist` has: Store, batch (on_write), memo, keyed collections, NotReady. <!-- DO NOT SHIP: final check of this list against the landed Shared surface -->
+
+### Changed
+
+- **Intended change: a key, row or value method that calls into incr during a keyed operation raises.** A `__hash__`, `__eq__` or value method that reads or writes incr (a read, a write, `keys()`, `memory_stats()`) while an operation on a keyed collection runs raises `RuntimeError` naming the collection, in release builds too, and the operation leaves rows, index and downstream values unchanged. The key index moved into incr-core under its own lock, and re-entry would deadlock on Shared or change the index under a staged write; before, a key method could read or write keyed collections mid-operation. Code whose `__hash__` or `__eq__` reads incr now raises at that call; no value a successful operation produces changes.
+- **Intended change: a raising key method during a foreign apply poisons the store.** A key `__hash__` or `__eq__` that raises while `refresh`, catch-up, a snapshot replace or a write's repair applies a record makes that call raise the Python error and poisons the store, so reopen it; reads of rows already applied keep working. A record the index refused is not in the runtime, so the store's invariant (runtime equals the log replayed) would no longer hold. Writes from the same process still raise before any change and do not poison. This is the rule `on_write` batches already follow.
+- **The memo format is 3.** A memo written as format 1 or 2 is not read: the open is a cold run, and the first checkpoint writes format 3, which stores `StoredDep::Row`.
+- **A memo checkpoint with nothing fresh writes nothing.** It no longer writes a new generation that only repeats the base, and a failed checkpoint counts its entries as unsaved again so the next one writes them.
+- **Keyed writes from inside a compute are refused**, on any compute running on the thread, not only the keyed collection's own.
+- **The memo's auto-checkpoint thread skips an open unlogged scope or staged batch**, and runs again afterwards if computes passed the trigger meanwhile.
+- **Replacing a row runs two row `__eq__` calls** instead of one.
+- **Python: `Runtime.overlay()` is not available on Shared.** `incr_concurrent` raises `RuntimeError` from `rt.overlay()` until an isolated overlay exists.
+- **Minimum Rust version.** `incr-concurrent-python` needs Rust 1.89 (it builds on incr-python-persist), as `incr-python` did since beta.7. `incr-persist`, `incr-python-persist` and `incr-kube` are 1.89, and the other crates keep 1.88.
+- **Python: persistence moved to the `incr-python-persist` crate.** Both packages share one implementation of the store, batch, memo, overlay and keyed logic; the class surface of `incr.persist` is recorded by a test and unchanged apart from the additions above.
+
+### Figures
+
+Figures: to be filled from the release benchmark run.
+
+- R1: 240,000 keys with one reader each, memory and upsert cost beside one input per key. Measured so far (Local, release build, loaded machine): 240,000 keys reconcile in 0.218 s, and one upsert takes 20 us and reruns exactly one reader.
+- R3 and R11: the memo and log checkpoint stalls at 1 GiB.
+- R5: compute stats overhead enabled, and disabled against beta.7.
+- R7: `graph_summary` and a bounded `graph_snapshot` at 1,000,000 nodes.
+- R10: reopen time and memory for 240,000 memo entries with three key reads each.
+
+### Known limitations
+
+- The known limitations listed under 0.2.0-beta.6 still apply.
+- **Shared keeps the version inputs of removed keys.** The per-key version input of a key that was removed stays on a Shared runtime.
+- **Non-canonical codecs can rank two-pair keys differently across processes.** A codec that encodes equal values to different bytes can rank two pairs of one key differently in two processes.
+- **Overlay is not available on Shared.** See Changed.
+
 ## [0.2.0-beta.7] - 2026-11-08
 
 ### Added
