@@ -2,10 +2,11 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::sync::Weak;
 
 use incr_core::{
-    with_value_code, Cells, DeleteError, ErasedIncr, Incr, IncrCollection, KeyCounts, KeyedChange,
-    KeyedCollection, KeyedSpent, Pair, PairOp, Runtime, Value,
+    with_value_code, Cells, DeleteError, ErasedIncr, Incr, IncrCollection, KeyCounts, KeyIndex,
+    KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp, Runtime, Value,
 };
 
 use super::binding::{decode, encode, Binding};
@@ -128,6 +129,13 @@ where
     /// The index's epoch, which advances on every change to it.
     pub fn epoch(&self) -> u64 {
         self.keyed.epoch()
+    }
+
+    /// A weak handle to the key index, for a caller that reads its
+    /// [`StateStats`](incr_core::StateStats) only while the collection
+    /// lives.
+    pub fn index_weak(&self) -> Weak<KeyIndex<P, u128, C>> {
+        self.keyed.index_weak()
     }
 
     fn version_node(&self) -> Incr<u64> {
