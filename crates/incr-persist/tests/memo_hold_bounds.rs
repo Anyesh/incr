@@ -136,6 +136,15 @@ fn a_thousand_row_deps_map_in_bounded_holds() {
     assert!(most <= 512, "{most} value calls in one hold");
 }
 
+/// Runs a checkpoint and fails if any of its holds ran no value call.
+/// Holds before it are not counted: a store call drops its spent values
+/// inside a hold that makes no value call.
+fn checkpoint_with_no_empty_hold(memo: &Memo<Shared, MemoryBackend>) {
+    EMPTY_HOLDS.store(0, Ordering::SeqCst);
+    memo.checkpoint().unwrap();
+    assert_no_hold_was_empty();
+}
+
 /// A hold that runs no value call was taken for nothing. Every entry in
 /// the tests below has a key and a value that some hold encodes, so an
 /// empty hold is a mapping or inspect hold that had no value to cover.
@@ -172,8 +181,7 @@ fn query_deps_next_to_a_keyed_collection_take_no_mapping_hold() {
         let node = memo.get_or_insert(tables.unwrap(), Probe(k));
         memo.runtime().get(node);
     }
-    memo.checkpoint().unwrap();
-    assert_no_hold_was_empty();
+    checkpoint_with_no_empty_hold(&memo);
 }
 
 /// Every entry of the batch was invalidated after it ran, so the
@@ -195,6 +203,5 @@ fn a_batch_of_dirty_entries_takes_no_inspect_hold() {
         memo.runtime().get(node);
     }
     memo.set_external("n", 2);
-    memo.checkpoint().unwrap();
-    assert_no_hold_was_empty();
+    checkpoint_with_no_empty_hold(&memo);
 }

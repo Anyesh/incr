@@ -94,6 +94,8 @@ fn an_automatic_checkpoint_runs_its_value_code_in_a_few_holds() {
     let read = rows.clone();
     builder.define(price, move |ctx, key: &Probe| read.get_key(ctx.rt(), key));
     let memo = builder.open(&store, MemoryMemo::new()).unwrap();
+    // Store calls before this drop their spent values inside a hold too.
+    let setup = HOLDS.load(Ordering::SeqCst);
     for k in 0..entries {
         let node = memo.get_or_insert(price, Probe(k));
         assert_eq!(memo.runtime().get(node), Some(Probe(k * 2)));
@@ -107,9 +109,9 @@ fn an_automatic_checkpoint_runs_its_value_code_in_a_few_holds() {
     drop(memo);
     assert_eq!(OUTSIDE.load(Ordering::SeqCst), 0);
     assert!(HELD.load(Ordering::SeqCst) >= 6 * entries as usize);
+    let holds = HOLDS.load(Ordering::SeqCst) - setup;
     assert!(
-        HOLDS.load(Ordering::SeqCst) <= checkpoints * (entries as usize).div_ceil(BATCH) * 6,
-        "{} holds for {checkpoints} checkpoints of {entries} entries",
-        HOLDS.load(Ordering::SeqCst)
+        holds <= checkpoints * (entries as usize).div_ceil(BATCH) * 6,
+        "{holds} holds for {checkpoints} checkpoints of {entries} entries"
     );
 }
