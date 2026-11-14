@@ -977,6 +977,7 @@
 727	runtime::reserve_tests::the_walk_listings_of_one_release_stay_linear
 1	runtime::seed_tests::a_claim_after_the_trust_check_stamps_above_w0
 1	runtime::seed_tests::a_claim_before_the_trust_check_downgrades_the_seed
+6	runtime::seed_tests::inspect_many_refuses_a_dep_change_and_a_recycled_slot_between_its_holds
 1	runtime::seed_tests::inspect_refuses_a_dep_change_between_its_holds
 1	runtime::seed_tests::local::a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle
 0	runtime::seed_tests::local::a_moved_trusted_dep_downgrades_to_recompute_first
