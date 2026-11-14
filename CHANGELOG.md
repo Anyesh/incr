@@ -32,7 +32,7 @@ All notable changes to this project are documented here. Format roughly follows 
 - **Keyed writes from inside a compute are refused**, on any compute running on the thread, not only the keyed collection's own.
 - **The memo's auto-checkpoint thread skips an open unlogged scope or staged batch**, and on Shared the skipped checkpoint runs as soon as the last of them closes, with no further compute; a close that follows no skipped checkpoint wakes nothing.
 - **Replacing a row runs two row `__eq__` calls** instead of one.
-- **A keyed write that a replay could not match raises `ValueError`.** When a held row is not `==` to its own decoded copy (one holding a float NaN, or an object compared by identity) and its codec now encodes it to bytes other than the logged ones (a set pickled under another hash seed), a write that would remove it raises `ValueError` naming the collection and key, logs nothing and leaves the store usable, because a reopen could not match the removal and would keep the old row. Use a codec that encodes such rows canonically.
+- **A keyed write that a replay could not match raises `ValueError`.** When a held row is not `==` to its own decoded copy (one holding a float NaN, or an object compared by identity) and its codec now encodes it to bytes other than the logged ones (a set pickled under another hash seed), a write that would remove it raises `ValueError` naming the collection and key, leaves the store usable and logs nothing (a refusal found while repairing after the append leaves the appended records applied, as `KeyedContention` does), because a reopen could not match the removal and would keep the old row. Use a codec that encodes such rows canonically.
 - **Python: writes through a keyed collection's `collection` raise** on both packages; write with `upsert`, `remove`, `reconcile` or a batch, which keep the key index and the log in step.
 - **Python: `get_traced` on Shared returns an `Incomplete` value's value**, as `get` does and as Local did.
 - **Python: `Runtime.overlay()` is not available on Shared.** `incr_concurrent` raises `RuntimeError` from `rt.overlay()` until an isolated overlay exists.
@@ -41,13 +41,14 @@ All notable changes to this project are documented here. Format roughly follows 
 
 ### Figures
 
-Figures: to be filled from the release benchmark run.
+Release build on a 12-core Linux box shared with other work, so treat them as orders of magnitude.
 
-- R1: 240,000 keys with one reader each, memory and upsert cost beside one input per key. Measured so far (Local, release build, loaded machine): 240,000 keys reconcile in 0.218 s, and one upsert takes 20 us and reruns exactly one reader.
-- R3 and R11: the memo and log checkpoint stalls at 1 GiB.
-- R5: compute stats overhead enabled, and disabled against beta.7.
-- R7: `graph_summary` and a bounded `graph_snapshot` at 1,000,000 nodes.
-- R10: reopen time and memory for 240,000 memo entries with three key reads each.
+- **R1 (end to end, 240,000 keys, Local / Shared):** `reconcile` of every key 2.25 s / 2.57 s; creating one `get_key` reader per key 0.27 s / 0.28 s; first read of every reader 0.51 s / 0.88 s. During 20 `on_write` units on Shared, four reader threads made 1.9 million reads and none saw a key mid-replace.
+- **R3 (memo checkpoint stall at 1 GiB, Local):** file backend 17.9 s (merge 3.1 s, write 14.8 s, snapshot under 4 ms); SQLite backend about 11 s to merge and about 300 s to write.
+- **R11 (log checkpoint, 1 GiB of 1,000-byte inputs, 1,000 dirty):** memory backend 3.3 s and reopen 1.3 s; file backend 19.9 s; peak RSS about 6 GiB.
+- **R5 (1,000-node chain, Local / Shared):** stats on costs 1.9x / 1.3x a run with them off, tracing 3.0x / 1.6x. Clean `get` is gated exactly: 92 instructions on Local and 190 on Shared, as in beta.7.
+- **R7:** `graph_summary` over 1,000,000 nodes in 20 groups takes 129 ms on Local and 133 ms on Shared.
+- **R10 (reopen of 240,000 memo entries with Row deps):** 0.92 s on Local and 0.93 s on Shared (store open 75 ms, memo open 270 ms, first reads 0.57 s); in the end-to-end run, the first read of every entry after reopen takes 2.7 s / 3.5 s.
 
 ### Known limitations
 
@@ -56,8 +57,10 @@ Figures: to be filled from the release benchmark run.
 - **Non-canonical codecs can rank two-pair keys differently across processes.** A codec that encodes equal values to different bytes can rank two pairs of one key differently in two processes.
 - **Overlay is not available on Shared.** See Changed.
 - **On Shared a reader can see a key as absent during a persisted replace.** A replace is applied record by record, so a read between its `Remove` and `Insert` finds no row.
+- **A key holding a row refused as above stays as it is.** Every later write that would remove that row, a `reconcile` that drops the key included, is refused in every process; only deleting the collection clears it.
+- **A refused-row check can miss across a compaction.** Under a codec that encodes one row two ways, a process that caught up before another process checkpointed holds the row at its old fingerprint, so its removal passes the check, while a process replaying the new snapshot holds the re-encoded bytes and may miss that removal.
 - **Shared collection operators do not apply the NotReady rules**, and Shared has no lookups and no `Collection.extend` or `replace`; these are Local only, as in beta.7.
-- **Compute stats cost about 1.8 times a run on a trivial chain when enabled** (50 nodes), because each compute is timed.
+- **Compute stats cost up to about twice a run when enabled** on cheap computes (1.9x on a 1,000-node Local chain), because each compute is timed; they are off by default.
 - **`Store::checkpoint` reports one stall**, with no split between the fold, the compaction and the reload.
 
 ## [0.2.0-beta.7] - 2026-11-08
