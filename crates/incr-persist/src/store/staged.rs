@@ -10,6 +10,36 @@ use super::{
 };
 use crate::{Backend, Error, Position, ReadOutcome, Record, Result};
 
+/// Where a staged batch calls [`STAGED_PARK`] on its thread, store mutex
+/// held.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StagedPark {
+    /// One staged record is applied to the runtime and kept for the run.
+    Applied,
+    /// The commit's run is in the log and the store's position has not
+    /// moved yet.
+    Landed,
+}
+
+#[cfg(test)]
+type StagedParkHook = Box<dyn Fn(StagedPark)>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STAGED_PARK: std::cell::RefCell<Option<StagedParkHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn park(point: StagedPark) {
+    STAGED_PARK.with(|hook| {
+        if let Some(hook) = &*hook.borrow() {
+            hook(point);
+        }
+    });
+}
+
 /// Writes applied to the runtime as they are made and appended to the log
 /// as one run at [`commit`](Self::commit), opened by
 /// [`Store::staged_batch`].
@@ -126,6 +156,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
             if self.options.durability == Durability::Sync {
                 self.backend.sync(last).map_err(Failure::Poison)?;
             }
+            #[cfg(test)]
+            park(StagedPark::Landed);
             for (position, record) in (after.0 + 1..).map(Position).zip(run) {
                 state.applied = position;
                 state.since_checkpoint += 1;
@@ -216,6 +248,8 @@ impl<C: Cells, B: Backend> StagedBatch<'_, C, B> {
             .write_pending_with(&mut state, pending, &mut |state, records| {
                 for record in records {
                     store.apply_staged(state, record, run)?;
+                    #[cfg(test)]
+                    park(StagedPark::Applied);
                 }
                 Ok((state.applied, false))
             })
@@ -286,7 +320,10 @@ impl<C: Cells, B: Backend> StagedBatch<'_, C, B> {
         let StagedBatch { store, run, .. } = self;
         let mut state = store.state()?;
         let record = record(&state, store.runtime())?;
-        store.apply_staged(&mut state, record, run)
+        store.apply_staged(&mut state, record, run)?;
+        #[cfg(test)]
+        park(StagedPark::Applied);
+        Ok(())
     }
 }
 
