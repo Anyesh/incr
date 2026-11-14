@@ -51,6 +51,12 @@ impl TableHandle {
     /// can be set under the store lock with no Python code; `None` for
     /// an unlabelled table or a key whose `__str__` raises, which is
     /// reported as unraisable.
+    /// A reference to `key` kept to label its entry, for a labelled table
+    /// only. Taken with the GIL, before any store closure.
+    fn spare_key(&self, py: Python<'_>, key: &Py<PyAny>) -> Option<Py<PyAny>> {
+        self.label.as_ref().map(|_| key.clone_ref(py))
+    }
+
     fn entry_label(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> Option<String> {
         let label = self.label.as_deref()?;
         match key.str() {
@@ -61,6 +67,13 @@ impl TableHandle {
             }
         }
     }
+}
+
+/// What the first store call of [`MemoCore::value_of`] returns: the value,
+/// or an entry of a labelled table that has no label yet.
+enum Entry {
+    Value(PyValue),
+    Unlabelled(Incr<PyValue>),
 }
 
 struct MemoDecl {
@@ -352,19 +365,38 @@ where
         }
         let table = handle.get();
         let registry = core.registry();
-        let label = handle.entry_label(py, key.0.bind(py));
-        let value = restoring(core, py, || {
+        let spare = handle.spare_key(py, &key.0);
+        let labelled_table = spare.is_some();
+        let first = restoring(core, py, || {
             B::write(py, core.store(), move |store, _| {
                 registry.scoped(|| {
                     let node = memo.into_inner().get_or_insert(table, key);
                     let rt = store.runtime();
-                    if let Some(label) = label.filter(|_| rt.label(node.slot()).is_none()) {
-                        rt.set_label(node.slot(), label);
+                    if labelled_table && !rt.has_label(node.slot()) {
+                        Entry::Unlabelled(node)
+                    } else {
+                        Entry::Value(rt.get(node))
                     }
-                    rt.get(node)
                 })
             })
         })?;
+        let value = match first {
+            Entry::Value(value) => value,
+            Entry::Unlabelled(node) => {
+                let label = spare.and_then(|key| handle.entry_label(py, key.bind(py)));
+                restoring(core, py, || {
+                    B::write(py, core.store(), move |store, _| {
+                        registry.scoped(|| {
+                            let rt = store.runtime();
+                            if let Some(label) = label.filter(|_| !rt.has_label(node.slot())) {
+                                rt.set_label(node.slot(), label);
+                            }
+                            rt.get(node)
+                        })
+                    })
+                })?
+            }
+        };
         drop(core.registry().take_failure());
         Ok(value)
     }
@@ -420,19 +452,29 @@ where
         let memo = carry::<B, _>(self.memo()?);
         let table = handle.get();
         let registry = core.registry();
-        let label = handle.entry_label(py, key.bind(py));
-        let node = restoring(core, py, || {
+        let spare = handle.spare_key(py, &key);
+        let labelled_table = spare.is_some();
+        let (node, labelled) = restoring(core, py, || {
             B::read(py, core.store(), move |store, _| {
                 registry.scoped(|| {
                     let node = memo.into_inner().get_or_insert(table, PyValue(key));
-                    let rt = store.runtime();
-                    if let Some(label) = label.filter(|_| rt.label(node.slot()).is_none()) {
-                        rt.set_label(node.slot(), label);
-                    }
-                    node
+                    let labelled = !labelled_table || store.runtime().has_label(node.slot());
+                    (node, labelled)
                 })
             })
         })?;
+        if !labelled {
+            let label = spare.and_then(|key| handle.entry_label(py, key.bind(py)));
+            if let Some(label) = label {
+                let slot = node.slot();
+                B::read(py, core.store(), move |store, _| {
+                    let rt = store.runtime();
+                    if !rt.has_label(slot) {
+                        rt.set_label(slot, label);
+                    }
+                })?;
+            }
+        }
         drop(core.registry().take_failure());
         Ok(node)
     }

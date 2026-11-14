@@ -567,3 +567,114 @@ def test_a_failed_open_memo_keeps_the_declared_tables_for_the_retry(persist):
     assert rt.get(memo.get_or_insert(second, 5)) == 11
     assert rt.get(rt.create_query(lambda ctx: ctx.memo(first, 3))) == 6
     store.close()
+
+
+class CountedKey:
+    strs = 0
+
+    def __init__(self, n, raises=False):
+        self.n = n
+        self.raises = raises
+
+    def __hash__(self):
+        return hash(self.n)
+
+    def __eq__(self, other):
+        return isinstance(other, CountedKey) and self.n == other.n
+
+    def __str__(self):
+        CountedKey.strs += 1
+        if self.raises:
+            raise RuntimeError("no str")
+        return f"k{self.n}"
+
+
+class KeyCodec:
+    def encode(self, obj):
+        return str(obj.n).encode()
+
+    def decode(self, data):
+        return CountedKey(int(data))
+
+
+@pytest.fixture
+def unraisable(monkeypatch):
+    monkeypatch.setattr(sys, "unraisablehook", lambda info: None)
+
+
+def labelled_memo(persist, log, memo_backend):
+    store = persist.Store.open(log, build_id="b1")
+    double = store.memo_table(
+        "double",
+        1,
+        KeyCodec(),
+        JsonCodec(),
+        lambda ctx, key: key.n * 2,
+        label="prices",
+    )
+    total = store.memo_table(
+        "total",
+        1,
+        KeyCodec(),
+        JsonCodec(),
+        lambda ctx, key: ctx.memo(double, key) + 1,
+    )
+    return store, double, total, store.open_memo(memo_backend)
+
+
+def node_label(rt, entry):
+    return rt.graph_snapshot(roots=[entry], depth=0)["nodes"][0]["label"]
+
+
+def test_a_labelled_entry_is_labelled_from_its_first_compute(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
+    store, double, _, memo = labelled_memo(persist, log, memo_backend)
+    rt = store.runtime
+    rt.enable_compute_stats(True)
+    assert rt.get(memo.get_or_insert(double, CountedKey(3))) == 6
+    stats = rt.compute_stats()
+    assert stats["prices"]["recomputed"] == 1
+    assert None not in stats
+    assert node_label(rt, memo.get_or_insert(double, CountedKey(3))) == "prices/k3"
+
+
+def test_a_labelled_entry_formats_its_key_once(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
+    store, double, _, memo = labelled_memo(persist, log, memo_backend)
+    rt = store.runtime
+    CountedKey.strs = 0
+    for _ in range(3):
+        assert rt.get(memo.get_or_insert(double, CountedKey(3))) == 6
+    assert CountedKey.strs == 1
+    CountedKey.strs = 0
+    query = rt.create_query(
+        lambda ctx: ctx.memo(double, CountedKey(4)) + ctx.memo(double, CountedKey(4))
+    )
+    assert rt.get(query) == 16
+    assert CountedKey.strs == 1
+
+
+def test_an_entry_restored_as_a_dependency_is_labelled_once_read_directly(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
+    store, _, total, memo = labelled_memo(persist, log, memo_backend)
+    assert store.runtime.get(memo.get_or_insert(total, CountedKey(5))) == 11
+    memo.checkpoint()
+    store.close()
+
+    store, double, total, memo = labelled_memo(persist, log, memo_backend)
+    rt = store.runtime
+    assert rt.get(memo.get_or_insert(total, CountedKey(5))) == 11
+    entry = memo.get_or_insert(double, CountedKey(5))
+    assert node_label(rt, entry) == "prices/k5"
+    assert rt.get(entry) == 10
+
+
+def test_a_key_whose_str_raises_leaves_the_entry_unlabelled(persist, unraisable):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
+    store, double, _, memo = labelled_memo(persist, log, memo_backend)
+    rt = store.runtime
+    entry = memo.get_or_insert(double, CountedKey(6, raises=True))
+    assert rt.get(entry) == 12
+    assert node_label(rt, entry) is None
+    query = rt.create_query(lambda ctx: ctx.memo(double, CountedKey(7, raises=True)))
+    assert rt.get(query) == 14

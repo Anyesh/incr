@@ -4059,6 +4059,15 @@ impl<C: Cells> Runtime<C> {
         self.inner.write().labels.remove(&slot);
     }
 
+    /// Whether the node slot has a label. Unlike [`Self::label`] this is
+    /// no unrecorded lookup: the answer must never flow into a computed
+    /// value, so it leaves a running compute's replay and stash adoption
+    /// untouched.
+    #[doc(hidden)]
+    pub fn has_label(&self, slot: u32) -> bool {
+        self.inner.read().labels.contains_key(&slot)
+    }
+
     /// Retrieve the label for a node slot, if any.
     pub fn label(&self, slot: u32) -> Option<String> {
         self.dep_stack.unrecorded_lookup();
