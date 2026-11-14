@@ -17,7 +17,8 @@ use super::collection::{fp_of_elements, FpDelta};
 use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard};
 use super::logged::{ElementOp, Elements, LoggedKey};
 use super::{set_record, Input, KeyRef, PersistValue, PersistedCollection, State, Store};
-use crate::{Backend, Error, Kind, Position, Record, Result};
+use crate::value_context::hold;
+use crate::{Backend, Error, Kind, Position, Record, Result, ValueScope};
 
 /// How many times a keyed write appends fixes for keys other writers
 /// changed under it before failing with [`Error::KeyedContention`].
@@ -41,10 +42,16 @@ pub(crate) type RowDep = (Vec<u8>, Option<u128>);
 /// Callers hold the memo lock or a `DepIndex` hold, under which a user
 /// `Drop` must not run, so every key a method materialises goes to `bag`.
 pub(crate) trait RowSource<C: Cells>: Send + Sync {
-    /// For a version input of this collection, its key's bytes and its
-    /// row's fingerprint, or `Ok(None)` when its row is not a logged one;
-    /// `None` for any other node.
-    fn live_row(&self, dep: ErasedIncr, bag: &mut Deferred<C>) -> Option<Result<Option<RowDep>>>;
+    /// For each of `deps`: for a version input of this collection, its
+    /// key's bytes and its row's fingerprint, or `Ok(None)` when its row
+    /// is not a logged one; `None` for any other node. The keys' value
+    /// code runs in a few holds of the store's value scope, not one per
+    /// key.
+    fn live_rows(
+        &self,
+        deps: &[ErasedIncr],
+        bag: &mut Deferred<C>,
+    ) -> Vec<Option<Result<Option<RowDep>>>>;
 
     /// The version input of the key `key_bytes` encode, created if no read
     /// created it; `None` when they do not decode. Takes the version lock,
@@ -85,6 +92,8 @@ where
 {
     key: String,
     keyed: Core<K, V, C, P>,
+    /// The store's value scope, whose hold batches the keys' value code.
+    scope: Option<ValueScope>,
 }
 
 // SAFETY: as for `KeyedBinding`: the rows are reachable only through the
@@ -108,6 +117,14 @@ where
 {
 }
 
+/// [`KeyedRows::row_fp`] for the rank read for a key.
+fn row_fp_of(rank: Option<u128>) -> Option<Option<u128>> {
+    match rank {
+        Some(UNLOGGED_RANK) => None,
+        rank => Some(rank),
+    }
+}
+
 impl<K, V, C, P> KeyedRows<K, V, C, P>
 where
     K: PersistValue + Hash + Eq,
@@ -118,10 +135,7 @@ where
     /// The fingerprint of `key`'s row, `Some(None)` for no row, and `None`
     /// for a row an unlogged write left at [`UNLOGGED_RANK`].
     fn row_fp(&self, key: &K) -> Option<Option<u128>> {
-        match self.keyed.read_rank(key) {
-            Some(UNLOGGED_RANK) => None,
-            rank => Some(rank),
-        }
+        row_fp_of(self.keyed.read_rank(key))
     }
 
     fn decode_key(&self, key_bytes: &[u8]) -> Option<K> {
@@ -136,14 +150,33 @@ where
     C: Cells,
     P: Pair<K, V> + PersistValue,
 {
-    fn live_row(&self, dep: ErasedIncr, bag: &mut Deferred<C>) -> Option<Result<Option<RowDep>>> {
-        let key = self.keyed.key_of_version(dep)?;
-        let row = match self.row_fp(&key) {
-            Some(fp) => encode(&self.key, &key).map(|bytes| Some((bytes, fp))),
-            None => Ok(None),
+    fn live_rows(
+        &self,
+        deps: &[ErasedIncr],
+        bag: &mut Deferred<C>,
+    ) -> Vec<Option<Result<Option<RowDep>>>> {
+        let scope = self.scope.as_ref();
+        let keys = self.keyed.keys_of_versions(deps, |f| hold(scope, f));
+        let found: Vec<&K> = keys.iter().flatten().collect();
+        let ranks = if found.is_empty() {
+            Vec::new()
+        } else {
+            self.keyed.read_ranks(&found, |f| hold(scope, f))
         };
-        bag.push(key);
-        Some(row)
+        let mut ranks = ranks.into_iter();
+        let mut rows = Vec::with_capacity(deps.len());
+        hold(scope, || {
+            rows.extend(keys.iter().map(|key| {
+                let key = key.as_ref()?;
+                let rank = ranks.next().expect("a rank per found key");
+                Some(match row_fp_of(rank) {
+                    Some(fp) => encode(&self.key, key).map(|bytes| Some((bytes, fp))),
+                    None => Ok(None),
+                })
+            }));
+        });
+        bag.push(keys);
+        rows
     }
 
     fn prepare(
@@ -1289,6 +1322,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let rows: Rows<C> = Arc::new(KeyedRows {
             key: key.to_owned(),
             keyed: keyed.clone(),
+            scope: self.value_scope(),
         });
         let binding = KeyedBinding {
             key: key.to_owned(),

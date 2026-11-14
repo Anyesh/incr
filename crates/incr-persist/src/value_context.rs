@@ -62,17 +62,53 @@ impl Drop for ValueContextGuard {
 /// [`current_value_scope`] while it holds its lock, on whichever thread
 /// takes it. Set it in [`Options::value_scope`](crate::Options::value_scope).
 #[derive(Clone)]
-pub struct ValueScope(Arc<dyn Any + Send + Sync>);
+pub struct ValueScope {
+    state: Arc<dyn Any + Send + Sync>,
+    hold: Option<fn(&mut dyn FnMut())>,
+}
 
 impl ValueScope {
     pub fn new<T: Any + Send + Sync>(state: Arc<T>) -> Self {
-        ValueScope(state)
+        ValueScope { state, hold: None }
+    }
+
+    /// This scope with `hold`, which runs a batch of value calls (clones,
+    /// encodes, decodes, hashes and comparisons of many entries) holding
+    /// whatever lock the binding's value code takes per call, so a batch
+    /// takes it once instead of once per call. incr-persist calls it under
+    /// store and memo locks, and a batch waits for no lock but the
+    /// binding's own; `hold` must call its argument exactly once, on the
+    /// calling thread.
+    pub fn holding(self, hold: fn(&mut dyn FnMut())) -> Self {
+        ValueScope {
+            hold: Some(hold),
+            ..self
+        }
     }
 
     /// The state this scope was created with, if it is a `T`.
     pub fn downcast<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
-        Arc::clone(&self.0).downcast().ok()
+        Arc::clone(&self.state).downcast().ok()
     }
+}
+
+/// Runs `f`, a batch of value calls that waits for no store or memo lock,
+/// inside `scope`'s hold, or directly without one.
+pub(crate) fn hold(scope: Option<&ValueScope>, f: impl FnOnce()) {
+    let mut f = Some(f);
+    let mut batch = || {
+        if let Some(f) = f.take() {
+            f();
+        }
+    };
+    match scope.and_then(|scope| scope.hold) {
+        Some(hold) => hold(&mut batch),
+        None => batch(),
+    }
+    assert!(
+        f.is_none(),
+        "incr-persist: a value scope's hold did not run its batch"
+    );
 }
 
 impl fmt::Debug for ValueScope {

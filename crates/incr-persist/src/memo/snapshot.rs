@@ -10,12 +10,17 @@ use incr_core::persist_hooks::{changed_at_erased, Deferred};
 use incr_core::{check_value_code, ErasedIncr, Runtime};
 
 use super::checkpoint::Fate;
+use super::dirty::Record;
 use super::mapping::LiveDep;
 use super::memo_core::{CoreRef, IndexGen, MemoCells};
 use super::table_core::Snap;
 use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, StoredDep};
-use crate::value_context::EncodeMismatch;
+use crate::value_context::{hold, EncodeMismatch, ValueScope};
 use crate::{Error, Result};
+
+/// Entries whose values a checkpoint clones or encodes inside one hold of
+/// the store's value scope; between batches other threads take its lock.
+const VALUE_BATCH: usize = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -111,9 +116,13 @@ impl<C: MemoCells> CoreRef<C> {
             // deps equals its closure of the current mapped values.
             let map = self.deps.read();
             let mut snaps = Vec::new();
-            for record in &dirty {
-                let table = &self.tables[record.table as usize];
-                snaps.extend(table.inspect_dirty(rt, &map, self.id, record, &mut bag));
+            let mut by_table: Vec<&Record> = dirty.iter().collect();
+            by_table.sort_by_key(|record| record.table);
+            for same in by_table.chunk_by(|a, b| a.table == b.table) {
+                let table = &self.tables[same[0].table as usize];
+                for batch in same.chunks(VALUE_BATCH) {
+                    table.inspect_dirty(rt, &map, self.id, batch, &mut snaps, &mut bag);
+                }
             }
             // A node that landed again since its `inspect`, which only a
             // write around the store allows, may have dependents inspected
@@ -179,7 +188,7 @@ impl<C: MemoCells> CoreRef<C> {
             let entry = index.read(&*self.backend, table, key).ok()??;
             (fingerprint(&entry.value) == fp).then_some(entry.value)
         };
-        let found = fresh(snaps, &clean, &stored, &mut mismatches);
+        let found = fresh(snaps, &clean, self.scope.as_ref(), &stored, &mut mismatches);
         drop(index);
         drop(clean);
         let snapshot = started.elapsed();
@@ -318,6 +327,7 @@ struct Origin {
 fn fresh(
     snaps: Vec<Snap>,
     clean: &HashMap<ErasedIncr, Clean>,
+    scope: Option<&ValueScope>,
     stored: &StoredAt<'_>,
     mismatches: &mut Vec<EncodeMismatch>,
 ) -> Found {
@@ -328,22 +338,29 @@ fn fresh(
             None
         }
     };
-    let encoded: Vec<Option<(Vec<u8>, Vec<u8>)>> = snaps
-        .iter()
-        .map(|snap| {
-            #[cfg(test)]
-            touched_key();
-            let key = note(snap.key.encode())?;
-            let value = note(snap.value.encode())?;
-            let value = match snap.seeded {
-                Some(fp) if fingerprint(&value) != fp => {
-                    stored(snap.table, &key, fp).unwrap_or(value)
-                }
-                _ => value,
-            };
-            Some((key, value))
-        })
-        .collect();
+    let mut encoded: Vec<Option<(Vec<u8>, Vec<u8>)>> = Vec::with_capacity(snaps.len());
+    for batch in snaps.chunks(VALUE_BATCH) {
+        hold(scope, || {
+            encoded.extend(batch.iter().map(|snap| {
+                #[cfg(test)]
+                touched_key();
+                let key = note(snap.key.encode())?;
+                let value = note(snap.value.encode())?;
+                Some((key, value))
+            }));
+        });
+    }
+    // Outside the holds: `stored` reads the backend, which takes its lock.
+    for (snap, bytes) in snaps.iter().zip(&mut encoded) {
+        let (Some(fp), Some((key, value))) = (snap.seeded, bytes) else {
+            continue;
+        };
+        if fingerprint(value) != fp {
+            if let Some(stored) = stored(snap.table, key, fp) {
+                *value = stored;
+            }
+        }
+    }
     let mut by_handle: HashMap<ErasedIncr, (u32, Vec<u8>, u128)> = snaps
         .iter()
         .zip(&encoded)
