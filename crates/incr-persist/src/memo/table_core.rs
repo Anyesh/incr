@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use incr_core::persist_hooks::{
     get_or_insert_query_seeded, inspect, probe_unchecked, seed_query, Deferred, Reuse, SeedBase,
@@ -163,16 +163,25 @@ pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
 impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
     /// The node's compute: `f`, then a record in the dirty set. A run that
     /// unwinds records nothing; its node is not Clean, so no checkpoint
-    /// takes it.
+    /// takes it. The node's handle is probed at the first run and kept,
+    /// as the closure belongs to that one node.
     fn closure(&self, core: &CoreRef<C>, key: K) -> impl Fn(&Runtime<C>) -> T + Send + Sync {
         let f = Arc::clone(&self.f);
         let core = core.clone();
         let (memo, index) = (core.id, self.index);
+        let node = OnceLock::new();
         move |rt| {
             let value = f(&MemoCtx { rt, core: &core }, &key);
-            let table: &TableCore<K, T, C> = core.table(memo, index);
-            if let Some(handle) = table.probe(rt, &key) {
-                core.computed(index, handle.erase());
+            let handle = match node.get() {
+                Some(&handle) => Some(handle),
+                None => {
+                    let table: &TableCore<K, T, C> = core.table(memo, index);
+                    let handle = table.probe(rt, &key).map(Incr::erase);
+                    handle.map(|handle| *node.get_or_init(|| handle))
+                }
+            };
+            if let Some(handle) = handle {
+                core.computed(index, handle);
             }
             value
         }

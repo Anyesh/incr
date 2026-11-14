@@ -271,7 +271,7 @@ impl AutoCheckpoint {
             if core.wake.wait(every) {
                 return;
             }
-            if core.lock_dirty().unsaved() == 0 {
+            if core.dirty.unsaved() == 0 {
                 continue;
             }
             // A panic in a key's or value's code fails this checkpoint, not

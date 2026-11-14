@@ -60,6 +60,10 @@ pub enum LockKind {
     /// after its pair collection's log guard to commit. Only value code
     /// runs under it, and nothing is taken under it.
     KeyIndex,
+    /// incr-persist's memo dirty-set shards, which a memo compute takes
+    /// after its body and a checkpoint takes all at once. Nothing is taken
+    /// under them.
+    MemoDirty,
 }
 
 impl LockKind {
@@ -85,6 +89,7 @@ impl LockKind {
             LockKind::Episodes => 80,
             LockKind::Instrument => 85,
             LockKind::KeyIndex => 90,
+            LockKind::MemoDirty => 95,
         }
     }
 }
@@ -502,6 +507,20 @@ mod tests {
     fn nothing_is_taken_under_the_key_index() {
         let _k = acquire(LockKind::KeyIndex);
         let _i = acquire(LockKind::Instrument);
+    }
+
+    #[test]
+    #[should_panic(expected = "taking Instrument while holding MemoDirty")]
+    fn nothing_is_taken_under_the_memo_dirty_set() {
+        let _d = acquire(LockKind::MemoDirty);
+        let _i = acquire(LockKind::Instrument);
+    }
+
+    #[test]
+    fn the_memo_dirty_set_is_taken_under_the_memo_lock() {
+        let _m = acquire(LockKind::Memo);
+        let _x = acquire(LockKind::DepIndex);
+        let _d = acquire(LockKind::MemoDirty);
     }
 
     #[test]

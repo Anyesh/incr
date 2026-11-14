@@ -502,3 +502,46 @@ fn a_clean_dep_the_base_lost_is_written_again<C: MemoCells>() {
     assert_eq!(runs.load(SeqCst), 0);
     assert_eq!(memo.stats().reused, 2);
 }
+
+/// Four threads compute leaves under rising `y` while another checkpoints
+/// throughout; one checkpoint after they finish saves every entry, so a
+/// reopen at the last `y` runs nothing.
+#[test]
+fn shared_computes_racing_checkpoints_lose_no_dirty_mark() {
+    const KEYS: u32 = 64;
+    let backends = Backends::new();
+    let last = {
+        let w = Leaves::<Shared>::open(&backends, options());
+        let mut last = 0;
+        for round in 1..=8 {
+            last = 1000 * round;
+            w.store.set(w.y, last).unwrap();
+            let done = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for t in 0..4 {
+                    let (w, done) = (&w, &done);
+                    s.spawn(move || {
+                        for k in (1..=KEYS).filter(|k| k % 4 == t) {
+                            assert_eq!(w.read(k), last + u64::from(k));
+                        }
+                        done.fetch_add(1, SeqCst);
+                    });
+                }
+                s.spawn(|| {
+                    while done.load(SeqCst) < 4 {
+                        w.memo.checkpoint().unwrap();
+                    }
+                });
+            });
+        }
+        w.memo.checkpoint().unwrap();
+        assert_eq!(w.memo.stats().unsaved_entries, 0);
+        last
+    };
+    let w = Leaves::<Shared>::open(&backends, options());
+    w.store.set(w.y, last).unwrap();
+    for k in 1..=KEYS {
+        assert_eq!(w.read(k), last + u64::from(k));
+    }
+    assert_eq!(w.runs(), 0);
+}

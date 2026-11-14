@@ -46,17 +46,16 @@ impl<C: MemoCells> CoreRef<C> {
         let (snaps, mut keys, clean, moved) = {
             let mut state = self.lock_memo();
             state.seed_info.retain(|&handle, _| rt.is_alive(handle));
-            let dirty = self.lock_dirty().attempt(|handle| rt.is_alive(handle));
+            let dirty = self.dirty.attempt(|handle| rt.is_alive(handle));
             attempt.started = true;
             // The read hold excludes every mapped write, and each finishes
             // its walk inside its own hold, so a Clean entry over mapped
             // deps equals its closure of the current mapped values.
             let map = self.deps.read();
             let mut snaps = Vec::new();
-            for (table, marks) in self.tables.iter().zip(&dirty) {
-                for (&handle, &mark) in marks {
-                    snaps.extend(table.inspect_dirty(rt, &map, self.id, handle, mark));
-                }
+            for record in &dirty {
+                let table = &self.tables[record.table as usize];
+                snaps.extend(table.inspect_dirty(rt, &map, self.id, record.handle, record.mark));
             }
             // A node that landed again since its `inspect`, which only a
             // write around the store allows, may have dependents inspected
@@ -66,15 +65,13 @@ impl<C: MemoCells> CoreRef<C> {
                 .partition(|snap| changed_at_erased(rt, snap.handle) == Some(snap.stamp));
             {
                 let taken: HashSet<ErasedIncr> = snaps.iter().map(|snap| snap.handle).collect();
-                let mut counts = self.lock_dirty();
-                for (table, marks) in dirty.iter().enumerate() {
-                    for (&handle, &mark) in marks {
-                        if !taken.contains(&handle) {
-                            counts.carry(table as u32, handle, mark);
-                        }
+                for record in &dirty {
+                    if !taken.contains(&record.handle) {
+                        self.dirty.carry(*record);
                     }
                 }
             }
+            let dirty: HashSet<ErasedIncr> = dirty.iter().map(|record| record.handle).collect();
             for snap in &mut snaps {
                 snap.seeded = state
                     .seed_info
@@ -82,7 +79,7 @@ impl<C: MemoCells> CoreRef<C> {
                     .filter(|&&(_, stamp)| stamp == snap.stamp)
                     .map(|&(fp, _)| fp);
             }
-            let is_dirty = |handle: &ErasedIncr| dirty.iter().any(|t| t.contains_key(handle));
+            let is_dirty = |handle: &ErasedIncr| dirty.contains(handle);
             // A clean entry has not run since it was written or seeded,
             // so while it keeps that stamp its value is the stored one.
             let mut clean: HashMap<ErasedIncr, u128> = HashMap::new();
@@ -166,11 +163,11 @@ impl<C: MemoCells> CoreRef<C> {
         state.stats.checkpoints += 1;
         let mut unsaveable = found.unsaveable;
         {
-            let mut dirty = self.lock_dirty();
+            let dirty = &self.dirty;
             for (fate, origin) in done.fates.iter().zip(&found.origin) {
                 match fate {
                     Fate::Written => {
-                        dirty.saved(origin.table, origin.handle, origin.mark);
+                        dirty.saved(origin.handle, origin.mark);
                         state
                             .seed_info
                             .insert(origin.handle, (origin.fp, origin.stamp));
@@ -193,7 +190,7 @@ impl<C: MemoCells> CoreRef<C> {
                 continue;
             };
             if let Ok(Some(handle)) = t.probe_bytes(rt, key, &mut bag) {
-                self.lock_dirty().lost(*table, handle);
+                self.dirty.lost(*table, handle);
             }
         }
         state.stats.unsaveable = unsaveable;
@@ -223,7 +220,7 @@ struct Attempt<'a, C: MemoCells> {
 impl<C: MemoCells> Drop for Attempt<'_, C> {
     fn drop(&mut self) {
         if self.started && !self.saved {
-            self.core.lock_dirty().failed();
+            self.core.dirty.failed();
         }
     }
 }
@@ -240,7 +237,6 @@ struct Found {
 
 /// The live entry behind a [`Found::entries`] entry.
 struct Origin {
-    table: u32,
     handle: ErasedIncr,
     mark: u64,
     stamp: u64,
@@ -328,7 +324,6 @@ fn fresh(
             continue;
         };
         found.origin.push(Origin {
-            table: snap.table,
             handle: snap.handle,
             mark: snap.mark,
             stamp: snap.stamp,
