@@ -13,7 +13,9 @@ mod memory;
 mod scope;
 mod store;
 
+use incr_core::Local;
 use incr_persist::Error;
+use incr_python_persist::binding::{CoreStore, Detached, PyBinding};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
@@ -26,8 +28,24 @@ incr_python_persist::persist_exceptions!(Exceptions, incr.persist);
 
 pub(crate) type PyBackend = incr_python_persist::backend::PyBackend<Exceptions>;
 pub(crate) type PyMemoBackend = incr_python_persist::memo_backend::PyMemoBackend<Exceptions>;
-pub(crate) type Registry = incr_python_persist::codec::Registry<Exceptions>;
 pub(crate) use incr_python_persist::codec::{PairCodec, Slot};
+
+/// Local store calls keep the GIL, since the runtime is confined to the
+/// opener's thread, and route as `engine_write` does.
+pub(crate) struct LocalBinding;
+
+impl PyBinding for LocalBinding {
+    type C = Local;
+    type Exceptions = Exceptions;
+
+    fn write<R: Send>(
+        _py: Python<'_>,
+        store: &CoreStore<Self>,
+        f: impl FnOnce(&CoreStore<Self>, Detached) -> R + Send,
+    ) -> PyResult<R> {
+        crate::engine_write(store.runtime(), || f(store, Detached::assume()))
+    }
+}
 
 #[cfg(feature = "conformance")]
 mod conformance {

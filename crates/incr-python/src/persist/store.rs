@@ -5,12 +5,11 @@
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use incr_core::Local;
 use incr_persist::memo::{Memo, MemoBuilder};
-use incr_persist::{Input, Options, PersistedCollection, Store};
-use incr_python_persist::store::{auto_checkpoint_of, build_id_of, durability_of};
+use incr_persist::{Input, PersistedCollection, Store};
+use incr_python_persist::store::StoreCore as BaseCore;
 use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -20,7 +19,7 @@ use super::batch::PyBatch;
 use super::keyed::Pending;
 use super::memo::{self, PyMemo, PyMemoTable};
 use super::PyBackend;
-use super::{PairCodec, Registry, Slot};
+use super::{LocalBinding, PairCodec, Slot};
 use crate::overlay::Born;
 use crate::{engine_write, KeyCounts, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
 
@@ -30,32 +29,24 @@ pub(super) type PyPersistedCollection = PersistedCollection<PyValue, Local>;
 /// runtime it owns, the codecs of its slots, and the persisted nodes the
 /// binding must keep direct writes off.
 pub(crate) struct StoreCore {
-    pub(super) store: Arc<Store<Local, PyBackend>>,
-    pub(super) registry: Arc<Registry>,
-    pub(super) build_id: u128,
+    pub(super) base: BaseCore<LocalBinding>,
     pub(super) memo_builder: RefCell<Option<MemoBuilder<Local>>>,
     pub(super) memo_decls: RefCell<Vec<super::memo::MemoDecl>>,
     pub(super) memo: OnceCell<Memo<Local, PyBackend>>,
-    inputs: RefCell<HashMap<u32, Input<PyValue>>>,
     collections: RefCell<HashMap<u32, PyPersistedCollection>>,
 }
 
 impl StoreCore {
     pub(crate) fn runtime(&self) -> &incr_compute::Runtime {
-        self.store.runtime()
+        self.base.runtime()
     }
 
     pub(crate) fn is_persisted_input(&self, slot: u32) -> bool {
-        self.inputs.borrow().contains_key(&slot)
+        self.base.is_persisted_input(slot)
     }
 
     pub(super) fn input_of(&self, node: &PyNodeId) -> PyResult<Input<PyValue>> {
-        self.inputs
-            .borrow()
-            .get(&node.inner.slot())
-            .copied()
-            .filter(|input| input.handle() == node.inner)
-            .ok_or_else(|| PyValueError::new_err("node is not a persisted input of this store"))
+        self.base.input_of(node.inner)
     }
 
     pub(super) fn collection_of(
@@ -71,23 +62,13 @@ impl StoreCore {
             })
     }
 
-    fn declare_codec(&self, slot: &Slot, codec: Option<Py<PyAny>>) -> PyResult<bool> {
-        match codec {
-            Some(codec) => self.registry.register(slot.clone(), codec),
-            None if self.registry.is_registered(slot) => Err(PyValueError::new_err(
-                "the key is already declared with a codec",
-            )),
-            None => Ok(false),
-        }
-    }
-
     /// Runs a store call with the store's codecs active.
     pub(super) fn run<R>(
         &self,
         py: Python<'_>,
         f: impl FnOnce(&Store<Local, PyBackend>) -> incr_persist::Result<R>,
     ) -> PyResult<R> {
-        self.registry.run(py, || f(&self.store))
+        self.base.registry().run(py, || f(self.base.store()))
     }
 }
 
@@ -159,27 +140,11 @@ impl PyStore {
         durability: &str,
         auto_checkpoint_records: Option<u64>,
     ) -> PyResult<PyStore> {
-        let build_id = build_id_of(build_id)?;
-        let auto_checkpoint_records = auto_checkpoint_of(auto_checkpoint_records)?;
-        let registry = Arc::new(Registry::default());
-        let options = Options {
-            durability: durability_of(durability)?,
-            auto_checkpoint_records,
-            value_scope: Some(registry.value_scope()),
-        };
-        let store = registry.run(py, || Store::open(PyBackend::new(backend), options))?;
-        #[expect(
-            clippy::arc_with_non_send_sync,
-            reason = "MemoBuilder::open takes the store as an Arc"
-        )]
         let core = Rc::new(StoreCore {
-            store: Arc::new(store),
-            registry,
-            build_id,
+            base: BaseCore::open(py, backend, build_id, durability, auto_checkpoint_records)?,
             memo_builder: RefCell::default(),
             memo_decls: RefCell::default(),
             memo: OnceCell::new(),
-            inputs: RefCell::default(),
             collections: RefCell::default(),
         });
         let runtime = Py::new(py, PyRuntime::persisted(Rc::clone(&core)))?;
@@ -206,28 +171,8 @@ impl PyStore {
         codec: Option<Py<PyAny>>,
     ) -> PyResult<PyNodeId> {
         let core = self.core_outside_overlay(py)?;
-        let slot = Slot::Key(key.to_owned());
-        let added = core.declare_codec(&slot, codec)?;
-        let declared = engine_write(core.runtime(), || {
-            core.run(py, |store| store.input(key, PyValue(default)))
-        })
-        .and_then(|declared| declared);
-        match declared {
-            Ok(input) => {
-                core.inputs
-                    .borrow_mut()
-                    .insert(input.handle().slot(), input);
-                Ok(PyNodeId {
-                    inner: input.handle(),
-                })
-            }
-            Err(e) => {
-                if added {
-                    core.registry.unregister(&slot);
-                }
-                Err(e)
-            }
-        }
+        let inner = core.base.input(py, key, default, codec)?;
+        Ok(PyNodeId { inner })
     }
 
     /// Declares the collection `key`, which starts with its logged elements,
@@ -241,7 +186,7 @@ impl PyStore {
     ) -> PyResult<PyCollection> {
         let core = self.core_outside_overlay(py)?;
         let slot = Slot::Key(key.to_owned());
-        let added = core.declare_codec(&slot, codec)?;
+        let added = core.base.declare_codec(&slot, codec)?;
         let declared = engine_write(core.runtime(), || {
             core.run(py, |store| store.collection::<PyValue>(key))
         })
@@ -261,7 +206,7 @@ impl PyStore {
             }
             Err(e) => {
                 if added {
-                    core.registry.unregister(&slot);
+                    core.base.registry().unregister(&slot);
                 }
                 Err(e)
             }
@@ -271,10 +216,7 @@ impl PyStore {
     /// Sets a persisted input: the value is logged, then applied.
     fn set(&self, py: Python<'_>, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
-        let input = core.input_of(&node)?;
-        engine_write(core.runtime(), || {
-            core.run(py, |store| store.set(input, PyValue(value)).map(drop))
-        })?
+        core.base.set(py, node.inner, value)
     }
 
     /// Appends one occurrence of `row` to a persisted collection.
@@ -370,13 +312,15 @@ impl PyStore {
     ) -> PyResult<PyKeyedCollection> {
         let core = self.core_outside_overlay(py)?;
         let slot = Slot::Key(key.to_owned());
-        if core.registry.is_registered(&slot) {
+        if core.base.registry().is_registered(&slot) {
             return Err(PyValueError::new_err(format!(
                 "the key {key:?} is already declared"
             )));
         }
         let pairs = Py::new(py, PairCodec::new(key_codec, codec))?;
-        core.registry.register(slot.clone(), pairs.into_any())?;
+        core.base
+            .registry()
+            .register(slot.clone(), pairs.into_any())?;
         let declared = engine_write(core.runtime(), || {
             core.run(py, |store| {
                 store.keyed_collection::<PyKey, PyValue, PyValue>(key)
@@ -388,7 +332,7 @@ impl PyStore {
                 PyKeyedCollection::persisted(self.runtime.bind(py).clone(), persisted, label)
             }
             Err(e) => {
-                core.registry.unregister(&slot);
+                core.base.registry().unregister(&slot);
                 Err(e)
             }
         }

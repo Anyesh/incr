@@ -28,7 +28,8 @@ pub(crate) struct OverlayScope {
 impl OverlayScope {
     pub(crate) fn open(py: Python<'_>, core: &Rc<StoreCore>) -> PyResult<Self> {
         let scope = core
-            .store
+            .base
+            .store()
             .unlogged_scope_shared()
             .map_err(|e| persist_error(py, e))?;
         Ok(Self {
@@ -77,6 +78,6 @@ impl OverlayScope {
     /// for the memo entries over the inputs it touched.
     pub(crate) fn close(self, py: Python<'_>) -> PyResult<()> {
         let Self { scope, core, .. } = self;
-        core.registry.run(py, || scope.close())
+        core.base.registry().run(py, || scope.close())
     }
 }

@@ -85,6 +85,18 @@ impl<B: PyBinding> StoreCore<B> {
         self.store.runtime()
     }
 
+    pub fn store(&self) -> &Arc<CoreStore<B>> {
+        &self.store
+    }
+
+    pub fn registry(&self) -> &Arc<Registry<B::Exceptions>> {
+        &self.registry
+    }
+
+    pub fn is_persisted_input(&self, slot: u32) -> bool {
+        self.inputs().contains_key(&slot)
+    }
+
     /// The id naming the code that computes memoized values.
     pub fn build_id(&self) -> u128 {
         self.build_id
@@ -128,7 +140,8 @@ impl<B: PyBinding> StoreCore<B> {
         self.inputs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn input_of(&self, node: Incr<PyValue>) -> PyResult<Input<PyValue>> {
+    /// The input `node` is, if it is a persisted input of this store.
+    pub fn input_of(&self, node: Incr<PyValue>) -> PyResult<Input<PyValue>> {
         self.inputs()
             .get(&node.slot())
             .copied()
@@ -136,7 +149,9 @@ impl<B: PyBinding> StoreCore<B> {
             .ok_or_else(|| PyValueError::new_err("node is not a persisted input of this store"))
     }
 
-    fn declare_codec(&self, slot: &Slot, codec: Option<Py<PyAny>>) -> PyResult<bool> {
+    /// Registers `codec` for `slot`; returns whether it is new. Without a
+    /// codec, the slot must not have one yet.
+    pub fn declare_codec(&self, slot: &Slot, codec: Option<Py<PyAny>>) -> PyResult<bool> {
         match codec {
             Some(codec) => self.registry.register(slot.clone(), codec),
             None if self.registry.is_registered(slot) => Err(PyValueError::new_err(

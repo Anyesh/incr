@@ -88,7 +88,7 @@ impl StoreCore {
     }
 
     fn new_memo_builder(&self) -> MemoBuilder<Local> {
-        MemoBuilder::new(MemoOptions::new(BuildId::Fixed(self.build_id)))
+        MemoBuilder::new(MemoOptions::new(BuildId::Fixed(self.base.build_id())))
     }
 }
 
@@ -118,7 +118,7 @@ pub(super) fn declare_table(
             )));
         }
     }
-    if core.registry.is_registered(&key_slot) {
+    if core.base.registry().is_registered(&key_slot) {
         return Err(PyValueError::new_err(format!(
             "memo table '{name}' is already declared"
         )));
@@ -128,8 +128,8 @@ pub(super) fn declare_table(
             "a memo table's function must be callable",
         ));
     }
-    core.registry.register(key_slot, key_codec)?;
-    core.registry.register(value_slot, codec)?;
+    core.base.registry().register(key_slot, key_codec)?;
+    core.base.registry().register(value_slot, codec)?;
     let callable = store
         .runtime
         .bind(py)
@@ -167,8 +167,8 @@ pub(super) fn open(slf: &Bound<'_, PyStore>, backend: Py<PyAny>) -> PyResult<PyM
         .take()
         .unwrap_or_else(|| core.new_memo_builder());
     let opened = engine_write(core.runtime(), || {
-        core.registry.run(py, || {
-            builder.open(&core.store, PyMemoBackend::new(backend))
+        core.base.registry().run(py, || {
+            builder.open(core.base.store(), PyMemoBackend::new(backend))
         })
     })
     .and_then(|opened| opened);
@@ -212,11 +212,11 @@ impl PyMemoTable {
                 self.name
             )));
         }
-        let value = core.registry.scoped(|| {
+        let value = core.base.registry().scoped(|| {
             let node = memo.get_or_insert(self.handle.get(), key);
             rt.get(node)
         });
-        drop(core.registry.take_failure());
+        drop(core.base.registry().take_failure());
         Ok(value)
     }
 }
@@ -282,10 +282,11 @@ impl PyMemo {
         }
         let memo = core.open_memo()?;
         let node = engine_read(core.runtime(), || {
-            core.registry
+            core.base
+                .registry()
                 .scoped(|| memo.get_or_insert(table.handle.get(), PyValue(key)))
         })?;
-        drop(core.registry.take_failure());
+        drop(core.base.registry().take_failure());
         Ok(PyNodeId { inner: node })
     }
 
@@ -299,11 +300,11 @@ impl PyMemo {
     fn checkpoint(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, usize>> {
         let core = self.core(py)?;
         let memo = core.open_memo()?;
-        drop(core.registry.take_failure());
+        drop(core.base.registry().take_failure());
         let done = engine_write(core.runtime(), || {
-            core.registry.scoped(|| memo.checkpoint())
+            core.base.registry().scoped(|| memo.checkpoint())
         })?;
-        let cause = core.registry.take_failure();
+        let cause = core.base.registry().take_failure();
         let stats = match done {
             Ok(stats) => stats,
             Err(error) => return Err(persist_error(py, error)),
