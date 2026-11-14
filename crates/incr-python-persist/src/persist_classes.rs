@@ -50,6 +50,28 @@ macro_rules! persist_classes {
 
         const _: () = assert!(std::mem::align_of::<PyStore>() <= 16);
 
+        /// A reference to the store's memo. Whichever reference is the last
+        /// drops the memo, joining its checkpoint thread, through the
+        /// binding's `drop_detached`, also when it is a call's own after
+        /// `close` took the store's.
+        struct MemoRef(Option<Arc<MemoCore<$b>>>);
+
+        impl std::ops::Deref for MemoRef {
+            type Target = MemoCore<$b>;
+
+            fn deref(&self) -> &MemoCore<$b> {
+                self.0.as_deref().expect("a MemoRef holds its memo until it drops")
+            }
+        }
+
+        impl Drop for MemoRef {
+            fn drop(&mut self) {
+                if let Some(last) = self.0.take().and_then(Arc::into_inner) {
+                    Python::attach(|py| <$b as PyBinding>::drop_detached(py, last));
+                }
+            }
+        }
+
         impl Drop for PyStore {
             fn drop(&mut self) {
                 Python::attach(|py| self.release(py));
@@ -78,14 +100,16 @@ macro_rules! persist_classes {
             fn release(&self, py: Python<'_>) {
                 let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner).take();
                 let core = self.core.lock().unwrap_or_else(PoisonError::into_inner).take();
-                <$b as PyBinding>::drop_detached(py, (memo, core));
+                drop(MemoRef(memo));
+                <$b as PyBinding>::drop_detached(py, core);
             }
 
-            fn memo(&self) -> PyResult<Arc<MemoCore<$b>>> {
+            fn memo(&self) -> PyResult<MemoRef> {
                 self.memo
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone()
+                    .map(|memo| MemoRef(Some(memo)))
                     .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
             }
 

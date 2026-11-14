@@ -253,3 +253,32 @@ def test_threads_writing_keys_batches_and_reading_memo_entries_finish(watchdog):
     assert errors == []
     assert [store.runtime.get(memo.get_or_insert(hours, key)) for key in keys] == [30] * 4
     store.close()
+
+
+def test_a_call_holding_the_memo_when_the_store_closes_does_not_deadlock(watchdog):
+    memo_backend = SlowMemo()
+    store = Store.open(MemoryBackend(), build_id=1)
+    entered, gate = threading.Event(), threading.Event()
+
+    def square(ctx, k):
+        if k == 5:
+            entered.set()
+            gate.wait(10)
+        return k * k
+
+    table = store.memo_table("sq", 1, PickleCodec(), PickleCodec(), square)
+    memo = store.open_memo(memo_backend, checkpoint_after_entries=1)
+    rt = store.runtime
+    assert rt.get(memo.get_or_insert(table, 0)) == 0
+    assert memo_backend.started.wait(10)
+    query = rt.create_query(lambda ctx: ctx.memo(table, 5))
+    reader = threading.Thread(target=lambda: rt.get(query))
+    reader.start()
+    assert entered.wait(10)
+    del memo
+    store.close()
+    gate.set()
+    time.sleep(0.2)
+    memo_backend.release.set()
+    reader.join(10)
+    assert not reader.is_alive()
