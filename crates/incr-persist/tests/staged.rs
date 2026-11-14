@@ -495,6 +495,55 @@ fn a_shared_staged_batch_keeps_the_store_alive<C: Cells>() {
     assert_eq!(log_after(&log, Position(last.0 - 1)).len(), 1);
 }
 
+fn a_rolled_away_value_misses_on_restore<C: MemoCells>() {
+    let log = MemoryBackend::new();
+    let memo_backend = MemoryMemo::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let open_both = |runs: &Arc<AtomicUsize>| {
+        let store = Arc::new(open::<C, _>(log.clone()));
+        let x = store.input("x", 1_u64).unwrap();
+        let xh = x.handle();
+        let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0xb1d)));
+        let scaled = builder.table::<u32, u64>("scaled", 1);
+        let runs = Arc::clone(runs);
+        builder.define(scaled, move |ctx, k| {
+            runs.fetch_add(1, SeqCst);
+            ctx.rt().get(xh) * u64::from(*k)
+        });
+        let memo = builder.open(&store, memo_backend.clone()).unwrap();
+        (store, x, memo, scaled)
+    };
+
+    let (store, x, memo, scaled) = open_both(&runs);
+    let q3 = memo.get_or_insert(scaled, 3);
+    assert_eq!(memo.runtime().get(q3), 3);
+    memo.checkpoint().unwrap();
+    let base = store.stats().unwrap().position;
+
+    let mut staged = store.staged_batch().unwrap();
+    staged.set(x, 2).unwrap();
+    let q4 = memo.get_or_insert(scaled, 4);
+    assert_eq!(memo.runtime().get(q4), 8);
+    assert_eq!(memo.runtime().get(q3), 6);
+    drop(staged);
+    assert_poisoned("set after the batch rolled away", store.set(x, 5));
+    assert_refused(
+        "memo checkpoint after the batch rolled away",
+        memo.checkpoint(),
+    );
+    assert!(log_after(&log, base).is_empty(), "nothing reached the log");
+    drop((memo, store));
+
+    runs.store(0, SeqCst);
+    let (store, x, memo, scaled) = open_both(&runs);
+    assert_eq!(store.runtime().get(x.handle()), 1);
+    let q3 = memo.get_or_insert(scaled, 3);
+    let q4 = memo.get_or_insert(scaled, 4);
+    assert_eq!(memo.runtime().get(q3), 3);
+    assert_eq!(memo.runtime().get(q4), 4);
+    assert_eq!(runs.load(SeqCst), 1, "only the rolled-away entry runs");
+}
+
 type SharedMemo = (
     Arc<Store<Shared, MemoryBackend>>,
     Memo<Shared, MemoryBackend>,
@@ -571,4 +620,5 @@ both!(
     a_foreign_record_before_the_run_poisons,
     a_memo_checkpoint_refuses_while_a_batch_is_staged,
     a_shared_staged_batch_keeps_the_store_alive,
+    a_rolled_away_value_misses_on_restore,
 );
