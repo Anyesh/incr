@@ -1089,6 +1089,38 @@ fn version_inputs_map_back_to_their_keys<C: Cells>() {
     assert_eq!(all, [one.erase(), seven.erase()].into_iter().collect());
 }
 
+/// `keys_of_versions` and `read_ranks` answer as `key_of_version` and
+/// `read_rank` do, each running its value code in one stretch.
+fn batched_key_and_rank_reads_run_in_one_stretch<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let (q, _) = key_reader(&rt, &kc, 1);
+    let (absent, _) = key_reader(&rt, &kc, 7);
+    rt.get(q);
+    rt.get(absent);
+    let one = kc.version_input(&1).expect("read in a query");
+    let seven = kc.version_input(&7).expect("read in a query");
+    let handles = [
+        one.erase(),
+        kc.pairs().version_node().erase(),
+        seven.erase(),
+    ];
+    let mut stretches = 0;
+    let keys = kc.keys_of_versions(&handles, |f| {
+        stretches += 1;
+        f();
+    });
+    assert_eq!(keys, vec![Some(1), None, Some(7)]);
+    let ranks = kc.read_ranks(&[&1, &7], |f| {
+        stretches += 1;
+        f();
+    });
+    assert_eq!(ranks, vec![kc.read_rank(&1), None]);
+    assert!(ranks[0].is_some());
+    assert_eq!(stretches, 2);
+}
+
 fn a_removed_key_without_readers_is_reclaimed_on_local_only<C: Cells>() {
     let rt = Runtime::<C>::new();
     let kc = Plain::<C>::new(&rt);
@@ -1179,6 +1211,7 @@ for_both!(
     get_key_outside_a_query_creates_nothing,
     get_key_inside_an_aggregate_combine_creates_its_input,
     version_inputs_map_back_to_their_keys,
+    batched_key_and_rank_reads_run_in_one_stretch,
     a_removed_key_without_readers_is_reclaimed_on_local_only,
     a_keyed_write_inside_a_compute_is_refused,
     one_upsert_among_many_keys_reruns_one_reader,

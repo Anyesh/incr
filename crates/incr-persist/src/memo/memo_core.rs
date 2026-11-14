@@ -17,7 +17,7 @@ use super::{
     Generation, IndexItem, MemoBackend, TableDesc,
 };
 use crate::store::dep_index::{DepIndex, External};
-use crate::value_context::EncodeMismatch;
+use crate::value_context::{EncodeMismatch, ValueScope};
 use crate::Result;
 
 /// Restores and checkpoints by count since the memo opened, and what the
@@ -191,6 +191,8 @@ pub(crate) struct MemoCore<C: MemoCells> {
     pub(crate) build: u128,
     pub(crate) catalog: Vec<TableDesc>,
     pub(crate) tables: Vec<Box<dyn ErasedTable<C>>>,
+    /// The store's value scope, whose hold batches a checkpoint's encodes.
+    pub(crate) scope: Option<ValueScope>,
     pub(crate) backend: Box<dyn ErasedBackend>,
     pub(crate) deps: Arc<DepIndex>,
     externals: NodeTable<String, u128, C>,
@@ -351,6 +353,7 @@ impl<C: MemoCells> MemoCore<C> {
         build: u128,
         catalog: Vec<TableDesc>,
         tables: Vec<Box<dyn ErasedTable<C>>>,
+        scope: Option<ValueScope>,
         backend: Box<dyn ErasedBackend>,
         deps: Arc<DepIndex>,
         externals: NodeTable<String, u128, C>,
@@ -363,6 +366,7 @@ impl<C: MemoCells> MemoCore<C> {
             build,
             catalog,
             tables,
+            scope,
             backend,
             deps,
             externals,

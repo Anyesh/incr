@@ -130,6 +130,7 @@ impl<C: MemoCells> MemoBuilder<C> {
             build,
             catalog,
             tables,
+            store.value_scope(),
             Box::new(backend),
             deps,
             rt.create_table(),

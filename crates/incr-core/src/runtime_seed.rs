@@ -152,51 +152,94 @@ impl<C: Cells> Runtime<C> {
     }
 
     pub(crate) fn inspect<T: Value>(&self, q: Incr<T>) -> Option<Inspected<T>> {
+        let mut bag = Deferred::new();
+        let seen = self.inspect_many(&[q], |f| f(), &mut bag).pop().flatten();
+        bag.drain(self);
+        seen
+    }
+
+    pub(crate) fn inspect_many<T: Value>(
+        &self,
+        qs: &[Incr<T>],
+        stretch: impl FnOnce(&mut dyn FnMut()),
+        bag: &mut Deferred<C>,
+    ) -> Vec<Option<Inspected<T>>> {
         assert!(
             !self.dep_stack.current_frame_active(self.runtime_id),
             "incr-core: inspect called during compute"
         );
-        if q.runtime_id() != self.runtime_id {
-            return None;
-        }
-        let id = NodeId(q.slot());
-        let (node, flags) = self.nodes.get_with_flags(id.0);
-        let first = {
+        let ours = |q: &Incr<T>| q.runtime_id() == self.runtime_id;
+        let first: Vec<Option<(u64, Vec<NodeId>)>> = {
             let _inner = self.inner.read();
-            read_under(node, q.generation())
+            qs.iter()
+                .map(|q| {
+                    ours(q)
+                        .then(|| read_under(self.nodes.get(q.slot()), q.generation()))
+                        .flatten()
+                })
+                .collect()
         };
-        let (stamp, deps) = first?;
-        self.park(ParkPoint::InspectBetweenHolds(id));
-        let type_tag = node.type_tag();
-        let arena_slot = node.arena_slot();
-        C::fence_acquire();
-        if node.generation() != q.generation() {
-            return None;
+        for (q, first) in qs.iter().zip(&first) {
+            if first.is_some() {
+                self.park(ParkPoint::InspectBetweenHolds(NodeId(q.slot())));
+            }
         }
-        let arena = self.arenas.tagged_arena::<T>(type_tag);
-        let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)))?;
-        // The value drops only after this hold if a check fails.
-        let checked = {
+        C::fence_acquire();
+        let mut values: Vec<Option<T>> = Vec::with_capacity(qs.len());
+        stretch(&mut || {
+            values.clear();
+            values.extend(qs.iter().zip(&first).map(|(q, first)| {
+                first.as_ref()?;
+                let node = self.nodes.get(q.slot());
+                if node.generation() != q.generation() {
+                    return None;
+                }
+                let arena = self.arenas.tagged_arena::<T>(node.type_tag())?;
+                value_code::run(|| arena.try_read(node.arena_slot()))
+            }));
+        });
+        assert_eq!(
+            values.len(),
+            qs.len(),
+            "incr-core: inspect_many's stretch did not run its argument"
+        );
+        let checked: Vec<Option<(u64, Vec<ErasedIncr>, bool)>> = {
             let _inner = self.inner.read();
-            read_under(node, q.generation())
-                .filter(|again| *again == (stamp, deps))
-                .map(|(_, deps)| {
+            qs.iter()
+                .zip(first)
+                .map(|(q, first)| {
+                    let (stamp, deps) = first?;
+                    let (node, flags) = self.nodes.get_with_flags(q.slot());
+                    let (_, deps) = read_under(node, q.generation())
+                        .filter(|again| again.0 == stamp && again.1 == deps)?;
                     let deps = deps
                         .iter()
                         .map(|d| {
                             ErasedIncr::new(d.0, self.nodes.get(d.0).generation(), self.runtime_id)
                         })
                         .collect();
-                    (deps, C::u8_load_relaxed(flags) & IN_GROUP != 0)
+                    Some((stamp, deps, C::u8_load_relaxed(flags) & IN_GROUP != 0))
                 })
+                .collect()
         };
-        let (deps, in_group) = checked?;
-        Some(Inspected {
-            value,
-            changed_at: stamp,
-            deps,
-            in_group,
-        })
+        values
+            .into_iter()
+            .zip(checked)
+            .map(|(value, checked)| match (value, checked) {
+                (Some(value), Some((changed_at, deps, in_group))) => Some(Inspected {
+                    value,
+                    changed_at,
+                    deps,
+                    in_group,
+                }),
+                (value, _) => {
+                    if let Some(value) = value {
+                        bag.push(value);
+                    }
+                    None
+                }
+            })
+            .collect()
     }
 }
 

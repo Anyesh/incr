@@ -15,7 +15,7 @@ use crate::child_test::run_in_child;
 use crate::cycle::{CycleStrategy, QueryOpts};
 use crate::handle::{ErasedIncr, Incr};
 use crate::persist_hooks::{
-    changed_at, changed_at_erased, frame_doomed, get_or_insert_query_seeded, inspect,
+    changed_at, changed_at_erased, frame_doomed, get_or_insert_query_seeded, inspect, inspect_many,
     pending_handle, probe_unchecked, seed_base, seed_query, Deferred, Reuse, SeedDep, SeedError,
 };
 use crate::reclaim_probe::{self, RetireSite};
@@ -54,6 +54,7 @@ both!(
     two_restores_in_one_compute_run_once,
     recomputed_seeded_dep_invalidates_trusting_entry,
     inspect_reads_a_clean_node_with_its_deps,
+    inspect_many_clones_every_value_inside_one_stretch,
     table_seeds_only_a_node_it_creates,
     a_panicking_seed_hook_leaves_no_node,
     changed_at_erased_refuses_dead_and_foreign_handles,
@@ -388,6 +389,65 @@ fn inspect_reads_a_clean_node_with_its_deps<C: Cells>() {
     assert!(!seen.in_group);
     rt.set(x, 5);
     assert!(inspect(&rt, q).is_none());
+}
+
+thread_local! {
+    static IN_STRETCH: Cell<bool> = const { Cell::new(false) };
+    static CLONES_OUTSIDE: Cell<u32> = const { Cell::new(0) };
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Stretched(u64);
+
+impl Clone for Stretched {
+    fn clone(&self) -> Self {
+        if !IN_STRETCH.with(Cell::get) {
+            CLONES_OUTSIDE.with(|n| n.set(n.get() + 1));
+        }
+        Stretched(self.0)
+    }
+}
+
+/// `inspect_many` answers as `inspect` does for each query, cloning every
+/// value inside the one call of its stretch.
+fn inspect_many_clones_every_value_inside_one_stretch<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    let qs: Vec<Incr<Stretched>> = (0..3_u64)
+        .map(|k| rt.create_query(move |rt: &Runtime<C>| Stretched(rt.get(x) + k)))
+        .collect();
+    assert_eq!(rt.get(qs[0]), Stretched(1));
+    assert_eq!(rt.get(qs[2]), Stretched(3));
+    CLONES_OUTSIDE.with(|n| n.set(0));
+    let mut stretches = 0;
+    let mut bag = Deferred::<C>::new();
+    let seen = inspect_many(
+        &rt,
+        &qs,
+        |f| {
+            stretches += 1;
+            IN_STRETCH.with(|s| s.set(true));
+            f();
+            IN_STRETCH.with(|s| s.set(false));
+        },
+        &mut bag,
+    );
+    bag.drain(&rt);
+    assert_eq!(stretches, 1);
+    assert_eq!(CLONES_OUTSIDE.with(Cell::get), 0);
+    let values: Vec<Option<Stretched>> = seen.into_iter().map(|s| s.map(|s| s.value)).collect();
+    assert_eq!(values, vec![Some(Stretched(1)), None, Some(Stretched(3))]);
+    let alone = inspect(&rt, qs[2]).expect("Clean");
+    let mut bag = Deferred::<C>::new();
+    let many = inspect_many(&rt, &qs[2..], |f| f(), &mut bag)
+        .pop()
+        .flatten();
+    bag.drain(&rt);
+    let many = many.expect("Clean");
+    assert_eq!(
+        (many.value, many.changed_at, many.deps, many.in_group),
+        (alone.value, alone.changed_at, alone.deps, alone.in_group)
+    );
 }
 
 /// The seed hook runs only for a node the miss creates; a hit, or the

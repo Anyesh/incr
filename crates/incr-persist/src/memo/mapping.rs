@@ -25,16 +25,65 @@ fn vouches<C: Cells>(rt: &Runtime<C>, handle: ErasedIncr, stamp: Option<u64>) ->
     stamp.is_some() && changed_at_erased(rt, handle) == stamp
 }
 
+/// What each of `deps`, the live deps of checkpointed entries, stores as.
+/// Row deps are mapped a collection at a time, so their keys' value code
+/// runs in a few holds of the store's value scope.
 pub(crate) fn map_live<C: Cells>(
     map: &DepMap,
     rt: &Runtime<C>,
     memo: u64,
-    dep: ErasedIncr,
+    deps: &[ErasedIncr],
     bag: &mut Deferred<C>,
-) -> LiveDep {
+) -> Vec<LiveDep> {
+    let mut mapped: Vec<Option<LiveDep>> = deps
+        .iter()
+        .map(|&dep| map_unkeyed(map, rt, memo, dep))
+        .collect();
+    for (collection, rows) in map.all_rows() {
+        let (at, pending): (Vec<usize>, Vec<ErasedIncr>) = mapped
+            .iter()
+            .zip(deps)
+            .enumerate()
+            .filter(|(_, (live, _))| live.is_none())
+            .map(|(i, (_, &dep))| (i, dep))
+            .unzip();
+        if pending.is_empty() {
+            break;
+        }
+        let trusted = trusted(map, collection);
+        let found = rows_of::<C>(rows).live_rows(&pending, bag);
+        for (i, row) in at.into_iter().zip(found) {
+            let Some(row) = row else {
+                continue;
+            };
+            mapped[i] = Some(match (row, trusted) {
+                (Ok(Some((key_bytes, fp))), true) => LiveDep::Stored(StoredDep::Row {
+                    collection: collection.to_owned(),
+                    key_bytes,
+                    fp,
+                }),
+                _ => LiveDep::Unmapped,
+            });
+        }
+    }
+    mapped
+        .into_iter()
+        .zip(deps)
+        .map(|(live, &dep)| live.unwrap_or(LiveDep::Query(dep)))
+        .collect()
+}
+
+/// What `dep` stores as if it is a store key or an external; `None` for
+/// any other node.
+fn map_unkeyed<C: Cells>(
+    map: &DepMap,
+    rt: &Runtime<C>,
+    memo: u64,
+    dep: ErasedIncr,
+) -> Option<LiveDep> {
     if let Some(key) = map.key_of(dep) {
         let entry = map.entry(key).expect("a handle's key is registered");
-        return match (entry.kind, entry.fp) {
+        return Some(match (entry.kind, entry.fp) {
             (_, DepFp::Untrusted) => LiveDep::Unmapped,
             (Kind::Input, DepFp::Known(fp)) => {
                 if vouches(rt, dep, entry.stamp) {
@@ -50,34 +99,20 @@ pub(crate) fn map_live<C: Cells>(
                 key: key.to_owned(),
                 fp,
             }),
-        };
+        });
     }
-    if let Some((owner, name)) = map.external_of(dep) {
-        let external = map
-            .external(owner, name)
-            .expect("an external's name is registered");
-        return if owner == memo && vouches(rt, dep, Some(external.stamp)) {
-            LiveDep::Stored(StoredDep::External {
-                name: name.to_owned(),
-                fp: external.fp,
-            })
-        } else {
-            LiveDep::Unmapped
-        };
-    }
-    for (collection, rows) in map.all_rows() {
-        if let Some(row) = rows_of::<C>(rows).live_row(dep, bag) {
-            return match (row, trusted(map, collection)) {
-                (Ok(Some((key_bytes, fp))), true) => LiveDep::Stored(StoredDep::Row {
-                    collection: collection.to_owned(),
-                    key_bytes,
-                    fp,
-                }),
-                _ => LiveDep::Unmapped,
-            };
-        }
-    }
-    LiveDep::Query(dep)
+    let (owner, name) = map.external_of(dep)?;
+    let external = map
+        .external(owner, name)
+        .expect("an external's name is registered");
+    Some(if owner == memo && vouches(rt, dep, Some(external.stamp)) {
+        LiveDep::Stored(StoredDep::External {
+            name: name.to_owned(),
+            fp: external.fp,
+        })
+    } else {
+        LiveDep::Unmapped
+    })
 }
 
 /// Whether the keyed collection `collection` is registered with a known

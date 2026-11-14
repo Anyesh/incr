@@ -102,7 +102,7 @@ impl<E> Default for Registry<E> {
 impl<E: PersistExceptions> Registry<E> {
     /// The value scope a store opened with these codecs carries.
     pub fn value_scope(self: &Arc<Self>) -> ValueScope {
-        ValueScope::new(Arc::clone(self))
+        ValueScope::new(Arc::clone(self)).holding(python_hold)
     }
 
     fn codecs(&self) -> MutexGuard<'_, HashMap<Slot, Py<PyAny>>> {
@@ -208,6 +208,12 @@ impl<E: PersistExceptions> Registry<E> {
             ))
         })
     }
+}
+
+/// Runs `f`, a batch of value calls, holding the GIL, so each call in it
+/// finds the GIL held instead of taking it.
+fn python_hold(f: &mut dyn FnMut()) {
+    Python::attach(|_| f());
 }
 
 fn active<E: PersistExceptions>() -> Result<Arc<Registry<E>>, String> {

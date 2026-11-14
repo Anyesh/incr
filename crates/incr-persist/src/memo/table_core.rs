@@ -2,8 +2,8 @@ use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use incr_core::persist_hooks::{
-    get_or_insert_query_seeded, inspect, probe_unchecked, seed_query, Deferred, Reuse, SeedBase,
-    SeedDep,
+    get_or_insert_query_seeded, inspect_many, probe_unchecked, seed_query, Deferred, Inspected,
+    Reuse, SeedBase, SeedDep,
 };
 use incr_core::{with_value_code, ErasedIncr, Incr, NodeTable, QueryOpts, Runtime};
 use serde::de::DeserializeOwned;
@@ -14,7 +14,9 @@ use super::handle::{MemoCtx, MemoKey, MemoValue};
 use super::mapping::{map_live, LiveDep};
 use super::memo_core::{CoreRef, MemoCells};
 use crate::store::dep_index::DepMap;
-use crate::value_context::{enter_value_scope, in_memo, EncodeMismatch, MemoPart, ValueScope};
+use crate::value_context::{
+    enter_value_scope, hold, in_memo, EncodeMismatch, MemoPart, ValueScope,
+};
 
 pub(crate) type MemoFn<K, T, C> = dyn Fn(&MemoCtx<'_, C>, &K) -> T + Send + Sync;
 
@@ -157,16 +159,19 @@ pub(crate) trait ErasedTable<C: MemoCells> {
         bag: &mut Deferred<C>,
     ) -> Option<(ErasedIncr, Seeded)>;
 
-    /// Dirty entry `handle` with its deps mapped under `map`'s hold, if it
-    /// is Clean through `inspect`.
+    /// Appends to `snaps` each of `records`, dirty entries of this table,
+    /// that is Clean through `inspect`, with its deps mapped under `map`'s
+    /// hold. Their values are cloned inside one hold of the store's value
+    /// scope.
     fn inspect_dirty(
         &self,
         rt: &Runtime<C>,
         map: &DepMap,
         memo: u64,
-        record: &Record,
+        records: &[&Record],
+        snaps: &mut Vec<Snap>,
         bag: &mut Deferred<C>,
-    ) -> Option<Snap>;
+    );
 }
 
 pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
@@ -341,36 +346,49 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         rt: &Runtime<C>,
         map: &DepMap,
         memo: u64,
-        record: &Record,
+        records: &[&Record],
+        snaps: &mut Vec<Snap>,
         bag: &mut Deferred<C>,
-    ) -> Option<Snap> {
-        let typed = rt.typed_handle::<T>(record.handle)?;
-        let seen = inspect(rt, typed)?;
+    ) {
+        let (records, qs): (Vec<&Record>, Vec<Incr<T>>) = records
+            .iter()
+            .filter_map(|&record| Some((record, rt.typed_handle::<T>(record.handle)?)))
+            .unzip();
+        let seen = inspect_many(rt, &qs, |f| hold(self.scope.as_ref(), f), bag);
+        let seen: Vec<(&Record, Inspected<T>)> = records
+            .into_iter()
+            .zip(seen)
+            .filter_map(|(record, seen)| Some((record, seen?)))
+            .collect();
         #[cfg(test)]
-        super::snapshot::park(super::snapshot::CheckpointPark::Inspected);
+        if !seen.is_empty() {
+            super::snapshot::park(super::snapshot::CheckpointPark::Inspected);
+        }
         // Read after `inspect` returns, so an input's stamp check sees at
         // least the run whose value was cloned.
-        let deps = seen
-            .deps
+        let deps: Vec<ErasedIncr> = seen
             .iter()
-            .map(|&d| map_live(map, rt, memo, d, bag))
+            .flat_map(|(_, seen)| seen.deps.iter().copied())
             .collect();
-        Some(Snap {
-            table: self.index,
-            handle: record.handle,
-            mark: record.mark,
-            stamp: seen.changed_at,
-            seeded: None,
-            key: Arc::clone(&record.key),
-            deps,
-            in_group: seen.in_group,
-            value: Box::new(Part {
-                table: Arc::clone(&self.name),
-                scope: self.scope.clone(),
-                part: MemoPart::Value,
-                x: seen.value,
-            }),
-        })
+        let mut deps = map_live(map, rt, memo, &deps, bag).into_iter();
+        for (record, seen) in seen {
+            snaps.push(Snap {
+                table: self.index,
+                handle: record.handle,
+                mark: record.mark,
+                stamp: seen.changed_at,
+                seeded: None,
+                key: Arc::clone(&record.key),
+                deps: deps.by_ref().take(seen.deps.len()).collect(),
+                in_group: seen.in_group,
+                value: Box::new(Part {
+                    table: Arc::clone(&self.name),
+                    scope: self.scope.clone(),
+                    part: MemoPart::Value,
+                    x: seen.value,
+                }),
+            });
+        }
     }
 }
 
