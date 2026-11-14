@@ -594,6 +594,75 @@ fn the_auto_checkpoint_skips_an_unlogged_scope_without_counting_an_error() {
     });
 }
 
+#[test]
+fn a_reader_never_sees_a_position_ahead_of_its_values_while_batches_commit() {
+    const ROUNDS: u64 = 300;
+    let log = MemoryBackend::new();
+    let store = Arc::new(open::<Shared, _>(log.clone()));
+    let x = store.input("x", 0_u64).unwrap();
+    let y = store.input("y", 0_u64).unwrap();
+    let base = store.stats().unwrap().position;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let reader = {
+        let (store, done) = (Arc::clone(&store), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let rt = store.runtime();
+            let (mut seen, mut refused, mut last) = (0_u64, 0_u64, (0_u64, 0_u64));
+            while !done.load(SeqCst) {
+                match store.refresh() {
+                    Ok(_) => {}
+                    Err(Error::StagedBatchOpen) => refused += 1,
+                    Err(other) => panic!("refresh failed: {other:?}"),
+                }
+                match store.stats() {
+                    Ok(stats) => {
+                        seen += 1;
+                        let committed = (stats.position.0 - base.0) / 2;
+                        let (vx, vy) = (rt.get(x.handle()), rt.get(y.handle()));
+                        assert!(
+                            vx >= committed && vy >= committed,
+                            "position says {committed} batches, values are {vx} and {vy}"
+                        );
+                    }
+                    Err(Error::StagedBatchOpen) => refused += 1,
+                    Err(other) => panic!("stats failed: {other:?}"),
+                }
+                let now = (rt.get(x.handle()), rt.get(y.handle()));
+                assert!(now.0 >= last.0 && now.1 >= last.1, "a value went backwards");
+                last = now;
+            }
+            (seen, refused)
+        })
+    };
+
+    for round in 1..=ROUNDS {
+        let mut staged = store.staged_batch().unwrap();
+        staged.set(x, round).unwrap();
+        staged.set(y, round).unwrap();
+        staged.commit().unwrap();
+        drop(staged);
+    }
+    done.store(true, SeqCst);
+    let (seen, refused) = reader.join().unwrap();
+    assert!(seen + refused > 0, "the reader never ran");
+
+    let rt = store.runtime();
+    assert_eq!(
+        store.stats().unwrap().position,
+        Position(base.0 + 2 * ROUNDS)
+    );
+    assert_eq!((rt.get(x.handle()), rt.get(y.handle())), (ROUNDS, ROUNDS));
+    drop(store);
+    let reopened = open::<Shared, _>(log);
+    let (rx, ry) = (
+        reopened.input("x", 0_u64).unwrap(),
+        reopened.input("y", 0_u64).unwrap(),
+    );
+    let rt = reopened.runtime();
+    assert_eq!((rt.get(rx.handle()), rt.get(ry.handle())), (ROUNDS, ROUNDS));
+}
+
 macro_rules! both {
     ($($name:ident),* $(,)?) => {
         mod local {
