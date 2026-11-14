@@ -582,12 +582,14 @@ trait Stage<C: Cells> {
     fn stale(&self) -> bool;
 
     /// The records that make the staged changes: per key, a `Remove` of
-    /// each pair it held, then an `Insert` of its new pair.
-    fn records(&self, state: &State<C>) -> Result<Vec<Record>>;
+    /// each pair it held, then an `Insert` of its new pair. Values decoded
+    /// along the way are kept in the stage, to drop with it after the store
+    /// lock is released.
+    fn records(&mut self, state: &State<C>) -> Result<Vec<Record>>;
 
     /// The records that leave each staged key holding exactly its staged
     /// pair, or none, given what the index holds now.
-    fn repairs(&self, state: &State<C>) -> Result<Vec<Record>>;
+    fn repairs(&mut self, state: &State<C>) -> Result<Vec<Record>>;
 
     fn key(&self, state: &State<C>) -> Result<String>;
 
@@ -662,6 +664,7 @@ where
     /// Set by a reconcile: the stage names every key the collection is to
     /// hold.
     complete: bool,
+    spent: Vec<P>,
 }
 
 impl<K, V, C, P> KeyedStage<K, V, C, P>
@@ -678,6 +681,7 @@ where
             keys: Vec::new(),
             by_key: HashMap::new(),
             complete: false,
+            spent: Vec::new(),
         }
     }
 
@@ -775,7 +779,7 @@ where
         self.keyed.epoch() != self.epoch
     }
 
-    fn records(&self, state: &State<C>) -> Result<Vec<Record>> {
+    fn records(&mut self, state: &State<C>) -> Result<Vec<Record>> {
         let key = self.key(state)?;
         let mut out = Vec::new();
         for staged in &self.keys {
@@ -785,7 +789,7 @@ where
                 Next::Gone => None,
             };
             for (pair, rank) in &staged.held {
-                out.push(logged_remove_record(&key, pair, *rank)?);
+                out.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
             }
             if let Some(pair) = next {
                 out.push(insert_record(&key, pair)?);
@@ -794,7 +798,7 @@ where
         Ok(out)
     }
 
-    fn repairs(&self, state: &State<C>) -> Result<Vec<Record>> {
+    fn repairs(&mut self, state: &State<C>) -> Result<Vec<Record>> {
         let key = self.key(state)?;
         let mut fixes = Vec::new();
         for staged in &self.keys {
@@ -817,7 +821,7 @@ where
             }
             for (at, (pair, rank)) in held.iter().enumerate() {
                 if Some(at) != keep {
-                    fixes.push(logged_remove_record(&key, pair, *rank)?);
+                    fixes.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
                 }
             }
         }
@@ -829,7 +833,7 @@ where
                     .collect()
             });
             for (pair, rank) in unnamed {
-                fixes.push(logged_remove_record(&key, pair, *rank)?);
+                fixes.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
             }
         }
         Ok(fixes)
@@ -863,8 +867,14 @@ fn insert_record<P: PersistValue>(key: &str, pair: &P) -> Result<Record> {
 /// encodes to bytes with another fingerprint and is not `==` to their
 /// decoded copy, neither matches, so the write fails with
 /// [`Error::UnstableRow`] instead of leaving the pair held by a replay. A
-/// pair at the unlogged rank has no logged bytes to match.
-fn logged_remove_record<K, V, P>(key: &str, pair: &P, rank: u128) -> Result<Record>
+/// pair at the unlogged rank has no logged bytes to match. The decoded copy
+/// is pushed onto `spent`, for the caller to drop outside its locks.
+fn logged_remove_record<K, V, P>(
+    key: &str,
+    pair: &P,
+    rank: u128,
+    spent: &mut Vec<P>,
+) -> Result<Record>
 where
     K: Value + Hash + Eq,
     V: Value + Hash + Eq,
@@ -872,8 +882,9 @@ where
 {
     let element = encode(key, pair)?;
     if rank != UNLOGGED_RANK && fp_of(&element) != rank {
-        let decoded: P = decode(key, &element)?;
-        if with_value_code(|| *pair != decoded) {
+        spent.push(decode(key, &element)?);
+        let decoded = &spent[spent.len() - 1];
+        if with_value_code(|| *pair != *decoded) {
             let row_key = with_value_code(|| pair.key());
             return Err(Error::UnstableRow {
                 key: key.to_owned(),
@@ -1337,28 +1348,34 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// store usable with every record it appended applied. Other errors
     /// behave as for [`Store::batch`].
     pub fn write_pending(&self, pending: PendingWrite<C>) -> Result<Position> {
+        let mut pending = pending;
         let mut locked = self.state()?;
-        self.write_pending_with(&mut locked, pending, &mut |state, records| {
+        let written = self.write_pending_with(&mut locked, &mut pending, &mut |state, records| {
             self.write_counted(state, records)
-        })
+        });
+        drop(locked);
+        drop(pending);
+        written
     }
 
     /// [`Store::write_pending`] with the store locked, handing each run of
     /// records to `write`, which returns the position it reached and
-    /// whether it applied records not in the run.
+    /// whether it applied records not in the run. The stages, and the values
+    /// they hold or decoded, stay in `pending`: the caller drops it after
+    /// releasing the store lock.
     pub(super) fn write_pending_with(
         &self,
         state: &mut State<C>,
-        pending: PendingWrite<C>,
+        pending: &mut PendingWrite<C>,
         write: &mut WriteRun<'_, C>,
     ) -> Result<Position> {
         let PendingWrite { ops, stages } = pending;
         let mut records = Vec::new();
-        for op in ops.0 {
+        for op in std::mem::take(&mut ops.0) {
             records.push(op(state, &self.runtime)?);
         }
         let mut stale = false;
-        for stage in stages.iter() {
+        for stage in stages.iter_mut() {
             records.extend(stage.records(state)?);
             stale |= stage.stale();
         }
@@ -1373,7 +1390,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             overtaken |= foreign;
         }
         if overtaken {
-            if let Some(at) = self.repair(state, &stages, write)? {
+            if let Some(at) = self.repair(state, stages, write)? {
                 last = at;
             }
         }
@@ -1445,14 +1462,14 @@ impl<C: Cells, B: Backend> Store<C, B> {
     fn repair(
         &self,
         state: &mut State<C>,
-        stages: &[Box<dyn Stage<C>>],
+        stages: &mut [Box<dyn Stage<C>>],
         write: &mut WriteRun<'_, C>,
     ) -> Result<Option<Position>> {
         let mut last = None;
         for round in 0..=REPAIR_ROUNDS {
             let mut fixes = Vec::new();
             let mut contended = None;
-            for stage in stages {
+            for stage in stages.iter_mut() {
                 let stage_fixes = stage.repairs(state)?;
                 if !stage_fixes.is_empty() && contended.is_none() {
                     contended = Some(stage.key(state)?);

@@ -241,19 +241,21 @@ impl<C: Cells, B: Backend> StagedBatch<'_, C, B> {
     /// further staged records.
     pub fn write_pending(&mut self, pending: PendingWrite<C>) -> Result<()> {
         self.require_open()?;
+        let mut pending = pending;
         let StagedBatch { store, run, .. } = self;
         let store = &**store;
         let mut state = store.state()?;
-        store
-            .write_pending_with(&mut state, pending, &mut |state, records| {
-                for record in records {
-                    store.apply_staged(state, record, run)?;
-                    #[cfg(test)]
-                    park(StagedPark::Applied);
-                }
-                Ok((state.applied, false))
-            })
-            .map(drop)
+        let written = store.write_pending_with(&mut state, &mut pending, &mut |state, records| {
+            for record in records {
+                store.apply_staged(state, record, run)?;
+                #[cfg(test)]
+                park(StagedPark::Applied);
+            }
+            Ok((state.applied, false))
+        });
+        drop(state);
+        drop(pending);
+        written.map(drop)
     }
 
     /// Appends the staged records in write order as one conditional run

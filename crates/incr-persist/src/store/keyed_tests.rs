@@ -68,6 +68,7 @@ local_and_shared!(
     a_removal_a_replay_could_not_match_is_refused,
     a_reconcile_removal_a_replay_could_not_match_is_refused,
     a_repair_removal_a_replay_could_not_match_is_refused,
+    row_drops_in_a_refused_keyed_write_run_after_the_store_lock,
 );
 
 fn open<C: Cells, B: Backend>(backend: B) -> Store<C, B> {
@@ -1381,4 +1382,99 @@ fn a_repair_removal_a_replay_could_not_match_is_refused<C: Cells>() {
     a.upsert(&ka, 1, Skewed::new("a")).unwrap();
     assert_refused(b.write_pending(pending), 1);
     b.upsert(&kb, 2, Skewed::new("c")).unwrap();
+}
+
+thread_local! {
+    static PROBED: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+}
+
+/// A row that counts its drops, and those that run with any incr lock held,
+/// since the lock order checker rejects taking `Binding` under one. A row
+/// built `skewed` is not `==` to its decoded copy, and every encoding of it
+/// differs.
+#[derive(Clone, Debug, Eq)]
+struct Probed {
+    text: String,
+    encoding: usize,
+    skewed: bool,
+}
+
+impl Probed {
+    fn new(text: &str, skewed: bool) -> Self {
+        Probed {
+            text: s(text),
+            encoding: 0,
+            skewed,
+        }
+    }
+}
+
+impl std::hash::Hash for Probed {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.text.hash(state);
+    }
+}
+
+impl PartialEq for Probed {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && (!self.skewed || self.encoding == other.encoding)
+    }
+}
+
+impl Serialize for Probed {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        (
+            &self.text,
+            ENCODES.fetch_add(1, Ordering::Relaxed) + 1,
+            self.skewed,
+        )
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Probed {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        <(String, usize, bool)>::deserialize(deserializer).map(|(text, encoding, skewed)| Probed {
+            text,
+            encoding,
+            skewed,
+        })
+    }
+}
+
+impl Drop for Probed {
+    fn drop(&mut self) {
+        let held = catch_unwind(AssertUnwindSafe(|| drop(acquire(LockKind::Binding)))).is_err();
+        let (all, under) = PROBED.get();
+        PROBED.set((all + 1, under + u32::from(held)));
+    }
+}
+
+fn row_drops_in_a_refused_keyed_write_run_after_the_store_lock<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: PersistedKeyed<u32, Probed, C> = a.keyed_collection("k").unwrap();
+    a.upsert(&ka, 1, Probed::new("a", false)).unwrap();
+    a.upsert(&ka, 1, Probed::new("b", false)).unwrap();
+    a.upsert(&ka, 2, Probed::new("x", true)).unwrap();
+    let logged = records(&log);
+    PROBED.set((0, 0));
+
+    assert!(a.upsert(&ka, 2, Probed::new("y", true)).is_err());
+    assert!(a.remove(&ka, &2).is_err());
+    assert!(a.reconcile(&ka, [(1, Probed::new("b", false))]).is_err());
+    let mut pending = PendingWrite::new();
+    pending.upsert(&ka, 3, Probed::new("w", false));
+    pending.upsert(&ka, 2, Probed::new("z", true));
+    assert!(a.write_pending(pending).is_err());
+    assert_eq!(records(&log), logged, "a refused write logs nothing");
+
+    let (all, under) = PROBED.get();
+    assert!(all > 0, "the refused writes dropped no row");
+    assert_eq!(under, 0, "{under} of {all} row drops ran under a lock");
 }
