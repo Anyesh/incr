@@ -56,6 +56,10 @@ pub enum LockKind {
     /// A runtime's trace times and compute stats, under which nothing is
     /// taken.
     Instrument,
+    /// A keyed collection's key index, taken alone to stage or read and
+    /// after its pair collection's log guard to commit. Only value code
+    /// runs under it, and nothing is taken under it.
+    KeyIndex,
 }
 
 impl LockKind {
@@ -80,6 +84,7 @@ impl LockKind {
             LockKind::Stashes => 75,
             LockKind::Episodes => 80,
             LockKind::Instrument => 85,
+            LockKind::KeyIndex => 90,
         }
     }
 }
@@ -484,6 +489,19 @@ mod tests {
     fn routing_under_the_store_panics() {
         let _s = acquire(LockKind::Store);
         assert_may_route();
+    }
+
+    #[test]
+    fn the_key_index_is_taken_after_a_collection_log() {
+        let _l = acquire(LockKind::CollectionLog);
+        let _k = acquire(LockKind::KeyIndex);
+    }
+
+    #[test]
+    #[should_panic(expected = "taking Instrument while holding KeyIndex")]
+    fn nothing_is_taken_under_the_key_index() {
+        let _k = acquire(LockKind::KeyIndex);
+        let _i = acquire(LockKind::Instrument);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::hash::{Hash, RandomState};
 use super::{CollectionLog, Delta, Displaced, IncrCollection, Staged, StagedDelete, StagedInsert};
 use crate::cells::Cells;
 use crate::hashed_multiset::{AddAt, HashedMultiset};
+use crate::persist_hooks::{RepSide, RepSink};
 use crate::runtime::Runtime;
 use crate::value::Value;
 use crate::value_code;
@@ -17,7 +18,7 @@ pub enum Change<T> {
 /// A batch prepared with no lock held: each change hashed (user `Hash`),
 /// each insert's copies made (user `Clone`), and each change assigned the
 /// group of the distinct value it names (user `Eq`).
-struct StagedBatch<T> {
+pub(crate) struct StagedBatch<T> {
     changes: Vec<Staged<T>>,
     group_of: Vec<usize>,
     groups: Vec<Group>,
@@ -113,7 +114,7 @@ struct Planned<T> {
 /// A committed batch: the new version if anything changed, the changes
 /// applied when asked for, and what the batch displaced, for the caller
 /// to drop once the version is set.
-struct CommittedBatch<T> {
+pub(crate) struct CommittedBatch<T> {
     version: Option<u64>,
     applied: Vec<Change<T>>,
     unused: Vec<T>,
@@ -121,12 +122,17 @@ struct CommittedBatch<T> {
 }
 
 impl<T: Hash + Eq + Clone> CollectionLog<T> {
-    /// Applies a staged batch under the log guard. Every lookup and user
-    /// `Clone` runs before the first change, changing nothing but the
-    /// table's capacity, so a panic leaves the log as it was; from the
-    /// first change on no user code runs.
-    fn apply_batch(&mut self, batch: StagedBatch<T>, report: bool) -> CommittedBatch<T> {
-        let mut plan = value_code::run(|| self.plan_batch(&batch, report));
+    /// Applies a staged batch under the log guard. Every lookup, user
+    /// `Clone` and report to `sink` runs before the first change, changing
+    /// nothing but the table's capacity, so a panic leaves the log as it
+    /// was; from the first change on no user code runs.
+    pub(crate) fn apply_batch<S: RepSink<T>>(
+        &mut self,
+        batch: StagedBatch<T>,
+        report: bool,
+        sink: &mut S,
+    ) -> CommittedBatch<T> {
+        let mut plan = value_code::run(|| self.plan_batch(&batch, report, sink));
         let mut applied = Vec::new();
         let mut unused = Vec::new();
         let start = self.deltas.len();
@@ -187,7 +193,12 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// replays the batch's changes against its count to get the net
     /// change one-by-one changes would make, and reserves room for the
     /// values it adds.
-    fn plan_batch(&mut self, batch: &StagedBatch<T>, report: bool) -> Vec<Planned<T>> {
+    fn plan_batch<S: RepSink<T>>(
+        &mut self,
+        batch: &StagedBatch<T>,
+        report: bool,
+        sink: &mut S,
+    ) -> Vec<Planned<T>> {
         let find = |elements: &HashedMultiset<T>, group: &Group| {
             elements.find(group.hash, batch.changes[group.first].key().1)
         };
@@ -228,6 +239,23 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             for (p, group) in plan.iter_mut().zip(&batch.groups) {
                 if p.at.is_some() {
                     p.at = find(&self.elements, group);
+                }
+            }
+        }
+        if S::ACTIVE {
+            for (g, p) in plan.iter().enumerate() {
+                let added = match (p.at, first_insert[g]) {
+                    (Some(at), _) => Some(self.elements.stored(at)),
+                    (None, Some(i)) => Some(batch.changes[i].key().1),
+                    (None, None) => None,
+                };
+                for rep in std::iter::repeat_n(added, p.inserts).flatten() {
+                    sink.on_rep(RepSide::Added, rep);
+                }
+                if let Some(at) = p.at {
+                    for _ in 0..p.deletes {
+                        sink.on_rep(RepSide::Removed, self.elements.stored(at));
+                    }
                 }
             }
         }
@@ -288,15 +316,38 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         changes: impl IntoIterator<Item = Change<T>>,
         report: bool,
     ) -> Vec<Change<T>> {
+        let batch = self.stage_batch(changes);
+        let committed = self.log.write().apply_batch(batch, report, &mut ());
+        self.publish_batch(rt, committed, || {})
+    }
+
+    /// Phase 1 of [`Self::apply`], run with no lock held: user `Hash`,
+    /// `Clone` and `Eq` within the batch.
+    pub(crate) fn stage_batch(
+        &self,
+        changes: impl IntoIterator<Item = Change<T>>,
+    ) -> StagedBatch<T> {
         self.check_mutable();
         value_code::check();
-        let batch = StagedBatch::new(&self.hasher, changes);
-        let committed = self.log.write().apply_batch(batch, report);
+        StagedBatch::new(&self.hasher, changes)
+    }
+
+    /// Sets the version for a batch committed under a log guard the caller
+    /// has released, then drops what it displaced, then runs `dispose`,
+    /// and only then routes a `group_by` the set reached. Returns the
+    /// changes applied when the batch reported them.
+    pub(crate) fn publish_batch(
+        &self,
+        rt: &Runtime<C>,
+        committed: CommittedBatch<T>,
+        dispose: impl FnOnce(),
+    ) -> Vec<Change<T>> {
         let routers = committed
             .version
             .is_some_and(|version| rt.set_unrouted(self.version_node, version));
         drop(committed.unused);
         committed.displaced.release(&self.log);
+        dispose();
         if routers {
             rt.route_queued();
         }

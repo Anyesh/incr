@@ -3721,3 +3721,55 @@ fn loom_memo_ends_before_another_threads_landings_changed_at() {
         second.join().unwrap();
     });
 }
+
+type Keyed = crate::keyed::KeyedCollection<u64, u64, Loom>;
+
+/// Two writers upsert one key while it holds a row. Whichever stages
+/// second either sees the first's write or finds the epoch moved and
+/// restages, so the key ends with exactly one pair, the index and the
+/// pair collection agree, and each write advanced the epoch once.
+#[test]
+fn loom_keyed_two_writers_one_key() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let keyed = Arc::new(Keyed::new(&rt));
+        keyed.upsert(&rt, 1, 10);
+        let writers: Vec<_> = [20_u64, 30]
+            .into_iter()
+            .map(|row| {
+                let (rt, keyed) = (Arc::clone(&rt), Arc::clone(&keyed));
+                thread::spawn(move || keyed.upsert(&rt, 1, row))
+            })
+            .collect();
+        for writer in writers {
+            let change = writer.join().unwrap();
+            assert_eq!(change.counts.replaced, 1);
+        }
+        let row = keyed.row(&1).expect("the key holds a row");
+        assert!(row == 20 || row == 30, "row {row}");
+        assert_eq!(keyed.pairs().values(&rt), vec![(1, row)]);
+        assert_eq!(keyed.rows().values(&rt), vec![row]);
+        assert_eq!(keyed.index().settled().0, 1);
+        assert_eq!(keyed.epoch(), 4);
+    });
+}
+
+/// A writer replaces a key's row while a reader reads it: the reader sees
+/// the old row or the new one, never none.
+#[test]
+fn loom_keyed_writer_against_a_row_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let keyed = Arc::new(Keyed::new(&rt));
+        keyed.upsert(&rt, 1, 10);
+        let writer = {
+            let (rt, keyed) = (Arc::clone(&rt), Arc::clone(&keyed));
+            thread::spawn(move || keyed.upsert(&rt, 1, 20))
+        };
+        let read = keyed.row(&1);
+        assert!(read == Some(10) || read == Some(20), "read {read:?}");
+        writer.join().unwrap();
+        assert_eq!(keyed.row(&1), Some(20));
+        assert_eq!(keyed.pairs().values(&rt), vec![(1, 20)]);
+    });
+}

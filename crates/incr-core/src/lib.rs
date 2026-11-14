@@ -40,6 +40,7 @@ pub mod handle;
 mod hashed_multiset;
 mod hold;
 mod instrument;
+pub mod keyed;
 pub mod lock_order;
 pub mod locks;
 #[cfg(loom)]
@@ -87,6 +88,7 @@ pub use fx::{FxBuildHasher, FxHasher};
 pub use generic_arena::GenericArena;
 pub use grid_table::{GridKey, GridTable};
 pub use handle::{ErasedIncr, Incr, RuntimeId};
+pub use keyed::{KeyCounts, KeyIndex, KeyTable, KeyedChange, KeyedCollection, Pair, PairOp};
 pub use locks::{LocalLock, Lock};
 pub use memory::{
     Held, MemoryStats, NodeKind, NodeMemory, StateKind, StateMemory, StateStats, ValueType,

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3587234840d122c9d49cffda34cb0749f46c04c5676bfda7300eee0014ecaa24 # shrinks to steps = [Upsert(1, 1), Apply([(true, 1, 2, 0)]), Apply([(true, 1, 1, 0)])]
+cc f3b6c4c3403c094afb643e74540551f9e569102706dd8a7728f427bde3736251 # shrinks to steps = [Reconcile([(4, 1)]), Apply([(true, 4, 0, 0)]), Apply([(true, 4, 1, 0)])]
