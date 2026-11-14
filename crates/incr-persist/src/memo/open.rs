@@ -264,6 +264,7 @@ impl AutoCheckpoint {
         };
         let wake = Arc::clone(&core.wake);
         let thread = thread::spawn(move || loop {
+            core.wake.arm();
             if core.wake.wait(every) {
                 return;
             }

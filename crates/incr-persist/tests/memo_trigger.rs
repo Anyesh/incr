@@ -152,3 +152,21 @@ fn an_interval_with_nothing_unsaved_writes_nothing() {
     w.read(1);
     w.wait_for_checkpoints(2);
 }
+
+/// A checkpoint the trigger woke that fails leaves the count past the
+/// trigger; the next compute must wake the thread again.
+#[test]
+fn the_trigger_wakes_the_thread_again_after_a_failed_checkpoint() {
+    let w = World::<Shared>::open(options().checkpoint_after_entries(2));
+    let scope = w.store.unlogged_scope().unwrap();
+    w.read(1);
+    w.read(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while w.memo.stats().auto_checkpoint_errors == 0 {
+        assert!(Instant::now() < deadline, "the trigger did not fire");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    scope.close().unwrap();
+    w.read(3);
+    w.wait_for_checkpoints(1);
+}

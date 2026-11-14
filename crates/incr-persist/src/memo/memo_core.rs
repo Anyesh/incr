@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -201,10 +202,23 @@ pub(crate) struct MemoCore<C: MemoCells> {
 
 /// What the automatic-checkpoint thread waits on. A leaf lock outside the
 /// lock order, like the dirty set's.
-#[derive(Default)]
 pub(crate) struct Wake {
     state: Mutex<Waking>,
     cond: Condvar,
+    /// Set while a compute that finds the trigger reached may wake the
+    /// thread; the first one to do so clears it, and the thread sets it
+    /// again before each wait.
+    armed: AtomicBool,
+}
+
+impl Default for Wake {
+    fn default() -> Self {
+        Wake {
+            state: Mutex::default(),
+            cond: Condvar::new(),
+            armed: AtomicBool::new(true),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -221,6 +235,19 @@ impl Wake {
     pub(crate) fn due(&self) {
         self.lock().due = true;
         self.cond.notify_all();
+    }
+
+    /// Lets the next compute that finds the trigger reached wake the
+    /// thread.
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// [`Self::due`] once per [`Self::arm`].
+    fn due_once(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.due();
+        }
     }
 
     pub(crate) fn stop(&self) {
@@ -314,11 +341,13 @@ impl<C: MemoCells> MemoCore<C> {
     }
 
     /// Records that `table`'s entry `handle` computed, and wakes the
-    /// automatic-checkpoint thread when that makes a checkpoint due.
+    /// automatic-checkpoint thread when a checkpoint is due. A count that
+    /// reached the trigger without a compute, carried or left by a failed
+    /// checkpoint, wakes it at the next compute.
     pub(crate) fn computed(&self, table: u32, handle: ErasedIncr) {
         let unsaved = self.lock_dirty().computed(table, handle);
-        if self.trigger == Some(unsaved) {
-            self.wake.due();
+        if self.trigger.is_some_and(|trigger| unsaved >= trigger) {
+            self.wake.due_once();
         }
     }
 
