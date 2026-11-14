@@ -166,7 +166,7 @@ where
         };
         let mut ranks = ranks.into_iter();
         let mut rows = Vec::with_capacity(deps.len());
-        hold(scope, || {
+        let mut map_rows = || {
             rows.extend(keys.iter().map(|key| {
                 let key = key.as_ref()?;
                 let rank = ranks.next().expect("a rank per found key");
@@ -175,7 +175,12 @@ where
                     None => Ok(None),
                 })
             }));
-        });
+        };
+        if found.is_empty() {
+            map_rows();
+        } else {
+            hold(scope, map_rows);
+        }
         bag.push(keys);
         rows
     }
