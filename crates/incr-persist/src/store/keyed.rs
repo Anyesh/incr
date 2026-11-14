@@ -2,12 +2,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::sync::{Arc, Weak};
 
 use incr_core::persist_hooks::Deferred;
 use incr_core::{
     with_value_code, Cells, DeleteError, ErasedIncr, Incr, IncrCollection, KeyCounts, KeyIndex,
-    KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp, Runtime, Value,
+    KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp, Runtime, Shared, Value,
 };
 
 use super::binding::{decode, encode, Binding};
@@ -382,16 +383,55 @@ pub(super) type WriteRun<'a, C> =
 /// was first staged, which the write checks again once it has applied
 /// (see [`Store::write_pending`]).
 pub struct PendingWrite<C: Cells> {
-    ops: Vec<PlainOp<C>>,
-    stages: Vec<Box<dyn Stage<C>>>,
+    ops: Erased<PlainOp<C>, C>,
+    stages: Erased<Box<dyn Stage<C>>, C>,
 }
 
 impl<C: Cells> Default for PendingWrite<C> {
     fn default() -> Self {
         PendingWrite {
-            ops: Vec::new(),
-            stages: Vec::new(),
+            ops: Erased(Vec::new(), PhantomData),
+            stages: Erased(Vec::new(), PhantomData),
         }
+    }
+}
+
+/// A pending write's erased plain ops or keyed stages.
+struct Erased<T, C>(Vec<T>, PhantomData<C>);
+
+// SAFETY: the plain ops capture only an `Input`, a `PersistedCollection`
+// and values, and `KeyedStage` is the only `Stage`; `_parts_are_send`
+// proves each of those `Send` on `Shared` for every value type.
+unsafe impl Send for Erased<PlainOp<Shared>, Shared> {}
+// SAFETY: as above.
+unsafe impl Send for Erased<Box<dyn Stage<Shared>>, Shared> {}
+
+fn _parts_are_send<T, K, V, P>()
+where
+    T: PersistValue + Hash + Eq,
+    K: Value + Hash + Eq,
+    V: Value + Hash + Eq,
+    P: Pair<K, V> + PersistValue,
+{
+    fn send<X: Send>() {}
+    send::<Input<T>>();
+    send::<Option<T>>();
+    send::<PersistedCollection<T, Shared>>();
+    send::<KeyedStage<K, V, Shared, P>>();
+    send::<PendingWrite<Shared>>();
+}
+
+impl<T, C> std::ops::Deref for Erased<T, C> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Vec<T> {
+        &self.0
+    }
+}
+
+impl<T, C> std::ops::DerefMut for Erased<T, C> {
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        &mut self.0
     }
 }
 
@@ -1239,11 +1279,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
     ) -> Result<Position> {
         let PendingWrite { ops, stages } = pending;
         let mut records = Vec::new();
-        for op in ops {
+        for op in ops.0 {
             records.push(op(state, &self.runtime)?);
         }
         let mut stale = false;
-        for stage in &stages {
+        for stage in stages.iter() {
             records.extend(stage.records(state)?);
             stale |= stage.stale();
         }
