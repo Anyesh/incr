@@ -44,7 +44,7 @@ All notable changes to this project are documented here. Format roughly follows 
 Release build on a 12-core Linux box shared with other work, so treat them as orders of magnitude.
 
 - **R1 (end to end, 240,000 keys, Local / Shared):** `reconcile` of every key 2.25 s / 2.57 s; creating one `get_key` reader per key 0.27 s / 0.28 s; first read of every reader 0.51 s / 0.88 s. During 20 `on_write` units on Shared, four reader threads made 1.9 million reads and none saw a key mid-replace.
-- **R3 (memo checkpoint stall at 1 GiB, Local):** file backend 17.9 s (merge 3.1 s, write 14.8 s, snapshot under 4 ms); SQLite backend about 11 s to merge and about 300 s to write.
+- **R3 (memo checkpoint stall at 1 GiB, Local):** file backend 17.9 s (merge 3.1 s, write 14.8 s, snapshot under 4 ms); SQLite backend about 11 s to merge and about 300 s to write. On Shared the automatic checkpoint runs on its own thread: computing 240,000 memo entries from Python took 2.6 s while it checkpointed half of them, against 1.8 s with no checkpoint.
 - **R11 (log checkpoint, 1 GiB of 1,000-byte inputs, 1,000 dirty):** memory backend 3.3 s and reopen 1.3 s; file backend 19.9 s; peak RSS about 6 GiB.
 - **R5 (1,000-node chain, Local / Shared):** stats on costs 1.9x / 1.3x a run with them off, tracing 3.0x / 1.6x. Clean `get` is gated exactly: 92 instructions on Local and 190 on Shared, as in beta.7.
 - **R7:** `graph_summary` over 1,000,000 nodes in 20 groups takes 129 ms on Local and 133 ms on Shared.
