@@ -138,12 +138,12 @@ pub fn same_element<P: Eq, R: ElementRank>(a: (&P, R), b: (&P, R)) -> bool {
 /// The position in `held` of the element `target` names: the first
 /// [`same_element`] of `target`'s rank, else the first of any rank.
 pub fn find_element<'a, P: Eq + 'a, R: ElementRank>(
-    held: impl Iterator<Item = (&'a P, R)> + Clone,
+    mut held: impl Iterator<Item = (&'a P, R)> + Clone,
     target: (&P, R),
 ) -> Option<usize> {
     held.clone()
         .position(|e| e.1 == target.1 && same_element(e, target))
-        .or_else(|| held.into_iter().position(|e| same_element(e, target)))
+        .or_else(|| held.position(|e| same_element(e, target)))
 }
 
 /// One change to a keyed collection's pairs, with the pair's rank. Of the
