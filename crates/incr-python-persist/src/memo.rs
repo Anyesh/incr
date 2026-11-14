@@ -47,16 +47,16 @@ impl TableHandle {
         *self.table.lock().unwrap_or_else(PoisonError::into_inner) = table;
     }
 
-    /// The label of `key`'s entry node, read with the GIL so the label
-    /// can be set under the store lock with no Python code; `None` for
-    /// an unlabelled table or a key whose `__str__` raises, which is
-    /// reported as unraisable.
     /// A reference to `key` kept to label its entry, for a labelled table
     /// only. Taken with the GIL, before any store closure.
     fn spare_key(&self, py: Python<'_>, key: &Py<PyAny>) -> Option<Py<PyAny>> {
         self.label.as_ref().map(|_| key.clone_ref(py))
     }
 
+    /// The label of `key`'s entry node, read with the GIL so the label
+    /// can be set under the store lock with no Python code; `None` for
+    /// an unlabelled table or a key whose `__str__` raises, which is
+    /// reported as unraisable.
     fn entry_label(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> Option<String> {
         let label = self.label.as_deref()?;
         match key.str() {
