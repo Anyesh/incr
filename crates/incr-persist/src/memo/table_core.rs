@@ -346,6 +346,8 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
     ) -> Option<Snap> {
         let typed = rt.typed_handle::<T>(record.handle)?;
         let seen = inspect(rt, typed)?;
+        #[cfg(test)]
+        super::snapshot::park(super::snapshot::CheckpointPark::Inspected);
         // Read after `inspect` returns, so an input's stamp check sees at
         // least the run whose value was cloned.
         let deps = seen
