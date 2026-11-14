@@ -26,7 +26,14 @@ enum KeyedKind {
 /// per key, with keys matched as a dict matches them. `collection` is the
 /// rows as a `Collection`, for the operators.
 ///
-/// Rows must be hashable. Key and row methods run as value code, on
+/// Rows need not be hashable: a pair hashes its key alone, and a row is
+/// unchanged when it is `==` to the held one, so an upsert of `{"a": True}`
+/// over `{"a": 1}` changes nothing. `collection` and operators over it
+/// still hash rows, so a collection of unhashable rows raises `TypeError`
+/// there. Writes through `collection` raise `RuntimeError`; write with
+/// `upsert`, `remove` and `reconcile`.
+///
+/// Key and row methods run as value code, on
 /// whichever thread writes or reads, so they must be thread-safe; one that
 /// calls into incr during an operation on the collection raises
 /// `RuntimeError`, which the operation raises, changing nothing.

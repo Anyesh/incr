@@ -221,8 +221,17 @@ macro_rules! persist_classes {
             /// log restores. `key_codec` and `codec` encode the
             /// keys and the rows, under the contracts of `store.input`. Write it
             /// with `store.upsert`, `store.remove`, `store.reconcile` or a
-            /// `store.batch`; its own writes raise. `label` names the collection's
-            /// group in `graph_summary`, labelling its pair and row nodes.
+            /// `store.batch`; its own writes and writes through its `collection`
+            /// raise. `label` names the collection's group in `graph_summary`,
+            /// labelling its pair and row nodes.
+            ///
+            /// Rows need not be hashable, but `collection` and operators over it
+            /// hash them. A row `==` to the held one is unchanged and logs
+            /// nothing, so `{"a": True}` over `{"a": 1}` changes nothing although
+            /// their encodings differ. A logged pair is matched by the fingerprint
+            /// of its bytes, so a row not `==` to its decoded copy (one holding
+            /// NaN or an object compared by identity) still replaces, restores
+            /// and catches up as one row.
             #[pyo3(signature = (key, key_codec, codec, label=None))]
             fn keyed_collection(
                 &self,

@@ -884,13 +884,16 @@ impl PyCollection {
 /// per key, with keys matched as a dict matches them. `collection` is the
 /// rows as a `Collection`, for the operators.
 ///
-/// Rows must be hashable. A change hashes each added pair's row in the pair
-/// collection, and each added or removed row again in `collection`'s output
-/// staging, which also runs one row `__eq__` per removed row; before Python
-/// 3.14, which caches a tuple's hash, a removed pair's row is hashed in the
-/// pair collection too. So an upsert that inserts pays two row `__hash__`
-/// calls, one that replaces pays three (four before 3.14) and two row
-/// `__eq__` against the held row, and one with an `==` row changes nothing.
+/// Rows need not be hashable: a pair hashes its key alone, and a row is
+/// unchanged when it is `==` to the held one, so an upsert of `{"a": True}`
+/// over `{"a": 1}` changes nothing. An upsert that replaces runs four row
+/// `__eq__` (two against the held row, two in the pair log, where the old
+/// and new pair share the key's hash) and one with an `==` row runs one
+/// and changes nothing. `collection` and operators over it still hash
+/// rows: once read, it hashes each added or removed row once, so a
+/// collection of unhashable rows raises `TypeError` there. Writes through
+/// `collection` raise `RuntimeError`; write with `upsert`, `remove` and
+/// `reconcile`.
 ///
 /// Key and row methods run as value code: one that calls into incr during
 /// an operation on the collection raises `RuntimeError`, which the
