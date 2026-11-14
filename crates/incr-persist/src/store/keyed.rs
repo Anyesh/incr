@@ -875,7 +875,7 @@ where
                     fixes.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
                 }
             }
-            state.after.push(held);
+            state.after.push_vec(held);
         }
         if self.complete {
             let held = self.keyed.keyed.ranked_pairs();
@@ -890,11 +890,11 @@ where
                     })
                     .collect()
             });
-            state.after.push(keys);
+            state.after.push_vec(keys);
             for (pair, rank) in unnamed {
                 fixes.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
             }
-            state.after.push(held);
+            state.after.push_vec(held);
         }
         Ok(fixes)
     }
@@ -1099,7 +1099,9 @@ where
         // hold, so a memo checkpoint never pairs a row with an older entry.
         guard.disarm();
         drop(hold);
-        bag.push((change, spent, read));
+        if !(change.changed.is_empty() && spent.is_empty() && read.is_empty()) {
+            bag.push((change, spent, read));
+        }
     }
 
     /// Brings the pairs to exactly `target`, ranks included, removing
@@ -1136,8 +1138,8 @@ where
             }
             (removed, inserted)
         });
-        bag.push(current);
-        bag.push(target);
+        bag.push_vec(current);
+        bag.push_vec(target);
         if let Some(changes) = changes {
             for (pair, _) in &removed {
                 changes.push(remove_record(&self.key, pair)?);
@@ -1167,7 +1169,7 @@ where
             .iter()
             .map(|pair| encode(&self.key, pair))
             .collect::<Result<Vec<_>>>();
-        bag.push(pairs);
+        bag.push_vec(pairs);
         let mut encoded = encoded?;
         encoded.sort_unstable();
         Ok(encoded)
@@ -1218,7 +1220,7 @@ where
         }
         let pairs = self.keyed.pairs().values(rt);
         let fp = fp_of_elements(&self.key, &pairs);
-        bag.push(pairs);
+        bag.push_vec(pairs);
         Ok(DepFp::Known(fp?))
     }
 
@@ -1406,7 +1408,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         guard.disarm();
         drop(hold);
-        state.after.push((change, spent, read));
+        if !(change.changed.is_empty() && spent.is_empty() && read.is_empty()) {
+            state.after.push((change, spent, read));
+        }
         let keyed = binding.keyed.clone();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedKeyed { id, keyed })

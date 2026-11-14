@@ -59,9 +59,12 @@ pub enum Error {
     Poisoned,
 
     /// A store method was called on a thread that is already inside a call
-    /// of the same store, such as from the `Drop` of a value the store or
-    /// the engine dropped under the store's lock, or from a subscriber.
-    /// Nothing was done; the outer call is unaffected.
+    /// of the same store, such as from the `Drop` of a value the engine
+    /// dropped under the store's lock, or from a subscriber. Nothing was
+    /// done. The outer call is unaffected, unless the refused call consumed
+    /// a [`StagedBatch`](crate::StagedBatch) or an
+    /// [`UnloggedScope`](crate::UnloggedScope) that then drops unfinished,
+    /// which poisons the store through the outer call.
     #[error("store called from inside one of its own calls on this thread")]
     Reentrant,
 

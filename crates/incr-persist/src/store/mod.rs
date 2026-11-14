@@ -190,7 +190,9 @@ pub struct Batch<'s, C: Cells, B: Backend> {
 /// they create and set runtime inputs, nor from a value, key or element
 /// type's trait method that the engine or the store is running, because
 /// that call may run under the store's own lock. Either call panics, in
-/// release builds too, before the store's lock is requested.
+/// release builds too, before the store's lock is requested, except that a
+/// call on the thread holding this store's lock returns
+/// [`Error::Reentrant`].
 ///
 /// A value's `Drop` may call the store. The values a store call displaces,
 /// decodes or clones drop after it releases its lock. Where the engine
@@ -772,10 +774,15 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// Stops the subscription `id`, so its callback is never called again
     /// and is dropped. An id already unsubscribed is ignored.
     pub fn unsubscribe(&self, id: SubscriptionId) -> Result<()> {
-        let mut state = self.state()?;
-        state
+        let mut guard = self.state()?;
+        let state = &mut *guard;
+        if let Some(at) = state
             .subscribers
-            .retain(|(subscribed, _)| *subscribed != id);
+            .iter()
+            .position(|(subscribed, _)| *subscribed == id)
+        {
+            state.after.push(state.subscribers.remove(at));
+        }
         Ok(())
     }
 

@@ -996,6 +996,19 @@ pub struct KeyedSpent<K, V, P, R = ()> {
     pairs: Vec<(P, R)>,
 }
 
+impl<K, V, P, R> KeyedSpent<K, V, P, R> {
+    /// Whether nothing was handed back.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+            && self.keys.is_empty()
+            && self.stages.is_empty()
+            && self.batches.is_empty()
+            && self.unused.is_empty()
+            && self.displaced.is_empty()
+            && self.pairs.is_empty()
+    }
+}
+
 impl<K, V, P, R> Default for KeyedSpent<K, V, P, R> {
     fn default() -> Self {
         Self {

@@ -249,8 +249,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
             map.register(key, binding.node(), Kind::Collection, fp, None);
         }
         drop(hold);
-        state.after.push(spent);
-        state.after.push(plan);
+        spent.keep_in(&state.after);
+        plan.keep_in(&state.after);
         let view = binding.collection.as_view();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedCollection { id, view })
@@ -321,6 +321,15 @@ struct Converge<T> {
     moved: HashSet<T>,
 }
 
+impl<T: Send + 'static> Converge<T> {
+    /// Moves the plan into `bag` unless it holds nothing.
+    fn keep_in(self, bag: &AfterLock) {
+        if !(self.current.is_empty() && self.target.is_empty() && self.moved.is_empty()) {
+            bag.push(self);
+        }
+    }
+}
+
 impl<T: Hash + Eq> Converge<T> {
     /// How many occurrences of `value`, an element of one side, the other
     /// side has that converging keeps.
@@ -339,6 +348,14 @@ impl<T: Hash + Eq> Converge<T> {
 struct Spent<T> {
     displaced: Vec<Displaced<T>>,
     values: Vec<T>,
+}
+
+impl<T: Send + 'static> Spent<T> {
+    /// Moves the values into `bag` unless there are none.
+    fn keep_in(self, bag: &AfterLock) {
+        bag.push_vec(self.displaced);
+        bag.push_vec(self.values);
+    }
 }
 
 impl<T> Default for Spent<T> {
@@ -397,7 +414,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         }
         guard.disarm();
         drop(hold);
-        bag.push(spent);
+        spent.keep_in(bag);
     }
 
     /// The elements encoded, in byte order. A store that does not declare
@@ -411,7 +428,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
             .iter()
             .map(|value| encode(&self.key, value))
             .collect::<Result<Vec<_>>>();
-        bag.push(values);
+        bag.push_vec(values);
         let mut encoded = encoded?;
         encoded.sort_unstable();
         Ok(encoded)
@@ -475,8 +492,8 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
             }
         }
         drop(hold);
-        bag.push(spent);
-        bag.push(plan);
+        spent.keep_in(bag);
+        plan.keep_in(bag);
         Ok(())
     }
 
@@ -566,7 +583,7 @@ where
         }
         let values = self.collection.values(rt);
         let fp = fp_of_elements(&self.key, &values);
-        bag.push(values);
+        bag.push_vec(values);
         Ok(DepFp::Known(fp?))
     }
 

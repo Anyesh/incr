@@ -196,8 +196,10 @@ fn no_user_drop_runs_under_a_store_lock<C: Cells>() {
     assert_eq!(under, 0, "{under} of {all} drops ran under a lock");
 }
 
+type StoreCall = Box<dyn Fn() -> Result<(), Error>>;
+
 thread_local! {
-    static REENTER: RefCell<Option<Box<dyn Fn() -> Result<(), Error>>>> =
+    static REENTER: RefCell<Option<StoreCall>> =
         const { RefCell::new(None) };
     static OUTCOMES: RefCell<Vec<Outcome>> = const { RefCell::new(Vec::new()) };
 }

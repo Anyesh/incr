@@ -78,7 +78,11 @@ impl ValueScope {
     /// takes it once instead of once per call. incr-persist calls it under
     /// store and memo locks, and a batch waits for no lock but the
     /// binding's own; `hold` must call its argument exactly once, on the
-    /// calling thread.
+    /// calling thread. A store also drops the values a call spent inside
+    /// `hold`, after releasing its lock; a `Drop` that calls a store from
+    /// there must first release whatever `hold` took, as the Python
+    /// bindings release the GIL, or it can deadlock against a store call
+    /// waiting for that lock.
     pub fn holding(self, hold: fn(&mut dyn FnMut())) -> Self {
         ValueScope {
             hold: Some(hold),

@@ -18,6 +18,14 @@ impl AfterLock {
             self.0.borrow_mut().push(Box::new(value));
         }
     }
+
+    /// [`Self::push`], keeping nothing for an empty `values`, so a call that
+    /// spent nothing takes no hold after its lock.
+    pub(super) fn push_vec<T: Send + 'static>(&self, values: Vec<T>) {
+        if !values.is_empty() {
+            self.push(values);
+        }
+    }
 }
 
 /// The values taken from an [`AfterLock`] as the mutex is released,
