@@ -145,8 +145,9 @@ fn header_roundtrips_and_checks_magic_and_format() {
         Err(Error::Corrupt(_))
     ));
 
-    // Format 1 entry frames carry no frame tag.
-    for other in [1, FORMAT + 1] {
+    // Format 1 entry frames carry no frame tag, and a format 2 build
+    // cannot decode `StoredDep::Row`.
+    for other in [1, 2, FORMAT + 1] {
         let mut body = MAGIC.to_vec();
         body.push(other);
         body.extend(postcard::to_stdvec(&header).unwrap());

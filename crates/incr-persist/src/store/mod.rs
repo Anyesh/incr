@@ -29,7 +29,7 @@ pub(crate) mod dep_index;
 #[cfg(test)]
 #[path = "dep_index_tests.rs"]
 mod dep_index_tests;
-mod keyed;
+pub(crate) mod keyed;
 #[cfg(test)]
 #[path = "keyed_tests.rs"]
 mod keyed_tests;
@@ -485,13 +485,17 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 binding.kind(),
                 binding.dep_fp(&self.runtime)?,
                 binding.mapped_stamp(),
+                binding.row_source(),
             ));
         }
         let deps = Arc::new(DepIndex::default());
         {
             let mut map = deps.write();
-            for (key, handle, kind, fp, stamp) in entries {
+            for (key, handle, kind, fp, stamp, rows) in entries {
                 map.register(key, handle, kind, fp, stamp);
+                if let Some(rows) = rows {
+                    map.register_rows(key, rows);
+                }
             }
         }
         state.deps = Some(Arc::clone(&deps));

@@ -1,10 +1,11 @@
 //! Between a live dep and its stored form, under a `DepIndex` hold.
 
-use incr_core::persist_hooks::changed_at_erased;
+use incr_core::persist_hooks::{changed_at_erased, Deferred};
 use incr_core::{Cells, ErasedIncr, Runtime};
 
 use super::StoredDep;
 use crate::store::dep_index::{DepFp, DepMap};
+use crate::store::keyed::rows_of;
 use crate::Kind;
 
 /// What a live dep of a checkpointed entry stores as.
@@ -29,6 +30,7 @@ pub(crate) fn map_live<C: Cells>(
     rt: &Runtime<C>,
     memo: u64,
     dep: ErasedIncr,
+    bag: &mut Deferred<C>,
 ) -> LiveDep {
     if let Some(key) = map.key_of(dep) {
         let entry = map.entry(key).expect("a handle's key is registered");
@@ -63,17 +65,39 @@ pub(crate) fn map_live<C: Cells>(
             LiveDep::Unmapped
         };
     }
+    for (collection, rows) in map.all_rows() {
+        if let Some(row) = rows_of::<C>(rows).live_row(dep, bag) {
+            return match (row, trusted(map, collection)) {
+                (Ok(Some((key_bytes, fp))), true) => LiveDep::Stored(StoredDep::Row {
+                    collection: collection.to_owned(),
+                    key_bytes,
+                    fp,
+                }),
+                _ => LiveDep::Unmapped,
+            };
+        }
+    }
     LiveDep::Query(dep)
+}
+
+/// Whether the keyed collection `collection` is registered with a known
+/// fingerprint, so a panic part-way through one of its writes leaves its
+/// rows unmapped.
+fn trusted(map: &DepMap, collection: &str) -> bool {
+    map.entry(collection)
+        .is_some_and(|entry| matches!(entry.fp, DepFp::Known(_)))
 }
 
 /// A stored store-key or external dep's live node and whether its
 /// fingerprint still matches; `None` when nothing live vouches for it.
-/// `None` for a query dep, which the restore walk maps.
+/// `None` for a query dep, which the restore walk maps. A row dep's
+/// decoded key goes to `bag`.
 pub(crate) fn map_stored<C: Cells>(
     map: &DepMap,
     rt: &Runtime<C>,
     memo: u64,
     dep: &StoredDep,
+    bag: &mut Deferred<C>,
 ) -> Option<(ErasedIncr, bool)> {
     match dep {
         StoredDep::Input { key, fp } => {
@@ -96,6 +120,16 @@ pub(crate) fn map_stored<C: Cells>(
             let external = map.external(memo, name)?;
             let handle = external.handle.erase();
             vouches(rt, handle, Some(external.stamp)).then_some((handle, external.fp == *fp))
+        }
+        StoredDep::Row {
+            collection,
+            key_bytes,
+            fp,
+        } => {
+            if !trusted(map, collection) {
+                return None;
+            }
+            rows_of::<C>(map.rows(collection)?).stored_row(key_bytes, *fp, bag)
         }
         StoredDep::Query { .. } => None,
     }

@@ -39,6 +39,10 @@ harness = false
 name = "memo"
 harness = false
 
+[[bench]]
+name = "memo_stall"
+harness = false
+
 [[example]]
 name = "sqlite_writers"
 required-features = ["sqlite"]

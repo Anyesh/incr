@@ -47,6 +47,12 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// copies; `None` for a collection.
     fn mapped_stamp(&self) -> Option<u64>;
 
+    /// For a keyed collection, the rows a memo maps `get_key` reads
+    /// through, which registering it in a [`DepIndex`] copies.
+    fn row_source(&self) -> Option<Box<dyn Any + Send + Sync>> {
+        None
+    }
+
     /// Applies `record`, one of this key's records in position order, to the
     /// node. `before` is the key's logged state without the record. With
     /// `deps`, the runtime write and the fingerprint update run inside one

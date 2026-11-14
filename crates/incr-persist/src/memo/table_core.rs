@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use incr_core::persist_hooks::{
     get_or_insert_query_seeded, inspect, probe_unchecked, seed_query, Deferred, Reuse, SeedBase,
@@ -9,6 +9,7 @@ use incr_core::{with_value_code, ErasedIncr, Incr, NodeTable, QueryOpts, Runtime
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use super::dirty::Record;
 use super::handle::{MemoCtx, MemoKey, MemoValue};
 use super::mapping::{map_live, LiveDep};
 use super::memo_core::{CoreRef, MemoCells};
@@ -31,50 +32,62 @@ pub(crate) enum Seeded {
     Failed,
 }
 
-/// One live entry a checkpoint's snapshot found, typed values hidden.
+/// One dirty live entry a checkpoint's snapshot found, typed values
+/// hidden.
 pub(crate) struct Snap {
     pub(crate) table: u32,
     pub(crate) handle: ErasedIncr,
+    /// The entry's dirty mark when the snapshot copied the dirty set.
+    pub(crate) mark: u64,
     /// The node's `changed_at` when `inspect` read it.
     pub(crate) stamp: u64,
+    /// The fp the entry was last written or seeded with, if it has kept
+    /// that stamp since: its value still equals those stored bytes.
+    pub(crate) seeded: Option<u128>,
+    pub(crate) key: KeyPart,
     pub(crate) deps: Vec<LiveDep>,
     pub(crate) in_group: bool,
-    pub(crate) item: Box<dyn Encode>,
+    pub(crate) value: Box<dyn Encode>,
 }
 
 pub(crate) trait Encode {
-    /// The key's and value's bytes, or the part that does not encode or
-    /// does not decode back equal to itself.
-    fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), EncodeMismatch>;
+    /// The bytes, or the part that does not encode or does not decode back
+    /// equal to itself.
+    fn encode(&self) -> Result<Vec<u8>, EncodeMismatch>;
 }
 
-struct Typed<K, T> {
+struct Part<X> {
     table: Arc<str>,
-    key: K,
-    value: T,
+    part: MemoPart,
+    x: X,
 }
 
-impl<K: MemoKey, T: MemoValue> Encode for Typed<K, T> {
-    fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), EncodeMismatch> {
-        let mismatch = |part| EncodeMismatch {
+impl<X: Serialize + DeserializeOwned + PartialEq> Encode for Part<X> {
+    fn encode(&self) -> Result<Vec<u8>, EncodeMismatch> {
+        let mismatch = || EncodeMismatch {
             table: self.table.to_string(),
-            part,
+            part: self.part,
         };
-        let table = &*self.table;
-        let key = encode(table, MemoPart::Key, &self.key).ok_or_else(|| mismatch(MemoPart::Key))?;
-        let value =
-            encode(table, MemoPart::Value, &self.value).ok_or_else(|| mismatch(MemoPart::Value))?;
-        let key_same = decode::<K>(table, MemoPart::Key, &key)
-            .is_some_and(|k| with_value_code(|| k == self.key));
-        if !key_same {
-            return Err(mismatch(MemoPart::Key));
+        let bytes = encode(&self.table, self.part, &self.x).ok_or_else(mismatch)?;
+        let same = decode::<X>(&self.table, self.part, &bytes)
+            .is_some_and(|x| with_value_code(|| x == self.x));
+        if same {
+            Ok(bytes)
+        } else {
+            Err(mismatch())
         }
-        let value_same = decode::<T>(table, MemoPart::Value, &value)
-            .is_some_and(|v| with_value_code(|| v == self.value));
-        if !value_same {
-            return Err(mismatch(MemoPart::Value));
-        }
-        Ok((key, value))
+    }
+}
+
+/// A live entry's key as its compute records it in the dirty set.
+pub(crate) type KeyPart = Arc<dyn Encode + Send + Sync>;
+
+/// A key already encoded, for an entry the backend lost.
+pub(crate) struct Encoded(pub(crate) Vec<u8>);
+
+impl Encode for Encoded {
+    fn encode(&self) -> Result<Vec<u8>, EncodeMismatch> {
+        Ok(self.0.clone())
     }
 }
 
@@ -127,16 +140,16 @@ pub(crate) trait ErasedTable<C: MemoCells> {
         bag: &mut Deferred<C>,
     ) -> Option<(ErasedIncr, Seeded)>;
 
-    /// Every live entry that is Clean through `inspect`, with its deps
-    /// mapped under `map`'s hold. The keys of entries it skips go to `bag`.
-    fn snapshot(
+    /// Dirty entry `handle` with its deps mapped under `map`'s hold, if it
+    /// is Clean through `inspect`.
+    fn inspect_dirty(
         &self,
         rt: &Runtime<C>,
         map: &DepMap,
         memo: u64,
-        out: &mut Vec<Snap>,
+        record: &Record,
         bag: &mut Deferred<C>,
-    );
+    ) -> Option<Snap>;
 }
 
 pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
@@ -147,10 +160,36 @@ pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
 }
 
 impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
+    /// The node's compute: `f`, then a record in the dirty set. A run that
+    /// unwinds records nothing; its node is not Clean, so no checkpoint
+    /// takes it. The node's handle is probed at the first run and kept,
+    /// as the closure belongs to that one node.
     fn closure(&self, core: &CoreRef<C>, key: K) -> impl Fn(&Runtime<C>) -> T + Send + Sync {
         let f = Arc::clone(&self.f);
         let core = core.clone();
-        move |rt| f(&MemoCtx { rt, core: &core }, &key)
+        let (memo, index) = (core.id, self.index);
+        let node = OnceLock::new();
+        let key = Arc::new(Part {
+            table: Arc::clone(&self.name),
+            part: MemoPart::Key,
+            x: key,
+        });
+        let part: KeyPart = key.clone();
+        move |rt| {
+            let value = f(&MemoCtx { rt, core: &core }, &key.x);
+            let handle = match node.get() {
+                Some(&handle) => Some(handle),
+                None => {
+                    let table: &TableCore<K, T, C> = core.table(memo, index);
+                    let handle = table.probe(rt, &key.x).map(Incr::erase);
+                    handle.map(|handle| *node.get_or_init(|| handle))
+                }
+            };
+            if let Some(handle) = handle {
+                core.computed(index, handle, &part);
+            }
+            value
+        }
     }
 
     pub(crate) fn probe(&self, rt: &Runtime<C>, key: &K) -> Option<Incr<T>> {
@@ -276,43 +315,38 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         Some((handle.erase(), seeded))
     }
 
-    fn snapshot(
+    fn inspect_dirty(
         &self,
         rt: &Runtime<C>,
         map: &DepMap,
         memo: u64,
-        out: &mut Vec<Snap>,
+        record: &Record,
         bag: &mut Deferred<C>,
-    ) {
-        let mut live = Vec::new();
-        self.nodes.for_each(rt, |key, handle| {
-            live.push((with_value_code(|| key.clone()), handle));
-        });
-        for (key, handle) in live {
-            let Some(seen) = inspect(rt, handle) else {
-                bag.push(key);
-                continue;
-            };
-            // Read after `inspect` returns, so an input's stamp check sees
-            // at least the run whose value was cloned.
-            let deps = seen
-                .deps
-                .iter()
-                .map(|&d| map_live(map, rt, memo, d))
-                .collect();
-            out.push(Snap {
-                table: self.index,
-                handle: handle.erase(),
-                stamp: seen.changed_at,
-                deps,
-                in_group: seen.in_group,
-                item: Box::new(Typed {
-                    table: Arc::clone(&self.name),
-                    key,
-                    value: seen.value,
-                }),
-            });
-        }
+    ) -> Option<Snap> {
+        let typed = rt.typed_handle::<T>(record.handle)?;
+        let seen = inspect(rt, typed)?;
+        // Read after `inspect` returns, so an input's stamp check sees at
+        // least the run whose value was cloned.
+        let deps = seen
+            .deps
+            .iter()
+            .map(|&d| map_live(map, rt, memo, d, bag))
+            .collect();
+        Some(Snap {
+            table: self.index,
+            handle: record.handle,
+            mark: record.mark,
+            stamp: seen.changed_at,
+            seeded: None,
+            key: Arc::clone(&record.key),
+            deps,
+            in_group: seen.in_group,
+            value: Box::new(Part {
+                table: Arc::clone(&self.name),
+                part: MemoPart::Value,
+                x: seen.value,
+            }),
+        })
     }
 }
 

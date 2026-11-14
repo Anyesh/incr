@@ -279,7 +279,7 @@ fn every_truncation_of_a_generation_file_runs_cold<C: MemoCells>() {
 
 /// `a(k) = k * x` and `b(k) = k * x + 1`, declared in either order.
 struct Pair<C: MemoCells> {
-    _store: St<C>,
+    store: St<C>,
     memo: Memo<C, MemoryBackend>,
     a: MemoTable<u32, u64>,
     b: MemoTable<u32, u64>,
@@ -313,12 +313,7 @@ impl<C: MemoCells> Pair<C> {
             u64::from(k) * ctx.rt().get(x) + 1
         });
         let memo = builder.open(&store, backend).unwrap();
-        Pair {
-            _store: store,
-            memo,
-            a,
-            b,
-        }
+        Pair { store, memo, a, b }
     }
 
     fn check(&self) {
@@ -337,7 +332,8 @@ fn swap(dir: &Path, one: &str, two: &str) {
 }
 
 /// Opens `Pair` over `backend`, declared `[b, a]` if `b_first`, checks
-/// it after `reused` restores and checkpoints both entries.
+/// it after `reused` restores and checkpoints both entries, recomputing
+/// reused ones so the checkpoint writes the catalog it was opened with.
 fn checkpoint_pair<C: MemoCells>(
     log: &MemoryBackend,
     backend: impl MemoBackend + 'static,
@@ -348,6 +344,15 @@ fn checkpoint_pair<C: MemoCells>(
     let w = Pair::<C>::open(log, backend, b_first, runs);
     w.check();
     assert_eq!(w.memo.stats().reused, reused);
+    if reused > 0 {
+        // A checkpoint with nothing fresh writes nothing.
+        let x = w.store.input("x", 1_u64).unwrap();
+        w.store.set(x, 2).unwrap();
+        w.memo.runtime().get(w.memo.get_or_insert(w.a, 1));
+        w.memo.runtime().get(w.memo.get_or_insert(w.b, 1));
+        w.store.set(x, 1).unwrap();
+        w.check();
+    }
     assert_eq!(w.memo.checkpoint().unwrap().written, 2);
 }
 
@@ -829,7 +834,7 @@ impl<C: MemoCells> Probe<'_, C> {
 /// and `t(5)`; after a restart restores `t(1)` and runs `panic`, a mapped
 /// write of the dep that panics. Then `t(2)`, restored after the panic,
 /// `t(3)`, new, and `t(5)`, restored after a checkpoint, all run cold; the
-/// checkpoint writes only the stored entries it merges; and the next
+/// checkpoint, with nothing it can save, writes nothing; and the next
 /// restart finds no entry it didn't store before the panic.
 fn assert_untrusted_after_panic<C: MemoCells, W>(
     open: impl Fn() -> (W, Memo<C, MemoryBackend>, MemoTable<u32, u64>),
@@ -855,8 +860,7 @@ fn assert_untrusted_after_panic<C: MemoCells, W>(
         let d = dep(&w, &memo);
         assert_eq!(p.read(2), 2 * d);
         assert_eq!(p.read(3), 3 * d);
-        let stats = memo.checkpoint().unwrap();
-        assert_eq!((stats.written, stats.merged), (3, 3));
+        assert!(memo.checkpoint().unwrap().unchanged);
         assert_eq!(p.read(5), 5 * d);
         let stats = memo.stats();
         assert_eq!((stats.reused, stats.revalidated, stats.cold), (1, 0, 2));

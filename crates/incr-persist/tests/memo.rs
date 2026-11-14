@@ -510,6 +510,8 @@ fn a_checkpoint_removes_the_generation_it_replaces<C: MemoCells>() {
         .read_entry(first.id(), &item)
         .unwrap()
         .is_some());
+    w.store.set(w.x, 2).unwrap();
+    assert_eq!(read(&w, 2), 4);
     w.memo.checkpoint().unwrap();
     let second = backends.memo.load().unwrap().unwrap();
     assert_ne!(second.id(), first.id());
@@ -632,7 +634,8 @@ fn a_restore_drops_no_key_under_the_memo_lock<C: MemoCells>() {
     assert_eq!(under_m, 0);
 }
 
-/// A Dirty entry is skipped by the snapshot, which holds M.
+/// The snapshot, which holds M, clones the key of the Clean entry and
+/// skips the Dirty one.
 fn a_checkpoint_drops_no_key_under_the_memo_lock<C: MemoCells>() {
     let backends = Backends::new();
     let store = backends.store::<C>();
@@ -640,13 +643,18 @@ fn a_checkpoint_drops_no_key_under_the_memo_lock<C: MemoCells>() {
     let xh = x.handle();
     let mut builder = MemoBuilder::new(options());
     let t = builder.table::<Watched, u64>("t", 1);
-    builder.define(t, move |ctx, k| ctx.rt().get(xh) + u64::from(k.0));
+    builder.define(t, move |ctx, k| match k.0 {
+        1 => ctx.rt().get(xh) + 1,
+        n => u64::from(n),
+    });
     let memo = builder.open(&store, backends.memo.clone()).unwrap();
-    let q = memo.get_or_insert(t, Watched(1));
-    assert_eq!(memo.runtime().get(q), 2);
+    for k in [1, 2] {
+        let q = memo.get_or_insert(t, Watched(k));
+        assert_eq!(memo.runtime().get(q), 2);
+    }
     store.set(x, 2).unwrap();
     let (drops, under_m) = watch(|| {
-        assert_eq!(memo.checkpoint().unwrap().written, 0);
+        assert_eq!(memo.checkpoint().unwrap().written, 1);
     });
     assert!(drops > 0);
     assert_eq!(under_m, 0);
