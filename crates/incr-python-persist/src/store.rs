@@ -3,7 +3,8 @@
 //! persisted inputs.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
 
 use incr_core::Incr;
 use incr_persist::memo::fingerprint;
@@ -12,7 +13,7 @@ use incr_persist::{
     StoreStats,
 };
 use incr_python_protocol::{PyKey, PyValue};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 
@@ -65,6 +66,27 @@ pub struct StoreCore<B: PyBinding> {
     build_id: u128,
     inputs: Mutex<HashMap<u32, Input<PyValue>>>,
     collections: Mutex<HashMap<u32, Collection<B>>>,
+    declaring: DeclareLock,
+}
+
+/// Runs one declaration at a time, so a failed one unregisters only a
+/// codec no concurrent declaration of the same slot relies on. Waited on
+/// with the GIL released, since a declaration runs Python under the store
+/// lock.
+#[derive(Default)]
+struct DeclareLock {
+    holder: Mutex<Option<ThreadId>>,
+    freed: Condvar,
+}
+
+/// The declaration lock, held until dropped.
+pub struct Declaring<'a>(&'a DeclareLock);
+
+impl Drop for Declaring<'_> {
+    fn drop(&mut self) {
+        *self.0.holder.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.0.freed.notify_one();
+    }
 }
 
 impl<B: PyBinding> StoreCore<B> {
@@ -91,6 +113,7 @@ impl<B: PyBinding> StoreCore<B> {
             build_id,
             inputs: Mutex::default(),
             collections: Mutex::default(),
+            declaring: DeclareLock::default(),
         })
     }
 
@@ -115,6 +138,39 @@ impl<B: PyBinding> StoreCore<B> {
         self.build_id
     }
 
+    /// Takes the lock every declaration of this store holds from its
+    /// first registry check until it has registered or unregistered its
+    /// codecs. `RuntimeError` when this thread holds it already, as a
+    /// codec that declares from inside a declaration would.
+    pub fn declare_lock(&self, py: Python<'_>) -> PyResult<Declaring<'_>> {
+        let lock = &self.declaring;
+        let me = std::thread::current().id();
+        let taken = py.detach(|| {
+            let mut holder = lock.holder.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                match *holder {
+                    None => {
+                        *holder = Some(me);
+                        return true;
+                    }
+                    Some(thread) if thread == me => return false,
+                    Some(_) => {
+                        holder = lock
+                            .freed
+                            .wait(holder)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                }
+            }
+        });
+        if !taken {
+            return Err(PyRuntimeError::new_err(
+                "a declaration on this store is already running on this thread",
+            ));
+        }
+        Ok(Declaring(lock))
+    }
+
     /// Declares the input `key` with `codec` and returns its node, which
     /// starts at its logged value or else at `default`. Without a codec
     /// the key must already have one.
@@ -125,6 +181,7 @@ impl<B: PyBinding> StoreCore<B> {
         default: Py<PyAny>,
         codec: Option<Py<PyAny>>,
     ) -> PyResult<Incr<PyValue>> {
+        let _declaring = self.declare_lock(py)?;
         let slot = Slot::Key(key.to_owned());
         let added = self.declare_codec(&slot, codec)?;
         let default = PyValue(default);
@@ -252,6 +309,7 @@ where
         key: &str,
         codec: Option<Py<PyAny>>,
     ) -> PyResult<Collection<B>> {
+        let _declaring = self.declare_lock(py)?;
         let slot = Slot::Key(key.to_owned());
         let added = self.declare_codec(&slot, codec)?;
         let persisted = self.declaring(&slot, added, || {
@@ -342,6 +400,7 @@ where
         key_codec: Py<PyAny>,
         codec: Py<PyAny>,
     ) -> PyResult<Keyed<B>> {
+        let _declaring = self.declare_lock(py)?;
         let slot = Slot::Key(key.to_owned());
         if self.registry.is_registered(&slot) {
             return Err(PyValueError::new_err(format!(

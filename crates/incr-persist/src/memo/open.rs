@@ -12,12 +12,12 @@ use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats, Wake};
 use super::options::MemoOptions;
 use super::table_core::{ErasedTable, TableCore};
 use super::{CheckpointStats, GenId, Generation, MemoBackend, TableDesc};
-use crate::value_context::EncodeMismatch;
+use crate::value_context::{EncodeMismatch, ValueScope};
 use crate::{Backend, Error, Result, Store};
 
 static NEXT_MEMO: AtomicU64 = AtomicU64::new(1);
 
-type Make<C> = Box<dyn FnOnce(&Runtime<C>) -> Box<dyn ErasedTable<C>>>;
+type Make<C> = Box<dyn FnOnce(&Runtime<C>, Option<ValueScope>) -> Box<dyn ErasedTable<C>> + Send>;
 
 struct Declared<C: MemoCells> {
     desc: TableDesc,
@@ -82,10 +82,11 @@ impl<C: MemoCells> MemoBuilder<C> {
         );
         let index = table.index;
         let name: Arc<str> = declared.desc.name.as_str().into();
-        declared.make = Some(Box::new(move |rt| {
+        declared.make = Some(Box::new(move |rt, scope| {
             Box::new(TableCore::<K, T, C> {
                 index,
                 name,
+                scope,
                 nodes: rt.create_table(),
                 f: Arc::new(f),
             })
@@ -119,7 +120,10 @@ impl<C: MemoCells> MemoBuilder<C> {
             .unwrap_or_else(|| Generation::empty(GenId(0)));
         let index = IndexGen::new(generation, build, &catalog);
         let rt = store.runtime();
-        let tables = makes.into_iter().map(|make| make(rt)).collect();
+        let tables = makes
+            .into_iter()
+            .map(|make| make(rt, store.value_scope()))
+            .collect();
         let core = CoreRef(Arc::new(MemoCore::new(
             self.id,
             build,
@@ -267,6 +271,7 @@ impl AutoCheckpoint {
         };
         let wake = Arc::clone(&core.wake);
         let thread = thread::spawn(move || {
+            let _scope = store.enter_value_scope();
             let mut failed = false;
             loop {
                 core.wake.arm();

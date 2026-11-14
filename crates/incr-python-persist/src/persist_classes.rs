@@ -62,8 +62,36 @@ macro_rules! persist_classes {
         }
 
         $crate::persist_classes!(@store_methods $b, $rt, {
-            /// Closes the store: later store calls raise `RuntimeError`. The
-            /// runtime keeps the values it holds.
+            /// Applies the records other writers appended since this store last
+            /// read the log, across a compaction too, and returns the position it
+            /// has applied through.
+            fn refresh(&self, py: Python<'_>) -> PyResult<u64> {
+                self.core_outside_overlay(py)?.refresh(py)
+            }
+
+            /// `position` (the last log position applied), `snapshot_position`
+            /// (the snapshot this store last wrote or crossed, 0 if none) and
+            /// `records_since_checkpoint`, read without touching the backend.
+            fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, $crate::pyo3::types::PyDict>> {
+                let stats = self.core_outside_overlay(py)?.stats(py)?;
+                let dict = $crate::pyo3::types::PyDict::new(py);
+                dict.set_item("position", stats.position.0)?;
+                dict.set_item("snapshot_position", stats.snapshot_position.0)?;
+                dict.set_item("records_since_checkpoint", stats.records_since_checkpoint)?;
+                Ok(dict)
+            }
+
+            /// Folds the log into a snapshot, compacting it, and returns the
+            /// position the snapshot covers.
+            fn checkpoint(&self, py: Python<'_>) -> PyResult<u64> {
+                self.core_outside_overlay(py)?.checkpoint(py)
+            }
+
+            /// Closes the store: later store calls raise `RuntimeError`. Unlike
+            /// a Local store's close, the runtime stays open and keeps the
+            /// values it holds, since other threads may be reading it and a
+            /// closed check on every read would cost each `get`; the backend
+            /// is released once the runtime and every node handle are gone.
             fn close(&self) {
                 let closed = self
                     .core

@@ -127,7 +127,7 @@ macro_rules! persist_exceptions {
             $module,
             TailMoved,
             PersistError,
-            "A backend's `append_at(after, records)` found the log's tail somewhere other than `after` and wrote nothing. A Python backend raises it to say so."
+            "A backend's `append_at(after, records)` found the log's tail somewhere other than `after` and wrote nothing. A Python backend raises it to say so, using the class of the package whose store it serves: `incr.persist.TailMoved` and `incr_concurrent.persist.TailMoved` are distinct classes, and a store reads the other package's as a plain backend error."
         );
 
         pub(crate) struct $name;
