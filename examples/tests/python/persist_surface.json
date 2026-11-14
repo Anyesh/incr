@@ -766,7 +766,7 @@
   "doc": "An open memo: `memo.get_or_insert(table, key)` gives an entry's node, and\n`memo.checkpoint()` writes the live entries to the backend.",
   "members": {
    "checkpoint": {
-    "doc": "Writes every live entry whose dependencies are persisted to the\nbackend as the next generation, and returns how many it `written`,\n`merged` from the previous generation, `evicted` and so on. Raises\n`Busy` when another handle is checkpointing. Raises `ValueError`\nnaming the table when an entry's key or value did not round-trip\nthrough its codec: the generation was still written, without that\nentry, which is recomputed on the next run.",
+    "doc": "Writes every live entry whose dependencies are persisted to the\nbackend as the next generation, and returns how many it `written`,\n`merged` from the previous generation, `evicted` and so on. Raises\n`Busy` when another handle is checkpointing. Raises `ValueError`\nnaming the table when an entry's key or value did not round-trip\nthrough its codec: the generation was still written, without that\nentry, which is recomputed on the next run. Raises `PersistError`,\nwriting nothing, while an `apply=\"on_write\"` batch or an overlay is\nopen. That refusal is best effort: a batch or scope another thread\nopens after the check is seen by the snapshot, and the content\nfingerprints stored with each entry keep a restore correct.",
     "kind": "method_descriptor",
     "signature": "(self, /)"
    },

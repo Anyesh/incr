@@ -692,7 +692,11 @@ macro_rules! persist_classes {
             /// `Busy` when another handle is checkpointing. Raises `ValueError`
             /// naming the table when an entry's key or value did not round-trip
             /// through its codec: the generation was still written, without that
-            /// entry, which is recomputed on the next run.
+            /// entry, which is recomputed on the next run. Raises `PersistError`,
+            /// writing nothing, while an `apply="on_write"` batch or an overlay is
+            /// open. That refusal is best effort: a batch or scope another thread
+            /// opens after the check is seen by the snapshot, and the content
+            /// fingerprints stored with each entry keep a restore correct.
             fn checkpoint(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, usize>> {
                 let store = self.store.bind(py).borrow();
                 let core = store.core_outside_overlay(py)?;
