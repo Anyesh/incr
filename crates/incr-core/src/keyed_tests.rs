@@ -1013,7 +1013,7 @@ fn a_removed_key_without_readers_is_reclaimed_on_local_only<C: Cells>() {
 }
 
 fn a_keyed_write_inside_a_compute_is_refused<C: Cells>() {
-    let rt = Runtime::<C>::new();
+    let rt = Arc::new(Runtime::<C>::new());
     let kc = Plain::<C>::new(&rt);
     let captured = Captured(kc.clone());
     let q = rt.create_query(move |rt| {
@@ -1022,6 +1022,20 @@ fn a_keyed_write_inside_a_compute_is_refused<C: Cells>() {
             .err()
     });
     let text = rt.get(q).expect("the write panics");
+    assert!(text.contains("inside a compute"), "{text}");
+    assert_eq!(kc.row(&1), None);
+
+    let other = Runtime::<C>::new();
+    let captured = Captured((kc.clone(), Arc::clone(&rt)));
+    let q = other.create_query(move |_| {
+        let (kc, rt) = captured.get();
+        catch_unwind(AssertUnwindSafe(|| kc.upsert(rt, 1, 1)))
+            .map_err(panic_text)
+            .err()
+    });
+    let text = other
+        .get(q)
+        .expect("a write inside another runtime's compute panics");
     assert!(text.contains("inside a compute"), "{text}");
     assert_eq!(kc.row(&1), None);
 }

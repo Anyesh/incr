@@ -882,7 +882,10 @@ fn refuse_value_code() {
     }
 }
 
-fn in_compute<C: Cells>(rt: &Runtime<C>) -> bool {
+/// Whether a read here records a dependency of a compute of `rt`: its
+/// frame is on top of this thread's stack. A write checks
+/// [`Runtime::frame_active`] instead, which counts every frame.
+fn records_reads<C: Cells>(rt: &Runtime<C>) -> bool {
     rt.dep_stack.current_frame_active(rt.runtime_id)
 }
 
@@ -894,7 +897,7 @@ fn in_compute<C: Cells>(rt: &Runtime<C>) -> bool {
 /// A key holds more than one pair only through `apply_pairs_with`; it then
 /// reads as the first pair with the smallest rank `R`. Every method panics
 /// when called from a key or row method run by a keyed write or read, and
-/// every write panics inside a compute of its runtime.
+/// every write panics inside a compute of any runtime.
 ///
 /// A key's version input stays while the collection lives under `Shared`,
 /// where deleting it could race a reader holding its handle, so their
@@ -1180,7 +1183,7 @@ where
     ) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
         refuse_value_code();
         assert!(
-            !in_compute(rt),
+            !rt.frame_active(),
             "incr-core: KeyedCollection written from inside a compute; a run the engine \
              discards would leave rows ahead of their readers' versions",
         );
@@ -1323,7 +1326,7 @@ where
     /// reads as [`Self::row`] too.
     pub fn get_key(&self, rt: &Runtime<C>, key: &K) -> Option<V> {
         refuse_value_code();
-        if !in_compute(rt) || rt.frame_doomed() {
+        if !records_reads(rt) || rt.frame_doomed() {
             return self.row(key);
         }
         rt.get(self.version_input_or_create(rt, key));
