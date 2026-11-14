@@ -6,10 +6,12 @@ and maps its row; doing that with one GIL acquisition per value made the
 caller's pass several times slower than the same pass without the
 trigger. Local checkpoints on the writing thread, so only Shared runs."""
 
+import os
 import pickle
 import time
 
 import incr_concurrent.persist as persist
+import pytest
 
 ENTRIES = 60_000
 SLOWDOWN_LIMIT = 3.0
@@ -51,6 +53,10 @@ def first_pass_secs(memo_options):
     return elapsed
 
 
+@pytest.mark.skipif(
+    not os.environ.get("INCR_TIMING_TESTS"),
+    reason="wall-clock ratio; set INCR_TIMING_TESTS=1 (memo_value_hold.rs guards the cause)",
+)
 def test_an_automatic_checkpoint_does_not_slow_the_reading_thread_down_severalfold():
     plain = min(first_pass_secs({}) for _ in range(ATTEMPTS))
     triggered = min(
