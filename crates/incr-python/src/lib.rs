@@ -42,14 +42,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use incr_compute::{
     Change, DeleteError, ErasedIncr, Incr, IncrCollection, NodeId, NodeTable, PropagationTrace,
     Runtime, SortedCollection,
 };
-use incr_core::{Local, RoutingFailed, RoutingHold};
-use keyed::{Applied, IndexGuard, KeyCounts, SharedIndex, StagedKeys};
+use incr_core::{Local, RoutingFailed};
+use incr_core::{PairOp, StateStats};
+use keyed::{IndexGuard, KeyCounts, KeyIndex, SharedIndex, StagedKeys};
 use overlay::{Born, Undo};
 use state::{PyCallable, RtState};
 
@@ -61,7 +62,7 @@ use incr_python_protocol::snapshot::{
 };
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, raise_into_engine,
-    routing_error, try_read, Exceptions, PyFixpoint, PyValue,
+    routing_error, try_read, Exceptions, PyFixpoint, PyKey, PyValue,
 };
 use ready::_NotReadySignal;
 
@@ -840,22 +841,36 @@ impl PyCollection {
 /// staging, which also runs one row `__eq__` per removed row; before Python
 /// 3.14, which caches a tuple's hash, a removed pair's row is hashed in the
 /// pair collection too. So an upsert that inserts pays two row `__hash__`
-/// calls, one that replaces pays three (four before 3.14) and one row
+/// calls, one that replaces pays three (four before 3.14) and two row
 /// `__eq__` against the held row, and one with an `==` row changes nothing.
+///
+/// Key and row methods run as value code: one that calls into incr during
+/// an operation on the collection raises `RuntimeError`, which the
+/// operation raises, changing nothing.
 ///
 /// `label` names the collection's group in `Runtime.graph_summary`: it
 /// labels the pair and row collections' version nodes, and the group
 /// reports the key count as `"keys"`.
 #[pyclass(name = "KeyedCollection", unsendable)]
 struct PyKeyedCollection {
+    kind: KeyedKind,
     pairs: IncrCollection<PyValue>,
     rows: IncrCollection<PyValue>,
-    index: Arc<SharedIndex>,
     rt: Py<PyRuntime>,
     born: Born,
-    /// Set for a keyed collection a store persists, which only the store
-    /// writes.
-    persisted: bool,
+}
+
+/// A keyed collection whose pairs are `(key, row)` tuples.
+pub(crate) type CoreKeyed = incr_core::KeyedCollection<PyKey, PyValue, Local, PyValue>;
+
+/// A labelled keyed collection's index, label and pair version node.
+type KeyedLabel = (Weak<dyn StateStats>, String, ErasedIncr);
+
+enum KeyedKind {
+    Plain(CoreKeyed),
+    /// A keyed collection a store persists, which only the store writes,
+    /// with the index that follows its pair collection.
+    Persisted(Arc<SharedIndex>),
 }
 
 impl OnRuntime for PyKeyedCollection {
@@ -874,11 +889,16 @@ fn index_in_use() -> PyErr {
     )
 }
 
+fn key_counts(change: &incr_core::KeyedChange<PyKey>) -> KeyCounts {
+    let counts = change.counts;
+    (counts.inserted, counts.replaced, counts.removed)
+}
+
 impl PyKeyedCollection {
-    /// The index, refused to a key or row method that calls back into this
-    /// collection while an operation on it runs.
-    fn index(&self) -> PyResult<IndexGuard<'_>> {
-        self.index.try_borrow_mut().ok_or_else(index_in_use)
+    /// The persisted index, refused to a key or row method that calls back
+    /// into this collection while an operation on it runs.
+    fn index(index: &SharedIndex) -> PyResult<IndexGuard<'_>> {
+        index.try_borrow_mut().ok_or_else(index_in_use)
     }
 
     /// The index lives in this object, not the engine, so a read that only
@@ -888,62 +908,49 @@ impl PyKeyedCollection {
         self.rt.bind(py).borrow().rt().map(drop)
     }
 
-    /// Applies `staged` to the pair collection and the index, and in an
-    /// overlay journals both.
-    fn apply_staged(
-        &self,
-        py: Python<'_>,
-        rt: &Runtime,
-        state: &RtState,
-        index: &mut IndexGuard<'_>,
-        staged: StagedKeys,
-        pairs: &IncrCollection<PyValue>,
-    ) -> PyResult<KeyCounts> {
-        let mut steps = Vec::new();
-        let journaling = state.overlay_active();
-        let (counts, applied) = index.apply_staged(
-            py,
-            staged,
-            |changes| engine_write(rt, || pairs.apply(rt, changes)),
-            journaling.then_some(&mut steps),
-            if self.persisted {
-                Applied::AsStaged
-            } else {
-                Applied::Reported
-            },
-        )?;
-        if journaling && !applied.is_empty() {
-            state.journal(|overlay| {
-                overlay.push(Undo::Keyed {
-                    pairs: pairs.clone(),
-                    index: Arc::clone(&self.index),
-                    applied,
-                    steps,
-                });
-            });
-        }
-        Ok(counts)
+    /// Runs `f`, a read of the core index, at an engine boundary that
+    /// routes nothing, as the index registers no dependency.
+    fn read_core<R>(&self, py: Python<'_>, f: impl FnOnce() -> R) -> PyResult<R> {
+        self.check_alive()?;
+        let runtime = self.rt.bind(py).borrow();
+        let rt = runtime.rt()?;
+        pyerr_boundary::<Exc, _>(|| in_runtime(rt, f))
     }
 
-    /// A keyed collection over `pairs`, a persisted collection's view when
-    /// the store persists it, else a new pair collection.
-    fn over(
+    /// Runs `write`, a write of the core collection, given a journal in an
+    /// overlay, and journals the pair ops it records so the exit can apply
+    /// their inverses.
+    fn write_core(
+        &self,
+        py: Python<'_>,
+        keyed: &CoreKeyed,
+        write: impl FnOnce(
+            Option<&mut Vec<PairOp<PyValue, ()>>>,
+        ) -> PyResult<incr_core::KeyedChange<PyKey>>,
+    ) -> PyResult<KeyCounts> {
+        let state = self.state(py);
+        let mut ops = Vec::new();
+        let journal = state.overlay_active().then_some(&mut ops);
+        let change = write(journal)?;
+        if !ops.is_empty() {
+            state.journal(|overlay| overlay.push(Undo::Keyed(keyed.clone(), ops)));
+        }
+        Ok(key_counts(&change))
+    }
+
+    /// Makes the wrapper over a new keyed collection's pair and row
+    /// collections: journals them as created in an overlay, and labels
+    /// them, reporting `stats` as the group's key count.
+    fn wrap(
         runtime: Bound<'_, PyRuntime>,
-        pairs: Option<IncrCollection<PyValue>>,
-        index: Arc<SharedIndex>,
+        kind: KeyedKind,
+        pairs: IncrCollection<PyValue>,
+        rows: IncrCollection<PyValue>,
+        stats: Weak<dyn StateStats>,
         label: Option<String>,
     ) -> PyResult<Self> {
-        let persisted = pairs.is_some();
         let state = runtime.borrow().state.clone();
-        let (pairs, rows) = runtime.borrow().engine_read(|rt| {
-            let pairs = pairs.unwrap_or_else(|| rt.create_collection::<PyValue>());
-            let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(or_stash(pair.0.bind(py).get_item(1)).unbind()))
-            });
-            let weak: std::sync::Weak<SharedIndex> = Arc::downgrade(&index);
-            rt.register_state(Some(rows.version_node().erase()), weak);
-            (pairs, rows)
-        })?;
+        let persisted = matches!(kind, KeyedKind::Persisted(_));
         state.journal(|overlay| {
             if !persisted {
                 overlay.created(pairs.version_node().erase());
@@ -954,19 +961,16 @@ impl PyKeyedCollection {
             let rt = runtime.borrow();
             rt.relabel(pairs.version_node().slot(), label.clone())?;
             rt.relabel(rows.version_node().slot(), label.clone())?;
-            rt.keyed_labels.borrow_mut().push((
-                Arc::downgrade(&index),
-                label,
-                pairs.version_node().erase(),
-            ));
+            rt.keyed_labels
+                .borrow_mut()
+                .push((stats, label, pairs.version_node().erase()));
         }
         Ok(PyKeyedCollection {
+            kind,
             pairs,
             rows,
-            index,
             rt: runtime.unbind(),
             born: state.born(),
-            persisted,
         })
     }
 
@@ -977,16 +981,29 @@ impl PyKeyedCollection {
         index: Arc<SharedIndex>,
         label: Option<String>,
     ) -> PyResult<Self> {
-        Self::over(runtime, Some(pairs), index, label)
+        let rows = runtime.borrow().engine_read(|rt| {
+            let rows = pairs.map(rt, |pair: &PyValue| -> PyValue {
+                Python::attach(|py| PyValue(or_stash(pair.0.bind(py).get_item(1)).unbind()))
+            });
+            let weak: Weak<SharedIndex> = Arc::downgrade(&index);
+            rt.register_state(Some(rows.version_node().erase()), weak);
+            rows
+        })?;
+        let stats: Weak<SharedIndex> = Arc::downgrade(&index);
+        Self::wrap(
+            runtime,
+            KeyedKind::Persisted(index),
+            pairs,
+            rows,
+            stats,
+            label,
+        )
     }
 
-    /// The pair collection a write goes to: this one's, or for a persisted
-    /// one, which only the store writes, the unlogged handle an overlay's
-    /// scope gives out.
-    fn pairs_for_write(&self, py: Python<'_>) -> PyResult<Cow<'_, IncrCollection<PyValue>>> {
-        if !self.persisted {
-            return Ok(Cow::Borrowed(&self.pairs));
-        }
+    /// The pair collection a persisted keyed collection's write goes to,
+    /// which only the store writes: the unlogged handle an overlay's scope
+    /// gives out.
+    fn persisted_pairs_for_write(&self, py: Python<'_>) -> PyResult<IncrCollection<PyValue>> {
         self.state(py)
             .journal_with(|overlay| overlay.writable_pairs(self))
             .ok_or_else(|| {
@@ -994,15 +1011,66 @@ impl PyKeyedCollection {
                     "keyed collection is persisted: write it with store.upsert, store.remove, store.reconcile or a store.batch",
                 )
             })?
-            .map(Cow::Owned)
     }
 
-    /// [`Self::index`] for an operation that writes, under `routing`.
-    fn index_for_write<'a>(&'a self, routing: RoutingHold<'a, Local>) -> PyResult<IndexGuard<'a>> {
-        self.index
+    /// Runs `stage` and applies what it staged to a persisted keyed
+    /// collection and its index, journalling both in an overlay. The index
+    /// is held for writing under a routing hold, since routing runs key
+    /// functions that may use the index.
+    fn write_persisted(
+        &self,
+        py: Python<'_>,
+        shared: &Arc<SharedIndex>,
+        stage: impl FnOnce(&KeyIndex, &mut StagedKeys) -> PyResult<()>,
+    ) -> PyResult<KeyCounts> {
+        self.check_alive()?;
+        let pairs = self.persisted_pairs_for_write(py)?;
+        let runtime = self.rt.bind(py).borrow();
+        let rt = runtime.rt()?;
+        let routing = rt.hold_routing_suppressed();
+        let mut index = shared
             .try_borrow_for_write(routing)
-            .ok_or_else(index_in_use)
+            .ok_or_else(index_in_use)?;
+        let mut staged = StagedKeys::default();
+        stage(&index, &mut staged)?;
+        let state = &runtime.state;
+        let mut steps = Vec::new();
+        let journaling = state.overlay_active();
+        let (counts, applied) = index.apply_staged(
+            py,
+            staged,
+            |changes| engine_write(rt, || pairs.apply(rt, changes)),
+            journaling.then_some(&mut steps),
+        )?;
+        if journaling && !applied.is_empty() {
+            state.journal(|overlay| {
+                overlay.push(Undo::PersistedKeyed {
+                    pairs: pairs.clone(),
+                    index: Arc::clone(shared),
+                    applied,
+                    steps,
+                });
+            });
+        }
+        Ok(counts)
     }
+}
+
+/// The pairs of `rows`, a mapping or an iterable of `(key, row)` pairs,
+/// read whole before any key or row method runs.
+fn reconcile_pairs(rows: &Bound<'_, PyAny>) -> PyResult<Vec<(PyKey, PyValue)>> {
+    let pairs = if rows.hasattr("items")? {
+        rows.call_method0("items")?
+    } else {
+        rows.clone()
+    };
+    pairs
+        .try_iter()?
+        .map(|pair| {
+            let (key, row): (Py<PyAny>, Py<PyAny>) = pair?.extract()?;
+            Ok((PyKey(key), PyValue(row)))
+        })
+        .collect()
 }
 
 #[pymethods]
@@ -1010,93 +1078,147 @@ impl PyKeyedCollection {
     #[new]
     #[pyo3(signature = (runtime, label=None))]
     fn new(runtime: Bound<'_, PyRuntime>, label: Option<String>) -> PyResult<Self> {
-        Self::over(runtime, None, Arc::new(SharedIndex::new()), label)
+        let keyed = runtime.borrow().engine_read(CoreKeyed::new)?;
+        let pairs = keyed.pairs();
+        let rows = keyed.rows().clone();
+        let stats: Weak<incr_core::KeyIndex<PyValue, (), Local>> = keyed.index_weak();
+        Self::wrap(runtime, KeyedKind::Plain(keyed), pairs, rows, stats, label)
     }
 
     /// Hold `row` for `key`: nothing happens if the held row is `==` to
     /// it, otherwise the pair is replaced or inserted.
-    fn upsert(&self, py: Python<'_>, key: Bound<'_, PyAny>, row: Bound<'_, PyAny>) -> PyResult<()> {
-        self.check_alive()?;
-        let pairs = self.pairs_for_write(py)?;
-        let runtime = self.rt.bind(py).borrow();
-        let rt = runtime.rt()?;
-        let routing = rt.hold_routing_suppressed();
-        let mut index = self.index_for_write(routing)?;
-        let mut staged = StagedKeys::default();
-        staged.stage(&index, &key, Some(&row))?;
-        self.apply_staged(py, rt, &runtime.state, &mut index, staged, &pairs)?;
-        Ok(())
+    fn upsert(&self, py: Python<'_>, key: Py<PyAny>, row: Py<PyAny>) -> PyResult<()> {
+        match &self.kind {
+            KeyedKind::Plain(keyed) => self
+                .write_core(py, keyed, |journal| {
+                    self.engine_write(py, |rt| {
+                        keyed.upsert_journaled(rt, PyKey(key), PyValue(row), journal)
+                    })
+                })
+                .map(drop),
+            KeyedKind::Persisted(shared) => self
+                .write_persisted(py, shared, |index, staged| {
+                    staged
+                        .stage(index, key.bind(py), Some(row.bind(py)))
+                        .map(drop)
+                })
+                .map(drop),
+        }
     }
 
     /// Remove `key`'s pair. Raises `KeyError` if no row is held for it.
-    fn remove(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<()> {
-        self.check_alive()?;
-        let pairs = self.pairs_for_write(py)?;
-        let runtime = self.rt.bind(py).borrow();
-        let rt = runtime.rt()?;
-        let routing = rt.hold_routing_suppressed();
-        let mut index = self.index_for_write(routing)?;
-        let mut staged = StagedKeys::default();
-        if !staged.stage(&index, &key, None)? {
-            return Err(pyo3::exceptions::PyKeyError::new_err(key.unbind()));
+    fn remove(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<()> {
+        let absent = || pyo3::exceptions::PyKeyError::new_err(key.clone_ref(py));
+        match &self.kind {
+            KeyedKind::Plain(keyed) => {
+                let target = PyKey(key.clone_ref(py));
+                let (_, _, removed) = self.write_core(py, keyed, |journal| {
+                    self.engine_write(py, |rt| keyed.remove_journaled(rt, &target, journal))
+                })?;
+                if removed == 0 {
+                    return Err(absent());
+                }
+                Ok(())
+            }
+            KeyedKind::Persisted(shared) => self
+                .write_persisted(py, shared, |index, staged| {
+                    if staged.stage(index, key.bind(py), None)? {
+                        Ok(())
+                    } else {
+                        Err(absent())
+                    }
+                })
+                .map(drop),
         }
-        self.apply_staged(py, rt, &runtime.state, &mut index, staged, &pairs)?;
-        Ok(())
     }
 
     /// The row held for `key`, or `None`.
-    fn get<'py>(&self, key: Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        self.check_open(key.py())?;
-        self.index()?.row(&key)
+    fn get(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
+        match &self.kind {
+            KeyedKind::Plain(keyed) => {
+                let row = self.read_core(py, || keyed.row(&PyKey(key)))?;
+                Ok(row.map(|row| row.0))
+            }
+            KeyedKind::Persisted(shared) => {
+                self.check_open(py)?;
+                let row = Self::index(shared)?.row(key.bind(py))?;
+                Ok(row.map(Bound::unbind))
+            }
+        }
     }
 
-    fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
-        self.check_open(key.py())?;
-        Ok(self.index()?.row(&key)?.is_some())
+    fn __contains__(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<bool> {
+        match &self.kind {
+            KeyedKind::Plain(keyed) => self.read_core(py, || keyed.contains(&PyKey(key))),
+            KeyedKind::Persisted(shared) => {
+                self.check_open(py)?;
+                Ok(Self::index(shared)?.row(key.bind(py))?.is_some())
+            }
+        }
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
-        self.check_open(py)?;
-        Ok(self.index()?.len())
+        match &self.kind {
+            KeyedKind::Plain(keyed) => self.read_core(py, || keyed.len()),
+            KeyedKind::Persisted(shared) => {
+                self.check_open(py)?;
+                Ok(Self::index(shared)?.len())
+            }
+        }
     }
 
     /// A new list of the held keys, in no particular order. Registers no
     /// dependency, like `get`.
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
-        self.check_open(py)?;
-        let index = self.index()?;
-        let list = pyo3::types::PyList::empty(py);
-        for pair in index.pairs() {
-            list.append(pair.bind(py).get_item(0)?)?;
+        match &self.kind {
+            KeyedKind::Plain(keyed) => {
+                let keys = self.read_core(py, || keyed.keys())?;
+                pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
+            }
+            KeyedKind::Persisted(shared) => {
+                self.check_open(py)?;
+                let index = Self::index(shared)?;
+                let keys = index
+                    .pairs()
+                    .map(|pair| pair.bind(py).get_item(0))
+                    .collect::<PyResult<Vec<_>>>()?;
+                pyo3::types::PyList::new(py, keys)
+            }
         }
-        Ok(list)
     }
 
     /// A new list of the held `(key, row)` tuples, in no particular order.
     /// Registers no dependency, like `get`.
     fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
-        self.check_open(py)?;
-        let index = self.index()?;
-        let list = pyo3::types::PyList::empty(py);
-        for pair in index.pairs() {
-            list.append(pair.bind(py))?;
+        match &self.kind {
+            KeyedKind::Plain(keyed) => {
+                let items = self.read_core(py, || keyed.items())?;
+                pyo3::types::PyList::new(py, items.into_iter().map(|pair| pair.0))
+            }
+            KeyedKind::Persisted(shared) => {
+                self.check_open(py)?;
+                let index = Self::index(shared)?;
+                pyo3::types::PyList::new(py, index.pairs().map(|pair| pair.bind(py)))
+            }
         }
-        Ok(list)
     }
 
     /// Make the held rows equal `rows`, a mapping or an iterable of
     /// `(key, row)` pairs (a later pair for a key wins), in one atomic
     /// change. Returns how many keys were `(inserted, replaced, removed)`.
     fn reconcile(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<KeyCounts> {
-        self.check_alive()?;
-        let pairs = self.pairs_for_write(py)?;
-        let runtime = self.rt.bind(py).borrow();
-        let rt = runtime.rt()?;
-        let routing = rt.hold_routing_suppressed();
-        let mut index = self.index_for_write(routing)?;
-        let mut staged = StagedKeys::default();
-        staged.stage_reconcile(&index, rows)?;
-        self.apply_staged(py, rt, &runtime.state, &mut index, staged, &pairs)
+        match &self.kind {
+            KeyedKind::Plain(keyed) => {
+                self.check_open(py)?;
+                let pairs = reconcile_pairs(rows)?;
+                self.write_core(py, keyed, |journal| {
+                    self.engine_write(py, |rt| keyed.reconcile_journaled(rt, pairs, journal))
+                })
+            }
+            KeyedKind::Persisted(shared) => self.write_persisted(py, shared, |index, staged| {
+                staged.stage_reconcile(index, rows)
+            }),
+        }
     }
 
     #[getter]
@@ -1259,7 +1381,7 @@ struct PyRuntime {
     /// counts `graph_summary` reports under their label's group while
     /// their pair collection's version node lives (one made in an overlay
     /// dies at its exit).
-    keyed_labels: RefCell<Vec<(std::sync::Weak<SharedIndex>, String, ErasedIncr)>>,
+    keyed_labels: RefCell<Vec<KeyedLabel>>,
     state: RtState,
 }
 
@@ -1818,7 +1940,6 @@ impl PyRuntime {
     /// node under the engine's read lock, so the cost is linear in the
     /// node count.
     fn graph_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        use incr_core::StateStats;
         let mut keyed = self.keyed_labels.borrow_mut();
         let (summary, alive) = self.engine_read(|rt| {
             let alive: Vec<bool> = keyed

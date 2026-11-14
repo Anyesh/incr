@@ -46,6 +46,12 @@ MUTATING = {
     "write",
     "declare_keyed",
     "checkpoint",
+    "upsert",
+    "upsert_journaled",
+    "remove_journaled",
+    "reconcile",
+    "reconcile_journaled",
+    "apply_pairs_with",
 }
 ENTRIES = {
     "engine_read": "engine_read",

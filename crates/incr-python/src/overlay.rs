@@ -10,12 +10,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use incr_compute::{Change, ErasedIncr, Incr, IncrCollection, Runtime};
+use incr_core::PairOp;
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 
 use crate::keyed::{KeyStep, SharedIndex};
 use crate::persist::OverlayScope;
-use crate::{engine_read, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
+use crate::{engine_read, CoreKeyed, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
 
 /// Set when the overlay that created an object ends, after which the
 /// object's nodes are gone and every use of it raises.
@@ -36,7 +37,10 @@ impl Born {
 pub(crate) enum Undo {
     Set(Incr<PyValue>, PyValue),
     Collection(IncrCollection<PyValue>, Vec<Change<PyValue>>),
-    Keyed {
+    /// The pair ops a plain keyed collection's write journalled, undone
+    /// by applying their inverses newest first.
+    Keyed(CoreKeyed, Vec<PairOp<PyValue, ()>>),
+    PersistedKeyed {
         pairs: IncrCollection<PyValue>,
         index: Arc<SharedIndex>,
         applied: Vec<Change<PyValue>>,
@@ -131,7 +135,15 @@ impl Overlay {
                 Undo::Collection(collection, applied) => {
                     collection.apply(rt, inverse(applied));
                 }
-                Undo::Keyed {
+                Undo::Keyed(keyed, ops) => {
+                    keyed.apply_pairs_with(
+                        rt,
+                        ops.into_iter().rev().map(PairOp::inverse),
+                        &mut (),
+                        None,
+                    );
+                }
+                Undo::PersistedKeyed {
                     pairs,
                     index,
                     applied,

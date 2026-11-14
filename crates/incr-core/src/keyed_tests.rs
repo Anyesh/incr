@@ -510,6 +510,33 @@ fn an_inverted_journal_restores_the_previous_state<C: Cells>() {
     );
 }
 
+fn journaled_writes_are_undone_by_their_inverted_journal<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = populated(&rt);
+    let before = snap(&rt, &kc);
+    let mut journal = Vec::new();
+    kc.upsert_journaled(&rt, kt(1, 7), r(11), Some(&mut journal));
+    kc.upsert_journaled(&rt, k(3), r(30), Some(&mut journal));
+    kc.remove_journaled(&rt, &k(2), Some(&mut journal));
+    kc.reconcile_journaled(&rt, [(k(1), r(12)), (k(5), r(50))], Some(&mut journal));
+    assert_eq!(journal.len(), 8);
+    assert!(matches!(&journal[1], PairOp::Insert((key, row), 0) if key.tag == 0 && row.val == 11));
+    kc.apply_pairs_with(
+        &rt,
+        journal.into_iter().rev().map(PairOp::inverse),
+        &mut (),
+        None,
+    );
+    let after = snap(&rt, &kc);
+    assert_eq!(
+        Snap {
+            epoch: before.epoch,
+            ..after
+        },
+        before
+    );
+}
+
 fn changed_lists_the_keys_whose_row_differs_and_epochs_rise<C: Cells>() {
     let rt = Runtime::<C>::new();
     let kc = Kc::<C>::new(&rt);
@@ -597,6 +624,7 @@ for_both!(
     a_key_with_two_pairs_reads_the_smallest_rank,
     removing_an_absent_pair_is_a_no_op,
     an_inverted_journal_restores_the_previous_state,
+    journaled_writes_are_undone_by_their_inverted_journal,
     changed_lists_the_keys_whose_row_differs_and_epochs_rise,
     keys_and_items_are_snapshots_and_len_counts_keys,
     settled_stats_are_read_without_the_lock,

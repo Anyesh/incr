@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from incr import KeyedCollection, Runtime
 
 ENTRY = {"nodes", "bytes", "py_refs"}
@@ -194,7 +196,7 @@ class Key:
         return isinstance(other, Key) and self.name == other.name
 
 
-def test_stats_from_a_key_method_during_a_keyed_operation_report_the_index():
+def test_stats_from_a_key_method_during_a_keyed_operation_are_refused():
     rt = Runtime()
     keyed = KeyedCollection(rt)
     hooks = []
@@ -204,9 +206,14 @@ def test_stats_from_a_key_method_during_a_keyed_operation_report_the_index():
     baseline = rt.memory_stats()["py_refs"]
 
     hooks.append(lambda: seen.append(rt.memory_stats()["py_refs"]))
-    keyed.upsert(Key("a", hooks), 2)
+    with pytest.raises(RuntimeError, match="must not call into the runtime"):
+        keyed.upsert(Key("a", hooks), 2)
 
-    assert seen == [baseline]
+    hooks.clear()
+    assert seen == []
+    assert keyed.get(Key("a", hooks)) == 1
+    assert [row for _, row in keyed.items()] == [1]
+    assert rt.memory_stats()["py_refs"] == baseline
 
 
 def test_lookups_count_their_keys_values_and_queue():

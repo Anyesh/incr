@@ -21,19 +21,6 @@ use pyo3::types::PyTuple;
 /// How many keys an operation inserted, gave a new row, and removed.
 pub(crate) type KeyCounts = (usize, usize, usize);
 
-/// What phase 2 treats as applied to the pair collection.
-#[derive(Clone, Copy)]
-pub(crate) enum Applied {
-    /// The changes the collection reports, matched to staged pairs by
-    /// identity: for a collection whose stored pairs are the index's own.
-    Reported,
-    /// Every staged change, for a persisted collection, whose stored pairs
-    /// are decoded copies that are equal to the index's but never the same
-    /// objects. The index mirrors the collection, so a staged delete of a
-    /// held pair always finds its equal in the collection.
-    AsStaged,
-}
-
 /// One index change an operation made, kept by an overlay to undo it:
 /// the pair, its stored hash, and whether the operation inserted it (else
 /// it removed it).
@@ -69,10 +56,6 @@ unsafe impl Send for SharedIndex {}
 unsafe impl Sync for SharedIndex {}
 
 impl SharedIndex {
-    pub(crate) fn new() -> Self {
-        Self::holding(KeyIndex::new())
-    }
-
     pub(crate) fn holding(index: KeyIndex) -> Self {
         let settled = (index.table.len(), index.table.allocation_size());
         Self {
@@ -221,16 +204,18 @@ impl KeyIndex {
     }
 
     /// Ends phase 1 by reserving room for every key `staged` adds, passes
-    /// its changes to `apply` (the pair collection's atomic `apply`), and
-    /// runs phase 2 from what that returns. Nothing changes if `apply`
-    /// fails; nothing is applied if the staged keys change nothing.
+    /// its changes to `apply` (the persisted pair collection's atomic
+    /// `apply`), and runs phase 2 from the staged changes, since the stored
+    /// pairs are decoded copies equal to the index's, never the same
+    /// objects. Returns the counts and, when journalling, what `apply`
+    /// reported. Nothing changes if `apply` fails; nothing is applied if
+    /// the staged keys change nothing.
     pub(crate) fn apply_staged(
         &mut self,
         py: Python<'_>,
         staged: StagedKeys,
         apply: impl FnOnce(Vec<Change<PyValue>>) -> PyResult<Vec<Change<PyValue>>>,
         journal: Option<&mut Vec<KeyStep>>,
-        applied_as: Applied,
     ) -> PyResult<(KeyCounts, Vec<Change<PyValue>>)> {
         let changes = staged.changes(py);
         if changes.is_empty() {
@@ -238,13 +223,13 @@ impl KeyIndex {
         }
         self.reserve_for(&staged);
         let applied = apply(changes)?;
-        let kept = journal.is_some().then(|| applied.clone());
-        let committed = match applied_as {
-            Applied::Reported => applied,
-            Applied::AsStaged => staged.changes(py),
+        let kept = if journal.is_some() {
+            applied
+        } else {
+            Vec::new()
         };
-        let counts = self.commit(py, &staged, committed, journal);
-        Ok((counts, kept.unwrap_or_default()))
+        let counts = self.commit(py, &staged, staged.changes(py), journal);
+        Ok((counts, kept))
     }
 
     fn reserve_for(&mut self, staged: &StagedKeys) {

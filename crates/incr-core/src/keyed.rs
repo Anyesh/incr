@@ -690,6 +690,28 @@ where
         self.tally(at, before, after);
     }
 
+    /// Journals what `upsert`, `remove` and `reconcile` staged, when
+    /// journalling: per key, each held pair it lets go, then each new one.
+    fn journal_staged(&mut self, table: &KeyTable<P, R>) {
+        let Some(mut journal) = self.journal.take() else {
+            return;
+        };
+        for (at, k) in self.keys.iter().enumerate() {
+            if k.untouched() {
+                continue;
+            }
+            for i in (0..k.held).filter(|i| !k.now.contains(&Src::Held(*i))) {
+                let (pair, rank) = self.pair(table, at, Src::Held(i));
+                journal.push(PairOp::Remove(pair.clone(), *rank));
+            }
+            for &src in k.now.iter().filter(|s| matches!(s, Src::New(_))) {
+                let (pair, rank) = self.pair(table, at, src);
+                journal.push(PairOp::Insert(pair.clone(), *rank));
+            }
+        }
+        self.journal = Some(journal);
+    }
+
     fn is_empty(&self) -> bool {
         self.keys.iter().all(StagedKey::untouched)
     }
@@ -820,25 +842,52 @@ where
         &self.index
     }
 
+    /// A weak handle to the index, for a caller that reads its
+    /// [`StateStats`] only while the collection lives.
+    pub fn index_weak(&self) -> Weak<KeyIndex<P, R, C>> {
+        Arc::downgrade(&self.index)
+    }
+
     /// Holds `row` for `key`. Changes nothing when the row read for `key`
     /// is `==` to `row`; otherwise every pair held for `key` gives way to
     /// one new pair of rank `R::default()`, which keeps the held key
     /// object when there is one.
     pub fn upsert(&self, rt: &Runtime<C>, key: K, row: V) -> KeyedChange<K> {
-        let (change, _) = self.write(rt, &mut (), false, &|stage, table, hasher| {
+        self.upsert_journaled(rt, key, row, None)
+    }
+
+    /// [`Self::upsert`], journalling into `journal` as
+    /// [`Self::apply_pairs_with`] does: each pair the write let go as a
+    /// removal, then each it took as an insert.
+    pub fn upsert_journaled(
+        &self,
+        rt: &Runtime<C>,
+        key: K,
+        row: V,
+        journal: Option<&mut Vec<PairOp<P, R>>>,
+    ) -> KeyedChange<K> {
+        self.write_journaled(rt, journal, &|stage, table, hasher| {
             stage.upsert(table, hasher, &key, &row);
             stage.settle_keys(table);
-        });
-        change
+        })
     }
 
     /// Drops every pair held for `key`; a no-op for a key with none.
     pub fn remove(&self, rt: &Runtime<C>, key: &K) -> KeyedChange<K> {
-        let (change, _) = self.write(rt, &mut (), false, &|stage, table, hasher| {
+        self.remove_journaled(rt, key, None)
+    }
+
+    /// [`Self::remove`], journalling as [`Self::upsert_journaled`] does.
+    pub fn remove_journaled(
+        &self,
+        rt: &Runtime<C>,
+        key: &K,
+        journal: Option<&mut Vec<PairOp<P, R>>>,
+    ) -> KeyedChange<K> {
+        self.write_journaled(rt, journal, &|stage, table, hasher| {
             stage.remove(table, hasher, key);
             stage.settle_keys(table);
-        });
-        change
+        })
     }
 
     /// Makes the rows read equal `rows` in one atomic write: a later pair
@@ -849,14 +898,40 @@ where
         rt: &Runtime<C>,
         rows: impl IntoIterator<Item = (K, V)>,
     ) -> KeyedChange<K> {
+        self.reconcile_journaled(rt, rows, None)
+    }
+
+    /// [`Self::reconcile`], journalling as [`Self::upsert_journaled`] does.
+    pub fn reconcile_journaled(
+        &self,
+        rt: &Runtime<C>,
+        rows: impl IntoIterator<Item = (K, V)>,
+        journal: Option<&mut Vec<PairOp<P, R>>>,
+    ) -> KeyedChange<K> {
         let rows: Vec<(K, V)> = rows.into_iter().collect();
-        let (change, _) = self.write(rt, &mut (), false, &|stage, table, hasher| {
+        self.write_journaled(rt, journal, &|stage, table, hasher| {
             for (key, row) in &rows {
                 stage.upsert(table, hasher, key, row);
             }
             stage.remove_the_rest(table);
             stage.settle_keys(table);
-        });
+        })
+    }
+
+    fn write_journaled(
+        &self,
+        rt: &Runtime<C>,
+        journal: Option<&mut Vec<PairOp<P, R>>>,
+        stage_ops: &StageOps<'_, K, V, P, R>,
+    ) -> KeyedChange<K> {
+        let (change, steps) =
+            self.write(rt, &mut (), journal.is_some(), &|stage, table, hasher| {
+                stage_ops(stage, table, hasher);
+                stage.journal_staged(table);
+            });
+        if let Some(journal) = journal {
+            journal.extend(steps);
+        }
         change
     }
 

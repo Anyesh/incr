@@ -94,8 +94,9 @@ def test_keys_from_a_key_method_during_an_operation_raise():
         def __eq__(self, other):
             return self is other
 
-    with pytest.raises(RuntimeError, match="during an operation"):
+    with pytest.raises(RuntimeError, match="key or row method"):
         kc.upsert(Key(), 1)
+    assert kc.items() == [("held", 0)]
 
 
 def test_240000_keys_list_in_under_a_second():

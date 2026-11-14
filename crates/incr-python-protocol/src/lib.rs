@@ -12,12 +12,15 @@
 
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
+use pyo3::types::PyTuple;
 use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, PoisonError};
 
-use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, RoutingFailed, Runtime};
+use incr_core::{
+    Cells, Cycle, CycleStrategy, Fixpoint, Pair, QueryOpts, Replay, RoutingFailed, Runtime,
+};
 
 pub mod inspect;
 pub mod notready;
@@ -309,10 +312,7 @@ impl Eq for PyValue {}
 
 impl Hash for PyValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Python::attach(|py| {
-            let h: isize = or_stash(self.0.bind(py).hash());
-            state.write_isize(h);
-        });
+        Python::attach(|py| hash_into(self.0.bind(py), state));
     }
 }
 
@@ -335,6 +335,83 @@ impl Ord for PyValue {
                 std::cmp::Ordering::Greater
             }
         })
+    }
+}
+
+/// A Python object as a keyed collection's key, matched as a dict matches
+/// keys: equal when it is the same object or `==`, hashed by `__hash__`.
+/// Any exception either raises, a `ValueError` from `==` included, unwinds
+/// the engine through [`or_stash`], where `PyValue` reads that `ValueError`
+/// as unequal and has no identity shortcut.
+pub struct PyKey(pub Py<PyAny>);
+
+/// Python `==` with the identity shortcut dicts and tuples use, an
+/// exception unwinding the engine.
+fn same_or_equal(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> bool {
+    a.is(b) || or_stash(a.eq(b))
+}
+
+fn hash_into<H: Hasher>(object: &Bound<'_, PyAny>, state: &mut H) {
+    state.write_isize(or_stash(object.hash()));
+}
+
+impl Clone for PyKey {
+    fn clone(&self) -> Self {
+        Python::attach(|py| PyKey(self.0.clone_ref(py)))
+    }
+}
+
+impl PartialEq for PyKey {
+    fn eq(&self, other: &Self) -> bool {
+        Python::attach(|py| same_or_equal(self.0.bind(py), other.0.bind(py)))
+    }
+}
+
+impl Eq for PyKey {}
+
+impl Hash for PyKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Python::attach(|py| hash_into(self.0.bind(py), state));
+    }
+}
+
+fn pair_item<'py>(pair: &'py PyValue, py: Python<'py>, i: usize) -> Bound<'py, PyAny> {
+    or_stash(pair.0.bind(py).get_item(i))
+}
+
+/// A keyed collection's pair: the `(key, row)` tuple held as a `PyValue`,
+/// the element the pair collection and its record format have always
+/// held. The row stays a `PyValue` so the rows collection is a plain
+/// collection of rows; `row_eq` matches rows as [`PyKey`] matches keys.
+impl Pair<PyKey, PyValue> for PyValue {
+    fn new(key: PyKey, row: PyValue) -> Self {
+        Python::attach(|py| {
+            PyValue(
+                or_stash(PyTuple::new(py, [key.0, row.0]))
+                    .into_any()
+                    .unbind(),
+            )
+        })
+    }
+
+    fn key(&self) -> PyKey {
+        Python::attach(|py| PyKey(pair_item(self, py, 0).unbind()))
+    }
+
+    fn row(&self) -> PyValue {
+        Python::attach(|py| PyValue(pair_item(self, py, 1).unbind()))
+    }
+
+    fn key_hash<H: Hasher>(&self, state: &mut H) {
+        Python::attach(|py| hash_into(&pair_item(self, py, 0), state));
+    }
+
+    fn key_eq(&self, key: &PyKey) -> bool {
+        Python::attach(|py| same_or_equal(&pair_item(self, py, 0), key.0.bind(py)))
+    }
+
+    fn row_eq(&self, row: &PyValue) -> bool {
+        Python::attach(|py| same_or_equal(&pair_item(self, py, 1), row.0.bind(py)))
     }
 }
 
