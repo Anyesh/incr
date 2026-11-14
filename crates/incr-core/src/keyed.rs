@@ -1329,14 +1329,20 @@ where
     /// on `key`'s version input, created at 0 on the first such read, so
     /// the query reruns only when a write changes this key's row; the row
     /// itself is read from the index. Outside one it reads as
-    /// [`Self::row`] and creates nothing. In a run the engine discards it
-    /// reads as [`Self::row`] too.
+    /// [`Self::row`] and creates nothing. In a run the engine discards, a
+    /// key no read created an input for reads as [`Self::row`] too, as a
+    /// `NodeTable` miss there creates nothing.
     pub fn get_key(&self, rt: &Runtime<C>, key: &K) -> Option<V> {
         refuse_value_code();
-        if !records_reads(rt) || rt.frame_doomed() {
+        if !records_reads(rt) {
             return self.row(key);
         }
-        rt.get(self.version_input_or_create(rt, key));
+        let handle = match self.version_input(key) {
+            Some(handle) => handle,
+            None if rt.frame_doomed() => return self.row(key),
+            None => self.version_input_or_create(rt, key),
+        };
+        rt.get(handle);
         let table = self.index.table.read();
         value_code::run(|| {
             table
