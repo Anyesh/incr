@@ -84,7 +84,6 @@ mod classes {
     use crate::PyRuntime;
 
     incr_python_persist::persist_classes!(
-        full,
         binding = LocalBinding,
         runtime = PyRuntime,
         module = "incr.persist",

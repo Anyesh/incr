@@ -5,103 +5,13 @@
 /// must hold nothing else, under the Python module path `$module`, with
 /// the pyclass flags `$flag` (such as `unsendable` or `frozen`).
 ///
-/// `minimal` defines `PyStore` with `open`, `runtime`, `input`, `set` and
-/// `close` only, for a package whose runtime implements
-/// [`StoreRuntime`](crate::classes::StoreRuntime): its store holds no memo
-/// and its close leaves the runtime open. `full` defines `PyStore` with
-/// every method, `PyBatch`, `PyMemo`, `PyMemoTable` and `PyOverlay`, for a
-/// runtime that implements
-/// [`FullStoreRuntime`](crate::classes::FullStoreRuntime); its close also
-/// closes the runtime. The package registers the classes itself.
+/// Defines `PyStore`, `PyBatch`, `PyMemo`, `PyMemoTable` and `PyOverlay`
+/// for a runtime that implements
+/// [`FullStoreRuntime`](crate::classes::FullStoreRuntime). The package
+/// registers the classes itself; Shared leaves `PyOverlay` unregistered.
 #[macro_export]
 macro_rules! persist_classes {
-    (minimal, binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
-        use std::sync::{Arc, Mutex, PoisonError};
-
-        use $crate::classes::StoreRuntime;
-        use $crate::pyo3::exceptions::PyRuntimeError;
-        use $crate::pyo3::prelude::*;
-
-        /// Persisted inputs over a backend, and the runtime that reads them.
-        ///
-        /// `store.input(key, default, codec)` declares a key and returns its node;
-        /// `codec` is any object with `encode(obj) -> bytes` and
-        /// `decode(bytes) -> obj`. Two contracts bind it: `decode(encode(x)) == x`,
-        /// and `encode` is deterministic (equal values give equal bytes), since
-        /// fingerprints hash the bytes. A codec runs on whichever thread writes or
-        /// replays, so it must be thread-safe. Write persisted inputs with
-        /// `store.set`; read them through `store.runtime`.
-        #[pyclass(name = "Store", module = $module, $($flag),*)]
-        pub(crate) struct PyStore {
-            core: Mutex<Option<Arc<$crate::store::StoreCore<$b>>>>,
-            runtime: Py<$rt>,
-        }
-
-        impl PyStore {
-            fn new(core: Arc<$crate::store::StoreCore<$b>>, runtime: Py<$rt>) -> Self {
-                PyStore {
-                    core: Mutex::new(Some(core)),
-                    runtime,
-                }
-            }
-
-            fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
-                let core = self
-                    .core
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone()
-                    .ok_or_else(|| PyRuntimeError::new_err("store is closed"))?;
-                self.runtime.bind(py).borrow().check_store_call()?;
-                Ok(core)
-            }
-
-            fn after_write(&self, _core: &$crate::store::StoreCore<$b>, _py: Python<'_>) {}
-        }
-
-        $crate::persist_classes!(@store_methods $b, $rt, {
-            /// Applies the records other writers appended since this store last
-            /// read the log, across a compaction too, and returns the position it
-            /// has applied through.
-            fn refresh(&self, py: Python<'_>) -> PyResult<u64> {
-                self.core_outside_overlay(py)?.refresh(py)
-            }
-
-            /// `position` (the last log position applied), `snapshot_position`
-            /// (the snapshot this store last wrote or crossed, 0 if none) and
-            /// `records_since_checkpoint`, read without touching the backend.
-            fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, $crate::pyo3::types::PyDict>> {
-                let stats = self.core_outside_overlay(py)?.stats(py)?;
-                let dict = $crate::pyo3::types::PyDict::new(py);
-                dict.set_item("position", stats.position.0)?;
-                dict.set_item("snapshot_position", stats.snapshot_position.0)?;
-                dict.set_item("records_since_checkpoint", stats.records_since_checkpoint)?;
-                Ok(dict)
-            }
-
-            /// Folds the log into a snapshot, compacting it, and returns the
-            /// position the snapshot covers.
-            fn checkpoint(&self, py: Python<'_>) -> PyResult<u64> {
-                self.core_outside_overlay(py)?.checkpoint(py)
-            }
-
-            /// Closes the store: later store calls raise `RuntimeError`. Unlike
-            /// a Local store's close, the runtime stays open and keeps the
-            /// values it holds, since other threads may be reading it and a
-            /// closed check on every read would cost each `get`; the backend
-            /// is released once the runtime and every node handle are gone.
-            fn close(&self) {
-                let closed = self
-                    .core
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                drop(closed);
-            }
-        });
-    };
-
-    (full, binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
+    (binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 

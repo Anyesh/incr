@@ -181,7 +181,6 @@ mod classes {
     use crate::PyRuntime;
 
     incr_python_persist::persist_classes!(
-        full,
         binding = SharedBinding,
         runtime = PyRuntime,
         module = "incr_concurrent.persist",
