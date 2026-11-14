@@ -2791,6 +2791,26 @@ impl<C: Cells> Runtime<C> {
             })
     }
 
+    /// [`Runtime::try_delete_node`] for several nodes as one set: deletes
+    /// every live node of `handles` and every node they own, or reports
+    /// why not and changes nothing. An edge between members of the set
+    /// does not count as a dependent; one from any other node refuses the
+    /// whole set. Returns [`DeleteError::NotAlive`] when no handle names a
+    /// live node of this runtime, or when one is from another runtime.
+    ///
+    /// Panics if called from inside a compute.
+    pub fn try_delete_nodes(&self, handles: &[ErasedIncr]) -> Result<(), DeleteError> {
+        if handles.iter().any(|h| h.runtime_id() != self.runtime_id) {
+            return Err(DeleteError::NotAlive);
+        }
+        value_code::check();
+        self.nested_entry(|| self.enter(|| self.delete_set(handles)))
+            .map_err(|refusal| match refusal {
+                StrictRefusal::Gone => DeleteError::NotAlive,
+                StrictRefusal::HasDependents(_) => DeleteError::HasDependents,
+            })
+    }
+
     fn panic_has_dependents(slot: u32) -> ! {
         panic!(
             "incr-core: delete_node on node {} which still has dependents; \

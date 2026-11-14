@@ -227,16 +227,37 @@ impl<C: Cells> Runtime<C> {
         root: ErasedIncr,
         spins: &mut u32,
     ) -> Result<(), StrictRefusal> {
-        let id = NodeId(root.slot());
         if self.dep_stack.current_frame_active(self.runtime_id) {
             panic!(
                 "incr-core: delete of node {} inside a compute, but it owns nodes; a node \
                  that owns nodes is deleted outside every compute",
-                id.0,
+                root.slot(),
             );
         }
+        self.delete_set_waiting(&[root], spins)
+    }
+
+    /// The strict delete of `roots` and everything they own as one set,
+    /// through [`Self::claim_set`].
+    pub(super) fn delete_set(&self, roots: &[ErasedIncr]) -> Result<(), StrictRefusal> {
+        assert!(
+            !self.dep_stack.current_frame_active(self.runtime_id),
+            "incr-core: try_delete_nodes called during compute; not permitted",
+        );
+        self.delete_set_waiting(roots, &mut 0)
+    }
+
+    fn delete_set_waiting(
+        &self,
+        roots: &[ErasedIncr],
+        spins: &mut u32,
+    ) -> Result<(), StrictRefusal> {
+        let Some(first) = roots.first() else {
+            return Err(StrictRefusal::Gone);
+        };
+        let id = NodeId(first.slot());
         loop {
-            match self.claim_set(&[root], id) {
+            match self.claim_set(roots, id) {
                 SetEnd::Released(bag, _) => {
                     bag.drain(self);
                     return Ok(());

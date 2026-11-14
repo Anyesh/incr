@@ -1080,3 +1080,35 @@ local_and_shared!(
     local_children_cut_short_final_pass_keeps_children,
     shared_children_cut_short_final_pass_keeps_children
 );
+
+fn delete_nodes_as_one_set<C: Cells>(rt: &Runtime<C>) {
+    let a = rt.create_input(1u32);
+    let b = rt.create_query(move |rt| rt.get(a) + 1);
+    let c = rt.create_query(move |rt| rt.get(b) * 2);
+    assert_eq!(rt.get(c), 4);
+    let nodes = rt.node_count();
+
+    assert_eq!(
+        rt.try_delete_nodes(&[a.erase(), b.erase()]),
+        Err(DeleteError::HasDependents)
+    );
+    assert_eq!(rt.node_count(), nodes, "a refused set deletes nothing");
+    rt.set(a, 2);
+    assert_eq!(rt.get(c), 6);
+
+    rt.delete_node(c);
+    assert_eq!(rt.try_delete_node(a), Err(DeleteError::HasDependents));
+    assert_eq!(rt.try_delete_nodes(&[a.erase(), b.erase()]), Ok(()));
+    assert_eq!(rt.node_count(), nodes - 3);
+    assert_eq!(
+        rt.try_delete_nodes(&[a.erase(), b.erase()]),
+        Err(DeleteError::NotAlive)
+    );
+    assert_eq!(rt.try_delete_nodes(&[]), Err(DeleteError::NotAlive));
+}
+
+local_and_shared!(
+    delete_nodes_as_one_set,
+    local_delete_nodes_as_one_set,
+    shared_delete_nodes_as_one_set
+);
