@@ -816,6 +816,18 @@ where
         changes
     }
 
+    /// Moves the keys and pairs the stage holds into `keep` and drops its
+    /// index containers, which hold no user value, so a caller keeping the
+    /// stages of many writes keeps only their values.
+    fn spend_into(self, keep: &mut KeyedSpent<K, V, P, R>) {
+        keep.keys
+            .extend(self.keys.into_iter().map(|staged| staged.key));
+        keep.keys.extend(self.changed);
+        keep.keys.extend(self.spare);
+        keep.pairs.extend(self.fresh.into_iter().flatten());
+        keep.ops.extend(self.journal.into_iter().flatten());
+    }
+
     fn outcome(&mut self, epoch: u64) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
         let change = KeyedChange {
             counts: self.counts,
@@ -989,24 +1001,11 @@ where
 pub struct KeyedSpent<K, V, P, R = ()> {
     ops: Vec<PairOp<P, R>>,
     keys: Vec<K>,
-    stages: Vec<KeyStage<K, V, P, R>>,
     batches: Vec<StagedBatch<P>>,
     unused: Vec<P>,
     displaced: Vec<Displaced<P>>,
     pairs: Vec<(P, R)>,
-}
-
-impl<K, V, P, R> KeyedSpent<K, V, P, R> {
-    /// Whether nothing was handed back.
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
-            && self.keys.is_empty()
-            && self.stages.is_empty()
-            && self.batches.is_empty()
-            && self.unused.is_empty()
-            && self.displaced.is_empty()
-            && self.pairs.is_empty()
-    }
+    _row: PhantomData<fn() -> V>,
 }
 
 impl<K, V, P, R> Default for KeyedSpent<K, V, P, R> {
@@ -1014,11 +1013,11 @@ impl<K, V, P, R> Default for KeyedSpent<K, V, P, R> {
         Self {
             ops: Vec::new(),
             keys: Vec::new(),
-            stages: Vec::new(),
             batches: Vec::new(),
             unused: Vec::new(),
             displaced: Vec::new(),
             pairs: Vec::new(),
+            _row: PhantomData,
         }
     }
 }
@@ -1258,7 +1257,7 @@ where
             if stage.is_empty() {
                 let outcome = stage.outcome(stage.epoch);
                 if let Some(keep) = keep {
-                    keep.stages.push(stage);
+                    stage.spend_into(keep);
                 }
                 return outcome;
             }
@@ -1269,7 +1268,7 @@ where
                 drop(table);
                 drop(log);
                 if let Some(keep) = keep.as_deref_mut() {
-                    keep.stages.push(stage);
+                    stage.spend_into(keep);
                     keep.batches.push(batch);
                 }
                 continue;
@@ -1293,7 +1292,7 @@ where
                         &mut keep.displaced,
                     );
                     keep.pairs.extend(dropped);
-                    keep.stages.push(stage);
+                    stage.spend_into(keep);
                 }
                 None => {
                     self.pairs

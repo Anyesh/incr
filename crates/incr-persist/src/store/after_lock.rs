@@ -10,13 +10,35 @@ use crate::ValueScope;
 /// mutex is released, so a `Drop` that calls the store does not run under
 /// its lock.
 #[derive(Default)]
-pub(super) struct AfterLock(RefCell<Vec<Box<dyn Any + Send>>>);
+pub(super) struct AfterLock {
+    values: RefCell<Vec<Box<dyn Any + Send>>>,
+    /// One accumulator per type, see [`AfterLock::with`].
+    accumulators: RefCell<Vec<Box<dyn Any + Send>>>,
+}
 
 impl AfterLock {
     pub(super) fn push<T: Send + 'static>(&self, value: T) {
         if std::mem::needs_drop::<T>() {
-            self.0.borrow_mut().push(Box::new(value));
+            self.values.borrow_mut().push(Box::new(value));
         }
+    }
+
+    /// Runs `f` on the call's one `T`, created on first use, so that the
+    /// many writes of one call append their spent values to the same
+    /// buffers instead of each keeping its own allocations alive until
+    /// the lock is released. `f` must not use this bag.
+    pub(super) fn with<T: Default + Send + 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut accumulators = self.accumulators.borrow_mut();
+        let at = match accumulators.iter().position(|kept| (**kept).is::<T>()) {
+            Some(at) => at,
+            None => {
+                accumulators.push(Box::new(T::default()));
+                accumulators.len() - 1
+            }
+        };
+        f(accumulators[at]
+            .downcast_mut::<T>()
+            .expect("an accumulator is found by its type"))
     }
 
     /// [`Self::push`], keeping nothing for an empty `values`, so a call that
@@ -46,7 +68,8 @@ impl<'a> Drained<'a> {
     }
 
     pub(super) fn take_from(&mut self, bag: &AfterLock) {
-        self.values.append(&mut bag.0.borrow_mut());
+        self.values.append(&mut bag.values.borrow_mut());
+        self.values.append(&mut bag.accumulators.borrow_mut());
     }
 }
 

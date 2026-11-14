@@ -995,6 +995,13 @@ fn element_ops<P: PersistValue>(key: &str, elements: &Elements) -> Result<Vec<Pa
     Ok(ops)
 }
 
+/// Moves the changed keys a keyed write reports into `bag`.
+fn keep_changed<K: Send + 'static>(bag: &AfterLock, change: KeyedChange<K>) {
+    if !change.changed.is_empty() {
+        bag.with(|keys: &mut Vec<K>| keys.extend(change.changed));
+    }
+}
+
 /// The ranked multiset `ops` build from nothing, a removal taking the
 /// held pair [`find_element`] names, as the index's own replay does.
 fn fold_ops<P: Eq + Send + 'static>(ops: Vec<PairOp<P, u128>>, bag: &AfterLock) -> Vec<Ranked<P>> {
@@ -1071,24 +1078,24 @@ where
         deps: Option<&DepIndex>,
         bag: &AfterLock,
     ) {
-        let change: KeyedChange<K>;
-        let mut spent = KeyedSpent::default();
         let mut read = Vec::new();
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
-        change = if guard.deps().is_some() && !recompute {
-            let mut sink = FpDelta::new(&self.key);
-            let change = self
-                .keyed
-                .apply_pairs_keeping(rt, ops, &mut sink, None, &mut spent);
-            if let Some(map) = guard.deps() {
-                sink.apply_to(map, &self.key);
+        let change = bag.with(|spent: &mut KeyedSpent<K, V, P, u128>| {
+            if guard.deps().is_some() && !recompute {
+                let mut sink = FpDelta::new(&self.key);
+                let change = self
+                    .keyed
+                    .apply_pairs_keeping(rt, ops, &mut sink, None, spent);
+                if let Some(map) = guard.deps() {
+                    sink.apply_to(map, &self.key);
+                }
+                change
+            } else {
+                self.keyed
+                    .apply_pairs_keeping(rt, ops, &mut (), None, spent)
             }
-            change
-        } else {
-            self.keyed
-                .apply_pairs_keeping(rt, ops, &mut (), None, &mut spent)
-        };
+        });
         if recompute && guard.deps().is_some() {
             let fp = self.fp(rt, &mut read);
             if let Some(map) = guard.deps() {
@@ -1099,9 +1106,8 @@ where
         // hold, so a memo checkpoint never pairs a row with an older entry.
         guard.disarm();
         drop(hold);
-        if !(change.changed.is_empty() && spent.is_empty() && read.is_empty()) {
-            bag.push((change, spent, read));
-        }
+        keep_changed(bag, change);
+        bag.push_vec(read);
     }
 
     /// Brings the pairs to exactly `target`, ranks included, removing
@@ -1387,14 +1393,14 @@ impl<C: Cells, B: Backend> Store<C, B> {
             keyed,
             rows,
         };
-        let mut spent = KeyedSpent::default();
         let mut read = Vec::new();
         let mut hold = state.deps.as_deref().map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), key);
-        let change =
+        let change = state.after.with(|spent: &mut KeyedSpent<K, V, P, u128>| {
             binding
                 .keyed
-                .apply_pairs_keeping(&self.runtime, ops, &mut (), None, &mut spent);
+                .apply_pairs_keeping(&self.runtime, ops, &mut (), None, spent)
+        });
         if guard.deps().is_some() {
             let fp = binding.fp(&self.runtime, &mut read);
             let node = Binding::<C>::node(&binding);
@@ -1408,9 +1414,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         guard.disarm();
         drop(hold);
-        if !(change.changed.is_empty() && spent.is_empty() && read.is_empty()) {
-            state.after.push((change, spent, read));
-        }
+        keep_changed(&state.after, change);
+        state.after.push_vec(read);
         let keyed = binding.keyed.clone();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedKeyed { id, keyed })
