@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use incr_core::{ErasedIncr, Incr, IncrCollection, Runtime};
+use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, Runtime};
 use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -75,6 +75,54 @@ pub trait FullStoreRuntime<B: PyBinding>: StoreRuntime<B> {
     fn get_with_status(&self, py: Python<'_>, node: Self::Node)
         -> PyResult<(Py<PyAny>, Py<PyAny>)>;
     fn set(&self, node: Self::Node, value: Py<PyAny>) -> PyResult<()>;
+}
+
+/// The core collection behind a package's plain `KeyedCollection`, whose
+/// pairs are `(key, row)` tuples.
+pub type PlainKeyed<C> = incr_core::KeyedCollection<PyKey, PyValue, C, PyValue, ()>;
+
+/// The core collection a per-key read reaches.
+pub enum KeyedSource<'a, B: PyBinding> {
+    Plain(&'a PlainKeyed<B::C>),
+    Persisted(&'a Keyed<B>),
+}
+
+impl<B: PyBinding> KeyedSource<'_, B> {
+    /// `key`'s row as [`incr_core::KeyedCollection::get_key`] reads it:
+    /// inside a compute of `rt`, a dependency on that key alone; outside
+    /// one, the row, creating nothing. With `label`, the version input
+    /// this read creates for a plain collection is labelled
+    /// `<label>/<str(key)>`; a key whose `__str__` raises leaves it
+    /// unlabelled and the error is reported as unraisable. Persisted
+    /// collections are not labelled, since incr-persist does not expose
+    /// their version inputs. Takes the GIL only to label. Engine
+    /// calls: the caller runs it inside its package's engine boundary.
+    pub fn get_key(&self, rt: &Runtime<B::C>, key: &PyKey, label: Option<&str>) -> Option<PyValue> {
+        match (self, label) {
+            (KeyedSource::Plain(keyed), Some(label)) if keyed.version_input(key).is_none() => {
+                let row = keyed.get_key(rt, key);
+                if let Some(handle) = keyed.version_input(key) {
+                    label_key(rt, handle.slot(), label, key);
+                }
+                row
+            }
+            (KeyedSource::Plain(keyed), _) => keyed.get_key(rt, key),
+            (KeyedSource::Persisted(persisted), _) => persisted.get_key(rt, key),
+        }
+    }
+}
+
+fn label_key<C: Cells>(rt: &Runtime<C>, slot: u32, label: &str, key: &PyKey) {
+    let text = Python::attach(|py| match key.0.bind(py).str() {
+        Ok(text) => Some(text.to_string()),
+        Err(e) => {
+            e.write_unraisable(py, Some(key.0.bind(py)));
+            None
+        }
+    });
+    if let Some(text) = text {
+        rt.set_label(slot, format!("{label}/{text}"));
+    }
 }
 
 /// The handle of `kc`, which must be a keyed collection `core` persists.

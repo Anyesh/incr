@@ -165,7 +165,7 @@
     "kind": "getset_descriptor"
    },
    "get": {
-    "doc": "The row held for `key`, or `None`.",
+    "doc": "The row held for `key`, or `None`. Registers no dependency: inside a\nquery, read a key with `ctx.get_key(kc, key)` so the query reruns\nwhen that key's row changes.",
     "kind": "method_descriptor",
     "signature": "(self, /, key)"
    },
@@ -440,6 +440,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /, node)"
    },
+   "get_key": {
+    "doc": "The row `kc` holds for `key`, or `None`, as stored. Outside a query\nit creates nothing; `ctx.get_key` is the read that depends on the\nkey. Raises `ValueError` for a keyed collection of another runtime.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, key)"
+   },
    "get_traced": {
     "doc": null,
     "kind": "method_descriptor",
@@ -583,6 +588,16 @@
     "doc": "The node's value. A `NotReady` value makes this query's value that\nvalue; an `Incomplete` one gives its `value` and makes this query's\nvalue `Incomplete`, with every `missing` it read added up.",
     "kind": "method_descriptor",
     "signature": "(self, /, node)"
+   },
+   "get_key": {
+    "doc": "The row `kc` holds for `key`, or `None`, read as `get` reads a node,\nwith a dependency on that key alone: the query reruns when a write\nchanges this key's row, inserts it or removes it, and not for other\nkeys. Raises `ValueError` for a keyed collection of another runtime.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, key)"
+   },
+   "get_key_status": {
+    "doc": "`(row, status)` for `kc`'s `key` as `get_status` gives them, read\nwith the dependency of `get_key`; `(None, None)` for an absent key.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc, key)"
    },
    "get_status": {
     "doc": "`(value, status)` as `Runtime.get_with_status` gives them, with\nneither rule of `get` applied.",

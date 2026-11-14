@@ -47,6 +47,7 @@ use incr_compute::{
 };
 use incr_core::{Local, RoutingFailed};
 use incr_core::{PairOp, StateStats};
+use incr_python_persist::classes::KeyedSource;
 use incr_python_persist::classes::{key_counts, reconcile_pairs, KeyCounts};
 use overlay::{Born, Undo};
 use persist::PyPersistedKeyed;
@@ -363,6 +364,41 @@ impl PyRuntimeRef {
         let rt = self.rt()?;
         let val: PyValue = engine_in_query(rt, || rt.get(node.inner))?;
         Ok(ready::with_status(py, val.0))
+    }
+
+    /// The row `kc` holds for `key`, or `None`, read as `get` reads a node,
+    /// with a dependency on that key alone: the query reruns when a write
+    /// changes this key's row, inserts it or removes it, and not for other
+    /// keys. Raises `ValueError` for a keyed collection of another runtime.
+    fn get_key(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let (rt, missing) = self.rt_and_missing()?;
+        let (source, label) = kc.key_source(py, rt)?;
+        let key = PyKey(key);
+        let row = engine_in_query(rt, || source.get_key(rt, &key, label))?;
+        ready::read::<Signal>(py, row.map_or_else(|| py.None(), |row| row.0), missing)
+    }
+
+    /// `(row, status)` for `kc`'s `key` as `get_status` gives them, read
+    /// with the dependency of `get_key`; `(None, None)` for an absent key.
+    fn get_key_status(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Py<PyAny>,
+    ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        let rt = self.rt()?;
+        let (source, label) = kc.key_source(py, rt)?;
+        let key = PyKey(key);
+        let row = engine_in_query(rt, || source.get_key(rt, &key, label))?;
+        Ok(ready::with_status(
+            py,
+            row.map_or_else(|| py.None(), |row| row.0),
+        ))
     }
 
     /// The value of `table`'s entry for `key` (see `Store.memo_table`),
@@ -856,6 +892,7 @@ struct PyKeyedCollection {
     rows: IncrCollection<PyValue>,
     rt: Py<PyRuntime>,
     born: Born,
+    label: Option<String>,
 }
 
 /// A keyed collection whose pairs are `(key, row)` tuples, read by rank `R`.
@@ -955,19 +992,20 @@ impl PyKeyedCollection {
             }
             overlay.created(rows.version_node().erase());
         });
-        if let Some(label) = label {
+        if let Some(label) = &label {
             let rt = runtime.borrow();
             rt.relabel(pairs.version_node().slot(), label.clone())?;
             rt.relabel(rows.version_node().slot(), label.clone())?;
             rt.keyed_labels
                 .borrow_mut()
-                .push((stats, label, pairs.version_node().erase()));
+                .push((stats, label.clone(), pairs.version_node().erase()));
         }
         Ok(PyKeyedCollection {
             kind,
             rows,
             rt: runtime.unbind(),
             born: state.born(),
+            label,
         })
     }
 
@@ -988,6 +1026,27 @@ impl PyKeyedCollection {
             stats,
             label,
         )
+    }
+
+    /// What a per-key read on `rt` reaches, and the label of the version
+    /// inputs it creates. Raises `ValueError` when `rt` is not this
+    /// collection's runtime.
+    fn key_source(
+        &self,
+        py: Python<'_>,
+        rt: &Runtime,
+    ) -> PyResult<(KeyedSource<'_, persist::LocalBinding>, Option<&str>)> {
+        self.check_alive()?;
+        if !std::ptr::eq(self.rt.bind(py).borrow().rt()?, rt) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "keyed collection belongs to another runtime",
+            ));
+        }
+        let source = match &self.kind {
+            KeyedKind::Plain(keyed) => KeyedSource::Plain(keyed),
+            KeyedKind::Persisted(persisted) => KeyedSource::Persisted(persisted),
+        };
+        Ok((source, self.label.as_deref()))
     }
 
     /// The writable collection behind `persisted`, which only an overlay's
@@ -1059,7 +1118,9 @@ impl PyKeyedCollection {
         Ok(())
     }
 
-    /// The row held for `key`, or `None`.
+    /// The row held for `key`, or `None`. Registers no dependency: inside a
+    /// query, read a key with `ctx.get_key(kc, key)` so the query reruns
+    /// when that key's row changes.
     fn get(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
         let key = PyKey(key);
         let row = match &self.kind {
@@ -1515,6 +1576,22 @@ impl PyRuntime {
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let val: PyValue = self.engine_read(|rt| rt.get(node.inner))?;
         Ok(ready::unwrapped(py, val.0))
+    }
+
+    /// The row `kc` holds for `key`, or `None`, as stored. Outside a query
+    /// it creates nothing; `ctx.get_key` is the read that depends on the
+    /// key. Raises `ValueError` for a keyed collection of another runtime.
+    fn get_key(
+        &self,
+        py: Python<'_>,
+        kc: PyRef<'_, PyKeyedCollection>,
+        key: Py<PyAny>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let rt = self.rt()?;
+        let (source, label) = kc.key_source(py, rt)?;
+        let key = PyKey(key);
+        let row = engine_read(rt, || source.get_key(rt, &key, label))?;
+        Ok(row.map(|row| row.0))
     }
 
     /// `(value, status)`: the value `get` returns, and `None`, the
