@@ -970,6 +970,31 @@ fn get_key_outside_a_query_creates_nothing<C: Cells>() {
     assert_eq!(kc.version_input(&2), None);
 }
 
+/// `combine` runs under `aggregate`'s state lock, so a `get_key` there
+/// creates a version input under it.
+fn get_key_inside_an_aggregate_combine_creates_its_input<C: Cells>() {
+    let rt = Arc::new(Runtime::<C>::new());
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let numbers = IncrCollection::<u8, C>::new(&rt);
+    numbers.insert(&rt, 1);
+    numbers.insert(&rt, 2);
+    let captured = Captured((kc.clone(), Arc::clone(&rt)));
+    let total = numbers.aggregate(
+        &rt,
+        0_u32,
+        |n| u32::from(*n),
+        move |a, b| {
+            let (kc, rt) = captured.get();
+            a + b + u32::from(kc.get_key(rt, &1).unwrap_or(0))
+        },
+    );
+    rt.get(total);
+    numbers.insert(&rt, 3);
+    rt.get(total);
+    assert!(kc.version_input(&1).is_some());
+}
+
 fn version_inputs_map_back_to_their_keys<C: Cells>() {
     let rt = Runtime::<C>::new();
     let kc = Plain::<C>::new(&rt);
@@ -1075,6 +1100,7 @@ for_both!(
     an_absent_key_reader_follows_removal_and_re_add,
     replayed_pairs_and_their_undo_rerun_the_reader,
     get_key_outside_a_query_creates_nothing,
+    get_key_inside_an_aggregate_combine_creates_its_input,
     version_inputs_map_back_to_their_keys,
     a_removed_key_without_readers_is_reclaimed_on_local_only,
     a_keyed_write_inside_a_compute_is_refused,

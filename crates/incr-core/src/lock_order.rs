@@ -27,10 +27,6 @@ pub enum LockKind {
     TableMiss,
     /// incr-persist's `DepIndex`.
     DepIndex,
-    /// A keyed collection's per-key version inputs, under which a reader
-    /// creates a key's input; only key `Hash`, `Eq` and `Clone` run under
-    /// it besides that.
-    KeyVersions,
     /// `join`'s state or a positional operator's mirror.
     OperatorState,
     /// `group_by`'s `groups`, which the router's `rt.set` runs under.
@@ -42,6 +38,11 @@ pub enum LockKind {
     /// A collection log guard or a sorted collection's `state`; a thread
     /// holds at most one.
     CollectionLog,
+    /// A keyed collection's per-key version inputs, under which a reader
+    /// creates a key's input; only key `Hash`, `Eq` and `Clone` run under
+    /// it besides that. Above the operator states, as user code run under
+    /// them, such as `aggregate`'s `combine`, may read a key.
+    KeyVersions,
     Inner,
     /// A runtime's lists of the routers each router's runs dirtied.
     RouterLists,
@@ -77,10 +78,10 @@ impl LockKind {
             LockKind::MemoIndex => 30,
             LockKind::TableMiss => 40,
             LockKind::DepIndex => 50,
-            LockKind::KeyVersions => 52,
             LockKind::OperatorState | LockKind::GroupState | LockKind::AggregateState => 55,
             LockKind::KeyCache => 56,
             LockKind::CollectionLog => 58,
+            LockKind::KeyVersions => 59,
             LockKind::Inner => 60,
             LockKind::RouterLists => 62,
             LockKind::Arena => 65,
