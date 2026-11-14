@@ -17,9 +17,11 @@ All notable changes to this project are documented here. Format roughly follows 
 - **Python: compute stats (R5).** `rt.enable_compute_stats(True)` turns on per-node counters, and `rt.compute_stats(reset=False)` returns `{group: {"recomputed", "cutoff", "verified", "elapsed_ns"}}` grouped by the label up to its first `/`, with unlabelled nodes under `None`. A recompute that returns an equal value counts under `cutoff`. Core gains the per-label counters and `label_group`, the grouping rule for the label up to its first `/`.
 - **Python: `rt.graph_summary()` (R7).** It returns `{"groups": [{"label", "kind", "nodes"}], "edges": [{"from", "to", "count"}]}` grouped by `label_group`, where `kind` is `"input"`, `"compute"` or `"mixed"`, unlabelled nodes are under `None`, and a keyed collection's group also carries `"keys"`. Core gains `graph_summary`.
 - **Python: trace entries carry edges and time (R6).** Each `node_traces` entry gains `"dependencies"` (ids of the nodes it read, those inside the trace) and `"elapsed_ns"` (zero for a node verified clean). `TraceAction` and the existing keys are unchanged; core's `NodeTrace` gains `dependencies` and `elapsed_ns`.
+- **Python: keyed collection rows need not be hashable (R12).** A keyed collection, plain or persisted, takes rows such as dicts and lists, which beta.7 refused with `TypeError`. A row `==` to the held one is unchanged and logs nothing; a logged pair is matched by the fingerprint of its bytes, then by `==`. `kc.collection` and operators over it still hash rows.
+- **Python: `label=` on `store.memo_table`.** Each entry's node is labelled `<label>/<str(key)>`, so `graph_summary` and `compute_stats` group a table's entries under its label.
 - **Core: `try_delete_nodes`.** It deletes a set of nodes as one unit and refuses it, with nothing deleted, if a node outside the set depends on one inside it.
 - **incr-persist: persisted keyed collections on the core keyed collection, `ValueScope`.** A persisted keyed collection restores into the core index, and its per-key readers rerun on every write path (a write, a catch-up, a snapshot replace and a repair). A binding gives the store a `ValueScope` in `Options`, which every thread that encodes or decodes enters (including the memo's automatic checkpoint thread), so a Python codec is found from any thread.
-- **Shared persistence from Python.** `incr_concurrent.persist` has: Store, batch (on_write), memo, keyed collections, NotReady. <!-- DO NOT SHIP: final check of this list against the landed Shared surface -->
+- **Shared persistence from Python.** `incr_concurrent.persist` has the surface of `incr.persist` except the overlay: `Store` with `auto_checkpoint_records` and `stats()`, `store.batch` with `apply="on_write"` and `retry`, the memo with `max_bytes`, `checkpoint_after_entries` and `stats()`, keyed collections with `get_key`, `keys()`, `items()` and `label=`, `conformance`, and the NotReady types. Dropping a batch or a memo on Shared releases the GIL before it takes the store lock.
 
 ### Changed
 
@@ -30,6 +32,8 @@ All notable changes to this project are documented here. Format roughly follows 
 - **Keyed writes from inside a compute are refused**, on any compute running on the thread, not only the keyed collection's own.
 - **The memo's auto-checkpoint thread skips an open unlogged scope or staged batch**, and runs again afterwards if computes passed the trigger meanwhile.
 - **Replacing a row runs two row `__eq__` calls** instead of one.
+- **Python: writes through a keyed collection's `collection` raise** on both packages; write with `upsert`, `remove`, `reconcile` or a batch, which keep the key index and the log in step.
+- **Python: `get_traced` on Shared returns an `Incomplete` value's value**, as `get` does and as Local did.
 - **Python: `Runtime.overlay()` is not available on Shared.** `incr_concurrent` raises `RuntimeError` from `rt.overlay()` until an isolated overlay exists.
 - **Minimum Rust version.** `incr-concurrent-python` needs Rust 1.89 (it builds on incr-python-persist), as `incr-python` did since beta.7. `incr-persist`, `incr-python-persist` and `incr-kube` are 1.89, and the other crates keep 1.88.
 - **Python: persistence moved to the `incr-python-persist` crate.** Both packages share one implementation of the store, batch, memo, overlay and keyed logic; the class surface of `incr.persist` is recorded by a test and unchanged apart from the additions above.
@@ -50,6 +54,11 @@ Figures: to be filled from the release benchmark run.
 - **Shared keeps the version inputs of removed keys.** The per-key version input of a key that was removed stays on a Shared runtime.
 - **Non-canonical codecs can rank two-pair keys differently across processes.** A codec that encodes equal values to different bytes can rank two pairs of one key differently in two processes.
 - **Overlay is not available on Shared.** See Changed.
+- **On Shared a reader can see a key as absent during a persisted replace.** A replace is applied record by record, so a read between its `Remove` and `Insert` finds no row.
+- **A row unequal to its own decoded copy, under a codec that encodes it two ways, can leave its old row held.** For a row holding a float NaN and a set pickled under another hash seed, a replace or remove followed by a reopen can keep the old pair, and a read may return it. Use a codec that encodes such rows canonically, or rows equal to their decoded copy. beta.7 had the same behaviour for hashable rows.
+- **Shared collection operators do not apply the NotReady rules**, and Shared has no lookups and no `Collection.extend` or `replace`; these are Local only, as in beta.7.
+- **Compute stats cost about 1.8 times a run on a trivial chain when enabled** (50 nodes), because each compute is timed.
+- **`Store::checkpoint` reports one stall**, with no split between the fold, the compaction and the reload.
 
 ## [0.2.0-beta.7] - 2026-11-08
 
