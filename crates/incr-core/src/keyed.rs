@@ -517,6 +517,8 @@ pub(crate) struct KeyStage<K, V, P, R> {
     changed: Vec<K>,
     /// The index hash of each key in `changed`, in the same order.
     changed_hashes: Vec<u64>,
+    /// Keys `apply` read from its ops that were staged already.
+    spare: Vec<K>,
     journal: Option<Vec<PairOp<P, R>>>,
     _row: PhantomData<fn() -> V>,
 }
@@ -537,6 +539,7 @@ where
             counts: KeyCounts::default(),
             changed: Vec::new(),
             changed_hashes: Vec::new(),
+            spare: Vec::new(),
             journal: journal.then(Vec::new),
             _row: PhantomData,
         }
@@ -564,14 +567,17 @@ where
         Some(Src::Held(table.bucket(slot).read_at()))
     }
 
-    fn locate(&mut self, table: &KeyTable<P, R>, hash: u64, key: &K) -> usize {
-        let staged = self.by_hash.get(&hash).and_then(|at| {
+    fn staged(&self, hash: u64, key: &K) -> Option<usize> {
+        self.by_hash.get(&hash).and_then(|at| {
             at.as_slice()
                 .iter()
                 .copied()
                 .find(|&i| self.keys[i].key == *key)
-        });
-        if let Some(at) = staged {
+        })
+    }
+
+    fn locate(&mut self, table: &KeyTable<P, R>, hash: u64, key: &K) -> usize {
+        if let Some(at) = self.staged(hash, key) {
             return at;
         }
         let slot = table.find_key(hash, key);
@@ -582,6 +588,24 @@ where
             }
             None => (key.clone(), 0),
         };
+        self.push(StagedKey {
+            hash,
+            key,
+            slot,
+            held,
+            now: (0..held).map(Src::Held).collect(),
+        })
+    }
+
+    /// [`Self::locate`] for an owned key, which the stage keeps either
+    /// way, so its `Drop` runs with the stage's.
+    fn locate_owned(&mut self, table: &KeyTable<P, R>, hash: u64, key: K) -> usize {
+        if let Some(at) = self.staged(hash, &key) {
+            self.spare.push(key);
+            return at;
+        }
+        let slot = table.find_key(hash, &key);
+        let held = slot.map_or(0, |s| table.bucket(s).pairs().len());
         self.push(StagedKey {
             hash,
             key,
@@ -669,7 +693,7 @@ where
         let (PairOp::Insert(pair, rank) | PairOp::Remove(pair, rank)) = op;
         let mut state = hasher.build_hasher();
         pair.key_hash(&mut state);
-        let at = self.locate(table, state.finish(), &pair.key());
+        let at = self.locate_owned(table, state.finish(), pair.key());
         let before = self.read(table, at);
         match op {
             PairOp::Insert(..) => {
@@ -790,14 +814,20 @@ impl<K: Eq> VersionMap<K> {
         })
     }
 
-    fn forget(&mut self, hash: u64, handle: Incr<u64>) -> Option<K> {
+    /// Removes `handle`'s entries and hands back both copies of its key,
+    /// so their `Drop` runs where the caller chooses.
+    fn forget(&mut self, hash: u64, handle: Incr<u64>) -> Vec<K> {
+        let mut keys = Vec::with_capacity(2);
         if let Some(bucket) = self.by_hash.get_mut(&hash) {
-            bucket.retain(|(_, held)| *held != handle);
+            if let Some(at) = bucket.iter().position(|(_, held)| *held == handle) {
+                keys.push(bucket.swap_remove(at).0);
+            }
             if bucket.is_empty() {
                 self.by_hash.remove(&hash);
             }
         }
-        self.by_handle.remove(&handle.erase())
+        keys.extend(self.by_handle.remove(&handle.erase()));
+        keys
     }
 }
 
@@ -1260,9 +1290,10 @@ where
         if !freed.is_empty() {
             let mut map = self.versions.map.write();
             for (hash, handle) in freed {
-                if let Some(key) = map.forget(hash, handle) {
+                let forgotten = map.forget(hash, handle);
+                if !forgotten.is_empty() {
                     C::u64_fetch_add(&self.versions.live, u64::MAX);
-                    keys.push(key);
+                    keys.extend(forgotten);
                 }
             }
         }

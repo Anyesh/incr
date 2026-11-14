@@ -516,6 +516,23 @@ fn user_drops_run_after_the_dep_index_hold<C: Cells>() {
     assert_eq!(kb.row(&1), Some(w("f")));
     b.delete(&kb).unwrap();
 
+    let kw = b
+        .keyed_collection::<Watched, Watched, (Watched, Watched)>("w")
+        .unwrap();
+    b.upsert(&kw, w("x"), w("1")).unwrap();
+    let captured = Captured(kw.clone());
+    let reader = b
+        .runtime()
+        .create_query(move |rt| captured.get().get_key(rt, &w("x")));
+    assert_eq!(b.runtime().get(reader), Some(w("1")));
+    b.runtime().delete_node(reader);
+    let reclaimed = DROPS.get().0;
+    b.remove(&kw, &w("x")).unwrap();
+    if C::SINGLE_THREADED {
+        assert_eq!(kw.version_input(&w("x")), None, "the input was reclaimed");
+    }
+    assert!(DROPS.get().0 > reclaimed);
+
     WATCHED.with(|watched| *watched.borrow_mut() = None);
     let (all, held) = DROPS.get();
     assert!(all > 0, "the writes dropped no Watched value");
