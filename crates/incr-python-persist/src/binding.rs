@@ -7,6 +7,7 @@ use incr_persist::Store;
 use pyo3::prelude::*;
 
 use crate::backend::PyBackend;
+use crate::ready::NotReadySignal;
 use crate::PersistExceptions;
 
 /// The incr-persist store a package's Python store wraps.
@@ -50,6 +51,8 @@ impl<T> Carry<T> for Plain<T> {
 pub trait PyBinding: Sized + 'static {
     type C: MemoCells;
     type Exceptions: PersistExceptions;
+    /// The package's `_NotReadySignal`, under its own module name.
+    type Signal: NotReadySignal;
     /// Wraps an engine handle a task passed to [`Self::write`] captures or
     /// returns, since `write` demands a `Send` task. Code generic over the
     /// binding states the instances it needs as `Send` bounds, which hold

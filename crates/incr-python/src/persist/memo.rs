@@ -44,7 +44,7 @@ fn memo_fn(
             .unwrap();
             let _guard = InvalidateRef(rt_ref.bind(py).clone());
             in_runtime(rt, || {
-                PyValue(ready::call_memo(
+                PyValue(ready::call_memo::<super::Signal, _>(
                     py,
                     rt,
                     &py_func,

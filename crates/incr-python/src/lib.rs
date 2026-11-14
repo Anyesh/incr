@@ -51,7 +51,7 @@ use overlay::{Born, Undo};
 use persist::PyPersistedKeyed;
 use state::{LocalState, PyCallable, RtState};
 
-use incr_python_persist::ready::{self, _NotReadySignal};
+use incr_python_persist::ready;
 use incr_python_protocol::notready::{
     lookup_failed, PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
@@ -62,6 +62,7 @@ use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, raise_into_engine,
     routing_error, try_read, Exceptions, PyFixpoint, PyKey, PyValue,
 };
+use persist::{_NotReadySignal, Signal};
 
 pyo3::create_exception!(
     incr,
@@ -222,7 +223,7 @@ fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync +
             // one the callback kept never reaches a dropped runtime.
             let _guard = InvalidateRef(rt_ref.bind(py).clone());
             in_runtime(rt, || {
-                PyValue(ready::call_query(
+                PyValue(ready::call_query::<Signal, _>(
                     py,
                     rt,
                     &py_func,
@@ -334,7 +335,7 @@ impl PyRuntimeRef {
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
         let val: PyValue = engine_in_query(rt, || rt.get(node.inner))?;
-        ready::read(py, val.0, missing)
+        ready::read::<Signal>(py, val.0, missing)
     }
 
     /// Like `get`, but a cycle that leaves the node without a value
@@ -342,7 +343,7 @@ impl PyRuntimeRef {
     fn try_get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
         let val = try_read::<Exc>(engine_in_query(rt, || rt.try_get(node.inner))?)?;
-        ready::read(py, val, missing)
+        ready::read::<Signal>(py, val, missing)
     }
 
     /// The value of `key`'s lookup (see `Runtime.create_lookup`), read as
@@ -352,7 +353,7 @@ impl PyRuntimeRef {
         let (_, missing) = self.rt_and_missing()?;
         let lookups = state.lookups();
         let val = engine_in_query(rt, || rt.get(lookups.node(rt, py, &key)))?;
-        ready::read(py, val.0, missing)
+        ready::read::<Signal>(py, val.0, missing)
     }
 
     /// `(value, status)` as `Runtime.get_with_status` gives them, with
@@ -373,7 +374,7 @@ impl PyRuntimeRef {
     ) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
         let val = engine_in_query(rt, || table.value_of(py, rt, PyValue(key)))??;
-        ready::read(py, val.0, missing)
+        ready::read::<Signal>(py, val.0, missing)
     }
 
     /// The input child named `key` of this query, created with `init()`

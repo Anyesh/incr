@@ -25,6 +25,7 @@ pub(crate) type PyPersistedKeyed = incr_python_persist::store::Keyed<LocalBindin
 pub(crate) type OverlayScope = incr_python_persist::scope::OverlayScope<LocalBinding>;
 
 incr_python_persist::persist_exceptions!(Exceptions, incr.persist);
+incr_python_persist::not_ready_signal!(Signal, incr);
 
 /// Local store calls keep the GIL, since the runtime is confined to the
 /// opener's thread, and route as `engine_write` and `engine_read` do.
@@ -33,6 +34,7 @@ pub(crate) struct LocalBinding;
 impl PyBinding for LocalBinding {
     type C = Local;
     type Exceptions = Exceptions;
+    type Signal = Signal;
     type Task<T> = LocalTask<T>;
 
     fn write<R: Send>(

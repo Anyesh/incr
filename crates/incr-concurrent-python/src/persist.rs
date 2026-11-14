@@ -14,6 +14,7 @@ use pyo3::types::PyModule;
 use crate::{engine_call, PyNodeId, PyRuntime};
 
 incr_python_persist::persist_exceptions!(Exceptions, incr_concurrent.persist);
+incr_python_persist::not_ready_signal!(Signal, incr_concurrent);
 
 mod memory {
     use super::Exceptions;
@@ -30,6 +31,7 @@ pub(crate) struct SharedBinding;
 impl PyBinding for SharedBinding {
     type C = Shared;
     type Exceptions = Exceptions;
+    type Signal = Signal;
     type Task<T> = Plain<T>;
 
     fn write<R: Send>(

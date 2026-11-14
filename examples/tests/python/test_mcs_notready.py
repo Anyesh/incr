@@ -562,3 +562,7 @@ def test_an_incomplete_element_makes_its_window_unavailable():
     total = gap_total(gaps)
     rows.replace(("bob", 6), Incomplete(("bob", 6), 3))
     assert rt.status(total) == Incomplete(0, 2)
+
+
+def test_the_signal_lives_under_the_package_module():
+    assert incr._NotReadySignal.__module__ == "incr"
