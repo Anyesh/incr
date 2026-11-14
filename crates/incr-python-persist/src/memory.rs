@@ -55,6 +55,28 @@ macro_rules! memory_classes {
                     .map_err(|e| persist_error(py, e))
             }
 
+            /// Appends `records` right after `after` if the log's tail is
+            /// still `after`, returning the last position; raises
+            /// `TailMoved`, writing nothing, when the tail is elsewhere.
+            fn append_at(
+                &self,
+                py: Python<'_>,
+                after: u64,
+                records: Vec<Vec<u8>>,
+            ) -> PyResult<u64> {
+                let records = records
+                    .iter()
+                    .map(|bytes| Record::decode(bytes))
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(|e| persist_error(py, e))?;
+                self.inner
+                    .conditional_append()
+                    .expect("the memory backend has a conditional append")
+                    .append_at(Position(after), &records)
+                    .map(|at| at.0)
+                    .map_err(|e| persist_error(py, e))
+            }
+
             fn sync(&self, py: Python<'_>, upto: u64) -> PyResult<()> {
                 self.inner
                     .sync(Position(upto))

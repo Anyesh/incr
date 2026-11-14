@@ -1,10 +1,19 @@
+import incr.persist as persist
 import pytest
-from incr.persist import MemoryBackend, MemoryMemo, conformance
+from incr.persist import (
+    MemoryBackend,
+    MemoryMemo,
+    PersistError,
+    Store,
+    TailMoved,
+    conformance,
+)
 from test_mcs_persist_conformance import (
     DictBackend,
     DictLogFactory,
     DictMemoFactory,
     EpochMismatch,
+    PickleCodec,
     SqliteLog,
     SqliteLogFactory,
 )
@@ -130,6 +139,73 @@ def test_a_fenced_handle_whose_append_lands_fails_the_fenced_case():
 
 def test_cases_lists_each_kind():
     assert "fenced_append_lands_nothing" in conformance.cases("log")
+    assert {
+        "append_at_a_stale_position_writes_nothing",
+        "racing_append_at_one_position_lands_exactly_one",
+        "append_at_right_after_compacting_to_the_tail_lands",
+    } <= set(conformance.cases("log"))
     assert conformance.cases("memo")
     with pytest.raises(ValueError):
         conformance.cases("elsewhere")
+
+
+def test_tail_moved_is_a_persist_error():
+    assert issubclass(TailMoved, PersistError)
+
+
+def test_memory_backend_append_at_lands_only_after_the_tail_it_names():
+    written = MemoryBackend()
+    store = Store.open(written, build_id=1)
+    store.set(store.input("x", 0, PickleCodec()), 1)
+    run = [record for _, record in written.read_from(0)]
+
+    backend = MemoryBackend()
+    with pytest.raises(TailMoved):
+        backend.append_at(1, run)
+    assert backend.read_from(0) == []
+    assert backend.append_at(0, run) == len(run)
+    with pytest.raises(TailMoved):
+        backend.append_at(0, run)
+    assert [record for _, record in backend.read_from(0)] == run
+
+
+def test_python_backends_with_append_at_pass_its_cases():
+    for factory in (DictLogFactory(), SqliteLogFactory()):
+        for case in (
+            "append_at_a_stale_position_writes_nothing",
+            "racing_append_at_one_position_lands_exactly_one",
+            "append_at_right_after_compacting_to_the_tail_lands",
+        ):
+            assert persist._conformance("store", factory, case) == {case: None}
+
+
+def test_a_backend_whose_append_at_ignores_the_tail_fails_naming_the_case():
+    class Unconditional(DictLogFactory):
+        def open(self, log):
+            backend = DictBackend(log)
+            backend.append_at = lambda after, records: backend.append(records)
+            return backend
+
+    with pytest.raises(conformance.ConformanceFailure) as failure:
+        conformance.run_log_backend(Unconditional())
+    assert failure.value.case == "append_at_a_stale_position_writes_nothing"
+
+
+def test_a_backend_whose_append_at_raises_another_error_on_a_moved_tail_fails():
+    class Mislabelled(DictLogFactory):
+        def open(self, log):
+            backend = DictBackend(log)
+            conditional = backend.append_at
+
+            def append_at(after, records):
+                try:
+                    return conditional(after, records)
+                except TailMoved:
+                    raise ValueError("stale") from None
+
+            backend.append_at = append_at
+            return backend
+
+    with pytest.raises(conformance.ConformanceFailure) as failure:
+        conformance.run_log_backend(Mislabelled())
+    assert failure.value.case == "append_at_a_stale_position_writes_nothing"

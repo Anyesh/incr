@@ -3,6 +3,7 @@ import pickle
 import pytest
 from incr.persist import Store
 from test_mcs_persist_conformance import DictBackend, DictLogState
+from test_mcs_persist_on_write import RecordingBackend
 
 
 # Decodes only bytes this test's own store wrote.
@@ -95,3 +96,35 @@ def test_a_reopen_after_a_triggered_checkpoint_replays_only_later_records():
 def test_auto_checkpoint_records_must_be_positive():
     with pytest.raises(ValueError):
         Store.open(DictBackend(DictLogState()), build_id=1, auto_checkpoint_records=0)
+
+
+def test_inside_an_on_write_batch_the_trigger_fires_before_the_append():
+    state = DictLogState()
+    backend = RecordingBackend(state)
+    store = Store.open(backend, build_id=1, auto_checkpoint_records=3)
+    node = store.input("x", 0, PickleCodec())
+    store.set(node, 1)
+    store.set(node, 2)
+    due = store.stats()
+    assert due["records_since_checkpoint"] == 3
+    del backend.calls[:]
+    with store.batch(apply="on_write") as b:
+        assert [call[0] for call in backend.calls] == ["compact"]
+        for value in range(3, 8):
+            b.set(node, value)
+    assert [call[0] for call in backend.calls] == ["compact", "append_at"]
+    assert len(backend.calls[1][2]) == 5
+    assert store.stats() == {
+        "position": due["position"] + 5,
+        "snapshot_position": due["position"],
+        "records_since_checkpoint": 5,
+    }
+
+    del backend.calls[:]
+    store.set(node, 8)
+    assert [call[0] for call in backend.calls] == ["compact", "append"]
+    assert store.stats()["records_since_checkpoint"] == 1
+    store.close()
+
+    again = Store.open(DictBackend(state), build_id=1, auto_checkpoint_records=3)
+    assert again.runtime.get(again.input("x", 0, PickleCodec())) == 8

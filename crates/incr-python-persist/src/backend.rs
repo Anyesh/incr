@@ -7,12 +7,15 @@
 //! list of `(position, record)` or `("compacted", snapshot_position)`,
 //! `load_snapshot() -> (position, records) | None`,
 //! `snapshot_id() -> (position, generation) | None`,
-//! `compact(upto, records)` and `writable() -> bool`. A raised exception
+//! `compact(upto, records)` and `writable() -> bool`, and optionally
+//! `append_at(after, records) -> int`, which appends only while the tail
+//! is `after` and otherwise raises `incr.persist.TailMoved`, writing
+//! nothing; `store.batch(apply="on_write")` needs it. A raised exception
 //! fails the store call it happened in and reaches the caller as itself,
-//! except that `incr.persist.ReadOnly` (a write on a read-only handle) and
+//! except that `incr.persist.ReadOnly` (a write on a read-only handle),
 //! `InvalidCompaction(upto, snapshot_at, tail)` (a `compact` outside the
-//! snapshot and the tail) are the store's own errors, which its logic
-//! branches on. `writable()` is the exception to raising: incr-persist's
+//! snapshot and the tail) and `TailMoved` from `append_at` are the store's
+//! own errors, which its logic branches on. `writable()` is the exception to raising: incr-persist's
 //! trait gives it no error channel, so an exception from it reads as
 //! `False`. The store itself never calls it (only the conformance cases
 //! do), so a read-only handle is known by its `append` and `compact`
@@ -21,7 +24,9 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use incr_persist::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
+use incr_persist::{
+    Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId,
+};
 use pyo3::exceptions::PyTypeError;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -95,18 +100,24 @@ pub fn bad_return<E: PersistExceptions>(what: &str) -> Error {
 }
 
 /// A Python object implementing the backend protocol, as a `Backend`
-/// whose errors use the exceptions `E`.
+/// whose errors use the exceptions `E`. It offers a `ConditionalAppend`
+/// exactly when the object had an `append_at` attribute when wrapped.
 pub struct PyBackend<E> {
     backend: Py<PyAny>,
+    has_append_at: bool,
     exceptions: PhantomData<fn() -> E>,
 }
 
 impl<E: PersistExceptions> PyBackend<E> {
-    pub fn new(backend: Py<PyAny>) -> Self {
-        PyBackend {
+    /// Wraps `backend`; raises what looking up its `append_at` raises,
+    /// other than `AttributeError`.
+    pub fn new(py: Python<'_>, backend: Py<PyAny>) -> PyResult<Self> {
+        let has_append_at = backend.bind(py).hasattr(intern!(py, "append_at"))?;
+        Ok(PyBackend {
             backend,
+            has_append_at,
             exceptions: PhantomData,
-        }
+        })
     }
 
     fn call<'py, A: pyo3::call::PyCallArgs<'py>>(
@@ -242,6 +253,29 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
                 .ok()
                 .and_then(|writable| writable.is_truthy().ok())
                 .unwrap_or(false)
+        })
+    }
+
+    fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {
+        self.has_append_at.then_some(self as &dyn ConditionalAppend)
+    }
+}
+
+impl<E: PersistExceptions> ConditionalAppend for PyBackend<E> {
+    fn append_at(&self, after: Position, records: &[Record]) -> Result<Position> {
+        Python::attach(|py| {
+            let list = encoded::<E>(py, records)?;
+            let landed = self
+                .backend
+                .bind(py)
+                .call_method1(intern!(py, "append_at"), (after.0, list));
+            match landed {
+                Ok(landed) => position::<E>(&landed, "append_at"),
+                Err(err) if err.is_instance(py, &E::tail_moved(py)) => {
+                    Err(Error::TailMoved { after })
+                }
+                Err(err) => Err(raised::<E>(err)),
+            }
         })
     }
 }

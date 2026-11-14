@@ -673,7 +673,7 @@
   "bases": [
    "object"
   ],
-  "doc": "The writes collected inside `with store.batch() as b:`.\n\nKeyed writes compose per key against the rows each key held when first\nstaged, so `b.upsert` twice on one key, or `b.upsert` then `b.remove`,\nleave exactly the final pair, and `b.remove` raises `KeyError` for a\nkey neither held nor staged. The collection takes the staged keys only\nonce the append has landed.",
+  "doc": "The writes of a `with store.batch() as b:` block; see `Store.batch`.\n\nIn an `on_exit` batch keyed writes compose per key against the rows\neach key held when first staged, so `b.upsert` twice on one key, or\n`b.upsert` then `b.remove`, leave exactly the final pair, and\n`b.remove` raises `KeyError` for a key neither held nor staged; the\ncollection takes the staged keys only once the append has landed. In\nan `on_write` batch each write applies at once, and `b.remove` raises\n`KeyError` for a key holding no row at that point.",
   "members": {
    "__enter__": {
     "doc": null,
@@ -709,6 +709,11 @@
     "doc": null,
     "kind": "method_descriptor",
     "signature": "(self, /, collection, old, new)"
+   },
+   "retry": {
+    "doc": "Appends the run of an `on_write` batch whose append raised, with\nthe same `append_at`, so it lands at most once, and returns the\nposition of its last record. Raises what the append raises, keeping\nthe run for another retry; `PersistError` once the run has landed;\n`RuntimeError` for an `on_exit` batch, inside the block, or after a\nblock that raised.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
    },
    "set": {
     "doc": null,
@@ -791,6 +796,11 @@
     "doc": null,
     "kind": "method_descriptor",
     "signature": "(self, /, records)"
+   },
+   "append_at": {
+    "doc": "Appends `records` right after `after` if the log's tail is\nstill `after`, returning the last position; raises\n`TailMoved`, writing nothing, when the tail is elsewhere.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, after, records)"
    },
    "compact": {
     "doc": null,
@@ -906,9 +916,9 @@
   "doc": "Persisted inputs and collections over a backend, and the runtime that\nreads them.\n\n`store.input(key, default, codec)` and `store.collection(key, codec)`\ndeclare a key and return its node or `Collection`; `codec` is any object\nwith `encode(obj) -> bytes` and `decode(bytes) -> obj`. Two contracts\nbind it: `decode(encode(x)) == x`, and `encode` is deterministic (equal\nvalues give equal bytes), since fingerprints hash the bytes. A codec\nneed not know `Pending`, `LookupFailed`, `Unavailable` or `Incomplete`:\nthose persist as themselves, and only their `row`, `value`, `key` and\n`reason` go through the codec. A value written to a slot with no codec\nraises, naming the slot.\n\nPersisted nodes are written through the store (`store.set`,\n`store.insert`, ...); `runtime.set` and a persisted collection's own\n`insert`, `delete`, `extend` and `replace` raise `RuntimeError`.",
   "members": {
    "batch": {
-    "doc": "Starts a batch: `with store.batch() as b:` collects `b.set`,\n`b.insert`, `b.delete`, `b.replace`, `b.upsert`, `b.remove` and\n`b.reconcile`, and on leaving the block appends them all as one\nrun, so a restore sees all of them or none. A block that raises\nwrites nothing.",
+    "doc": "Starts a batch of `b.set`, `b.insert`, `b.delete`, `b.replace`,\n`b.upsert`, `b.remove` and `b.reconcile`, appended to the log as\none run, so a restore sees all of them or none.\n\n`apply=\"on_exit\"` (the default) collects the writes and appends and\napplies them on leaving the block; a block that raises writes\nnothing, and reads inside it see the values from before it.\n\n`apply=\"on_write\"` applies each write at once, so reads inside the\nblock see it, and appends the run on leaving the block with the\nbackend's `append_at`, right after the position the store had\napplied; a backend without `append_at` refuses it with\n`PersistError`. Entering catches up with the log and runs a due\n`auto_checkpoint_records` checkpoint, so none falls between the\nbatch's records. Until the run lands every other store call that\nwrites, declares, refreshes or checkpoints, a memo checkpoint and a\nsecond batch raise `PersistError`. If the append raises, the block\nraises it and the batch keeps its run: `b.retry()` appends it again\nand lands it at most once. A block that raises, or a batch dropped\nbefore its run lands, poisons the store, since the runtime holds\nwrites the log never receives: every later store call raises\n`PersistError` and the way out is to close the store and open the\nlog again. A backend that fences this writer keeps raising, so its\nway out is the same.",
     "kind": "method_descriptor",
-    "signature": "(self, /)"
+    "signature": "(self, /, apply='on_exit')"
    },
    "checkpoint": {
     "doc": "Folds the log into a snapshot, compacting it, and returns the\nposition the snapshot covers.",
@@ -1006,6 +1016,14 @@
    }
   },
   "signature": "()"
+ },
+ "incr.persist.TailMoved": {
+  "bases": [
+   "PersistError"
+  ],
+  "doc": "A backend's `append_at(after, records)` found the log's tail somewhere other than `after` and wrote nothing. A Python backend raises it to say so.",
+  "members": {},
+  "signature": null
  },
  "incr.persist._conformance": {
   "doc": "Runs the cases of `kind` (`\"store\"` or `\"memo\"`), or only `case`.\nReturns each case's name mapped to `None` on a pass or the panic\nmessage.",
