@@ -1,7 +1,8 @@
 import pickle
 
+import incr.persist
+import incr_concurrent.persist
 import pytest
-from incr.persist import Store
 from test_mcs_persist_conformance import DictBackend, DictLogState
 from test_mcs_persist_on_write import RecordingBackend
 
@@ -13,6 +14,16 @@ class PickleCodec:
 
     def decode(self, data):
         return pickle.loads(data)
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(incr.persist, id="local"),
+        pytest.param(incr_concurrent.persist, id="shared"),
+    ]
+)
+def Store(request):
+    return request.param.Store
 
 
 class Refused(Exception):
@@ -37,7 +48,7 @@ class CountingBackend(DictBackend):
         return super().compact(upto, records)
 
 
-def test_a_fresh_store_reports_no_snapshot():
+def test_a_fresh_store_reports_no_snapshot(Store):
     store = Store.open(DictBackend(DictLogState()), build_id=1)
     assert store.stats() == {
         "position": 0,
@@ -46,7 +57,7 @@ def test_a_fresh_store_reports_no_snapshot():
     }
 
 
-def test_the_write_after_n_records_checkpoints_first():
+def test_the_write_after_n_records_checkpoints_first(Store):
     store = Store.open(
         DictBackend(DictLogState()), build_id=1, auto_checkpoint_records=3
     )
@@ -63,7 +74,7 @@ def test_the_write_after_n_records_checkpoints_first():
     assert store.stats()["records_since_checkpoint"] == 0
 
 
-def test_a_failing_triggered_checkpoint_fails_the_write_and_leaves_the_log():
+def test_a_failing_triggered_checkpoint_fails_the_write_and_leaves_the_log(Store):
     state = DictLogState()
     backend = CountingBackend(state, refuse_compact=True)
     store = Store.open(backend, build_id=1, auto_checkpoint_records=2)
@@ -77,7 +88,7 @@ def test_a_failing_triggered_checkpoint_fails_the_write_and_leaves_the_log():
     assert store.runtime.get(node) == 1
 
 
-def test_a_reopen_after_a_triggered_checkpoint_replays_only_later_records():
+def test_a_reopen_after_a_triggered_checkpoint_replays_only_later_records(Store):
     state = DictLogState()
     store = Store.open(DictBackend(state), build_id=1, auto_checkpoint_records=3)
     node = store.input("x", 0, PickleCodec())
@@ -93,7 +104,7 @@ def test_a_reopen_after_a_triggered_checkpoint_replays_only_later_records():
     assert again.runtime.get(again.input("x", 0, PickleCodec())) == 5
 
 
-def test_auto_checkpoint_records_must_be_positive():
+def test_auto_checkpoint_records_must_be_positive(Store):
     with pytest.raises(ValueError):
         Store.open(DictBackend(DictLogState()), build_id=1, auto_checkpoint_records=0)
 
@@ -101,7 +112,7 @@ def test_auto_checkpoint_records_must_be_positive():
 def test_inside_an_on_write_batch_the_trigger_fires_before_the_append():
     state = DictLogState()
     backend = RecordingBackend(state)
-    store = Store.open(backend, build_id=1, auto_checkpoint_records=3)
+    store = incr.persist.Store.open(backend, build_id=1, auto_checkpoint_records=3)
     node = store.input("x", 0, PickleCodec())
     store.set(node, 1)
     store.set(node, 2)
@@ -126,5 +137,5 @@ def test_inside_an_on_write_batch_the_trigger_fires_before_the_append():
     assert store.stats()["records_since_checkpoint"] == 1
     store.close()
 
-    again = Store.open(DictBackend(state), build_id=1, auto_checkpoint_records=3)
+    again = incr.persist.Store.open(DictBackend(state), build_id=1, auto_checkpoint_records=3)
     assert again.runtime.get(again.input("x", 0, PickleCodec())) == 8

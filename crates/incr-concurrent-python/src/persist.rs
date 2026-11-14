@@ -98,6 +98,7 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("Busy", py.get_type::<Busy>())?;
     module.add("ReadOnly", py.get_type::<ReadOnly>())?;
     module.add("InvalidCompaction", py.get_type::<InvalidCompaction>())?;
+    module.add("TailMoved", py.get_type::<TailMoved>())?;
     module.add_class::<memory::PyMemoryBackend>()?;
     module.add_class::<classes::PyStore>()?;
     incr_python_persist::codec::install_hook::<Exceptions>();

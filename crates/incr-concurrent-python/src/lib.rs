@@ -703,6 +703,17 @@ impl PyRuntime {
         }
     }
 
+    /// Raises `RuntimeError`: a Shared runtime has no isolation for an
+    /// overlay's candidate values, so every other thread would read values
+    /// the overlay later undoes. Run what-ifs on an `incr.Runtime`.
+    fn overlay(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "overlay is not available on incr_concurrent: a Shared runtime has no isolation \
+             for an overlay's candidate values, so other threads would read values the \
+             overlay later undoes; run what-ifs on an incr.Runtime",
+        ))
+    }
+
     fn create_input(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<PyNodeId> {
         let v = PyValue(value);
         let node = engine_call(py, &self.inner, || self.inner.create_input(v))?;
