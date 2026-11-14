@@ -231,12 +231,11 @@ macro_rules! persist_classes {
             /// their encodings differ. A logged pair is matched by the fingerprint
             /// of its bytes, so a row not `==` to its decoded copy (one holding
             /// NaN or an object compared by identity) still replaces, restores
-            /// and catches up as one row, unless its codec re-encodes it to
-            /// different bytes (a set pickled under another hash seed, say): such
-            /// a row can, after a replace or remove and a reopen, leave its old
-            /// row held too, and a read may return the old row. Use a codec
-            /// that encodes such rows canonically, or rows that equal their
-            /// decoded copy.
+            /// and catches up as one row. A write that would remove a held row
+            /// which is not `==` to its decoded copy and whose codec now encodes
+            /// it to different bytes (a set pickled under another hash seed, say)
+            /// raises `ValueError` and writes nothing, since a replay could not
+            /// find it.
             #[pyo3(signature = (key, key_codec, codec, label=None))]
             fn keyed_collection(
                 &self,
