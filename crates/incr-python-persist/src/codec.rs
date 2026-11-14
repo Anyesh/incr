@@ -33,7 +33,7 @@ use incr_python_protocol::notready::{
     self, PyIncomplete, PyLookupFailed, PyPending, PyUnavailable,
 };
 use incr_python_protocol::persist::{install, Hook};
-use incr_python_protocol::PyValue;
+use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -221,6 +221,8 @@ pub fn install_hook<E: PersistExceptions>() {
     let _ = install(Hook {
         encode: encode::<E>,
         decode: decode::<E>,
+        encode_key: encode_key::<E>,
+        decode_key: decode_key::<E>,
     });
 }
 
@@ -235,6 +237,36 @@ fn decode<E: PersistExceptions>(py: Python<'_>, bytes: &[u8]) -> Result<PyValue,
     let codec = registry.codec_for(py)?;
     unframe(py, &codec, bytes)
         .map(PyValue)
+        .map_err(|e| registry.stash(e))
+}
+
+/// The key codec of the keyed collection whose slot is current: its
+/// pairs' [`PairCodec`].
+fn key_codec_for<E: PersistExceptions>(
+    py: Python<'_>,
+    registry: &Registry<E>,
+) -> Result<Py<PyAny>, String> {
+    let codec = registry.codec_for(py)?;
+    let pairs = codec.bind(py).downcast::<PairCodec>().map_err(|_| {
+        registry.stash(PyErr::from_type(
+            E::persist_error(py),
+            "a key was encoded outside a keyed collection",
+        ))
+    })?;
+    Ok(pairs.get().key.clone_ref(py))
+}
+
+fn encode_key<E: PersistExceptions>(py: Python<'_>, key: &PyKey) -> Result<Vec<u8>, String> {
+    let registry = active::<E>()?;
+    let codec = key_codec_for(py, &registry)?;
+    frame(py, &codec, key.0.bind(py)).map_err(|e| registry.stash(e))
+}
+
+fn decode_key<E: PersistExceptions>(py: Python<'_>, bytes: &[u8]) -> Result<PyKey, String> {
+    let registry = active::<E>()?;
+    let codec = key_codec_for(py, &registry)?;
+    unframe(py, &codec, bytes)
+        .map(PyKey)
         .map_err(|e| registry.stash(e))
 }
 
@@ -400,7 +432,7 @@ fn unframe(py: Python<'_>, codec: &Py<PyAny>, bytes: &[u8]) -> PyResult<Py<PyAny
 
 /// The codec of a keyed collection's `(key, row)` pairs: each half is framed
 /// with its own user codec, so a not-ready row persists as itself.
-#[pyclass(module = "incr.persist")]
+#[pyclass(module = "incr.persist", frozen)]
 pub struct PairCodec {
     key: Py<PyAny>,
     row: Py<PyAny>,
