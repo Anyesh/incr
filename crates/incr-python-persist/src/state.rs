@@ -43,14 +43,14 @@ struct Inner<B: PyBinding, X> {
 
 enum Journal<B: PyBinding> {
     Idle,
-    Open(Overlay<B>),
+    Open(Box<Overlay<B>>),
     Lent,
 }
 
 /// Puts a lent journal back, also when the code using it unwinds.
 struct Lend<'a, B: PyBinding> {
     slot: &'a Mutex<Journal<B>>,
-    overlay: Option<Overlay<B>>,
+    overlay: Option<Box<Overlay<B>>>,
 }
 
 impl<B: PyBinding> Drop for Lend<'_, B> {
@@ -133,14 +133,14 @@ impl<B: PyBinding, X> RtState<B, X> {
     }
 
     pub fn begin_overlay(&self, overlay: Overlay<B>) {
-        *lock(&self.0.overlay) = Journal::Open(overlay);
+        *lock(&self.0.overlay) = Journal::Open(Box::new(overlay));
         self.0.active.store(true, Ordering::Release);
     }
 
     pub fn end_overlay(&self) -> Option<Overlay<B>> {
         self.0.active.store(false, Ordering::Release);
         match std::mem::replace(&mut *lock(&self.0.overlay), Journal::Idle) {
-            Journal::Open(overlay) => Some(overlay),
+            Journal::Open(overlay) => Some(*overlay),
             Journal::Idle | Journal::Lent => None,
         }
     }
