@@ -56,9 +56,7 @@ macro_rules! persist_classes {
                 Ok(core)
             }
 
-            fn after_write(&self, _core: &$crate::store::StoreCore<$b>, _py: Python<'_>) -> PyResult<()> {
-                Ok(())
-            }
+            fn after_write(&self, _core: &$crate::store::StoreCore<$b>, _py: Python<'_>) {}
         }
 
         $crate::persist_classes!(@store_methods $b, $rt, {
@@ -170,7 +168,7 @@ macro_rules! persist_classes {
                 self.core_live(py)
             }
 
-            fn after_write(&self, core: &$crate::store::StoreCore<$b>, py: Python<'_>) -> PyResult<()> {
+            fn after_write(&self, core: &$crate::store::StoreCore<$b>, py: Python<'_>) {
                 self.memo.after_write(core, py)
             }
 
@@ -208,7 +206,8 @@ macro_rules! persist_classes {
                 let core = self.core_outside_overlay(py)?;
                 let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
                 core.insert(py, persisted, row)?;
-                self.after_write(&core, py)
+                self.after_write(&core, py);
+                Ok(())
             }
 
             /// Removes one occurrence of `row` from a persisted collection. Removing
@@ -222,7 +221,8 @@ macro_rules! persist_classes {
                 let core = self.core_outside_overlay(py)?;
                 let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
                 core.delete(py, persisted, row)?;
-                self.after_write(&core, py)
+                self.after_write(&core, py);
+                Ok(())
             }
 
             /// Removes one occurrence of `old`, if present, and inserts `new`, as
@@ -237,7 +237,8 @@ macro_rules! persist_classes {
                 let core = self.core_outside_overlay(py)?;
                 let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
                 core.replace(py, persisted, old, new)?;
-                self.after_write(&core, py)
+                self.after_write(&core, py);
+                Ok(())
             }
 
             /// Appends every row of `rows` in one logged step.
@@ -250,7 +251,8 @@ macro_rules! persist_classes {
                 let core = self.core_outside_overlay(py)?;
                 let persisted = core.collection_of(<$rt as FullStoreRuntime<$b>>::version_slot(&collection))?;
                 core.extend(py, persisted, rows)?;
-                self.after_write(&core, py)
+                self.after_write(&core, py);
+                Ok(())
             }
 
             /// Declares the keyed collection `key`: a `KeyedCollection` over a
@@ -288,7 +290,8 @@ macro_rules! persist_classes {
                 let mut pending = Pending::default();
                 pending.upsert(py, &core, &keyed, key, row)?;
                 core.write_pending(py, pending)?;
-                self.after_write(&core, py)
+                self.after_write(&core, py);
+                Ok(())
             }
 
             /// Removes `key`'s pair from a persisted keyed collection. Raises
@@ -304,7 +307,8 @@ macro_rules! persist_classes {
                 let mut pending = Pending::default();
                 pending.remove(py, &core, &keyed, key)?;
                 core.write_pending(py, pending)?;
-                self.after_write(&core, py)
+                self.after_write(&core, py);
+                Ok(())
             }
 
             /// Makes a persisted keyed collection hold exactly `rows`, as
@@ -322,7 +326,7 @@ macro_rules! persist_classes {
                 pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)?;
                 let counts = key_counts(pending.counts(&keyed));
                 core.write_pending(py, pending)?;
-                self.after_write(&core, py)?;
+                self.after_write(&core, py);
                 Ok(counts)
             }
 
@@ -409,8 +413,11 @@ macro_rules! persist_classes {
             /// logged store write and batch commit runs a due checkpoint after it
             /// lands, and a read never does (call `memo.checkpoint_if_due()` after
             /// a read-only rebuild); a Shared memo's checkpoint thread runs it. A
-            /// triggered checkpoint that fails raises from the write that ran it,
-            /// after the write landed, except `Busy`, which leaves it due for the
+            /// triggered checkpoint that fails does not raise from the write that
+            /// ran it, which has landed: `memo.stats()` counts it under
+            /// `auto_checkpoint_errors` with its text under
+            /// `last_auto_checkpoint_error`, and it stays due, retried by the first
+            /// write after a new entry computes. `Busy` leaves it due for the
             /// next write.
             #[pyo3(signature = (backend, *, max_bytes=None, checkpoint_after_entries=None))]
             fn open_memo(
@@ -511,7 +518,9 @@ macro_rules! persist_classes {
                 } else {
                     let core = batch_core(&self.store, py)?;
                     self.batch.exit(py, &core)?;
-                    self.store.bind(py).try_borrow()?.after_write(&core, py)?;
+                    if let Ok(store) = self.store.bind(py).try_borrow() {
+                        store.after_write(&core, py);
+                    }
                 }
                 Ok(false)
             }
@@ -525,7 +534,9 @@ macro_rules! persist_classes {
             fn retry(&mut self, py: Python<'_>) -> PyResult<u64> {
                 let core = batch_core(&self.store, py)?;
                 let position = self.batch.retry(py, &core)?;
-                self.store.bind(py).try_borrow()?.after_write(&core, py)?;
+                if let Ok(store) = self.store.bind(py).try_borrow() {
+                        store.after_write(&core, py);
+                    }
                 Ok(position)
             }
 
@@ -694,15 +705,19 @@ macro_rules! persist_classes {
 
             /// `entries` and `bytes` of the current generation, `unsaved_entries`
             /// computed since the last checkpoint and not saved,
-            /// `unsaveable` entries the last checkpoint could not save, and
-            /// `evicted_last_checkpoint`, read without touching the backend.
+            /// `unsaveable` entries the last checkpoint could not save,
+            /// `evicted_last_checkpoint`, `auto_checkpoint_errors` (triggered
+            /// checkpoints that failed) and `last_auto_checkpoint_error` (the
+            /// latest such failure a write ran, as text, or `None`), read without
+            /// touching the backend.
             fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
                 let store = self.store.bind(py).try_borrow()?;
                 let stats = store.memo.stats(store.core()?, py)?;
                 let dict = PyDict::new(py);
-                for (name, count) in $crate::memo::stats_counts(&stats) {
+                for (name, count) in stats.counts() {
                     dict.set_item(name, count)?;
                 }
+                dict.set_item("last_auto_checkpoint_error", stats.last_auto_checkpoint_error)?;
                 Ok(dict)
             }
         }
@@ -829,7 +844,8 @@ macro_rules! persist_classes {
             ) -> PyResult<()> {
                 let core = self.core_outside_overlay(py)?;
                 core.set(py, <$rt as StoreRuntime<$b>>::node_inner(&node), value)?;
-                self.after_write(&core, py)
+                self.after_write(&core, py);
+                Ok(())
             }
 
             $($extra)*

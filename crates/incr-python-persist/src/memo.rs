@@ -59,6 +59,19 @@ pub struct MemoCore<B: PyBinding> {
     builder: Mutex<Option<MemoBuilder<B::C>>>,
     decls: Mutex<Vec<MemoDecl>>,
     memo: OnceLock<OpenMemo<B>>,
+    auto: Mutex<AutoCheckpoint>,
+}
+
+/// The failures of checkpoints a write triggered on a single-threaded
+/// runtime, which the write does not raise.
+#[derive(Default)]
+struct AutoCheckpoint {
+    errors: u64,
+    last_error: Option<String>,
+    /// After a failure, the unsaved count it left: the next triggered
+    /// checkpoint waits until a compute raises the count above it, so a
+    /// failing backend is not retried on every write.
+    retry_above: Option<u64>,
 }
 
 impl<B: PyBinding> Default for MemoCore<B> {
@@ -67,6 +80,7 @@ impl<B: PyBinding> Default for MemoCore<B> {
             builder: Mutex::default(),
             decls: Mutex::default(),
             memo: OnceLock::new(),
+            auto: Mutex::default(),
         }
     }
 }
@@ -78,6 +92,10 @@ impl<B: PyBinding> MemoCore<B> {
 
     fn decls(&self) -> MutexGuard<'_, Vec<MemoDecl>> {
         self.decls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn auto(&self) -> MutexGuard<'_, AutoCheckpoint> {
+        self.auto.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -147,15 +165,30 @@ fn checkpoint_counts(stats: &CheckpointStats) -> HashMap<&'static str, usize> {
     ])
 }
 
-/// The fields of `stats` that `memo.stats()` returns.
-pub fn stats_counts(stats: &MemoStats) -> [(&'static str, u64); 5] {
-    [
-        ("entries", stats.entries),
-        ("bytes", stats.bytes),
-        ("unsaved_entries", stats.unsaved_entries),
-        ("unsaveable", stats.unsaveable),
-        ("evicted_last_checkpoint", stats.evicted_last_checkpoint),
-    ]
+/// What `memo.stats()` returns.
+pub struct PyMemoStats {
+    pub stats: MemoStats,
+    /// Triggered checkpoints that failed, by a write on a single-threaded
+    /// runtime or by a Shared memo's checkpoint thread.
+    pub auto_checkpoint_errors: u64,
+    /// The text of the latest failure a write's triggered checkpoint
+    /// raised; the checkpoint thread's failures carry none.
+    pub last_auto_checkpoint_error: Option<String>,
+}
+
+impl PyMemoStats {
+    /// The counts `memo.stats()` returns beside `last_auto_checkpoint_error`.
+    pub fn counts(&self) -> [(&'static str, u64); 6] {
+        let stats = &self.stats;
+        [
+            ("entries", stats.entries),
+            ("bytes", stats.bytes),
+            ("unsaved_entries", stats.unsaved_entries),
+            ("unsaveable", stats.unsaveable),
+            ("evicted_last_checkpoint", stats.evicted_last_checkpoint),
+            ("auto_checkpoint_errors", self.auto_checkpoint_errors),
+        ]
+    }
 }
 
 impl<B: PyBinding> MemoCore<B> {
@@ -367,24 +400,58 @@ where
 
     /// Runs a due checkpoint after a logged write or batch commit on a
     /// single-threaded runtime; a Shared memo's checkpoint thread runs it
-    /// instead. Does nothing when no memo is open. A checkpoint another
-    /// handle holds (`Busy`) is left for the next write, which finds it
-    /// still due; any other failure raises, after the write has landed.
-    pub fn after_write(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<()> {
+    /// instead. Does nothing when no memo is open. Never raises, since the
+    /// write has landed: a failure is counted in [`Self::stats`] and the
+    /// checkpoint stays due, retried by the first write after a compute
+    /// adds an unsaved entry. A checkpoint another handle holds (`Busy`)
+    /// is left for the next write, which finds it still due.
+    pub fn after_write(&self, core: &StoreCore<B>, py: Python<'_>) {
         if !<B::C as Cells>::SINGLE_THREADED || !self.is_open() {
-            return Ok(());
+            return;
         }
-        self.run_checkpoint(core, py, |memo| match memo.checkpoint_if_due() {
+        let retry_above = self.auto().retry_above;
+        if let Some(noted) = retry_above {
+            match self.memo_stats(core, py) {
+                Ok(stats) if stats.unsaved_entries > noted => {}
+                Ok(_) => return,
+                Err(e) => return self.note_auto_failure(core, py, &e),
+            }
+        }
+        let done = self.run_checkpoint(core, py, |memo| match memo.checkpoint_if_due() {
             Err(Error::Busy) => Ok(None),
             done => done,
-        })
-        .map(drop)
+        });
+        match done {
+            Ok(_) => self.auto().retry_above = None,
+            Err(e) => self.note_auto_failure(core, py, &e),
+        }
+    }
+
+    fn note_auto_failure(&self, core: &StoreCore<B>, py: Python<'_>, error: &PyErr) {
+        let text = error.to_string();
+        let unsaved = self
+            .memo_stats(core, py)
+            .map_or(0, |stats| stats.unsaved_entries);
+        let mut auto = self.auto();
+        auto.errors += 1;
+        auto.last_error = Some(text);
+        auto.retry_above = Some(unsaved);
+    }
+
+    fn memo_stats(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<MemoStats> {
+        let memo = carry::<B, _>(self.memo()?);
+        B::read(py, core.store(), move |_, _| memo.into_inner().stats())
     }
 
     /// The memo's counts, read without touching the backend.
-    pub fn stats(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<MemoStats> {
-        let memo = carry::<B, _>(self.memo()?);
-        B::read(py, core.store(), move |_, _| memo.into_inner().stats())
+    pub fn stats(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<PyMemoStats> {
+        let stats = self.memo_stats(core, py)?;
+        let auto = self.auto();
+        Ok(PyMemoStats {
+            auto_checkpoint_errors: stats.auto_checkpoint_errors + auto.errors,
+            last_auto_checkpoint_error: auto.last_error.clone(),
+            stats,
+        })
     }
 
     fn run_checkpoint(

@@ -11,7 +11,15 @@ import pytest
 
 PACKAGES = [pytest.param(incr.persist, id="local")]
 
-STATS = {"entries", "bytes", "unsaved_entries", "unsaveable", "evicted_last_checkpoint"}
+STATS = {
+    "entries",
+    "bytes",
+    "unsaved_entries",
+    "unsaveable",
+    "evicted_last_checkpoint",
+    "auto_checkpoint_errors",
+    "last_auto_checkpoint_error",
+}
 
 
 @pytest.fixture(params=PACKAGES)
@@ -67,7 +75,7 @@ def reopen(persist, graph, backends, **memo_options):
     return Graph(persist, *backends, **memo_options)
 
 
-def test_stats_has_the_five_fields_and_counts_unsaved_entries(persist, backends):
+def test_stats_has_its_fields_and_counts_unsaved_entries(persist, backends):
     graph = Graph(persist, *backends)
     stats = graph.memo.stats()
     assert set(stats) == STATS
@@ -209,3 +217,93 @@ def test_checkpoint_after_entries_must_be_positive(persist, backends):
     with pytest.raises(ValueError, match="checkpoint_after_entries"):
         store.open_memo(memo_backend, checkpoint_after_entries=0)
     store.open_memo(memo_backend, checkpoint_after_entries=1)
+
+
+class FailingMemo:
+    """A memo backend whose `write_generation` raises while `fail` is set,
+    counting the attempts."""
+
+    def __init__(self, persist):
+        self.inner = persist.MemoryMemo()
+        self.fail = False
+        self.writes = 0
+
+    def lock_checkpoint(self):
+        return self.inner.lock_checkpoint()
+
+    def load(self):
+        return self.inner.load()
+
+    def read_entry(self, *args):
+        return self.inner.read_entry(*args)
+
+    def write_generation(self, *args):
+        self.writes += 1
+        if self.fail:
+            raise OSError("memo disk full")
+        return self.inner.write_generation(*args)
+
+    def remove_generation(self, *args):
+        return self.inner.remove_generation(*args)
+
+
+@pytest.fixture
+def failing(persist):
+    memo_backend = FailingMemo(persist)
+    graph = Graph(persist, persist.MemoryBackend(), memo_backend, checkpoint_after_entries=3)
+    for k in range(3):
+        graph.read(k)
+    memo_backend.fail = True
+    return graph, memo_backend
+
+
+def test_a_failed_triggered_checkpoint_leaves_the_write_returning_once(failing):
+    graph, memo_backend = failing
+    position = graph.store.stats()["position"]
+    assert graph.store.set(graph.tick, 1) is None
+    assert graph.store.stats()["position"] == position + 1
+    stats = graph.memo.stats()
+    assert stats["auto_checkpoint_errors"] == 1
+    assert "memo disk full" in stats["last_auto_checkpoint_error"]
+    assert memo_backend.writes == 1
+
+
+def test_a_failed_triggered_checkpoint_waits_for_a_new_compute(failing):
+    graph, memo_backend = failing
+    graph.store.set(graph.tick, 1)
+    graph.store.set(graph.tick, 2)
+    assert memo_backend.writes == 1
+    assert graph.memo.stats()["auto_checkpoint_errors"] == 1
+    graph.read(10)
+    memo_backend.fail = False
+    graph.store.set(graph.tick, 3)
+    assert memo_backend.writes == 2
+    stats = graph.memo.stats()
+    assert (stats["unsaved_entries"], stats["entries"]) == (0, 4)
+    assert stats["auto_checkpoint_errors"] == 1
+
+
+def test_reconcile_returns_its_counts_when_the_triggered_checkpoint_fails(failing):
+    graph, _ = failing
+    kc = graph.store.keyed_collection("kc", CountingCodec(), CountingCodec())
+    assert graph.store.reconcile(kc, {"a": 1, "b": 2}) == (2, 0, 0)
+    assert graph.memo.stats()["auto_checkpoint_errors"] == 1
+
+
+def test_an_on_write_batch_commits_when_the_triggered_checkpoint_fails(failing):
+    graph, _ = failing
+    position = graph.store.stats()["position"]
+    with graph.store.batch(apply="on_write") as b:
+        b.set(graph.tick, 1)
+    assert graph.store.stats()["position"] == position + 1
+    graph.store.set(graph.tick, 2)
+    assert graph.store.runtime.get(graph.tick) == 2
+
+
+def test_explicit_checkpoints_still_raise(failing):
+    graph, _ = failing
+    with pytest.raises(OSError, match="memo disk full"):
+        graph.memo.checkpoint_if_due()
+    with pytest.raises(OSError, match="memo disk full"):
+        graph.memo.checkpoint()
+    assert graph.memo.stats()["auto_checkpoint_errors"] == 0
