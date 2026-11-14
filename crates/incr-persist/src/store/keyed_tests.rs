@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::collection::fp_of_elements;
 use super::dep_index::{DepFp, DepIndex};
 use super::{Options, PendingWrite, PersistedKeyed, Store};
+use crate::memo::{BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo};
 use crate::{
     Backend, Cells, Error, Kind, Local, MemoryBackend, Position, ReadOutcome, Record, Result,
     Shared, SnapshotId,
@@ -53,6 +54,11 @@ local_and_shared!(
     an_upsert_back_to_the_held_row_still_wins_over_a_foreign_write,
     a_reconcile_overtaken_by_a_foreign_insert_removes_it,
     a_reconcile_keeps_keys_staged_earlier_in_the_write,
+    key_readers_rerun_for_local_and_foreign_writes_to_their_key,
+    a_snapshot_converge_reruns_only_the_changed_keys,
+    delete_and_forget_rerun_key_readers,
+    a_scope_write_and_its_undo_rerun_key_readers,
+    undeclare_is_refused_while_a_query_reads_a_key,
 );
 
 fn open<C: Cells, B: Backend>(backend: B) -> Store<C, B> {
@@ -510,6 +516,23 @@ fn user_drops_run_after_the_dep_index_hold<C: Cells>() {
     assert_eq!(kb.row(&1), Some(w("f")));
     b.delete(&kb).unwrap();
 
+    let kw = b
+        .keyed_collection::<Watched, Watched, (Watched, Watched)>("w")
+        .unwrap();
+    b.upsert(&kw, w("x"), w("1")).unwrap();
+    let captured = Captured(kw.clone());
+    let reader = b
+        .runtime()
+        .create_query(move |rt| captured.get().get_key(rt, &w("x")));
+    assert_eq!(b.runtime().get(reader), Some(w("1")));
+    b.runtime().delete_node(reader);
+    let reclaimed = DROPS.get().0;
+    b.remove(&kw, &w("x")).unwrap();
+    if C::SINGLE_THREADED {
+        assert_eq!(kw.version_input(&w("x")), None, "the input was reclaimed");
+    }
+    assert!(DROPS.get().0 > reclaimed);
+
     WATCHED.with(|watched| *watched.borrow_mut() = None);
     let (all, held) = DROPS.get();
     assert!(all > 0, "the writes dropped no Watched value");
@@ -649,3 +672,363 @@ fn a_reconcile_keeps_keys_staged_earlier_in_the_write<C: Cells>() {
     store.write_pending(pending).unwrap();
     assert_eq!(pairs(&store, &kc), [pair(2, "y"), pair(3, "z")]);
 }
+
+/// Lets a query closure, which must be `Send + Sync`, capture a keyed
+/// collection.
+struct Captured<T>(T);
+
+// SAFETY: every test runs a `Local` store and its handles on the one
+// thread that opened it; `Shared` handles are `Send + Sync` anyway.
+unsafe impl<T> Send for Captured<T> {}
+// SAFETY: see `Send`.
+unsafe impl<T> Sync for Captured<T> {}
+
+impl<T> Captured<T> {
+    fn get(&self) -> &T {
+        &self.0
+    }
+}
+
+/// A query reading `key` through `get_key`, and how often it ran.
+struct Reader {
+    query: incr_core::Incr<Option<String>>,
+    runs: Arc<AtomicUsize>,
+}
+
+impl Reader {
+    fn new<C: Cells, B: Backend>(store: &Store<C, B>, kc: &Kc<C>, key: u32) -> Self {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let kc = Captured(kc.clone());
+        let query = store.runtime().create_query(move |rt| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            kc.get().get_key(rt, &key)
+        });
+        Reader { query, runs }
+    }
+
+    /// The row read and how often the query has run, after reading it.
+    fn read<C: Cells, B: Backend>(&self, store: &Store<C, B>) -> (Option<String>, usize) {
+        let row = store.runtime().get(self.query);
+        (row, self.runs.load(Ordering::SeqCst))
+    }
+}
+
+fn key_readers_rerun_for_local_and_foreign_writes_to_their_key<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka = keyed(&a);
+    let b = open::<C, _>(log.clone());
+    let kb = keyed(&b);
+    a.upsert(&ka, 1, s("a")).unwrap();
+    a.upsert(&ka, 2, s("b")).unwrap();
+    let one = Reader::new(&a, &ka, 1);
+    let two = Reader::new(&a, &ka, 2);
+    assert_eq!(one.read(&a), (Some(s("a")), 1));
+    assert_eq!(two.read(&a), (Some(s("b")), 1));
+
+    a.upsert(&ka, 1, s("c")).unwrap();
+    assert_eq!(one.read(&a), (Some(s("c")), 2));
+    assert_eq!(two.read(&a), (Some(s("b")), 1));
+
+    a.upsert(&ka, 1, s("c")).unwrap();
+    assert_eq!(one.read(&a), (Some(s("c")), 2), "an equal row");
+
+    b.refresh().unwrap();
+    b.upsert(&kb, 2, s("d")).unwrap();
+    a.refresh().unwrap();
+    assert_eq!(two.read(&a), (Some(s("d")), 2));
+    assert_eq!(one.read(&a), (Some(s("c")), 2));
+
+    a.remove(&ka, &1).unwrap();
+    assert_eq!(one.read(&a), (None, 3));
+    a.upsert(&ka, 1, s("e")).unwrap();
+    assert_eq!(one.read(&a), (Some(s("e")), 4));
+}
+
+fn a_snapshot_converge_reruns_only_the_changed_keys<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka = keyed(&a);
+    let b = open::<C, _>(log.clone());
+    let kb = keyed(&b);
+    for (k, v) in [(1, "a"), (2, "b"), (4, "d")] {
+        a.upsert(&ka, k, s(v)).unwrap();
+    }
+    b.refresh().unwrap();
+    let readers: Vec<Reader> = (1..=4).map(|k| Reader::new(&b, &kb, k)).collect();
+    for reader in &readers {
+        reader.read(&b);
+    }
+
+    a.upsert(&ka, 1, s("c")).unwrap();
+    a.remove(&ka, &2).unwrap();
+    a.upsert(&ka, 3, s("e")).unwrap();
+    a.checkpoint().unwrap();
+    b.refresh().unwrap();
+
+    let read: Vec<(Option<String>, usize)> = readers.iter().map(|r| r.read(&b)).collect();
+    assert_eq!(
+        read,
+        [
+            (Some(s("c")), 2),
+            (None, 2),
+            (Some(s("e")), 2),
+            (Some(s("d")), 1),
+        ]
+    );
+}
+
+fn delete_and_forget_rerun_key_readers<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let one = Reader::new(&store, &kc, 1);
+    assert_eq!(one.read(&store), (Some(s("a")), 1));
+    store.delete(&kc).unwrap();
+    assert_eq!(one.read(&store), (None, 2));
+    store.upsert(&kc, 1, s("b")).unwrap();
+    assert_eq!(one.read(&store), (Some(s("b")), 3));
+    log.append(&[Record::Forget { key: s("k") }]).unwrap();
+    store.refresh().unwrap();
+    assert_eq!(one.read(&store), (None, 4));
+}
+
+fn a_scope_write_and_its_undo_rerun_key_readers<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let one = Reader::new(&store, &kc, 1);
+    assert_eq!(one.read(&store), (Some(s("a")), 1));
+    let rt = store.runtime();
+
+    let scope = store.unlogged_scope().unwrap();
+    let overlay = scope.keyed(&kc).unwrap();
+    let mut journal = Vec::new();
+    overlay.upsert_journaled(rt, 1, s("z"), Some(&mut journal));
+    assert_eq!(one.read(&store), (Some(s("z")), 2));
+    let absent = Reader::new(&store, &kc, 9);
+    assert_eq!(absent.read(&store), (None, 1));
+    overlay.apply_pairs_with(
+        rt,
+        journal.into_iter().rev().map(PairOp::inverse),
+        &mut (),
+        None,
+    );
+    scope.close().unwrap();
+    assert_eq!(one.read(&store), (Some(s("a")), 3));
+    assert!(
+        kc.version_input(&9).is_some(),
+        "a version input created inside the scope stays"
+    );
+}
+
+fn undeclare_is_refused_while_a_query_reads_a_key<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let one = Reader::new(&store, &kc, 1);
+    one.read(&store);
+    assert!(matches!(
+        store.undeclare(&kc),
+        Err(Error::HasDependents { key }) if key == "k"
+    ));
+    let version = kc.version_input(&1).unwrap();
+    store.runtime().delete_node(one.query);
+    store.undeclare(&kc).unwrap();
+    assert!(!store.runtime().is_alive(version));
+}
+
+/// One process over `log` and `memo`: a memo table `price` whose entry for
+/// key `k` reads row `k` of the keyed collection through `get_key`.
+struct Priced<C: MemoCells> {
+    store: Arc<Store<C, MemoryBackend>>,
+    kc: Kc<C>,
+    memo: Memo<C, MemoryBackend>,
+    price: MemoTable<u32, Option<String>>,
+    runs: Arc<AtomicUsize>,
+}
+
+impl<C: MemoCells> Priced<C> {
+    fn open(log: &MemoryBackend, memo: &MemoryMemo) -> Self {
+        Self::on(Arc::new(open::<C, _>(log.clone())), memo)
+    }
+
+    fn on(store: Arc<Store<C, MemoryBackend>>, memo: &MemoryMemo) -> Self {
+        let kc = keyed(&store);
+        let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0x51)));
+        let price = builder.table::<u32, Option<String>>("price", 1);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let captured = Captured(kc.clone());
+        builder.define(price, move |ctx, k| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            captured.get().get_key(ctx.rt(), k)
+        });
+        let memo = builder.open(&store, memo.clone()).unwrap();
+        Priced {
+            store,
+            kc,
+            memo,
+            price,
+            runs,
+        }
+    }
+
+    fn read(&self, k: u32) -> Option<String> {
+        let q = self.memo.get_or_insert(self.price, k);
+        self.memo.runtime().get(q)
+    }
+
+    fn runs(&self) -> usize {
+        self.runs.load(Ordering::SeqCst)
+    }
+}
+
+/// Fills keys 1 to 3, computes their entries and checkpoints them.
+fn priced_checkpoint<C: MemoCells>(log: &MemoryBackend, memo: &MemoryMemo) {
+    let p = Priced::<C>::open(log, memo);
+    for (k, v) in [(1, "a"), (2, "b"), (3, "c")] {
+        p.store.upsert(&p.kc, k, s(v)).unwrap();
+    }
+    for k in 1..=3 {
+        p.read(k);
+    }
+    assert_eq!(p.memo.checkpoint().unwrap().written, 3);
+}
+
+fn row_deps_verify_after_reopen_while_rows_match<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    priced_checkpoint::<C>(&log, &memo);
+    let p = Priced::<C>::open(&log, &memo);
+    assert_eq!(
+        (1..=3).map(|k| p.read(k)).collect::<Vec<_>>(),
+        [Some(s("a")), Some(s("b")), Some(s("c"))]
+    );
+    assert_eq!(p.runs(), 0);
+    let stats = p.memo.stats();
+    assert_eq!((stats.reused, stats.revalidated, stats.cold), (3, 0, 0));
+    p.store.upsert(&p.kc, 2, s("x")).unwrap();
+    assert_eq!(p.read(2), Some(s("x")));
+    assert_eq!(p.runs(), 1);
+}
+
+fn a_changed_row_reruns_and_a_removed_key_runs_after_reopen<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    priced_checkpoint::<C>(&log, &memo);
+    {
+        let store = open::<C, _>(log.clone());
+        let kc = keyed(&store);
+        store.upsert(&kc, 2, s("x")).unwrap();
+        store.remove(&kc, &3).unwrap();
+    }
+    let p = Priced::<C>::open(&log, &memo);
+    assert_eq!(
+        (1..=3).map(|k| p.read(k)).collect::<Vec<_>>(),
+        [Some(s("a")), Some(s("x")), None]
+    );
+    assert_eq!(p.runs(), 2);
+    let stats = p.memo.stats();
+    assert_eq!((stats.reused, stats.revalidated, stats.cold), (1, 2, 0));
+}
+
+fn a_key_read_before_the_memo_opens_still_maps<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    priced_checkpoint::<C>(&log, &memo);
+    let store = Arc::new(open::<C, _>(log.clone()));
+    let kc = keyed(&store);
+    let early = Reader::new(&store, &kc, 1);
+    assert_eq!(early.read(&store), (Some(s("a")), 1));
+    let p = Priced::<C>::on(store, &memo);
+    assert_eq!(p.read(1), Some(s("a")));
+    assert_eq!(p.runs(), 0);
+    assert_eq!(p.memo.stats().reused, 1);
+}
+
+/// A scope's upsert and its undo by another upsert leave the key's row
+/// as logged but at the default rank, which no logged pair has; an entry
+/// reading it must not checkpoint as reading the logged row, or a later
+/// logged removal would leave it verified against an absent key.
+fn a_row_restored_in_a_scope_at_the_default_rank_does_not_checkpoint<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    {
+        let p = Priced::<C>::open(&log, &memo);
+        p.store.upsert(&p.kc, 1, s("a")).unwrap();
+        let rt = p.store.runtime();
+        let scope = p.store.unlogged_scope().unwrap();
+        let overlay = scope.keyed(&p.kc).unwrap();
+        overlay.upsert(rt, 1, s("b"));
+        overlay.upsert(rt, 1, s("a"));
+        scope.close().unwrap();
+        assert_eq!(p.kc.row(&1), Some(s("a")));
+        assert_eq!(p.read(1), Some(s("a")));
+        p.memo.checkpoint().unwrap();
+        p.store.remove(&p.kc, &1).unwrap();
+    }
+    let p = Priced::<C>::open(&log, &memo);
+    assert_eq!(p.read(1), None);
+    assert_eq!(p.runs(), 1);
+}
+
+/// A compute's first read of a key creates its version input. Every path
+/// to the store mutex refuses a running compute, so the read takes none.
+fn a_key_read_in_a_compute_creates_its_input_without_the_store<C: Cells>() {
+    let store = open::<C, _>(MemoryBackend::new());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let reader = Reader::new(&store, &kc, 1);
+    assert_eq!(kc.version_input(&1), None);
+    assert_eq!(store.runtime().get(reader.query), Some(s("a")));
+    assert!(kc.version_input(&1).is_some());
+}
+
+local_and_shared!(a_key_read_in_a_compute_creates_its_input_without_the_store);
+
+#[test]
+fn a_key_read_in_a_compute_runs_while_another_thread_holds_the_store() {
+    let store = Arc::new(open::<Shared, _>(MemoryBackend::new()));
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let reader = Reader::new(&store, &kc, 1);
+    let held = store.state().unwrap();
+    let (sent, read) = std::sync::mpsc::channel();
+    let reading = Arc::clone(&store);
+    let thread = std::thread::spawn(move || {
+        sent.send(reading.runtime().get(reader.query)).unwrap();
+    });
+    let row = read
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the read waited on the store mutex");
+    drop(held);
+    thread.join().unwrap();
+    assert_eq!(row, Some(s("a")));
+    assert!(kc.version_input(&1).is_some());
+}
+
+macro_rules! memo_local_and_shared {
+    ($($name:ident),* $(,)?) => {
+        $(
+            mod $name {
+                #[test]
+                fn local() {
+                    super::$name::<crate::Local>();
+                }
+
+                #[test]
+                fn shared() {
+                    super::$name::<crate::Shared>();
+                }
+            }
+        )*
+    };
+}
+
+memo_local_and_shared!(
+    row_deps_verify_after_reopen_while_rows_match,
+    a_changed_row_reruns_and_a_removed_key_runs_after_reopen,
+    a_key_read_before_the_memo_opens_still_maps,
+    a_row_restored_in_a_scope_at_the_default_rank_does_not_checkpoint,
+);

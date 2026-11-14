@@ -3773,3 +3773,55 @@ fn loom_keyed_writer_against_a_row_reader() {
         assert_eq!(keyed.pairs().values(&rt), vec![(1, 20)]);
     });
 }
+
+/// A query reads a key through `get_key`, creating its version input,
+/// while a writer replaces the key's row. Whichever order the creation and
+/// the writer's version set take, the query ends on the new row: either
+/// it read the new row, or the set reached the input it depends on.
+#[test]
+fn loom_keyed_get_key_creates_its_input_against_an_upsert() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let keyed = Arc::new(Keyed::new(&rt));
+        keyed.upsert(&rt, 1, 10);
+        let reading = Arc::clone(&keyed);
+        let reader = rt.create_query(move |rt: &Rt| reading.get_key(rt, &1));
+        let writer = {
+            let (rt, keyed) = (Arc::clone(&rt), Arc::clone(&keyed));
+            thread::spawn(move || keyed.upsert(&rt, 1, 20))
+        };
+        let read = rt.get(reader);
+        assert!(read == Some(10) || read == Some(20), "read {read:?}");
+        writer.join().unwrap();
+        assert_eq!(rt.get(reader), Some(20));
+        assert!(keyed.version_input(&1).is_some());
+    });
+}
+
+/// Two writers replace one key's row while a query reads it through
+/// `get_key`: after both, the query reads the row the key holds.
+#[test]
+fn loom_keyed_two_writers_one_key_with_a_get_key_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let keyed = Arc::new(Keyed::new(&rt));
+        keyed.upsert(&rt, 1, 10);
+        let reading = Arc::clone(&keyed);
+        let reader = rt.create_query(move |rt: &Rt| reading.get_key(rt, &1));
+        assert_eq!(rt.get(reader), Some(10));
+        let writers: Vec<_> = [20_u64, 30]
+            .into_iter()
+            .map(|row| {
+                let (rt, keyed) = (Arc::clone(&rt), Arc::clone(&keyed));
+                thread::spawn(move || keyed.upsert(&rt, 1, row))
+            })
+            .collect();
+        let read = rt.get(reader);
+        assert!(matches!(read, Some(10 | 20 | 30)), "read {read:?}");
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let row = keyed.row(&1).expect("the key holds a row");
+        assert_eq!(rt.get(reader), Some(row));
+    });
+}

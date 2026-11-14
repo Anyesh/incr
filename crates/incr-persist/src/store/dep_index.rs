@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -73,6 +74,9 @@ pub(crate) struct DepMap {
     /// this map but owns its own external nodes.
     externals: HashMap<(u64, String), External>,
     external_names: HashMap<ErasedIncr, (u64, String)>,
+    /// Each keyed collection's rows by its key, a `keyed::Rows<C>` of the
+    /// store's cells.
+    rows: HashMap<String, Box<dyn Any + Send + Sync>>,
 }
 
 impl DepIndex {
@@ -163,6 +167,7 @@ impl DepMap {
     }
 
     pub(crate) fn unregister(&mut self, key: &str) -> Option<DepEntry> {
+        self.rows.remove(key);
         let entry = self.by_key.remove(key)?;
         self.by_handle.remove(&entry.handle);
         Some(entry)
@@ -193,6 +198,18 @@ impl DepMap {
             DepFp::Known(fp) => self.set_fp(key, fp),
             DepFp::Untrusted => self.untrust(key),
         }
+    }
+
+    pub(crate) fn register_rows(&mut self, key: &str, rows: Box<dyn Any + Send + Sync>) {
+        self.rows.insert(key.to_owned(), rows);
+    }
+
+    pub(crate) fn rows(&self, key: &str) -> Option<&(dyn Any + Send + Sync)> {
+        self.rows.get(key).map(|rows| &**rows)
+    }
+
+    pub(crate) fn all_rows(&self) -> impl Iterator<Item = (&str, &(dyn Any + Send + Sync))> {
+        self.rows.iter().map(|(key, rows)| (key.as_str(), &**rows))
     }
 
     pub(crate) fn key_of(&self, handle: ErasedIncr) -> Option<&str> {

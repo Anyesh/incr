@@ -14,7 +14,7 @@ use crate::{Error, Result};
 /// The leading bytes of a header frame's body.
 pub const MAGIC: [u8; 8] = *b"incrmemo";
 /// The format version this build writes and reads, stored after [`MAGIC`].
-pub const FORMAT: u8 = 2;
+pub const FORMAT: u8 = 3;
 /// The bytes before a frame's body.
 pub const FRAME_HEADER_LEN: usize = 8;
 
@@ -74,6 +74,15 @@ pub enum StoredDep {
     External { name: String, fp: u128 },
     /// Another memo entry: the fingerprint of its encoded value.
     Query { table: u32, key: Vec<u8>, fp: u128 },
+    /// One key of a Store keyed collection, read through `get_key`:
+    /// `key_bytes` encode the key under the collection's key, and `fp` is
+    /// the fingerprint of the bytes the pair read for it was applied from,
+    /// `None` for a key holding no row.
+    Row {
+        collection: String,
+        key_bytes: Vec<u8>,
+        fp: Option<u128>,
+    },
 }
 
 /// One memoized query result. Its identity within a generation is
