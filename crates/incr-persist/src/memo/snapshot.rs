@@ -167,13 +167,22 @@ impl<C: MemoCells> CoreRef<C> {
         let mut unsaveable = found.unsaveable;
         {
             let mut dirty = self.lock_dirty();
-            for (fate, (table, handle, mark, stamp, fp)) in done.fates.iter().zip(&found.origin) {
+            for (fate, origin) in done.fates.iter().zip(&found.origin) {
                 match fate {
                     Fate::Written => {
-                        dirty.saved(*table, *handle, *mark);
-                        state.seed_info.insert(*handle, (*fp, *stamp));
+                        dirty.saved(origin.table, origin.handle, origin.mark);
+                        state
+                            .seed_info
+                            .insert(origin.handle, (origin.fp, origin.stamp));
                     }
-                    Fate::Unkept | Fate::Oversized => unsaveable += 1,
+                    // Nothing else rewrites a clean dep the base lacks.
+                    Fate::Unkept => {
+                        unsaveable += 1;
+                        for &(table, handle) in &origin.clean {
+                            dirty.lost(table, handle);
+                        }
+                    }
+                    Fate::Oversized => unsaveable += 1,
                     Fate::Evicted => {}
                 }
             }
@@ -222,11 +231,22 @@ impl<C: MemoCells> Drop for Attempt<'_, C> {
 /// What [`fresh`] hands the write step and keeps for after it.
 struct Found {
     entries: Vec<Entry>,
-    /// Per entry: its table, handle, dirty mark, stamp and value fp.
-    origin: Vec<(u32, ErasedIncr, u64, u64, u128)>,
+    /// Per entry, in order.
+    origin: Vec<Origin>,
     /// Snapshot entries left out: in a cycle group, a part that does not
     /// round-trip, or a dep that maps to nothing.
     unsaveable: u64,
+}
+
+/// The live entry behind a [`Found::entries`] entry.
+struct Origin {
+    table: u32,
+    handle: ErasedIncr,
+    mark: u64,
+    stamp: u64,
+    fp: u128,
+    /// Its query deps that were clean, by table and handle.
+    clean: Vec<(u32, ErasedIncr)>,
 }
 
 /// The snapshot's entries that every keep rule but the query-dep fixpoint
@@ -307,13 +327,21 @@ fn fresh(
             found.unsaveable += 1;
             continue;
         };
-        found.origin.push((
-            snap.table,
-            snap.handle,
-            snap.mark,
-            snap.stamp,
-            fingerprint(&value),
-        ));
+        found.origin.push(Origin {
+            table: snap.table,
+            handle: snap.handle,
+            mark: snap.mark,
+            stamp: snap.stamp,
+            fp: fingerprint(&value),
+            clean: snap
+                .deps
+                .iter()
+                .filter_map(|dep| match dep {
+                    LiveDep::Query(handle) => Some((clean.get(handle)?.key.table, *handle)),
+                    _ => None,
+                })
+                .collect(),
+        });
         found.entries.push(Entry {
             table: snap.table,
             key,

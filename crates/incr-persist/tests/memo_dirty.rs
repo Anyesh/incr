@@ -43,6 +43,7 @@ both!(
     a_failed_checkpoint_leaves_its_entries_unsaved,
     a_checkpoint_with_nothing_fresh_writes_nothing,
     a_cutoff_recompute_keeps_the_bytes_its_clean_dependents_name,
+    a_clean_dep_the_base_lost_is_written_again,
 );
 
 const BUILD: u128 = 0xd1;
@@ -447,6 +448,57 @@ fn a_cutoff_recompute_keeps_the_bytes_its_clean_dependents_name<C: MemoCells>() 
     let (store, x, memo, read, runs) = open();
     store.set(x, 5).unwrap();
     assert_eq!(memo.runtime().get(read), 12);
+    assert_eq!(runs.load(SeqCst), 0);
+    assert_eq!(memo.stats().reused, 2);
+}
+
+/// `parent(k) = child(k) + y`, `child(k) = k * x`. Another build replaces
+/// the base after both were stored, so the next checkpoint cannot keep the
+/// rerun parent over its clean child; it marks the child lost, and the
+/// checkpoint after it writes both, which a reopen reuses.
+fn a_clean_dep_the_base_lost_is_written_again<C: MemoCells>() {
+    let backends = Backends::new();
+    let open = || {
+        let store = backends.store::<C>();
+        let x = store.input("x", 3_u64).unwrap();
+        let y = store.input("y", 10_u64).unwrap();
+        let (xh, yh, runs) = (x.handle(), y.handle(), Arc::new(AtomicUsize::new(0)));
+        let mut builder = MemoBuilder::new(options());
+        let child = builder.table::<u32, u64>("child", 1);
+        let parent = builder.table::<u32, u64>("parent", 1);
+        let counter = Arc::clone(&runs);
+        builder.define(child, move |ctx, &k| {
+            counter.fetch_add(1, SeqCst);
+            u64::from(k) * ctx.rt().get(xh)
+        });
+        let counter = Arc::clone(&runs);
+        builder.define(parent, move |ctx, &k| {
+            counter.fetch_add(1, SeqCst);
+            ctx.get(child, k) + ctx.rt().get(yh)
+        });
+        let memo = builder.open(&store, backends.memo.clone()).unwrap();
+        let read = memo.get_or_insert(parent, 2);
+        (store, y, memo, read, runs)
+    };
+    {
+        let (store, y, memo, read, _) = open();
+        assert_eq!(memo.runtime().get(read), 16);
+        memo.checkpoint().unwrap();
+        let other = Backends {
+            log: MemoryBackend::new(),
+            memo: backends.memo.clone(),
+        };
+        let w = Leaves::<C>::open(&other, MemoOptions::new(BuildId::Fixed(BUILD + 1)));
+        w.read(1);
+        w.memo.checkpoint().unwrap();
+        store.set(y, 20).unwrap();
+        assert_eq!(memo.runtime().get(read), 26);
+        assert_eq!(memo.checkpoint().unwrap().unkept, 1);
+        assert_eq!(memo.checkpoint().unwrap().written, 2);
+    }
+    let (store, y, memo, read, runs) = open();
+    store.set(y, 20).unwrap();
+    assert_eq!(memo.runtime().get(read), 26);
     assert_eq!(runs.load(SeqCst), 0);
     assert_eq!(memo.stats().reused, 2);
 }
