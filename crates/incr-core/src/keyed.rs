@@ -1225,7 +1225,7 @@ where
             drop(table);
             drop(log);
             let hashes = mem::take(&mut stage.changed_hashes);
-            self.bump(rt, &hashes);
+            let queued = self.bump(rt, &hashes);
             let outcome = stage.outcome(epoch);
             match keep.as_deref_mut() {
                 Some(keep) => {
@@ -1243,25 +1243,32 @@ where
                         .publish_batch(rt, committed, move || drop((dropped, stage)));
                 }
             }
+            if queued {
+                rt.route_queued();
+            }
             self.reclaim(rt, &hashes, keep);
             return outcome;
         }
     }
 
     /// Sets the version input of every key with one of `hashes` to a fresh
-    /// value. Runs no user code.
-    fn bump(&self, rt: &Runtime<C>, hashes: &[u64]) {
+    /// value without routing: whether a set queued a router, which the
+    /// caller routes once the write's other sets are done. Runs no user
+    /// code.
+    fn bump(&self, rt: &Runtime<C>, hashes: &[u64]) -> bool {
         if hashes.is_empty() || !self.versions.any() {
-            return;
+            return false;
         }
         let value = C::u64_fetch_add(&self.versions.changes, 1);
         let handles: Vec<Incr<u64>> = {
             let map = self.versions.map.read();
             map.by_hashes(hashes).map(|(_, _, handle)| handle).collect()
         };
+        let mut queued = false;
         for handle in handles {
-            rt.set(handle, value);
+            queued |= rt.set_unrouted(handle, value);
         }
+        queued
     }
 
     /// Under `Local`, deletes the version input of each key with one of
