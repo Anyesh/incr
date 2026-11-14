@@ -7,12 +7,16 @@
 //! per persisted slot.
 
 pub mod backend;
+pub mod batch;
 pub mod binding;
 pub mod codec;
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod keyed;
+pub mod memo;
 pub mod memo_backend;
 mod memory;
+pub mod scope;
 pub mod store;
 
 #[doc(hidden)]

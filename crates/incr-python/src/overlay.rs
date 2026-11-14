@@ -81,7 +81,10 @@ impl Overlay {
     }
 
     pub(crate) fn touch(&mut self, node: &PyNodeId) -> PyResult<()> {
-        self.persist.as_mut().ok_or_else(no_scope)?.touch(node)
+        self.persist
+            .as_mut()
+            .ok_or_else(no_scope)?
+            .touch(node.inner)
     }
 
     pub(crate) fn writable_collection(
@@ -91,7 +94,7 @@ impl Overlay {
         self.persist
             .as_mut()
             .ok_or_else(no_scope)?
-            .collection(collection)
+            .collection(collection.inner.version_node().slot())
     }
 
     pub(crate) fn writable_keyed(

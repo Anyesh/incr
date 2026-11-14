@@ -40,8 +40,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use incr_compute::{
     Change, DeleteError, ErasedIncr, Incr, IncrCollection, NodeId, NodeTable, PropagationTrace,
@@ -1318,10 +1317,10 @@ struct PyRuntime {
 /// pyclass object to 16 bytes.
 enum Holder {
     Owned(Box<Runtime>),
-    Persisted(Rc<persist::StoreCore>),
+    Persisted(Arc<persist::StoreCore>),
     Poisoned(#[expect(dead_code, reason = "held so close drops it")] Box<Runtime>),
     PoisonedPersisted(
-        #[expect(dead_code, reason = "held so close drops it")] Rc<persist::StoreCore>,
+        #[expect(dead_code, reason = "held so close drops it")] Arc<persist::StoreCore>,
     ),
     Closed,
 }
@@ -1340,7 +1339,7 @@ const _: () = {
 };
 
 impl PyRuntime {
-    fn persisted(core: Rc<persist::StoreCore>) -> Self {
+    fn persisted(core: Arc<persist::StoreCore>) -> Self {
         PyRuntime {
             holder: Holder::Persisted(core),
             version_bridges: RefCell::new(HashMap::new()),
@@ -1395,7 +1394,7 @@ impl PyRuntime {
         }
     }
 
-    pub(crate) fn store_core(&self) -> Option<&Rc<persist::StoreCore>> {
+    pub(crate) fn store_core(&self) -> Option<&Arc<persist::StoreCore>> {
         match &self.holder {
             Holder::Persisted(core) => Some(core),
             _ => None,

@@ -2,74 +2,44 @@
 //! live in a backend's log. Writes to them go through the store; the
 //! runtime and the graph API read them like any other node.
 
-use std::cell::{OnceCell, RefCell};
-use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
-use incr_core::Local;
-use incr_persist::memo::{Memo, MemoBuilder};
-use incr_persist::{Input, PersistedCollection, Store};
-use incr_python_persist::store::StoreCore as BaseCore;
-use incr_python_protocol::{PyKey, PyValue};
+use incr_python_persist::keyed::Pending;
+use incr_python_persist::memo::MemoCore;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use super::batch::PyBatch;
-use super::keyed::Pending;
 use super::memo::{self, PyMemo, PyMemoTable};
-use super::PyBackend;
-use super::{LocalBinding, PairCodec, Slot};
+use super::{LocalBinding, PyPersistedKeyed, StoreCore};
 use crate::overlay::Born;
-use crate::{engine_write, KeyCounts, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
+use crate::{
+    key_counts, reconcile_pairs, KeyCounts, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime,
+};
 
-pub(super) type PyPersistedCollection = PersistedCollection<PyValue, Local>;
-
-/// What the store's Python objects share: the incr-persist store with the
-/// runtime it owns, the codecs of its slots, and the persisted nodes the
-/// binding must keep direct writes off.
-pub(crate) struct StoreCore {
-    pub(super) base: BaseCore<LocalBinding>,
-    pub(super) memo_builder: RefCell<Option<MemoBuilder<Local>>>,
-    pub(super) memo_decls: RefCell<Vec<super::memo::MemoDecl>>,
-    pub(super) memo: OnceCell<Memo<Local, PyBackend>>,
-    collections: RefCell<HashMap<u32, PyPersistedCollection>>,
+/// The version slot of `collection`, which store calls name it by.
+pub(super) fn version_slot(collection: &PyCollection) -> u32 {
+    collection.inner.version_node().slot()
 }
 
-impl StoreCore {
-    pub(crate) fn runtime(&self) -> &incr_compute::Runtime {
-        self.base.runtime()
-    }
-
-    pub(crate) fn is_persisted_input(&self, slot: u32) -> bool {
-        self.base.is_persisted_input(slot)
-    }
-
-    pub(super) fn input_of(&self, node: &PyNodeId) -> PyResult<Input<PyValue>> {
-        self.base.input_of(node.inner)
-    }
-
-    pub(super) fn collection_of(
-        &self,
-        collection: &PyCollection,
-    ) -> PyResult<PyPersistedCollection> {
-        self.collections
-            .borrow()
-            .get(&collection.inner.version_node().slot())
-            .cloned()
-            .ok_or_else(|| {
-                PyValueError::new_err("collection is not a persisted collection of this store")
-            })
-    }
-
-    /// Runs a store call with the store's codecs active.
-    pub(super) fn run<R>(
-        &self,
-        py: Python<'_>,
-        f: impl FnOnce(&Store<Local, PyBackend>) -> incr_persist::Result<R>,
-    ) -> PyResult<R> {
-        self.base.registry().run(py, || f(self.base.store()))
-    }
+/// The handle of `kc`, which must be a keyed collection `core` persists.
+pub(super) fn keyed_of(
+    py: Python<'_>,
+    core: &Arc<StoreCore>,
+    kc: &PyKeyedCollection,
+) -> PyResult<PyPersistedKeyed> {
+    let runtime = kc.rt.bind(py).borrow();
+    kc.persisted_handle()
+        .filter(|_| {
+            runtime
+                .store_core()
+                .is_some_and(|owner| Arc::ptr_eq(owner, core))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            PyValueError::new_err("collection is not a persisted keyed collection of this store")
+        })
 }
 
 /// Persisted inputs and collections over a backend, and the runtime that
@@ -90,14 +60,15 @@ impl StoreCore {
 /// `insert`, `delete`, `extend` and `replace` raise `RuntimeError`.
 #[pyclass(name = "Store", module = "incr.persist", unsendable)]
 pub(crate) struct PyStore {
-    core: Option<Rc<StoreCore>>,
+    core: Option<Arc<StoreCore>>,
+    pub(super) memo: MemoCore<LocalBinding>,
     pub(super) runtime: Py<PyRuntime>,
 }
 
 const _: () = assert!(std::mem::align_of::<PyStore>() <= 16);
 
 impl PyStore {
-    pub(super) fn core(&self) -> PyResult<&Rc<StoreCore>> {
+    pub(super) fn core(&self) -> PyResult<&Arc<StoreCore>> {
         self.core
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
@@ -106,13 +77,13 @@ impl PyStore {
     /// The core of a store whose runtime is usable: a runtime poisoned by
     /// a failed overlay restore refuses every store call, since a
     /// checkpoint would fold the half-restored collections.
-    pub(super) fn core_live(&self, py: Python<'_>) -> PyResult<Rc<StoreCore>> {
-        let core = Rc::clone(self.core()?);
+    pub(super) fn core_live(&self, py: Python<'_>) -> PyResult<Arc<StoreCore>> {
+        let core = Arc::clone(self.core()?);
         self.runtime.bind(py).borrow().rt()?;
         Ok(core)
     }
 
-    pub(super) fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Rc<StoreCore>> {
+    pub(super) fn core_outside_overlay(&self, py: Python<'_>) -> PyResult<Arc<StoreCore>> {
         if self.runtime.bind(py).borrow().state.overlay_active() {
             return Err(PyRuntimeError::new_err(
                 "store calls cannot run inside an overlay",
@@ -140,16 +111,21 @@ impl PyStore {
         durability: &str,
         auto_checkpoint_records: Option<u64>,
     ) -> PyResult<PyStore> {
-        let core = Rc::new(StoreCore {
-            base: BaseCore::open(py, backend, build_id, durability, auto_checkpoint_records)?,
-            memo_builder: RefCell::default(),
-            memo_decls: RefCell::default(),
-            memo: OnceCell::new(),
-            collections: RefCell::default(),
-        });
-        let runtime = Py::new(py, PyRuntime::persisted(Rc::clone(&core)))?;
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "the shared store core is reached through `Arc` in both packages; a Local one stays on its runtime's thread"
+        )]
+        let core = Arc::new(StoreCore::open(
+            py,
+            backend,
+            build_id,
+            durability,
+            auto_checkpoint_records,
+        )?);
+        let runtime = Py::new(py, PyRuntime::persisted(Arc::clone(&core)))?;
         Ok(PyStore {
             core: Some(core),
+            memo: MemoCore::default(),
             runtime,
         })
     }
@@ -171,7 +147,7 @@ impl PyStore {
         codec: Option<Py<PyAny>>,
     ) -> PyResult<PyNodeId> {
         let core = self.core_outside_overlay(py)?;
-        let inner = core.base.input(py, key, default, codec)?;
+        let inner = core.input(py, key, default, codec)?;
         Ok(PyNodeId { inner })
     }
 
@@ -185,38 +161,19 @@ impl PyStore {
         codec: Option<Py<PyAny>>,
     ) -> PyResult<PyCollection> {
         let core = self.core_outside_overlay(py)?;
-        let slot = Slot::Key(key.to_owned());
-        let added = core.base.declare_codec(&slot, codec)?;
-        let declared = engine_write(core.runtime(), || {
-            core.run(py, |store| store.collection::<PyValue>(key))
+        let persisted = core.collection(py, key, codec)?;
+        Ok(PyCollection {
+            inner: persisted.handle().clone(),
+            rt: self.runtime.clone_ref(py),
+            born: Born::default(),
+            persisted: true,
         })
-        .and_then(|declared| declared);
-        match declared {
-            Ok(persisted) => {
-                let inner = persisted.handle().clone();
-                core.collections
-                    .borrow_mut()
-                    .insert(inner.version_node().slot(), persisted);
-                Ok(PyCollection {
-                    inner,
-                    rt: self.runtime.clone_ref(py),
-                    born: Born::default(),
-                    persisted: true,
-                })
-            }
-            Err(e) => {
-                if added {
-                    core.base.registry().unregister(&slot);
-                }
-                Err(e)
-            }
-        }
     }
 
     /// Sets a persisted input: the value is logged, then applied.
     fn set(&self, py: Python<'_>, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
-        core.base.set(py, node.inner, value)
+        core.set(py, node.inner, value)
     }
 
     /// Appends one occurrence of `row` to a persisted collection.
@@ -227,10 +184,8 @@ impl PyStore {
         row: Py<PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
-        let persisted = core.collection_of(&collection)?;
-        engine_write(core.runtime(), || {
-            core.run(py, |store| persisted.insert(store, PyValue(row)).map(drop))
-        })?
+        let persisted = core.collection_of(version_slot(&collection))?;
+        core.insert(py, persisted, row)
     }
 
     /// Removes one occurrence of `row` from a persisted collection. Removing
@@ -242,10 +197,8 @@ impl PyStore {
         row: Py<PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
-        let persisted = core.collection_of(&collection)?;
-        engine_write(core.runtime(), || {
-            core.run(py, |store| persisted.delete(store, &PyValue(row)).map(drop))
-        })?
+        let persisted = core.collection_of(version_slot(&collection))?;
+        core.delete(py, persisted, row)
     }
 
     /// Removes one occurrence of `old`, if present, and inserts `new`, as
@@ -258,14 +211,8 @@ impl PyStore {
         new: Py<PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
-        let persisted = core.collection_of(&collection)?;
-        engine_write(core.runtime(), || {
-            core.run(py, |store| {
-                persisted
-                    .replace(store, Some(&PyValue(old)), PyValue(new))
-                    .map(drop)
-            })
-        })?
+        let persisted = core.collection_of(version_slot(&collection))?;
+        core.replace(py, persisted, old, new)
     }
 
     /// Appends every row of `rows` in one logged step.
@@ -276,22 +223,8 @@ impl PyStore {
         rows: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
-        let persisted = core.collection_of(&collection)?;
-        let rows = rows
-            .try_iter()?
-            .map(|row| row.map(|row| PyValue(row.unbind())))
-            .collect::<PyResult<Vec<_>>>()?;
-        engine_write(core.runtime(), || {
-            core.run(py, |store| {
-                store
-                    .batch(|batch| {
-                        for row in rows {
-                            batch.insert(&persisted, row);
-                        }
-                    })
-                    .map(drop)
-            })
-        })?
+        let persisted = core.collection_of(version_slot(&collection))?;
+        core.extend(py, persisted, rows)
     }
 
     /// Declares the keyed collection `key`: a `KeyedCollection` over a
@@ -311,31 +244,8 @@ impl PyStore {
         label: Option<String>,
     ) -> PyResult<PyKeyedCollection> {
         let core = self.core_outside_overlay(py)?;
-        let slot = Slot::Key(key.to_owned());
-        if core.base.registry().is_registered(&slot) {
-            return Err(PyValueError::new_err(format!(
-                "the key {key:?} is already declared"
-            )));
-        }
-        let pairs = Py::new(py, PairCodec::new(key_codec, codec))?;
-        core.base
-            .registry()
-            .register(slot.clone(), pairs.into_any())?;
-        let declared = engine_write(core.runtime(), || {
-            core.run(py, |store| {
-                store.keyed_collection::<PyKey, PyValue, PyValue>(key)
-            })
-        })
-        .and_then(|declared| declared);
-        match declared {
-            Ok(persisted) => {
-                PyKeyedCollection::persisted(self.runtime.bind(py).clone(), persisted, label)
-            }
-            Err(e) => {
-                core.base.registry().unregister(&slot);
-                Err(e)
-            }
-        }
+        let persisted = core.keyed_collection(py, key, key_codec, codec)?;
+        PyKeyedCollection::persisted(self.runtime.bind(py).clone(), persisted, label)
     }
 
     /// Holds `row` for `key` in a persisted keyed collection, as
@@ -348,9 +258,10 @@ impl PyStore {
         row: Py<PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
+        let keyed = keyed_of(py, &core, &kc)?;
         let mut pending = Pending::default();
-        pending.upsert(py, &core, &kc, key, row)?;
-        engine_write(core.runtime(), || core.write(py, pending))?
+        pending.upsert(py, &core, &keyed, key, row)?;
+        core.write_pending(py, pending)
     }
 
     /// Removes `key`'s pair from a persisted keyed collection. Raises
@@ -362,9 +273,10 @@ impl PyStore {
         key: Py<PyAny>,
     ) -> PyResult<()> {
         let core = self.core_outside_overlay(py)?;
+        let keyed = keyed_of(py, &core, &kc)?;
         let mut pending = Pending::default();
-        pending.remove(py, &core, &kc, key)?;
-        engine_write(core.runtime(), || core.write(py, pending))?
+        pending.remove(py, &core, &keyed, key)?;
+        core.write_pending(py, pending)
     }
 
     /// Makes a persisted keyed collection hold exactly `rows`, as
@@ -377,10 +289,11 @@ impl PyStore {
         rows: &Bound<'_, PyAny>,
     ) -> PyResult<KeyCounts> {
         let core = self.core_outside_overlay(py)?;
+        let keyed = keyed_of(py, &core, &kc)?;
         let mut pending = Pending::default();
-        pending.reconcile(py, &core, &kc, rows)?;
-        let counts = pending.counts(py, &core, &kc)?;
-        engine_write(core.runtime(), || core.write(py, pending))??;
+        pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)?;
+        let counts = key_counts(pending.counts(&keyed));
+        core.write_pending(py, pending)?;
         Ok(counts)
     }
 
@@ -426,17 +339,14 @@ impl PyStore {
     /// read the log, across a compaction too, and returns the position it
     /// has applied through.
     fn refresh(&self, py: Python<'_>) -> PyResult<u64> {
-        let core = self.core_outside_overlay(py)?;
-        engine_write(core.runtime(), || {
-            core.run(py, |store| store.refresh().map(|at| at.0))
-        })?
+        self.core_outside_overlay(py)?.refresh(py)
     }
 
     /// `position` (the last log position applied), `snapshot_position`
     /// (the snapshot this store last wrote or crossed, 0 if none) and
     /// `records_since_checkpoint`, read without touching the backend.
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = self.core()?.run(py, |store| store.stats())?;
+        let stats = self.core()?.stats(py)?;
         let dict = PyDict::new(py);
         dict.set_item("position", stats.position.0)?;
         dict.set_item("snapshot_position", stats.snapshot_position.0)?;
@@ -447,10 +357,7 @@ impl PyStore {
     /// Folds the log into a snapshot, compacting it, and returns the
     /// position the snapshot covers.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<u64> {
-        let core = self.core_outside_overlay(py)?;
-        engine_write(core.runtime(), || {
-            core.run(py, |store| store.checkpoint().map(|at| at.0))
-        })?
+        self.core_outside_overlay(py)?.checkpoint(py)
     }
 
     /// Closes the store and its runtime: every later call on either raises.
@@ -458,7 +365,11 @@ impl PyStore {
         let py = slf.py();
         let runtime = slf.try_borrow()?.runtime.clone_ref(py);
         PyRuntime::close_persisted(runtime.bind(py))?;
-        let core = slf.try_borrow_mut()?.core.take();
+        let (core, memo) = {
+            let mut store = slf.try_borrow_mut()?;
+            (store.core.take(), std::mem::take(&mut store.memo))
+        };
+        drop(memo);
         drop(core);
         Ok(())
     }

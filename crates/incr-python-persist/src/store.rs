@@ -7,15 +7,26 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use incr_core::Incr;
 use incr_persist::memo::fingerprint;
-use incr_persist::{Durability, Input, Options, Store};
-use incr_python_protocol::PyValue;
+use incr_persist::{
+    Durability, Input, Options, PendingWrite, PersistedCollection, PersistedKeyed, Store,
+    StoreStats,
+};
+use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use crate::backend::PyBackend;
-use crate::binding::{CoreStore, Detached, PyBinding};
-use crate::codec::{Registry, Slot};
+use crate::binding::{carry, Carry, CoreStore, Detached, PyBinding};
+use crate::codec::{PairCodec, Registry, Slot};
+use crate::keyed::Pending;
+
+/// A persisted collection of a package's store.
+pub type Collection<B> = PersistedCollection<PyValue, <B as PyBinding>::C>;
+
+/// A persisted keyed collection of a package's store, whose pairs are
+/// `(key, row)` tuples.
+pub type Keyed<B> = PersistedKeyed<PyKey, PyValue, <B as PyBinding>::C, PyValue>;
 
 /// The `build_id` a store is opened with: an int, or a str incr hashes.
 pub fn build_id_of(build_id: &Bound<'_, PyAny>) -> PyResult<u128> {
@@ -46,14 +57,14 @@ pub fn auto_checkpoint_of(records: Option<u64>) -> PyResult<Option<u64>> {
     Ok(records)
 }
 
-/// A store, its codecs and its persisted inputs, shareable across threads
-/// when `B::C` is. The input table is a leaf lock under which no Python
-/// runs.
+/// A store, its codecs and its persisted inputs and collections, shareable across threads when `B::C` is. The input and collection
+/// tables are leaf locks under which no Python runs.
 pub struct StoreCore<B: PyBinding> {
     store: Arc<CoreStore<B>>,
     registry: Arc<Registry<B::Exceptions>>,
     build_id: u128,
     inputs: Mutex<HashMap<u32, Input<PyValue>>>,
+    collections: Mutex<HashMap<u32, Collection<B>>>,
 }
 
 impl<B: PyBinding> StoreCore<B> {
@@ -78,6 +89,7 @@ impl<B: PyBinding> StoreCore<B> {
             registry,
             build_id,
             inputs: Mutex::default(),
+            collections: Mutex::default(),
         })
     }
 
@@ -140,6 +152,41 @@ impl<B: PyBinding> StoreCore<B> {
         self.inputs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn collections(&self) -> MutexGuard<'_, HashMap<u32, Collection<B>>> {
+        self.collections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The persisted collection whose version node has slot
+    /// `version_slot`, if this store declared it.
+    pub fn collection_of(&self, version_slot: u32) -> PyResult<Collection<B>> {
+        self.collections()
+            .get(&version_slot)
+            .cloned()
+            .ok_or_else(|| {
+                PyValueError::new_err("collection is not a persisted collection of this store")
+            })
+    }
+
+    /// Applies the records other writers appended since this store last
+    /// read the log, and returns the position it has applied through.
+    pub fn refresh(&self, py: Python<'_>) -> PyResult<u64> {
+        self.write(py, |store, _| store.refresh().map(|at| at.0))
+    }
+
+    /// Folds the log into a snapshot and returns the position it covers.
+    pub fn checkpoint(&self, py: Python<'_>) -> PyResult<u64> {
+        self.write(py, |store, _| store.checkpoint().map(|at| at.0))
+    }
+
+    /// The store's positions, read without touching the backend. It goes
+    /// through `B::write`, which routes nothing, so a stored routing
+    /// failure is left for the next read.
+    pub fn stats(&self, py: Python<'_>) -> PyResult<StoreStats> {
+        self.write(py, |store, _| store.stats())
+    }
+
     /// The input `node` is, if it is a persisted input of this store.
     pub fn input_of(&self, node: Incr<PyValue>) -> PyResult<Input<PyValue>> {
         self.inputs()
@@ -163,10 +210,10 @@ impl<B: PyBinding> StoreCore<B> {
 
     /// Runs a store call through `B::write` with the store's codecs active,
     /// raising a codec's exception as itself.
-    fn write<R: Send>(
+    pub fn write<R: Send>(
         &self,
         py: Python<'_>,
-        f: impl FnOnce(&CoreStore<B>, Detached) -> incr_persist::Result<R> + Send,
+        f: impl FnOnce(&Arc<CoreStore<B>>, Detached) -> incr_persist::Result<R> + Send,
     ) -> PyResult<R> {
         drop(self.registry.take_failure());
         let registry = &self.registry;
@@ -174,5 +221,154 @@ impl<B: PyBinding> StoreCore<B> {
             registry.scoped(|| f(store, detached))
         })?;
         self.registry.finish(py, result)
+    }
+
+    /// Runs `declare` with `slot`'s codec registered, unregistering it
+    /// when `declare` fails and the registration was new.
+    fn declaring<R>(
+        &self,
+        slot: &Slot,
+        added: bool,
+        declare: impl FnOnce() -> PyResult<R>,
+    ) -> PyResult<R> {
+        let declared = declare();
+        if declared.is_err() && added {
+            self.registry.unregister(slot);
+        }
+        declared
+    }
+}
+
+impl<B: PyBinding> StoreCore<B>
+where
+    B::Task<Collection<B>>: Send,
+{
+    /// Declares the collection `key` with `codec` and returns it, holding
+    /// its logged elements. Without a codec the key must already have one.
+    pub fn collection(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        codec: Option<Py<PyAny>>,
+    ) -> PyResult<Collection<B>> {
+        let slot = Slot::Key(key.to_owned());
+        let added = self.declare_codec(&slot, codec)?;
+        let persisted = self.declaring(&slot, added, || {
+            self.write(py, move |store, _| {
+                store.collection::<PyValue>(key).map(carry::<B, _>)
+            })
+        })?;
+        let persisted = persisted.into_inner();
+        self.collections()
+            .insert(persisted.handle().version_node().slot(), persisted.clone());
+        Ok(persisted)
+    }
+
+    /// Appends one occurrence of `row` to `persisted`.
+    pub fn insert(&self, py: Python<'_>, persisted: Collection<B>, row: Py<PyAny>) -> PyResult<()> {
+        let persisted = carry::<B, _>(persisted);
+        self.write(py, move |store, _| {
+            persisted.into_inner().insert(store, PyValue(row)).map(drop)
+        })
+    }
+
+    /// Removes one occurrence of `row` from `persisted`; an absent row is
+    /// logged and changes nothing.
+    pub fn delete(&self, py: Python<'_>, persisted: Collection<B>, row: Py<PyAny>) -> PyResult<()> {
+        let persisted = carry::<B, _>(persisted);
+        self.write(py, move |store, _| {
+            persisted
+                .into_inner()
+                .delete(store, &PyValue(row))
+                .map(drop)
+        })
+    }
+
+    /// Removes one occurrence of `old`, if present, and inserts `new`, as
+    /// one logged step.
+    pub fn replace(
+        &self,
+        py: Python<'_>,
+        persisted: Collection<B>,
+        old: Py<PyAny>,
+        new: Py<PyAny>,
+    ) -> PyResult<()> {
+        let persisted = carry::<B, _>(persisted);
+        self.write(py, move |store, _| {
+            persisted
+                .into_inner()
+                .replace(store, Some(&PyValue(old)), PyValue(new))
+                .map(drop)
+        })
+    }
+
+    /// Appends every row of `rows` in one logged step.
+    pub fn extend(
+        &self,
+        py: Python<'_>,
+        persisted: Collection<B>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let rows = rows
+            .try_iter()?
+            .map(|row| row.map(|row| PyValue(row.unbind())))
+            .collect::<PyResult<Vec<_>>>()?;
+        let persisted = carry::<B, _>(persisted);
+        self.write(py, move |store, _| {
+            let persisted = persisted.into_inner();
+            store
+                .batch(|batch| {
+                    for row in rows {
+                        batch.insert(&persisted, row);
+                    }
+                })
+                .map(drop)
+        })
+    }
+}
+
+impl<B: PyBinding> StoreCore<B>
+where
+    B::Task<Keyed<B>>: Send,
+{
+    /// Declares the keyed collection `key` over `(key, row)` pairs encoded
+    /// by `key_codec` and `codec`, holding the pairs the log restores.
+    /// Raises `ValueError` if the key is already declared.
+    pub fn keyed_collection(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        key_codec: Py<PyAny>,
+        codec: Py<PyAny>,
+    ) -> PyResult<Keyed<B>> {
+        let slot = Slot::Key(key.to_owned());
+        if self.registry.is_registered(&slot) {
+            return Err(PyValueError::new_err(format!(
+                "the key {key:?} is already declared"
+            )));
+        }
+        let pairs = Py::new(py, PairCodec::new(key_codec, codec))?;
+        self.registry.register(slot.clone(), pairs.into_any())?;
+        let persisted = self.declaring(&slot, true, || {
+            self.write(py, move |store, _| {
+                store
+                    .keyed_collection::<PyKey, PyValue, PyValue>(key)
+                    .map(carry::<B, _>)
+            })
+        })?;
+        Ok(persisted.into_inner())
+    }
+}
+
+impl<B: PyBinding> StoreCore<B>
+where
+    B::Task<PendingWrite<B::C>>: Send,
+{
+    /// Appends `pending` as one run and applies it.
+    pub fn write_pending(&self, py: Python<'_>, pending: Pending<B>) -> PyResult<()> {
+        let pending = carry::<B, _>(pending.into_write());
+        self.write(py, move |store, _| {
+            store.write_pending(pending.into_inner()).map(drop)
+        })
     }
 }

@@ -8,22 +8,19 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use incr_compute::Runtime;
 use incr_core::Local;
-use incr_persist::memo::{BuildId, Memo, MemoBuilder, MemoCtx, MemoOptions, MemoTable};
+use incr_persist::memo::MemoCtx;
+use incr_python_persist::memo::{MemoFn, TableHandle};
 use incr_python_protocol::{in_runtime, PyValue};
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use super::persist_error;
-use super::store::{PyStore, StoreCore};
-use super::PyBackend;
-use super::PyMemoBackend;
-use super::Slot;
+use super::store::PyStore;
+use super::StoreCore;
 use crate::state::{PyCallable, RtState};
-use crate::{engine_read, engine_write, ready, InvalidateRef, PyNodeId, PyRuntimeRef};
+use crate::{ready, InvalidateRef, PyNodeId, PyRuntimeRef};
 
 /// The closure the engine runs for a memo table: `py_func` called with a
 /// `RuntimeRef` that is invalidated when it returns, and the entry's key.
@@ -58,38 +55,9 @@ fn memo_fn(
     }
 }
 
-type TableHandle = Rc<Cell<MemoTable<PyValue, PyValue>>>;
-
-/// A declared memo table, kept so a builder consumed by a failed open can
-/// be made again. Its handle is shared with the `MemoTable` object, whose
-/// handle names the builder that declared it and so is replaced with it.
-pub(super) struct MemoDecl {
-    name: String,
-    version: u32,
-    func: Py<PyAny>,
-    handle: TableHandle,
-}
-
-impl StoreCore {
-    fn restore_memo_builder(&self, py: Python<'_>, state: &RtState) {
-        let mut builder = self.new_memo_builder();
-        for decl in self.memo_decls.borrow().iter() {
-            let handle = builder.table::<PyValue, PyValue>(&decl.name, decl.version);
-            builder.define(handle, memo_fn(state.hold(decl.func.clone_ref(py))));
-            decl.handle.set(handle);
-        }
-        *self.memo_builder.borrow_mut() = Some(builder);
-    }
-
-    fn open_memo(&self) -> PyResult<&Memo<Local, PyBackend>> {
-        self.memo
-            .get()
-            .ok_or_else(|| PyRuntimeError::new_err("no memo is open: call store.open_memo first"))
-    }
-
-    fn new_memo_builder(&self) -> MemoBuilder<Local> {
-        MemoBuilder::new(MemoOptions::new(BuildId::Fixed(self.base.build_id())))
-    }
+/// The memo closure maker of a store whose runtime state is `state`.
+fn maker(state: RtState) -> impl Fn(Py<PyAny>) -> MemoFn<Local> {
+    move |func| Box::new(memo_fn(state.hold(func)))
 }
 
 pub(super) fn declare_table(
@@ -103,50 +71,17 @@ pub(super) fn declare_table(
     let py = slf.py();
     let store = slf.try_borrow()?;
     let core = store.core_outside_overlay(py)?;
-    if core.memo.get().is_some() {
-        return Err(PyRuntimeError::new_err(
-            "memo_table must be called before open_memo",
-        ));
-    }
-    let key_slot = Slot::MemoKey(name.to_owned());
-    let value_slot = Slot::MemoValue(name.to_owned());
-    for (slot, given) in [(&key_slot, &key_codec), (&value_slot, &codec)] {
-        if given.is_none(py) {
-            return Err(PyValueError::new_err(format!(
-                "no codec is registered for {}",
-                slot.describe()
-            )));
-        }
-    }
-    if core.base.registry().is_registered(&key_slot) {
-        return Err(PyValueError::new_err(format!(
-            "memo table '{name}' is already declared"
-        )));
-    }
-    if !func.bind(py).is_callable() {
-        return Err(PyTypeError::new_err(
-            "a memo table's function must be callable",
-        ));
-    }
-    core.base.registry().register(key_slot, key_codec)?;
-    core.base.registry().register(value_slot, codec)?;
-    let callable = store
-        .runtime
-        .bind(py)
-        .borrow()
-        .state
-        .hold(func.clone_ref(py));
-    let mut builder = core.memo_builder.borrow_mut();
-    let builder = builder.get_or_insert_with(|| core.new_memo_builder());
-    let handle = builder.table::<PyValue, PyValue>(name, version);
-    builder.define(handle, memo_fn(callable));
-    let handle = Rc::new(Cell::new(handle));
-    core.memo_decls.borrow_mut().push(MemoDecl {
-        name: name.to_owned(),
+    let state = store.runtime.bind(py).borrow().state.clone();
+    let handle = store.memo.declare_table(
+        &core,
+        py,
+        name,
         version,
+        key_codec,
+        codec,
         func,
-        handle: Rc::clone(&handle),
-    });
+        maker(state),
+    )?;
     Ok(PyMemoTable {
         store: slf.clone().unbind(),
         name: name.to_owned(),
@@ -158,31 +93,8 @@ pub(super) fn open(slf: &Bound<'_, PyStore>, backend: Py<PyAny>) -> PyResult<PyM
     let py = slf.py();
     let store = slf.try_borrow()?;
     let core = store.core_outside_overlay(py)?;
-    if core.memo.get().is_some() {
-        return Err(PyRuntimeError::new_err("the memo is already open"));
-    }
-    let builder = core
-        .memo_builder
-        .borrow_mut()
-        .take()
-        .unwrap_or_else(|| core.new_memo_builder());
-    let opened = engine_write(core.runtime(), || {
-        core.base.registry().run(py, || {
-            builder.open(core.base.store(), PyMemoBackend::new(backend))
-        })
-    })
-    .and_then(|opened| opened);
-    let memo = match opened {
-        Ok(memo) => memo,
-        Err(e) => {
-            let state = store.runtime.bind(py).borrow().state.clone();
-            core.restore_memo_builder(py, &state);
-            return Err(e);
-        }
-    };
-    core.memo
-        .set(memo)
-        .map_err(|_| PyRuntimeError::new_err("the memo is already open"))?;
+    let state = store.runtime.bind(py).borrow().state.clone();
+    store.memo.open(&core, py, backend, maker(state))?;
     Ok(PyMemo {
         store: slf.clone().unbind(),
     })
@@ -205,19 +117,7 @@ impl PyMemoTable {
     pub(crate) fn value_of(&self, py: Python<'_>, rt: &Runtime, key: PyValue) -> PyResult<PyValue> {
         let store = self.store.bind(py).try_borrow()?;
         let core = store.core()?;
-        let memo = core.open_memo()?;
-        if !std::ptr::eq(core.runtime(), rt) {
-            return Err(PyValueError::new_err(format!(
-                "memo table '{}' belongs to the runtime of its store, not this one",
-                self.name
-            )));
-        }
-        let value = core.base.registry().scoped(|| {
-            let node = memo.get_or_insert(self.handle.get(), key);
-            rt.get(node)
-        });
-        drop(core.base.registry().take_failure());
-        Ok(value)
+        store.memo.value_of(core, rt, &self.name, &self.handle, key)
     }
 }
 
@@ -243,22 +143,9 @@ pub(crate) struct PyMemo {
 const _: () = assert!(std::mem::align_of::<PyMemo>() <= 16);
 
 impl PyMemo {
-    fn core(&self, py: Python<'_>) -> PyResult<std::rc::Rc<StoreCore>> {
+    fn core(&self, py: Python<'_>) -> PyResult<std::sync::Arc<StoreCore>> {
         self.store.bind(py).try_borrow()?.core_outside_overlay(py)
     }
-}
-
-fn mismatch_message(tables: &[(String, &'static str)]) -> String {
-    let names = tables
-        .iter()
-        .map(|(table, part)| format!("memo table '{table}' ({part})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{names} did not round-trip through the codec (decode(encode(x)) != x): the generation \
-         was written without those entries, they are recomputed on the next run, and nothing \
-         wrong is stored"
-    )
 }
 
 #[pymethods]
@@ -280,14 +167,9 @@ impl PyMemo {
                 table.name
             )));
         }
-        let memo = core.open_memo()?;
-        let node = engine_read(core.runtime(), || {
-            core.base
-                .registry()
-                .scoped(|| memo.get_or_insert(table.handle.get(), PyValue(key)))
-        })?;
-        drop(core.base.registry().take_failure());
-        Ok(PyNodeId { inner: node })
+        let store = self.store.bind(py).try_borrow()?;
+        let inner = store.memo.get_or_insert(&core, py, &table.handle, key)?;
+        Ok(PyNodeId { inner })
     }
 
     /// Writes every live entry whose dependencies are persisted to the
@@ -299,39 +181,6 @@ impl PyMemo {
     /// entry, which is recomputed on the next run.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, usize>> {
         let core = self.core(py)?;
-        let memo = core.open_memo()?;
-        drop(core.base.registry().take_failure());
-        let done = engine_write(core.runtime(), || {
-            core.base.registry().scoped(|| memo.checkpoint())
-        })?;
-        let cause = core.base.registry().take_failure();
-        let stats = match done {
-            Ok(stats) => stats,
-            Err(error) => return Err(persist_error(py, error)),
-        };
-        let mismatches = memo.take_encode_mismatches();
-        if !mismatches.is_empty() {
-            let tables = mismatches
-                .into_iter()
-                .map(|m| {
-                    let part = match m.part {
-                        incr_persist::MemoPart::Key => "keys",
-                        incr_persist::MemoPart::Value => "values",
-                    };
-                    (m.table, part)
-                })
-                .collect::<Vec<_>>();
-            let err = PyValueError::new_err(mismatch_message(&tables));
-            err.set_cause(py, cause);
-            return Err(err);
-        }
-        Ok(HashMap::from([
-            ("written", stats.written),
-            ("unkept", stats.unkept),
-            ("merged", stats.merged),
-            ("corrupt", stats.corrupt),
-            ("evicted", stats.evicted),
-            ("oversized", stats.oversized),
-        ]))
+        self.store.bind(py).try_borrow()?.memo.checkpoint(&core, py)
     }
 }

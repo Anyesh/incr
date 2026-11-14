@@ -1,19 +1,12 @@
 //! `store.batch()`: the writes of a `with` block, appended as one run when
 //! the block ends without an exception.
 
-use pyo3::exceptions::PyRuntimeError;
+use incr_python_persist::batch::Batch;
 use pyo3::prelude::*;
 
-use super::keyed::Pending;
-use super::store::PyStore;
-use crate::{engine_write, PyCollection, PyKeyedCollection, PyNodeId};
-
-#[derive(PartialEq)]
-enum Phase {
-    New,
-    Open,
-    Done,
-}
+use super::store::{keyed_of, version_slot, PyStore};
+use super::LocalBinding;
+use crate::{reconcile_pairs, PyCollection, PyKeyedCollection, PyNodeId};
 
 /// The writes collected inside `with store.batch() as b:`.
 ///
@@ -25,26 +18,14 @@ enum Phase {
 #[pyclass(name = "Batch", module = "incr.persist", unsendable)]
 pub(crate) struct PyBatch {
     store: Py<PyStore>,
-    phase: Phase,
-    pending: Pending,
+    batch: Batch<LocalBinding>,
 }
 
 impl PyBatch {
     pub(super) fn new(store: Py<PyStore>) -> Self {
         Self {
             store,
-            phase: Phase::New,
-            pending: Pending::default(),
-        }
-    }
-
-    fn open(&self) -> PyResult<()> {
-        if self.phase == Phase::Open {
-            Ok(())
-        } else {
-            Err(PyRuntimeError::new_err(
-                "the batch is not open: use it as `with store.batch() as b`",
-            ))
+            batch: Batch::default(),
         }
     }
 }
@@ -52,13 +33,7 @@ impl PyBatch {
 #[pymethods]
 impl PyBatch {
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
-        {
-            let mut batch = slf.try_borrow_mut()?;
-            if batch.phase != Phase::New {
-                return Err(PyRuntimeError::new_err("a batch can be entered once"));
-            }
-            batch.phase = Phase::Open;
-        }
+        slf.try_borrow_mut()?.batch.enter()?;
         Ok(slf)
     }
 
@@ -70,20 +45,18 @@ impl PyBatch {
         _exc: Option<&Bound<'_, PyAny>>,
         _traceback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        self.open()?;
-        self.phase = Phase::Done;
-        let pending = std::mem::take(&mut self.pending);
+        let pending = self.batch.exit()?;
         if exc_type.is_none() {
             let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-            engine_write(core.runtime(), || core.write(py, pending))??;
+            core.write_pending(py, pending)?;
         }
         Ok(false)
     }
 
     fn set(&mut self, py: Python<'_>, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
-        self.open()?;
+        let pending = self.batch.pending()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.set(&core, &node, value)
+        pending.set(&core, node.inner, value)
     }
 
     fn insert(
@@ -92,9 +65,9 @@ impl PyBatch {
         collection: PyRef<'_, PyCollection>,
         row: Py<PyAny>,
     ) -> PyResult<()> {
-        self.open()?;
+        let pending = self.batch.pending()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.insert(&core, &collection, row)
+        pending.insert(&core, version_slot(&collection), row)
     }
 
     fn delete(
@@ -103,9 +76,9 @@ impl PyBatch {
         collection: PyRef<'_, PyCollection>,
         row: Py<PyAny>,
     ) -> PyResult<()> {
-        self.open()?;
+        let pending = self.batch.pending()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.delete(&core, &collection, row)
+        pending.delete(&core, version_slot(&collection), row)
     }
 
     fn replace(
@@ -115,9 +88,9 @@ impl PyBatch {
         old: Py<PyAny>,
         new: Py<PyAny>,
     ) -> PyResult<()> {
-        self.open()?;
+        let pending = self.batch.pending()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.replace(&core, &collection, old, new)
+        pending.replace(&core, version_slot(&collection), old, new)
     }
 
     fn upsert(
@@ -127,9 +100,9 @@ impl PyBatch {
         key: Py<PyAny>,
         row: Py<PyAny>,
     ) -> PyResult<()> {
-        self.open()?;
+        let pending = self.batch.pending()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.upsert(py, &core, &kc, key, row)
+        pending.upsert(py, &core, &keyed_of(py, &core, &kc)?, key, row)
     }
 
     fn remove(
@@ -138,9 +111,9 @@ impl PyBatch {
         kc: PyRef<'_, PyKeyedCollection>,
         key: Py<PyAny>,
     ) -> PyResult<()> {
-        self.open()?;
+        let pending = self.batch.pending()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.remove(py, &core, &kc, key)
+        pending.remove(py, &core, &keyed_of(py, &core, &kc)?, key)
     }
 
     fn reconcile(
@@ -149,8 +122,9 @@ impl PyBatch {
         kc: PyRef<'_, PyKeyedCollection>,
         rows: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        self.open()?;
+        let pending = self.batch.pending()?;
         let core = self.store.bind(py).borrow().core_outside_overlay(py)?;
-        self.pending.reconcile(py, &core, &kc, rows)
+        let keyed = keyed_of(py, &core, &kc)?;
+        pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)
     }
 }

@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use incr_python_persist::binding::{CoreStore, Detached, PyBinding};
+use incr_python_persist::binding::{CoreStore, Detached, Plain, PyBinding};
 use incr_python_persist::incr_persist::Shared;
 use incr_python_persist::store::StoreCore;
 use pyo3::exceptions::PyRuntimeError;
@@ -30,11 +30,20 @@ pub(crate) struct SharedBinding;
 impl PyBinding for SharedBinding {
     type C = Shared;
     type Exceptions = Exceptions;
+    type Task<T> = Plain<T>;
 
     fn write<R: Send>(
         py: Python<'_>,
-        store: &CoreStore<Self>,
-        f: impl FnOnce(&CoreStore<Self>, Detached) -> R + Send,
+        store: &Arc<CoreStore<Self>>,
+        f: impl FnOnce(&Arc<CoreStore<Self>>, Detached) -> R + Send,
+    ) -> PyResult<R> {
+        engine_call(py, store.runtime(), move || f(store, Detached::assume()))
+    }
+
+    fn read<R: Send>(
+        py: Python<'_>,
+        store: &Arc<CoreStore<Self>>,
+        f: impl FnOnce(&Arc<CoreStore<Self>>, Detached) -> R + Send,
     ) -> PyResult<R> {
         engine_call(py, store.runtime(), move || f(store, Detached::assume()))
     }
