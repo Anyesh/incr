@@ -463,7 +463,8 @@ impl PyStore {
     /// `b.insert`, `b.delete`, `b.replace`, `b.upsert`, `b.remove` and
     /// `b.reconcile`, and on leaving the block appends them all as one
     /// run, so a restore sees all of them or none. A block that raises
-    /// writes nothing.
+    /// writes nothing. `b.counts(kc)` reports what the batch's keyed
+    /// writes so far do to `kc`'s keys.
     fn batch(slf: &Bound<'_, Self>) -> PyResult<PyBatch> {
         let py = slf.py();
         slf.try_borrow()?.core_outside_overlay(py)?;
