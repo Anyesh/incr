@@ -1056,14 +1056,16 @@ fn get_key_inside_an_aggregate_combine_creates_its_input<C: Cells>() {
     let numbers = IncrCollection::<u8, C>::new(&rt);
     numbers.insert(&rt, 1);
     numbers.insert(&rt, 2);
-    let captured = Captured((kc.clone(), Arc::clone(&rt)));
+    // Weak: the runtime owns `combine`, so a strong handle would be a cycle.
+    let captured = Captured((kc.clone(), Arc::downgrade(&rt)));
     let total = numbers.aggregate(
         &rt,
         0_u32,
         |n| u32::from(*n),
         move |a, b| {
             let (kc, rt) = captured.get();
-            a + b + u32::from(kc.get_key(rt, &1).unwrap_or(0))
+            let rt = rt.upgrade().expect("the test holds the runtime");
+            a + b + u32::from(kc.get_key(&rt, &1).unwrap_or(0))
         },
     );
     rt.get(total);
