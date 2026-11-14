@@ -74,6 +74,15 @@ pub enum StoredDep {
     External { name: String, fp: u128 },
     /// Another memo entry: the fingerprint of its encoded value.
     Query { table: u32, key: Vec<u8>, fp: u128 },
+    /// One key of a Store keyed collection, read through `get_key`:
+    /// `key_bytes` encode the key under the collection's key, and `fp` is
+    /// the fingerprint of the bytes the pair read for it was applied from,
+    /// or a constant for a key holding no row.
+    Row {
+        collection: String,
+        key_bytes: Vec<u8>,
+        fp: u128,
+    },
 }
 
 /// One memoized query result. Its identity within a generation is

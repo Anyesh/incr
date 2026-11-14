@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::sync::Arc;
 
 use incr_core::{
     with_value_code, Cells, DeleteError, ErasedIncr, Incr, IncrCollection, KeyCounts, KeyedChange,
@@ -21,6 +22,110 @@ const REPAIR_ROUNDS: usize = 3;
 
 type Core<K, V, C, P> = KeyedCollection<K, V, C, P, u128>;
 type Ranked<P> = (P, u128);
+
+/// The fingerprint a [`StoredDep::Row`](crate::memo::StoredDep::Row)
+/// stores for a key holding no row.
+pub(crate) const ABSENT_ROW_FP: u128 = 0;
+
+/// What a memo maps of a keyed collection's `get_key` reads. A row's
+/// fingerprint is the rank of the pair read for its key: the fingerprint
+/// of the bytes that pair was applied from.
+pub(crate) trait RowSource<C: Cells>: Send + Sync {
+    /// For a version input of this collection, its key's bytes and its
+    /// row's fingerprint; `None` for any other node.
+    fn live_row(&self, dep: ErasedIncr) -> Option<Result<(Vec<u8>, u128)>>;
+
+    /// The version input of the key `key_bytes` encode, created if no read
+    /// created it; `None` when they do not decode. Takes the version lock,
+    /// so not under a `DepIndex` hold.
+    fn prepare(&self, rt: &Runtime<C>, key_bytes: &[u8]) -> Option<ErasedIncr>;
+
+    /// The version input of the key `key_bytes` encode and whether its
+    /// row's fingerprint is `fp`; `None` when it has none or they do not
+    /// decode.
+    fn stored_row(&self, key_bytes: &[u8], fp: u128) -> Option<(ErasedIncr, bool)>;
+}
+
+/// A [`RowSource`] as a `DepIndex` holds it, behind `Any`.
+pub(crate) type Rows<C> = Arc<dyn RowSource<C>>;
+
+/// The [`Rows`] a `DepIndex` registered, under the store's cells `C`.
+pub(crate) fn rows_of<C: Cells>(rows: &(dyn Any + Send + Sync)) -> &Rows<C> {
+    rows.downcast_ref::<Rows<C>>()
+        .expect("a store registers rows of its own cells")
+}
+
+struct KeyedRows<K, V, C, P>
+where
+    K: 'static,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V>,
+{
+    key: String,
+    keyed: Core<K, V, C, P>,
+}
+
+// SAFETY: as for `KeyedBinding`: the rows are reachable only through the
+// `DepIndex` of the store that created them, and that store owns a
+// `Runtime<C>`, which is Send or Sync exactly when C's cells are.
+unsafe impl<K, V, C, P> Send for KeyedRows<K, V, C, P>
+where
+    K: 'static,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V>,
+{
+}
+// SAFETY: see `Send`.
+unsafe impl<K, V, C, P> Sync for KeyedRows<K, V, C, P>
+where
+    K: 'static,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V>,
+{
+}
+
+impl<K, V, C, P> KeyedRows<K, V, C, P>
+where
+    K: PersistValue + Hash + Eq,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V> + PersistValue,
+{
+    fn row_fp(&self, key: &K) -> u128 {
+        self.keyed.read_rank(key).unwrap_or(ABSENT_ROW_FP)
+    }
+
+    fn decode_key(&self, key_bytes: &[u8]) -> Option<K> {
+        decode(&self.key, key_bytes).ok()
+    }
+}
+
+impl<K, V, C, P> RowSource<C> for KeyedRows<K, V, C, P>
+where
+    K: PersistValue + Hash + Eq,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V> + PersistValue,
+{
+    fn live_row(&self, dep: ErasedIncr) -> Option<Result<(Vec<u8>, u128)>> {
+        let key = self.keyed.key_of_version(dep)?;
+        Some(encode(&self.key, &key).map(|bytes| (bytes, self.row_fp(&key))))
+    }
+
+    fn prepare(&self, rt: &Runtime<C>, key_bytes: &[u8]) -> Option<ErasedIncr> {
+        let key = self.decode_key(key_bytes)?;
+        Some(self.keyed.version_input_or_create(rt, &key).erase())
+    }
+
+    fn stored_row(&self, key_bytes: &[u8], fp: u128) -> Option<(ErasedIncr, bool)> {
+        let key = self.decode_key(key_bytes)?;
+        let handle = self.keyed.version_input(&key)?;
+        Some((handle.erase(), self.row_fp(&key) == fp))
+    }
+}
 
 /// A persisted keyed collection: a collection key in the log whose
 /// elements are `P` pairs, bound to a [`KeyedCollection`] that reads at
@@ -57,6 +162,7 @@ where
 {
     key: String,
     pub(super) keyed: Core<K, V, C, P>,
+    rows: Rows<C>,
 }
 
 // SAFETY: the parts of `KeyedCollection<K, V, C, P, R>` that are not
@@ -874,6 +980,10 @@ where
         None
     }
 
+    fn row_source(&self) -> Option<Box<dyn Any + Send + Sync>> {
+        Some(Box::new(Arc::clone(&self.rows)))
+    }
+
     fn apply(
         &mut self,
         rt: &Runtime<C>,
@@ -971,9 +1081,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// a logged pair does not decode as `P` or the key is already bound to
     /// another type, a plain collection included, and with
     /// [`Error::KindMismatch`] when the key is an input.
+    ///
+    /// A memo entry that reads a key through [`PersistedKeyed::get_key`]
+    /// stores the key, encoded under `key`, and its row's fingerprint, and
+    /// is reused after a restart while that row is unchanged.
     pub fn keyed_collection<K, V, P>(&self, key: &str) -> Result<PersistedKeyed<K, V, C, P>>
     where
-        K: Value + Hash + Eq,
+        K: PersistValue + Hash + Eq,
         V: Value + Hash + Eq,
         P: Pair<K, V> + PersistValue,
     {
@@ -1001,9 +1115,15 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if let Some(logged) = logged {
             logged.elements = Elements::default();
         }
+        let keyed = KeyedCollection::new(&self.runtime);
+        let rows: Rows<C> = Arc::new(KeyedRows {
+            key: key.to_owned(),
+            keyed: keyed.clone(),
+        });
         let binding = KeyedBinding {
             key: key.to_owned(),
-            keyed: KeyedCollection::new(&self.runtime),
+            keyed,
+            rows,
         };
         let mut spent = KeyedSpent::default();
         let mut read = Vec::new();
@@ -1016,8 +1136,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if guard.deps().is_some() {
             let fp = binding.fp(&self.runtime, &mut read);
             let node = Binding::<C>::node(&binding);
+            let rows = Binding::<C>::row_source(&binding);
             if let Some(map) = guard.deps() {
                 map.register(key, node, Kind::Collection, fp, None);
+                if let Some(rows) = rows {
+                    map.register_rows(key, rows);
+                }
             }
         }
         guard.disarm();

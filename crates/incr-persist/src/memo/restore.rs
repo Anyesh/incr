@@ -15,6 +15,7 @@ use super::mapping::map_stored;
 use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoState};
 use super::table_core::{decode, encode, Seeded, TableCore};
 use super::{fingerprint, Entry, StoredDep};
+use crate::store::keyed::rows_of;
 use crate::value_context::MemoPart;
 
 impl<C: MemoCells> CoreRef<C> {
@@ -358,8 +359,24 @@ impl<C: MemoCells> Walk<'_, C> {
         let mut unchanged = true;
         let mut children = visit.children.iter();
         for dep in &entry.deps {
-            if let StoredDep::External { name, .. } = dep {
-                self.core.external(self.rt, name);
+            match dep {
+                StoredDep::External { name, .. } => {
+                    self.core.external(self.rt, name);
+                }
+                StoredDep::Row {
+                    collection,
+                    key_bytes,
+                    ..
+                } => {
+                    let rows = {
+                        let map = self.core.deps.read();
+                        map.rows(collection).map(|rows| rows_of::<C>(rows).clone())
+                    };
+                    rows?.prepare(self.rt, key_bytes)?;
+                }
+                StoredDep::Input { .. }
+                | StoredDep::Collection { .. }
+                | StoredDep::Query { .. } => {}
             }
         }
         let map = self.core.deps.read();

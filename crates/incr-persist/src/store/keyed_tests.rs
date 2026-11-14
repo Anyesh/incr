@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::collection::fp_of_elements;
 use super::dep_index::{DepFp, DepIndex};
 use super::{Options, PendingWrite, PersistedKeyed, Store};
+use crate::memo::{BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo};
 use crate::{
     Backend, Cells, Error, Kind, Local, MemoryBackend, Position, ReadOutcome, Record, Result,
     Shared, SnapshotId,
@@ -823,3 +824,133 @@ fn undeclare_is_refused_while_a_query_reads_a_key<C: Cells>() {
     store.undeclare(&kc).unwrap();
     assert!(!store.runtime().is_alive(version));
 }
+
+/// One process over `log` and `memo`: a memo table `price` whose entry for
+/// key `k` reads row `k` of the keyed collection through `get_key`.
+struct Priced<C: MemoCells> {
+    store: Arc<Store<C, MemoryBackend>>,
+    kc: Kc<C>,
+    memo: Memo<C, MemoryBackend>,
+    price: MemoTable<u32, Option<String>>,
+    runs: Arc<AtomicUsize>,
+}
+
+impl<C: MemoCells> Priced<C> {
+    fn open(log: &MemoryBackend, memo: &MemoryMemo) -> Self {
+        Self::on(Arc::new(open::<C, _>(log.clone())), memo)
+    }
+
+    fn on(store: Arc<Store<C, MemoryBackend>>, memo: &MemoryMemo) -> Self {
+        let kc = keyed(&store);
+        let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0x51)));
+        let price = builder.table::<u32, Option<String>>("price", 1);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let captured = Captured(kc.clone());
+        builder.define(price, move |ctx, k| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            captured.get().get_key(ctx.rt(), k)
+        });
+        let memo = builder.open(&store, memo.clone()).unwrap();
+        Priced {
+            store,
+            kc,
+            memo,
+            price,
+            runs,
+        }
+    }
+
+    fn read(&self, k: u32) -> Option<String> {
+        let q = self.memo.get_or_insert(self.price, k);
+        self.memo.runtime().get(q)
+    }
+
+    fn runs(&self) -> usize {
+        self.runs.load(Ordering::SeqCst)
+    }
+}
+
+/// Fills keys 1 to 3, computes their entries and checkpoints them.
+fn priced_checkpoint<C: MemoCells>(log: &MemoryBackend, memo: &MemoryMemo) {
+    let p = Priced::<C>::open(log, memo);
+    for (k, v) in [(1, "a"), (2, "b"), (3, "c")] {
+        p.store.upsert(&p.kc, k, s(v)).unwrap();
+    }
+    for k in 1..=3 {
+        p.read(k);
+    }
+    assert_eq!(p.memo.checkpoint().unwrap().written, 3);
+}
+
+fn row_deps_verify_after_reopen_while_rows_match<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    priced_checkpoint::<C>(&log, &memo);
+    let p = Priced::<C>::open(&log, &memo);
+    assert_eq!(
+        (1..=3).map(|k| p.read(k)).collect::<Vec<_>>(),
+        [Some(s("a")), Some(s("b")), Some(s("c"))]
+    );
+    assert_eq!(p.runs(), 0);
+    let stats = p.memo.stats();
+    assert_eq!((stats.reused, stats.revalidated, stats.cold), (3, 0, 0));
+    p.store.upsert(&p.kc, 2, s("x")).unwrap();
+    assert_eq!(p.read(2), Some(s("x")));
+    assert_eq!(p.runs(), 1);
+}
+
+fn a_changed_row_reruns_and_a_removed_key_runs_after_reopen<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    priced_checkpoint::<C>(&log, &memo);
+    {
+        let store = open::<C, _>(log.clone());
+        let kc = keyed(&store);
+        store.upsert(&kc, 2, s("x")).unwrap();
+        store.remove(&kc, &3).unwrap();
+    }
+    let p = Priced::<C>::open(&log, &memo);
+    assert_eq!(
+        (1..=3).map(|k| p.read(k)).collect::<Vec<_>>(),
+        [Some(s("a")), Some(s("x")), None]
+    );
+    assert_eq!(p.runs(), 2);
+    let stats = p.memo.stats();
+    assert_eq!((stats.reused, stats.revalidated, stats.cold), (1, 2, 0));
+}
+
+fn a_key_read_before_the_memo_opens_still_maps<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    priced_checkpoint::<C>(&log, &memo);
+    let store = Arc::new(open::<C, _>(log.clone()));
+    let kc = keyed(&store);
+    let early = Reader::new(&store, &kc, 1);
+    assert_eq!(early.read(&store), (Some(s("a")), 1));
+    let p = Priced::<C>::on(store, &memo);
+    assert_eq!(p.read(1), Some(s("a")));
+    assert_eq!(p.runs(), 0);
+    assert_eq!(p.memo.stats().reused, 1);
+}
+
+macro_rules! memo_local_and_shared {
+    ($($name:ident),* $(,)?) => {
+        $(
+            mod $name {
+                #[test]
+                fn local() {
+                    super::$name::<crate::Local>();
+                }
+
+                #[test]
+                fn shared() {
+                    super::$name::<crate::Shared>();
+                }
+            }
+        )*
+    };
+}
+
+memo_local_and_shared!(
+    row_deps_verify_after_reopen_while_rows_match,
+    a_changed_row_reruns_and_a_removed_key_runs_after_reopen,
+    a_key_read_before_the_memo_opens_still_maps,
+);
