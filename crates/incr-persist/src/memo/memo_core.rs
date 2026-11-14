@@ -213,6 +213,11 @@ pub(crate) struct Wake {
     /// thread; the first one to do so clears it, and the thread sets it
     /// again before each wait.
     armed: AtomicBool,
+    /// Set by the thread after a checkpoint skipped for an open staged
+    /// batch or unlogged scope; the close of the last one, or the thread
+    /// itself when it finds both closed already, clears it and wakes the
+    /// thread. SeqCst, see `DepIndex::unlogged`.
+    skipped: AtomicBool,
 }
 
 impl Default for Wake {
@@ -221,6 +226,7 @@ impl Default for Wake {
             state: Mutex::default(),
             cond: Condvar::new(),
             armed: AtomicBool::new(true),
+            skipped: AtomicBool::new(false),
         }
     }
 }
@@ -229,6 +235,10 @@ impl Default for Wake {
 struct Waking {
     stop: bool,
     due: bool,
+    #[cfg(test)]
+    dues: u64,
+    #[cfg(test)]
+    held_skips: u64,
 }
 
 impl Wake {
@@ -237,8 +247,52 @@ impl Wake {
     }
 
     pub(crate) fn due(&self) {
-        self.lock().due = true;
+        let mut waking = self.lock();
+        waking.due = true;
+        #[cfg(test)]
+        {
+            waking.dues += 1;
+        }
+        drop(waking);
         self.cond.notify_all();
+    }
+
+    /// How many times [`Self::due`] ran.
+    #[cfg(test)]
+    pub(crate) fn dues(&self) -> u64 {
+        self.lock().dues
+    }
+
+    /// Counts a skipped checkpoint after which the thread waits for a close.
+    #[cfg(test)]
+    pub(crate) fn held_skip(&self) {
+        self.lock().held_skips += 1;
+        self.cond.notify_all();
+    }
+
+    /// Waits up to `timeout` until [`Self::held_skip`] ran `n` times:
+    /// whether it did.
+    #[cfg(test)]
+    pub(crate) fn wait_for_held_skips(&self, n: u64, timeout: Duration) -> bool {
+        let waking = self.lock();
+        let (waking, _) = self
+            .cond
+            .wait_timeout_while(waking, timeout, |w| w.held_skips < n)
+            .unwrap_or_else(PoisonError::into_inner);
+        waking.held_skips >= n
+    }
+
+    /// Records a checkpoint skipped for an open staged batch or unlogged
+    /// scope, for [`Self::resume`].
+    pub(crate) fn skip(&self) {
+        self.skipped.store(true, Ordering::SeqCst);
+    }
+
+    /// [`Self::due`] if a skip is recorded, clearing it.
+    pub(crate) fn resume(&self) {
+        if self.skipped.swap(false, Ordering::SeqCst) {
+            self.due();
+        }
     }
 
     /// Lets the next compute that finds the trigger reached wake the

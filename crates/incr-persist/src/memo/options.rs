@@ -69,8 +69,10 @@ impl MemoOptions {
     /// the last checkpoint attempt (`MemoStats::unsaved_entries`).
     /// [`Memo::checkpoint_if_due`](super::Memo::checkpoint_if_due) runs it
     /// then; on `Shared` the automatic-checkpoint thread also wakes for it,
-    /// started even without [`Self::auto_checkpoint_secs`]. A read never
-    /// checkpoints on its own thread. Panics if `entries` is 0.
+    /// started even without [`Self::auto_checkpoint_secs`], and runs one
+    /// it skipped for an open staged batch or unlogged scope once the last
+    /// of those closes. A read never checkpoints on its own thread. Panics
+    /// if `entries` is 0.
     pub fn checkpoint_after_entries(mut self, entries: u64) -> Self {
         assert!(
             entries > 0,

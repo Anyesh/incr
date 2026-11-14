@@ -12,6 +12,7 @@ use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats, Wake};
 use super::options::MemoOptions;
 use super::table_core::{ErasedTable, TableCore};
 use super::{CheckpointStats, GenId, Generation, MemoBackend, TableDesc};
+use crate::store::dep_index::DepIndex;
 use crate::value_context::{EncodeMismatch, ValueScope};
 use crate::{Backend, Error, Result, Store};
 
@@ -249,13 +250,15 @@ impl<C: MemoCells, B: Backend> Drop for Memo<C, B> {
 
 struct AutoCheckpoint {
     wake: Arc<Wake>,
+    deps: Arc<DepIndex>,
     thread: JoinHandle<()>,
 }
 
 impl AutoCheckpoint {
     /// Only called for `Shared`, which `open` checks. Checkpoints every
-    /// `every` and whenever the trigger makes one due, skipping a turn with
-    /// nothing unsaved.
+    /// `every`, whenever the trigger makes one due, and when the last
+    /// staged batch or unlogged scope closes after a checkpoint was skipped
+    /// for it, skipping a turn with nothing unsaved.
     fn start<C: MemoCells, B: Backend + 'static>(
         store: &Arc<Store<C, B>>,
         core: &CoreRef<C>,
@@ -270,6 +273,8 @@ impl AutoCheckpoint {
             unreachable!("incr-persist: automatic checkpoints are Shared-only");
         };
         let wake = Arc::clone(&core.wake);
+        let deps = Arc::clone(&core.deps);
+        deps.watch(&wake);
         let thread = thread::spawn(move || {
             let _scope = store.enter_value_scope();
             let mut failed = false;
@@ -277,7 +282,9 @@ impl AutoCheckpoint {
                 core.wake.arm();
                 // Computes that reached the trigger while the thread was
                 // unarmed did not wake it. After a failure the next compute
-                // wakes it instead, so a lasting error does not spin.
+                // wakes it instead, so a lasting error does not spin; after
+                // a skip for an open staged batch or unlogged scope, the
+                // close of the last one does too.
                 if !failed && core.checkpoint_due() {
                     core.wake.due_once();
                 }
@@ -292,18 +299,25 @@ impl AutoCheckpoint {
                 let done = catch_unwind(AssertUnwindSafe(|| core.checkpoint(store.runtime())));
                 failed = !matches!(done, Ok(Ok(_)));
                 match done {
-                    Ok(
-                        Ok(_)
-                        | Err(Error::Busy | Error::UnloggedScopeOpen | Error::StagedBatchOpen),
-                    ) => {}
+                    Ok(Ok(_) | Err(Error::Busy)) => {}
+                    Ok(Err(Error::UnloggedScopeOpen | Error::StagedBatchOpen)) => {
+                        core.wake.skip();
+                        if core.deps.holds_checkpoints() {
+                            #[cfg(test)]
+                            core.wake.held_skip();
+                        } else {
+                            core.wake.resume();
+                        }
+                    }
                     Ok(Err(_)) | Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
                 }
             }
         });
-        AutoCheckpoint { wake, thread }
+        AutoCheckpoint { wake, deps, thread }
     }
 
     fn stop(self) {
+        self.deps.unwatch(&self.wake);
         self.wake.stop();
         if let Err(payload) = self.thread.join() {
             if !thread::panicking() {
@@ -312,3 +326,7 @@ impl AutoCheckpoint {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "auto_checkpoint_tests.rs"]
+mod tests;

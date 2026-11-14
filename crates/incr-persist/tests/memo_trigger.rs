@@ -159,8 +159,8 @@ fn an_interval_with_nothing_unsaved_writes_nothing() {
 }
 
 /// A trigger reached while an unlogged scope is open is skipped, not
-/// counted as an error; the next compute after the scope closes wakes
-/// the thread again.
+/// counted as an error; the scope's close wakes the thread again, with no
+/// further compute.
 #[test]
 fn the_trigger_wakes_the_thread_again_after_a_skipped_checkpoint() {
     let w = World::<Shared>::open(options().checkpoint_after_entries(2));
@@ -172,7 +172,6 @@ fn the_trigger_wakes_the_thread_again_after_a_skipped_checkpoint() {
     assert_eq!(stats.checkpoints, 0);
     assert_eq!(stats.auto_checkpoint_errors, 0);
     scope.close().unwrap();
-    w.read(3);
     w.wait_for_checkpoints(1);
 }
 

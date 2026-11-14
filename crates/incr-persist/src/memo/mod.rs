@@ -39,6 +39,7 @@ pub use codec::*;
 pub use file::{FileMemo, FileMemoGuard};
 pub use generation::{GenId, Generation};
 pub use handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
+pub(crate) use memo_core::Wake;
 pub use memo_core::{MemoCells, MemoStats};
 pub use memory::MemoryMemo;
 pub use open::{Memo, MemoBuilder};

@@ -1,11 +1,14 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+};
 
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::{ErasedIncr, Incr};
 
+use crate::memo::Wake;
 use crate::Kind;
 
 /// The xxh3-128 of `bytes`: every fingerprint the memo compares.
@@ -63,6 +66,10 @@ pub(crate) struct DepIndex {
     /// Set once the store is poisoned: a memo then refuses to checkpoint,
     /// because the runtime may hold changes the log never received.
     poisoned: AtomicBool,
+    /// The automatic-checkpoint threads of the memos open over the store,
+    /// resumed when the last staged batch or unlogged scope closes. A leaf
+    /// lock outside the lock order, held only to take a [`Wake`]'s.
+    waiters: Mutex<Vec<Weak<Wake>>>,
 }
 
 #[derive(Default)]
@@ -80,20 +87,67 @@ pub(crate) struct DepMap {
 }
 
 impl DepIndex {
+    // `unlogged` and `staged` are SeqCst, like a `Wake`'s skip: a thread
+    // that records a skip and then finds both clear, and a close that
+    // clears one and then finds the skip, cannot both miss the other.
     pub(crate) fn unlogged(&self) -> bool {
-        self.unlogged.load(Ordering::Acquire)
+        self.unlogged.load(Ordering::SeqCst)
     }
 
+    /// Clearing it resumes the threads that skipped a checkpoint, when no
+    /// staged batch is open either.
     pub(super) fn set_unlogged(&self, open: bool) {
-        self.unlogged.store(open, Ordering::Release);
+        self.unlogged.store(open, Ordering::SeqCst);
+        if !open {
+            self.closed();
+        }
     }
 
     pub(crate) fn staged(&self) -> bool {
-        self.staged.load(Ordering::Acquire)
+        self.staged.load(Ordering::SeqCst)
     }
 
+    /// Clearing it resumes the threads that skipped a checkpoint, when no
+    /// unlogged scope is open either.
     pub(super) fn set_staged(&self, open: bool) {
-        self.staged.store(open, Ordering::Release);
+        self.staged.store(open, Ordering::SeqCst);
+        if !open {
+            self.closed();
+        }
+    }
+
+    /// Whether a staged batch or an unlogged scope is open, so a memo
+    /// refuses to checkpoint.
+    pub(crate) fn holds_checkpoints(&self) -> bool {
+        self.unlogged() || self.staged()
+    }
+
+    fn closed(&self) {
+        if self.holds_checkpoints() {
+            return;
+        }
+        for waiter in self.lock_waiters().iter() {
+            if let Some(wake) = waiter.upgrade() {
+                wake.resume();
+            }
+        }
+    }
+
+    fn lock_waiters(&self) -> MutexGuard<'_, Vec<Weak<Wake>>> {
+        self.waiters.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Resumes `wake` at every close after it [skipped](Wake::skip) a
+    /// checkpoint, until [`Self::unwatch`].
+    pub(crate) fn watch(&self, wake: &Arc<Wake>) {
+        let mut waiters = self.lock_waiters();
+        waiters.retain(|waiter| waiter.strong_count() > 0);
+        waiters.push(Arc::downgrade(wake));
+    }
+
+    pub(crate) fn unwatch(&self, wake: &Arc<Wake>) {
+        self.lock_waiters()
+            .retain(|waiter| waiter.strong_count() > 0 && waiter.as_ptr() != Arc::as_ptr(wake));
     }
 
     pub(crate) fn poisoned(&self) -> bool {
