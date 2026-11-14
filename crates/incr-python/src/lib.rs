@@ -953,7 +953,7 @@ impl PyKeyedCollection {
     /// Runs `write` on `keyed`, given a journal in an overlay, and journals
     /// the pair ops it records as `undo` of them, so the exit can apply
     /// their inverses.
-    fn write_core<R: Ord + Copy + Default + Send + Sync + 'static>(
+    fn write_core<R: incr_core::ElementRank + Send + Sync + 'static>(
         &self,
         py: Python<'_>,
         keyed: &PyKeyedCore<R>,

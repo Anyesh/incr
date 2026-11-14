@@ -89,7 +89,8 @@ pub use generic_arena::GenericArena;
 pub use grid_table::{GridKey, GridTable};
 pub use handle::{ErasedIncr, Incr, RuntimeId};
 pub use keyed::{
-    KeyCounts, KeyIndex, KeyTable, KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp,
+    find_element, same_element, ElementRank, KeyCounts, KeyIndex, KeyTable, KeyedChange,
+    KeyedCollection, KeyedSpent, Pair, PairOp,
 };
 pub use locks::{LocalLock, Lock};
 pub use memory::{

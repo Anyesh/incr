@@ -105,13 +105,54 @@ pub struct KeyedChange<K> {
     pub epoch: u64,
 }
 
+/// The rank a keyed collection orders a key's pairs by. A rank that
+/// `identifies` names its element: two pairs of one key with equal such
+/// ranks are the same element whether or not they are `==`, as two pairs
+/// applied from the same bytes are, so two pairs that are not one element
+/// must never share an identifying rank.
+pub trait ElementRank: Ord + Copy + Default {
+    fn identifies(&self) -> bool;
+}
+
+impl ElementRank for () {
+    fn identifies(&self) -> bool {
+        false
+    }
+}
+
+/// The fingerprint of the bytes a persisted pair was applied from; 0 marks
+/// a pair no logged bytes back, which identifies nothing.
+impl ElementRank for u128 {
+    fn identifies(&self) -> bool {
+        *self != 0
+    }
+}
+
+/// Whether the ranked pairs `a` and `b` are one element: their ranks are
+/// equal and identify it, or the pairs are `==`. Runs `P::eq` only when
+/// the ranks do not settle it.
+pub fn same_element<P: Eq, R: ElementRank>(a: (&P, R), b: (&P, R)) -> bool {
+    (a.1 == b.1 && a.1.identifies()) || a.0 == b.0
+}
+
+/// The position in `held` of the element `target` names: the first
+/// [`same_element`] of `target`'s rank, else the first of any rank.
+pub fn find_element<'a, P: Eq + 'a, R: ElementRank>(
+    held: impl Iterator<Item = (&'a P, R)> + Clone,
+    target: (&P, R),
+) -> Option<usize> {
+    held.clone()
+        .position(|e| e.1 == target.1 && same_element(e, target))
+        .or_else(|| held.into_iter().position(|e| same_element(e, target)))
+}
+
 /// One change to a keyed collection's pairs, with the pair's rank. Of the
 /// pairs held for one key, the first with the smallest rank is read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PairOp<P, R> {
     Insert(P, R),
-    /// Removes one held pair `==` to this one, preferring one of this
-    /// rank; a no-op if no such pair is held.
+    /// Removes one held pair that is the [`same_element`] as this one,
+    /// preferring one of this rank; a no-op if no such pair is held.
     Remove(P, R),
 }
 
@@ -528,7 +569,7 @@ where
     K: Value + Hash + Eq,
     V: Value + Hash + Eq,
     P: Pair<K, V>,
-    R: Ord + Copy + Default,
+    R: ElementRank,
 {
     fn new(journal: bool) -> Self {
         Self {
@@ -704,12 +745,11 @@ where
                 }
             }
             PairOp::Remove(..) => {
-                let now = &self.keys[at].now;
-                let equal = |s: &Src| self.pair(table, at, *s).0 == *pair;
-                let found = now
-                    .iter()
-                    .position(|s| self.pair(table, at, *s).1 == *rank && equal(s))
-                    .or_else(|| now.iter().position(equal));
+                let held = self.keys[at].now.iter().map(|s| {
+                    let (p, r) = self.pair(table, at, *s);
+                    (p, *r)
+                });
+                let found = find_element(held, (pair, *rank));
                 if let Some(i) = found {
                     let src = self.keys[at].now.remove(i);
                     if self.journal.is_some() {
@@ -975,7 +1015,7 @@ where
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
-    R: Ord + Copy + Default + Send + Sync + 'static,
+    R: ElementRank + Send + Sync + 'static,
 {
     /// An empty keyed collection in `rt`, its index registered for
     /// [`Runtime::memory_stats`] against the rows collection's version node.

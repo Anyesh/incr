@@ -134,6 +134,13 @@ fn rt_(val: u8, tag: u8) -> Row {
     Row { val, tag }
 }
 
+/// A rank as the persisted fingerprint is one: nonzero names its element.
+impl ElementRank for u8 {
+    fn identifies(&self) -> bool {
+        *self != 0
+    }
+}
+
 type Kc<C> = KeyedCollection<Key, Row, C, (Key, Row), u8>;
 type Quad = (u8, u8, u8, u8);
 
@@ -465,6 +472,46 @@ fn a_key_with_two_pairs_reads_the_smallest_rank<C: Cells>() {
     assert_eq!(kc.pairs().values(&rt).len(), 1);
 }
 
+#[test]
+fn same_element_is_an_identifying_rank_or_eq() {
+    let (a, b) = (1u8, 2u8);
+    assert!(same_element((&a, 7u8), (&b, 7u8)));
+    assert!(!same_element((&a, 0u8), (&b, 0u8)));
+    assert!(same_element((&a, 0u8), (&a, 3u8)));
+    assert!(!same_element((&a, 3u8), (&b, 4u8)));
+    assert!(same_element((&a, 5u128), (&b, 5u128)));
+    assert!(!same_element((&a, 0u128), (&b, 0u128)));
+    assert!(!same_element((&a, ()), (&b, ())));
+    assert!(same_element((&a, ()), (&a, ())));
+}
+
+#[test]
+fn find_element_prefers_a_rank_match() {
+    let held = [(1u8, 0u8), (2, 4), (1, 6)];
+    let find = |pair: u8, rank: u8| find_element(held.iter().map(|(p, r)| (p, *r)), (&pair, rank));
+    assert_eq!(find(1, 6), Some(2));
+    assert_eq!(find(1, 9), Some(0));
+    assert_eq!(find(9, 4), Some(1));
+    assert_eq!(find(9, 0), None);
+}
+
+/// A removal names its pair by an identifying rank even when the pairs
+/// are not `==`, as a re-decoded NaN row is not; rank 0 names nothing.
+fn a_remove_matches_an_identifying_rank_without_eq<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Kc::<C>::new(&rt);
+    apply(&rt, &kc, vec![PairOp::Insert((k(1), r(10)), 5)]);
+    let change = apply(&rt, &kc, vec![PairOp::Remove((k(1), r(11)), 5)]);
+    assert_eq!(change.counts, counts(0, 0, 1));
+    assert!(kc.is_empty());
+    assert!(kc.pairs().values(&rt).is_empty());
+
+    kc.upsert(&rt, k(2), r(20));
+    let change = apply(&rt, &kc, vec![PairOp::Remove((k(2), r(21)), 0)]);
+    assert_eq!(change.counts, KeyCounts::default());
+    assert_eq!(kc.row(&k(2)).map(|row| row.val), Some(20));
+}
+
 fn removing_an_absent_pair_is_a_no_op<C: Cells>() {
     let rt = Runtime::<C>::new();
     let kc = Kc::<C>::new(&rt);
@@ -646,6 +693,7 @@ for_both!(
     a_remove_then_insert_of_one_key_reports_two_changes,
     a_key_with_two_pairs_reads_the_smallest_rank,
     removing_an_absent_pair_is_a_no_op,
+    a_remove_matches_an_identifying_rank_without_eq,
     an_inverted_journal_restores_the_previous_state,
     journaled_writes_are_undone_by_their_inverted_journal,
     changed_lists_the_keys_whose_row_differs_and_epochs_rise,
@@ -674,6 +722,16 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
+/// Rank `level` of a pair: 0 identifies nothing, and a nonzero rank names
+/// one pair only, as a fingerprint of its bytes does, though one pair can
+/// have two.
+fn rank_of(key: u8, row: u8, level: u8) -> u8 {
+    match level {
+        0 => 0,
+        _ => level * 16 + key * 3 + row + 1,
+    }
+}
+
 fn model_read(model: &Model, key: u8) -> Option<u8> {
     let held = model.get(&key)?;
     first_smallest(held.iter().map(|e| e.1)).map(|i| held[i].0 .1)
@@ -697,10 +755,11 @@ fn model_apply(model: &mut Model, ops: &[PairOp<(u8, u8), u8>]) -> Vec<PairOp<(u
                 let Some(held) = model.get_mut(&pair.0) else {
                     continue;
                 };
+                let same = |e: &((u8, u8), u8)| (e.1 == *rank && *rank != 0) || e.0 == *pair;
                 let found = held
                     .iter()
-                    .position(|e| e == &(*pair, *rank))
-                    .or_else(|| held.iter().position(|e| e.0 == *pair));
+                    .position(|e| e.1 == *rank && same(e))
+                    .or_else(|| held.iter().position(same));
                 if let Some(i) = found {
                     let (pair, rank) = held.remove(i);
                     journal.push(PairOp::Remove(pair, rank));
@@ -764,7 +823,8 @@ fn run_steps<C: Cells>(steps: Vec<Step>) {
             Step::Apply(ops) => {
                 let ops: Vec<PairOp<(u8, u8), u8>> = ops
                     .iter()
-                    .map(|&(insert, key, row, rank)| match insert {
+                    .map(|&(insert, key, row, level)| (insert, key, row, rank_of(key, row, level)))
+                    .map(|(insert, key, row, rank)| match insert {
                         true => PairOp::Insert((key, row), rank),
                         false => PairOp::Remove((key, row), rank),
                     })
