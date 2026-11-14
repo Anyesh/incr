@@ -2,11 +2,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use proptest::prelude::*;
 
 use super::*;
 use crate::persist_hooks::RepSide;
+use crate::{ErasedIncr, Incr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Call {
@@ -612,6 +614,14 @@ macro_rules! for_both {
             $(#[test] fn $name() { super::$name::<crate::cells::Shared>(); })*
         }
     };
+    (@rows $($name:ident),* $(,)?) => {
+        mod rows_local {
+            $(#[test] fn $name() { super::$name::<crate::cells::Local>(); })*
+        }
+        mod rows_shared {
+            $(#[test] fn $name() { super::$name::<crate::cells::Shared>(); })*
+        }
+    };
 }
 
 for_both!(
@@ -851,3 +861,208 @@ fn apply_pairs_keeping_drops_nothing_until_the_kept_value_drops() {
     drop(keep);
     assert!(TRACKED_DROPS.get() >= 4, "{} dropped", TRACKED_DROPS.get());
 }
+
+/// Lets a query closure, which must be `Send + Sync`, capture a keyed
+/// collection.
+struct Captured<T>(T);
+
+// SAFETY: every test runs a `Local` runtime and its collections on the one
+// thread that created them; `Shared` collections are `Send + Sync` anyway.
+unsafe impl<T> Send for Captured<T> {}
+// SAFETY: see `Send`.
+unsafe impl<T> Sync for Captured<T> {}
+
+impl<T> Captured<T> {
+    fn get(&self) -> &T {
+        &self.0
+    }
+}
+
+type Runs = Arc<std::sync::atomic::AtomicUsize>;
+
+fn runs_of(runs: &Runs) -> usize {
+    runs.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A query reading `key` through `get_key`, and how often it ran.
+fn key_reader<C: Cells>(rt: &Runtime<C>, kc: &Plain<C>, key: u8) -> (Incr<Option<u8>>, Runs) {
+    let runs: Runs = Arc::default();
+    let counted = Arc::clone(&runs);
+    let kc = Captured(kc.clone());
+    let q = rt.create_query(move |rt| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        kc.get().get_key(rt, &key)
+    });
+    (q, runs)
+}
+
+fn a_key_reader_reruns_only_when_its_row_changes<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    kc.upsert(&rt, 2, 20);
+    let (a, runs) = key_reader(&rt, &kc, 1);
+    assert_eq!(rt.get(a), Some(10));
+    assert_eq!(runs_of(&runs), 1);
+
+    kc.upsert(&rt, 2, 21);
+    assert_eq!(rt.get(a), Some(10));
+    assert_eq!(runs_of(&runs), 1, "a write to another key");
+
+    kc.upsert(&rt, 1, 10);
+    assert_eq!(rt.get(a), Some(10));
+    assert_eq!(runs_of(&runs), 1, "an equal row");
+
+    kc.upsert(&rt, 1, 11);
+    assert_eq!(rt.get(a), Some(11));
+    assert_eq!(runs_of(&runs), 2);
+
+    kc.reconcile(&rt, [(1, 11), (3, 30)]);
+    assert_eq!(rt.get(a), Some(11));
+    assert_eq!(runs_of(&runs), 2, "a reconcile leaving the key's row");
+}
+
+fn an_absent_key_reader_follows_removal_and_re_add<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    let (q, runs) = key_reader(&rt, &kc, 3);
+    assert_eq!(rt.get(q), None);
+    kc.upsert(&rt, 3, 30);
+    assert_eq!(rt.get(q), Some(30));
+    kc.remove(&rt, &3);
+    assert_eq!(rt.get(q), None);
+    kc.upsert(&rt, 3, 31);
+    assert_eq!(rt.get(q), Some(31));
+    assert_eq!(runs_of(&runs), 4);
+    kc.remove(&rt, &4);
+    assert_eq!(rt.get(q), Some(31));
+    assert_eq!(runs_of(&runs), 4);
+}
+
+fn replayed_pairs_and_their_undo_rerun_the_reader<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let (q, runs) = key_reader(&rt, &kc, 1);
+    assert_eq!(rt.get(q), Some(10));
+    let mut journal = Vec::new();
+    kc.upsert_journaled(&rt, 1, 12, Some(&mut journal));
+    assert_eq!(rt.get(q), Some(12));
+    kc.apply_pairs_with(
+        &rt,
+        journal.into_iter().rev().map(PairOp::inverse),
+        &mut (),
+        None,
+    );
+    assert_eq!(rt.get(q), Some(10));
+    kc.apply_pairs_with(&rt, [PairOp::Insert((1, 9), 0)], &mut (), None);
+    assert_eq!(rt.get(q), Some(10), "a higher-ranked pair is not read");
+    assert_eq!(runs_of(&runs), 3);
+}
+
+fn get_key_outside_a_query_creates_nothing<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    assert_eq!(kc.get_key(&rt, &1), Some(10));
+    assert_eq!(kc.get_key(&rt, &2), None);
+    assert_eq!(kc.version_input(&1), None);
+    assert_eq!(kc.version_input(&2), None);
+}
+
+fn version_inputs_map_back_to_their_keys<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let (q, _) = key_reader(&rt, &kc, 1);
+    let (absent, _) = key_reader(&rt, &kc, 7);
+    rt.get(q);
+    rt.get(absent);
+    let one = kc.version_input(&1).expect("read in a query");
+    let seven = kc.version_input(&7).expect("read in a query");
+    assert_eq!(kc.key_of_version(one.erase()), Some(1));
+    assert_eq!(kc.key_of_version(seven.erase()), Some(7));
+    assert_eq!(kc.key_of_version(kc.pairs().version_node().erase()), None);
+    let all: std::collections::HashSet<ErasedIncr> = kc.version_inputs().into_iter().collect();
+    assert_eq!(all, [one.erase(), seven.erase()].into_iter().collect());
+}
+
+fn a_removed_key_without_readers_is_reclaimed_on_local_only<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    kc.upsert(&rt, 2, 20);
+    let (gone, _) = key_reader(&rt, &kc, 1);
+    let (kept, _) = key_reader(&rt, &kc, 2);
+    rt.get(gone);
+    rt.get(kept);
+    let handle = kc.version_input(&1).unwrap();
+    rt.try_delete_node(gone).unwrap();
+    kc.remove(&rt, &1);
+    kc.remove(&rt, &2);
+    if C::SINGLE_THREADED {
+        assert_eq!(kc.version_input(&1), None);
+        assert!(!rt.is_alive(handle));
+        assert_eq!(kc.key_of_version(handle.erase()), None);
+    } else {
+        assert_eq!(kc.version_input(&1), Some(handle));
+        assert!(rt.is_alive(handle));
+    }
+    assert!(kc.version_input(&2).is_some(), "a key with a reader");
+    assert_eq!(rt.get(kept), None);
+}
+
+fn a_keyed_write_inside_a_compute_is_refused<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    let captured = Captured(kc.clone());
+    let q = rt.create_query(move |rt| {
+        catch_unwind(AssertUnwindSafe(|| captured.get().upsert(rt, 1, 1)))
+            .map_err(panic_text)
+            .err()
+    });
+    let text = rt.get(q).expect("the write panics");
+    assert!(text.contains("inside a compute"), "{text}");
+    assert_eq!(kc.row(&1), None);
+}
+
+fn one_upsert_among_many_keys_reruns_one_reader<C: Cells>() {
+    const KEYS: u32 = 240_000;
+    let rt = Runtime::<C>::new();
+    let kc = KeyedCollection::<u32, u32, C>::new(&rt);
+    kc.reconcile(&rt, (0..KEYS).map(|key| (key, key)));
+    let runs: Runs = Arc::default();
+    let readers: Vec<Incr<Option<u32>>> = (0..KEYS)
+        .step_by(240)
+        .map(|key| {
+            let counted = Arc::clone(&runs);
+            let kc = Captured(kc.clone());
+            rt.create_query(move |rt| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                kc.get().get_key(rt, &key)
+            })
+        })
+        .collect();
+    for &q in &readers {
+        rt.get(q);
+    }
+    let before = runs_of(&runs);
+    kc.upsert(&rt, 480, 7);
+    for &q in &readers {
+        rt.get(q);
+    }
+    assert_eq!(runs_of(&runs) - before, 1);
+    assert_eq!(rt.get(readers[2]), Some(7));
+}
+
+for_both!(
+    @rows
+    a_key_reader_reruns_only_when_its_row_changes,
+    an_absent_key_reader_follows_removal_and_re_add,
+    replayed_pairs_and_their_undo_rerun_the_reader,
+    get_key_outside_a_query_creates_nothing,
+    version_inputs_map_back_to_their_keys,
+    a_removed_key_without_readers_is_reclaimed_on_local_only,
+    a_keyed_write_inside_a_compute_is_refused,
+    one_upsert_among_many_keys_reruns_one_reader,
+);

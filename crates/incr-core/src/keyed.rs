@@ -3,6 +3,12 @@
 //! key's pairs without a scan, and every write goes through it, so the
 //! index and the pair collection hold the same multiset of pairs.
 //!
+//! A query reads one key's row with [`KeyedCollection::get_key`], which
+//! depends on that key's version input and reads the row from the index
+//! untracked, as `IncrCollection::values` reads its log. Every write sets
+//! the version input of each key whose row it changed, so a reader reruns
+//! only for its own keys.
+//!
 //! A write runs as `IncrCollection::publish` does. It stages under the
 //! index's read guard, as value code: user `Hash`, key and row `Eq`, and
 //! `Clone`, changing nothing. It then takes the pair collection's log guard
@@ -19,13 +25,15 @@ use std::sync::{Arc, Weak};
 
 use crate::cells::Cells;
 use crate::collection::{Change, Displaced, IncrCollection, StagedBatch};
+use crate::dep_stack::DepStack;
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
+use crate::handle::{ErasedIncr, Incr};
 use crate::lock_order::LockKind;
 use crate::locks::OrderedLock;
 use crate::memory::{Held, StateKind, StateMemory, StateStats};
 use crate::persist_hooks::RepSink;
-use crate::runtime::Runtime;
+use crate::runtime::{DeleteError, Runtime};
 use crate::value::Value;
 use crate::value_code;
 
@@ -507,6 +515,8 @@ pub(crate) struct KeyStage<K, V, P, R> {
     epoch: u64,
     counts: KeyCounts,
     changed: Vec<K>,
+    /// The index hash of each key in `changed`, in the same order.
+    changed_hashes: Vec<u64>,
     journal: Option<Vec<PairOp<P, R>>>,
     _row: PhantomData<fn() -> V>,
 }
@@ -526,6 +536,7 @@ where
             epoch: 0,
             counts: KeyCounts::default(),
             changed: Vec::new(),
+            changed_hashes: Vec::new(),
             journal: journal.then(Vec::new),
             _row: PhantomData,
         }
@@ -649,6 +660,7 @@ where
             _ => return,
         }
         self.changed.push(self.keys[at].key.clone());
+        self.changed_hashes.push(self.keys[at].hash);
     }
 
     /// Stages `op` as the persisted binding replays it, counting it by
@@ -746,6 +758,83 @@ where
     }
 }
 
+/// A keyed collection's version inputs by key, both ways. Keys are found
+/// by their hash under the index's hasher, so a writer finds the inputs of
+/// the keys it changed from the hashes it staged, running no user code.
+struct VersionMap<K> {
+    by_hash: HashMap<u64, Vec<(K, Incr<u64>)>, FxBuildHasher>,
+    by_handle: HashMap<ErasedIncr, K, FxBuildHasher>,
+}
+
+impl<K: Eq> VersionMap<K> {
+    /// Runs key `Eq`.
+    fn find(&self, hash: u64, key: &K) -> Option<Incr<u64>> {
+        self.by_hash
+            .get(&hash)?
+            .iter()
+            .find(|(held, _)| held == key)
+            .map(|(_, handle)| *handle)
+    }
+
+    /// Every input whose key has one of `hashes`, colliding keys included.
+    fn by_hashes<'a>(
+        &'a self,
+        hashes: &'a [u64],
+    ) -> impl Iterator<Item = (u64, &'a K, Incr<u64>)> + 'a {
+        hashes.iter().flat_map(move |&hash| {
+            self.by_hash
+                .get(&hash)
+                .into_iter()
+                .flatten()
+                .map(move |(key, handle)| (hash, key, *handle))
+        })
+    }
+
+    fn forget(&mut self, hash: u64, handle: Incr<u64>) -> Option<K> {
+        if let Some(bucket) = self.by_hash.get_mut(&hash) {
+            bucket.retain(|(_, held)| *held != handle);
+            if bucket.is_empty() {
+                self.by_hash.remove(&hash);
+            }
+        }
+        self.by_handle.remove(&handle.erase())
+    }
+}
+
+/// The version inputs of the keys queries read through
+/// [`KeyedCollection::get_key`]: each created at 0 by its first read in a
+/// query and set to a fresh value by every write that changes its key's
+/// row.
+struct KeyVersions<K: 'static, C: Cells> {
+    map: OrderedLock<VersionMap<K>, C>,
+    /// The value the next write sets its keys' inputs to. Starts at 1,
+    /// above every input's initial 0, so every set changes the input.
+    changes: C::U64,
+    /// How many inputs `map` holds, so a write to a collection no query
+    /// reads by key takes no lock.
+    live: C::U64,
+}
+
+impl<K: 'static, C: Cells> KeyVersions<K, C> {
+    fn new() -> Self {
+        Self {
+            map: OrderedLock::new(
+                LockKind::KeyVersions,
+                VersionMap {
+                    by_hash: HashMap::default(),
+                    by_handle: HashMap::default(),
+                },
+            ),
+            changes: C::new_u64(1),
+            live: C::new_u64(0),
+        }
+    }
+
+    fn any(&self) -> bool {
+        C::u64_load_acquire(&self.live) != 0
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn refused() -> ! {
@@ -763,6 +852,10 @@ fn refuse_value_code() {
     }
 }
 
+fn in_compute<C: Cells>(rt: &Runtime<C>) -> bool {
+    rt.dep_stack.current_frame_active(rt.runtime_id)
+}
+
 /// Rows held by key: at most one row read per key, over a pair collection
 /// of `P` and a rows collection mapped from it with [`Pair::row`]. Writes
 /// go through the key index; queries read [`Self::rows`] or
@@ -770,9 +863,17 @@ fn refuse_value_code() {
 ///
 /// A key holds more than one pair only through `apply_pairs_with`; it then
 /// reads as the first pair with the smallest rank `R`. Every method panics
-/// when called from a key or row method run by a keyed write or read.
+/// when called from a key or row method run by a keyed write or read, and
+/// every write panics inside a compute of its runtime.
+///
+/// A key's version input stays while the collection lives under `Shared`,
+/// where deleting it could race a reader holding its handle, so their
+/// number grows with the keys ever read in a query. Under `Local` a write
+/// that leaves a key without a row deletes its input if no query depends
+/// on it.
 pub struct KeyedCollection<K, V, C, P = (K, V), R = ()>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -781,11 +882,13 @@ where
     pairs: IncrCollection<P, C>,
     rows: IncrCollection<V, C>,
     index: Arc<KeyIndex<P, R, C>>,
+    versions: Arc<KeyVersions<K, C>>,
     _key: PhantomData<fn() -> K>,
 }
 
 impl<K, V, C, P, R> Clone for KeyedCollection<K, V, C, P, R>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -796,16 +899,19 @@ where
             pairs: self.pairs.clone(),
             rows: self.rows.clone(),
             index: Arc::clone(&self.index),
+            versions: Arc::clone(&self.versions),
             _key: PhantomData,
         }
     }
 }
 
 /// What keyed writes let go, from [`KeyedCollection::apply_pairs_keeping`]:
-/// their ops, staged pairs and keys they did not use, pairs they displaced
-/// and the key index's dropped pairs. Dropping it runs their `Drop`.
+/// their ops, staged pairs and keys they did not use, pairs they displaced,
+/// the key index's dropped pairs and the keys of version inputs deleted.
+/// Dropping it runs their `Drop`.
 pub struct KeyedSpent<K, V, P, R = ()> {
     ops: Vec<PairOp<P, R>>,
+    keys: Vec<K>,
     stages: Vec<KeyStage<K, V, P, R>>,
     batches: Vec<StagedBatch<P>>,
     unused: Vec<P>,
@@ -817,6 +923,7 @@ impl<K, V, P, R> Default for KeyedSpent<K, V, P, R> {
     fn default() -> Self {
         Self {
             ops: Vec::new(),
+            keys: Vec::new(),
             stages: Vec::new(),
             batches: Vec::new(),
             unused: Vec::new(),
@@ -849,6 +956,7 @@ where
             pairs,
             rows,
             index,
+            versions: Arc::new(KeyVersions::new()),
             _key: PhantomData,
         }
     }
@@ -988,8 +1096,8 @@ where
     /// staged pairs and keys it did not use, the pairs it displaced and
     /// the index's dropped pairs move into `keep`, for a caller that runs
     /// their `Drop` once it may, such as after releasing a lock user code
-    /// must not run under. Version set and routing are as in
-    /// [`Self::apply_pairs_with`].
+    /// must not run under. Version sets, routing and the deletion of
+    /// version inputs are as in [`Self::apply_pairs_with`].
     pub fn apply_pairs_keeping<S: RepSink<P>>(
         &self,
         rt: &Runtime<C>,
@@ -1028,7 +1136,10 @@ where
     }
 
     /// Without `keep`, drops what the write lets go after the version set
-    /// and before routing, and a failed attempt's stage at once.
+    /// and before routing, and a failed attempt's stage at once. The changed
+    /// keys' version inputs are set after the index and log guards are
+    /// released and before the pair collection's version, with no user
+    /// code run since the first change.
     fn write_keeping<S: RepSink<P>>(
         &self,
         rt: &Runtime<C>,
@@ -1038,6 +1149,11 @@ where
         mut keep: Option<&mut KeyedSpent<K, V, P, R>>,
     ) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
         refuse_value_code();
+        assert!(
+            !in_compute(rt),
+            "incr-core: KeyedCollection written from inside a compute; a run the engine \
+             discards would leave rows ahead of their readers' versions",
+        );
         let index = &*self.index;
         loop {
             let mut stage = KeyStage::new(journal);
@@ -1075,8 +1191,10 @@ where
             index.settle(&table);
             drop(table);
             drop(log);
+            let hashes = mem::take(&mut stage.changed_hashes);
+            self.bump(rt, &hashes);
             let outcome = stage.outcome(epoch);
-            match keep {
+            match keep.as_deref_mut() {
                 Some(keep) => {
                     self.pairs.publish_batch_keeping(
                         rt,
@@ -1092,8 +1210,153 @@ where
                         .publish_batch(rt, committed, move || drop((dropped, stage)));
                 }
             }
+            self.reclaim(rt, &hashes, keep);
             return outcome;
         }
+    }
+
+    /// Sets the version input of every key with one of `hashes` to a fresh
+    /// value. Runs no user code.
+    fn bump(&self, rt: &Runtime<C>, hashes: &[u64]) {
+        if hashes.is_empty() || !self.versions.any() {
+            return;
+        }
+        let value = C::u64_fetch_add(&self.versions.changes, 1);
+        let handles: Vec<Incr<u64>> = {
+            let map = self.versions.map.read();
+            map.by_hashes(hashes).map(|(_, _, handle)| handle).collect()
+        };
+        for handle in handles {
+            rt.set(handle, value);
+        }
+    }
+
+    /// Under `Local`, deletes the version input of each key with one of
+    /// `hashes` that holds no row and has no dependent; its key goes to
+    /// `keep` when given.
+    fn reclaim(&self, rt: &Runtime<C>, hashes: &[u64], keep: Option<&mut KeyedSpent<K, V, P, R>>) {
+        if !C::SINGLE_THREADED || hashes.is_empty() || !self.versions.any() {
+            return;
+        }
+        let candidates: Vec<(u64, K, Incr<u64>)> = {
+            let map = self.versions.map.read();
+            value_code::run(|| {
+                map.by_hashes(hashes)
+                    .map(|(hash, key, handle)| (hash, key.clone(), handle))
+                    .collect()
+            })
+        };
+        let mut freed = Vec::new();
+        for (hash, key, handle) in &candidates {
+            if self.held(key) {
+                continue;
+            }
+            match rt.try_delete_node(*handle) {
+                Ok(()) | Err(DeleteError::NotAlive) => freed.push((*hash, *handle)),
+                Err(DeleteError::HasDependents) => {}
+            }
+        }
+        let mut keys: Vec<K> = Vec::new();
+        if !freed.is_empty() {
+            let mut map = self.versions.map.write();
+            for (hash, handle) in freed {
+                if let Some(key) = map.forget(hash, handle) {
+                    C::u64_fetch_add(&self.versions.live, u64::MAX);
+                    keys.push(key);
+                }
+            }
+        }
+        keys.extend(candidates.into_iter().map(|(_, key, _)| key));
+        match keep {
+            Some(keep) => keep.keys.extend(keys),
+            None => drop(keys),
+        }
+    }
+
+    /// Whether `key` holds a row, read as value code under the index's
+    /// read guard. Marks nothing on a running compute.
+    fn held(&self, key: &K) -> bool {
+        let table = self.index.table.read();
+        value_code::run(|| {
+            table
+                .find_key(self.index.hasher.hash_one(key), key)
+                .is_some()
+        })
+    }
+
+    /// The row read for `key`. Inside a compute of `rt` the read depends
+    /// on `key`'s version input, created at 0 on the first such read, so
+    /// the query reruns only when a write changes this key's row; the row
+    /// itself is read from the index. Outside one it reads as
+    /// [`Self::row`] and creates nothing. In a run the engine discards it
+    /// reads as [`Self::row`] too.
+    pub fn get_key(&self, rt: &Runtime<C>, key: &K) -> Option<V> {
+        refuse_value_code();
+        if !in_compute(rt) || rt.frame_doomed() {
+            return self.row(key);
+        }
+        rt.get(self.version_input_or_create(rt, key));
+        let table = self.index.table.read();
+        value_code::run(|| {
+            table
+                .find_key(self.index.hasher.hash_one(key), key)
+                .map(|s| table.bucket(s).read().0.row())
+        })
+    }
+
+    /// `key`'s version input, if a read created one.
+    pub fn version_input(&self, key: &K) -> Option<Incr<u64>> {
+        refuse_value_code();
+        let hash = value_code::run(|| self.index.hasher.hash_one(key));
+        let map = self.versions.map.read();
+        value_code::run(|| map.find(hash, key))
+    }
+
+    /// `key`'s version input, created at 0 if no read created one yet.
+    /// Takes the version lock, ranked above `DepIndex`, so a caller holding
+    /// a `DepIndex` hold must not call it.
+    pub fn version_input_or_create(&self, rt: &Runtime<C>, key: &K) -> Incr<u64> {
+        if let Some(handle) = self.version_input(key) {
+            return handle;
+        }
+        let hash = value_code::run(|| self.index.hasher.hash_one(key));
+        let mut map = self.versions.map.write();
+        if let Some(handle) = value_code::run(|| map.find(hash, key)) {
+            return handle;
+        }
+        let (by_hash, by_handle) = value_code::run(|| (key.clone(), key.clone()));
+        let handle = rt.create_input_unchecked(0_u64);
+        map.by_hash.entry(hash).or_default().push((by_hash, handle));
+        map.by_handle.insert(handle.erase(), by_handle);
+        C::u64_fetch_add(&self.versions.live, 1);
+        handle
+    }
+
+    /// A copy of the key whose version input is `handle`.
+    pub fn key_of_version(&self, handle: ErasedIncr) -> Option<K> {
+        refuse_value_code();
+        if !self.versions.any() {
+            return None;
+        }
+        let map = self.versions.map.read();
+        value_code::run(|| map.by_handle.get(&handle).cloned())
+    }
+
+    /// Every version input, in no particular order.
+    pub fn version_inputs(&self) -> Vec<ErasedIncr> {
+        self.versions.map.read().by_handle.keys().copied().collect()
+    }
+
+    /// The rank of the pair read for `key`. Records no dependency and
+    /// marks nothing on a running compute.
+    pub fn read_rank(&self, key: &K) -> Option<R> {
+        refuse_value_code();
+        let table = self.index.table.read();
+        value_code::run(|| {
+            table
+                .find_key(self.index.hasher.hash_one(key), key)
+                .map(|s| table.bucket(s).read().1)
+        })
     }
 
     /// Runs `f` on the table as value code, under its read guard. Records

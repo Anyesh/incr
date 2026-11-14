@@ -27,6 +27,10 @@ pub enum LockKind {
     TableMiss,
     /// incr-persist's `DepIndex`.
     DepIndex,
+    /// A keyed collection's per-key version inputs, under which a reader
+    /// creates a key's input; only key `Hash`, `Eq` and `Clone` run under
+    /// it besides that.
+    KeyVersions,
     /// `join`'s state or a positional operator's mirror.
     OperatorState,
     /// `group_by`'s `groups`, which the router's `rt.set` runs under.
@@ -73,6 +77,7 @@ impl LockKind {
             LockKind::MemoIndex => 30,
             LockKind::TableMiss => 40,
             LockKind::DepIndex => 50,
+            LockKind::KeyVersions => 52,
             LockKind::OperatorState | LockKind::GroupState | LockKind::AggregateState => 55,
             LockKind::KeyCache => 56,
             LockKind::CollectionLog => 58,
