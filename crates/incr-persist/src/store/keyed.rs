@@ -27,6 +27,9 @@ type Ranked<P> = (P, u128);
 /// an unlogged scope's writes leave behind: no logged bytes back it.
 const UNLOGGED_RANK: u128 = 0;
 
+/// A key's bytes and its row's fingerprint, `None` for no row.
+pub(crate) type RowDep = (Vec<u8>, Option<u128>);
+
 /// What a memo maps of a keyed collection's `get_key` reads. A row's
 /// fingerprint is the rank of the pair read for its key: the fingerprint
 /// of the bytes that pair was applied from, `None` for a key holding no
@@ -35,7 +38,7 @@ pub(crate) trait RowSource<C: Cells>: Send + Sync {
     /// For a version input of this collection, its key's bytes and its
     /// row's fingerprint, or `Ok(None)` when its row is not a logged one;
     /// `None` for any other node.
-    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<(Vec<u8>, Option<u128>)>>>;
+    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<RowDep>>>;
 
     /// The version input of the key `key_bytes` encode, created if no read
     /// created it; `None` when they do not decode. Takes the version lock,
@@ -117,7 +120,7 @@ where
     C: Cells,
     P: Pair<K, V> + PersistValue,
 {
-    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<(Vec<u8>, Option<u128>)>>> {
+    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<RowDep>>> {
         let key = self.keyed.key_of_version(dep)?;
         let Some(fp) = self.row_fp(&key) else {
             return Some(Ok(None));
