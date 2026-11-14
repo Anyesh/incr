@@ -508,6 +508,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.options.value_scope.clone().map(enter_value_scope)
     }
 
+    /// [`Options::value_scope`], for code that enters it on another thread.
+    pub(crate) fn value_scope(&self) -> Option<ValueScope> {
+        self.options.value_scope.clone()
+    }
+
     /// The runtime the store keeps in sync with the log. Create queries and
     /// read values through it; write inputs through the store.
     pub fn runtime(&self) -> &Runtime<C> {

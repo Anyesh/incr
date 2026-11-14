@@ -36,7 +36,7 @@ impl<C: MemoCells> CoreRef<C> {
             return t.cold(self, rt, key);
         }
         check_value_code();
-        let Some(bytes) = encode(&t.name, MemoPart::Key, &key) else {
+        let Some(bytes) = encode(t.scope.as_ref(), &t.name, MemoPart::Key, &key) else {
             return t.cold(self, rt, key);
         };
         if !self.index().holds(table.index, &bytes) {
@@ -84,7 +84,7 @@ impl<C: MemoCells> CoreRef<C> {
         // The root is seeded here, typed, so its stored key is checked
         // against the live one and its handle comes back typed.
         let entry = walk.visits[root].entry.as_ref().expect("read above");
-        let stored = decode::<K>(&t.name, MemoPart::Key, &entry.key);
+        let stored = decode::<K>(t.scope.as_ref(), &t.name, MemoPart::Key, &entry.key);
         let same = with_value_code(|| stored.as_ref() == Some(&key));
         bag.push(stored);
         if !same {
