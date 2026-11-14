@@ -1,4 +1,4 @@
-//! `Serialize` and `Deserialize` for [`PyValue`] and [`PyKey`], behind the `persist`
+//! `Serialize` and `Deserialize` for [`PyValue`], [`PyPair`] and [`PyKey`], behind the `persist`
 //! feature. A value crosses serde as one byte string that a process-wide
 //! [`Hook`] produces and reads back, so this crate needs no persistence
 //! dependency and the binding decides what the bytes are.
@@ -6,17 +6,17 @@
 use std::fmt;
 use std::sync::OnceLock;
 
-use pyo3::Python;
+use pyo3::{Bound, PyAny, Python};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{PyKey, PyValue};
+use crate::{PyKey, PyPair, PyValue};
 
 /// How a binding turns values into bytes and back. Both run with the GIL
 /// held, on the thread serde runs on, and report a failure as the message
 /// serde carries.
 pub struct Hook {
-    pub encode: fn(Python<'_>, &PyValue) -> Result<Vec<u8>, String>,
+    pub encode: fn(Python<'_>, &Bound<'_, PyAny>) -> Result<Vec<u8>, String>,
     pub decode: fn(Python<'_>, &[u8]) -> Result<PyValue, String>,
     /// A keyed collection's key alone, as its pairs encode their key half.
     pub encode_key: fn(Python<'_>, &PyKey) -> Result<Vec<u8>, String>,
@@ -35,12 +35,31 @@ fn hook() -> Result<&'static Hook, &'static str> {
     HOOK.get().ok_or("no value codec hook is installed")
 }
 
+fn serialize_value<S: Serializer>(
+    value: &pyo3::Py<PyAny>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let hook = hook().map_err(serde::ser::Error::custom)?;
+    let bytes = Python::attach(|py| (hook.encode)(py, value.bind(py)))
+        .map_err(serde::ser::Error::custom)?;
+    serializer.serialize_bytes(&bytes)
+}
+
 impl Serialize for PyValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let hook = hook().map_err(serde::ser::Error::custom)?;
-        let bytes =
-            Python::attach(|py| (hook.encode)(py, self)).map_err(serde::ser::Error::custom)?;
-        serializer.serialize_bytes(&bytes)
+        serialize_value(&self.0, serializer)
+    }
+}
+
+impl Serialize for PyPair {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_value(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PyPair {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        PyValue::deserialize(deserializer).map(|value| PyPair(value.0))
     }
 }
 

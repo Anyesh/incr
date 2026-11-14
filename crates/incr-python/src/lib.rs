@@ -62,7 +62,7 @@ use incr_python_protocol::snapshot::{
 };
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, raise_into_engine,
-    routing_error, try_read, Exceptions, PyFixpoint, PyKey, PyValue,
+    routing_error, try_read, Exceptions, PyFixpoint, PyKey, PyPair, PyValue,
 };
 use persist::{_NotReadySignal, Signal};
 
@@ -896,7 +896,7 @@ struct PyKeyedCollection {
 }
 
 /// A keyed collection whose pairs are `(key, row)` tuples, read by rank `R`.
-type PyKeyedCore<R> = incr_core::KeyedCollection<PyKey, PyValue, Local, PyValue, R>;
+type PyKeyedCore<R> = incr_core::KeyedCollection<PyKey, PyValue, Local, PyPair, R>;
 
 /// A keyed collection whose pairs are `(key, row)` tuples.
 pub(crate) type CoreKeyed = PyKeyedCore<()>;
@@ -957,10 +957,10 @@ impl PyKeyedCollection {
         &self,
         py: Python<'_>,
         keyed: &PyKeyedCore<R>,
-        undo: fn(PyKeyedCore<R>, Vec<PairOp<PyValue, R>>) -> Undo,
+        undo: fn(PyKeyedCore<R>, Vec<PairOp<PyPair, R>>) -> Undo,
         write: impl FnOnce(
             &PyKeyedCore<R>,
-            Option<&mut Vec<PairOp<PyValue, R>>>,
+            Option<&mut Vec<PairOp<PyPair, R>>>,
         ) -> PyResult<incr_core::KeyedChange<PyKey>>,
     ) -> PyResult<KeyCounts> {
         let state = self.state(py);
@@ -979,7 +979,7 @@ impl PyKeyedCollection {
     fn wrap(
         runtime: Bound<'_, PyRuntime>,
         kind: KeyedKind,
-        pairs: IncrCollection<PyValue>,
+        pairs: IncrCollection<PyPair>,
         rows: IncrCollection<PyValue>,
         stats: Weak<dyn StateStats>,
         label: Option<String>,
@@ -1017,7 +1017,7 @@ impl PyKeyedCollection {
     ) -> PyResult<Self> {
         let pairs = persisted.pairs();
         let rows = persisted.rows().clone();
-        let stats: Weak<incr_core::KeyIndex<PyValue, u128, Local>> = persisted.index_weak();
+        let stats: Weak<incr_core::KeyIndex<PyPair, u128, Local>> = persisted.index_weak();
         Self::wrap(
             runtime,
             KeyedKind::Persisted(persisted),
@@ -1071,7 +1071,7 @@ impl PyKeyedCollection {
         let keyed = runtime.borrow().engine_read(CoreKeyed::new)?;
         let pairs = keyed.pairs();
         let rows = keyed.rows().clone();
-        let stats: Weak<incr_core::KeyIndex<PyValue, (), Local>> = keyed.index_weak();
+        let stats: Weak<incr_core::KeyIndex<PyPair, (), Local>> = keyed.index_weak();
         Self::wrap(runtime, KeyedKind::Plain(keyed), pairs, rows, stats, label)
     }
 

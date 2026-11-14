@@ -1,5 +1,4 @@
 import importlib
-import sys
 
 import incr.persist
 import incr_concurrent.persist
@@ -322,21 +321,26 @@ def test_a_key_whose_hash_or_eq_raises_leaves_everything_unchanged(pkg, raising,
     assert read(rt, nodes) == {"values": [1, 2, 30], "count": 3, "sum": 33}
 
 
-def test_row_hash_calls_per_upsert_meet_the_documented_bound(pkg):
+@pytest.mark.parametrize("read_rows", [True, False], ids=["rows-read", "rows-unread"])
+def test_row_hash_calls_per_upsert_meet_the_documented_bound(pkg, read_rows):
+    # Pairs hash their key alone, so only `kc.collection`'s output hashes
+    # rows, once per added or removed row, and only once it is read.
     rt = pkg.Runtime()
     kc = pkg.KeyedCollection(rt)
-    count = kc.collection.count()
+    count = kc.collection.count() if read_rows else None
     kc.upsert("a", Row(1))
-    rt.get(count)
-
-    def hashes(change):
-        Row.hashes = 0
-        change()
+    if count is not None:
         rt.get(count)
-        return Row.hashes
 
-    rehashed = 0 if sys.version_info >= (3, 14) else 1
-    assert hashes(lambda: kc.upsert("b", Row(2))) == 2
-    assert hashes(lambda: kc.upsert("b", Row(3))) == 3 + rehashed
-    assert hashes(lambda: kc.upsert("b", Row(3))) == 0
-    assert hashes(lambda: kc.remove("b")) == 1 + rehashed
+    def calls(change):
+        Row.hashes = Row.eqs = 0
+        change()
+        if count is not None:
+            rt.get(count)
+        return Row.hashes, Row.eqs
+
+    per_row = int(read_rows)
+    assert calls(lambda: kc.upsert("b", Row(2))) == (per_row, 0)
+    assert calls(lambda: kc.upsert("b", Row(3))) == (2 * per_row, 4 + per_row)
+    assert calls(lambda: kc.upsert("b", Row(3))) == (0, 1)
+    assert calls(lambda: kc.remove("b")) == (per_row, per_row)

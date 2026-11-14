@@ -227,10 +227,13 @@ pub fn install_hook<E: PersistExceptions>() {
     });
 }
 
-fn encode<E: PersistExceptions>(py: Python<'_>, value: &PyValue) -> Result<Vec<u8>, String> {
+fn encode<E: PersistExceptions>(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> Result<Vec<u8>, String> {
     let registry = active::<E>()?;
     let codec = registry.codec_for(py)?;
-    frame(py, &codec, value.0.bind(py)).map_err(|e| registry.stash(e))
+    frame(py, &codec, value).map_err(|e| registry.stash(e))
 }
 
 fn decode<E: PersistExceptions>(py: Python<'_>, bytes: &[u8]) -> Result<PyValue, String> {

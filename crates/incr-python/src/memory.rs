@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use incr_compute::{MemoryStats, NodeKind};
 use incr_python_protocol::inspect::label_group;
-use incr_python_protocol::PyValue;
+use incr_python_protocol::{PyPair, PyValue};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -16,7 +16,10 @@ use pyo3::types::{PyDict, PyTuple};
 /// binding puts in the engine. A `window`'s `Vec<PyValue>` is not among
 /// them, as its length is not known from its type.
 fn py_refs_of(type_id: TypeId) -> usize {
-    if type_id == TypeId::of::<PyValue>() || type_id == TypeId::of::<Py<PyTuple>>() {
+    if type_id == TypeId::of::<PyValue>()
+        || type_id == TypeId::of::<PyPair>()
+        || type_id == TypeId::of::<Py<PyTuple>>()
+    {
         1
     } else if type_id == TypeId::of::<(PyValue, PyValue)>() {
         2

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use incr_core::{Incr, IncrCollection, KeyedCollection};
 use incr_persist::{Input, UnloggedScope};
-use incr_python_protocol::{PyKey, PyValue};
+use incr_python_protocol::{PyKey, PyPair, PyValue};
 use pyo3::prelude::*;
 
 use crate::backend::PyBackend;
@@ -15,7 +15,7 @@ use crate::binding::{carry, Carry, PyBinding};
 use crate::store::{Collection, Keyed, StoreCore};
 
 /// The writable runtime collection behind a persisted keyed collection.
-pub type UnloggedKeyed<B> = KeyedCollection<PyKey, PyValue, <B as PyBinding>::C, PyValue, u128>;
+pub type UnloggedKeyed<B> = KeyedCollection<PyKey, PyValue, <B as PyBinding>::C, PyPair, u128>;
 
 /// The unlogged scope of a package's store.
 pub type Scope<B> =

@@ -6,7 +6,7 @@ use incr_python_persist::classes::{
 };
 use incr_python_persist::incr_persist::Shared;
 use incr_python_persist::store::Keyed;
-use incr_python_protocol::{PyKey, PyValue};
+use incr_python_protocol::{PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -50,7 +50,7 @@ impl PyKeyedCollection {
         py: Python<'_>,
         runtime: Bound<'_, PyRuntime>,
         kind: KeyedKind,
-        pairs: IncrCollection<PyValue>,
+        pairs: IncrCollection<PyPair>,
         rows: IncrCollection<PyValue>,
         label: Option<String>,
     ) -> PyResult<Self> {

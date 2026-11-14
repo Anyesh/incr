@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use incr_core::{Change, ErasedIncr, Incr, IncrCollection, KeyedCollection, PairOp, Runtime};
+use incr_core::{Change, ErasedIncr, Incr, IncrCollection, PairOp, Runtime};
 use incr_persist::Input;
-use incr_python_protocol::{PyKey, PyValue};
+use incr_python_protocol::{PyPair, PyValue};
 use pyo3::prelude::*;
 
 use crate::binding::PyBinding;
@@ -16,7 +16,7 @@ use crate::scope::{OverlayScope, Scope, UnloggedKeyed};
 use crate::store::{Collection, Keyed};
 
 /// A plain keyed collection of a `C` runtime.
-pub type PlainKeyed<C> = KeyedCollection<PyKey, PyValue, C, PyValue, ()>;
+pub use crate::classes::PlainKeyed;
 
 /// Set when the overlay that created an object ends, after which the
 /// object's nodes are gone and every use of it raises.
@@ -41,9 +41,9 @@ pub enum Undo<B: PyBinding> {
     Collection(IncrCollection<PyValue, B::C>, Vec<Change<PyValue>>),
     /// The pair ops a plain keyed collection's write journalled, undone
     /// by applying their inverses newest first.
-    Keyed(PlainKeyed<B::C>, Vec<PairOp<PyValue, ()>>),
+    Keyed(PlainKeyed<B::C>, Vec<PairOp<PyPair, ()>>),
     /// The same for a persisted keyed collection's unlogged writes.
-    PersistedKeyed(UnloggedKeyed<B>, Vec<PairOp<PyValue, u128>>),
+    PersistedKeyed(UnloggedKeyed<B>, Vec<PairOp<PyPair, u128>>),
     Label(u32, Option<String>),
 }
 

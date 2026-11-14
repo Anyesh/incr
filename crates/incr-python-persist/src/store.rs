@@ -12,7 +12,7 @@ use incr_persist::{
     Durability, Input, Options, PendingWrite, PersistedCollection, PersistedKeyed, Store,
     StoreStats,
 };
-use incr_python_protocol::{PyKey, PyValue};
+use incr_python_protocol::{PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
@@ -27,7 +27,7 @@ pub type Collection<B> = PersistedCollection<PyValue, <B as PyBinding>::C>;
 
 /// A persisted keyed collection of a package's store, whose pairs are
 /// `(key, row)` tuples.
-pub type Keyed<B> = PersistedKeyed<PyKey, PyValue, <B as PyBinding>::C, PyValue>;
+pub type Keyed<B> = PersistedKeyed<PyKey, PyValue, <B as PyBinding>::C, PyPair>;
 
 /// The `build_id` a store is opened with: an int, or a str incr hashes.
 pub fn build_id_of(build_id: &Bound<'_, PyAny>) -> PyResult<u128> {
@@ -417,7 +417,7 @@ where
         let persisted = self.declaring(&slot, true, || {
             self.write(py, move |store, _| {
                 store
-                    .keyed_collection::<PyKey, PyValue, PyValue>(key)
+                    .keyed_collection::<PyKey, PyValue, PyPair>(key)
                     .map(carry::<B, _>)
             })
         })?;

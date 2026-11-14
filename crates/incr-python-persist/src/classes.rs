@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, Runtime};
-use incr_python_protocol::{PyKey, PyValue};
+use incr_python_protocol::{PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::PyClass;
@@ -79,7 +79,7 @@ pub trait FullStoreRuntime<B: PyBinding>: StoreRuntime<B> {
 
 /// The core collection behind a package's plain `KeyedCollection`, whose
 /// pairs are `(key, row)` tuples.
-pub type PlainKeyed<C> = incr_core::KeyedCollection<PyKey, PyValue, C, PyValue, ()>;
+pub type PlainKeyed<C> = incr_core::KeyedCollection<PyKey, PyValue, C, PyPair, ()>;
 
 /// The core collection a per-key read reaches.
 pub enum KeyedSource<'a, B: PyBinding> {

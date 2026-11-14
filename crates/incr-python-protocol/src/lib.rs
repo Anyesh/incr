@@ -375,18 +375,66 @@ impl Hash for PyKey {
     }
 }
 
-fn pair_item<'py>(pair: &'py PyValue, py: Python<'py>, i: usize) -> Bound<'py, PyAny> {
+fn pair_item<'py>(pair: &'py PyPair, py: Python<'py>, i: usize) -> Bound<'py, PyAny> {
     or_stash(pair.0.bind(py).get_item(i))
 }
 
-/// A keyed collection's pair: the `(key, row)` tuple held as a `PyValue`,
-/// the element the pair collection and its record format have always
-/// held. The row stays a `PyValue` so the rows collection is a plain
-/// collection of rows; `row_eq` matches rows as [`PyKey`] matches keys.
-impl Pair<PyKey, PyValue> for PyValue {
+/// A keyed collection's pair: the `(key, row)` tuple, encoded as a
+/// `PyValue` holding the tuple is, so the record format is unchanged.
+/// Hashing it hashes only the key, so a row need not be hashable; equal
+/// pairs have equal keys. `==` is tuple `==`: true for the same object,
+/// else each item `==` with the same shortcut, a `ValueError` from one
+/// (NumPy, pandas) counting as unequal and any other exception unwinding
+/// the engine through [`or_stash`]. The row stays a `PyValue` so the rows
+/// collection is a plain collection of rows, whose operators hash rows.
+pub struct PyPair(pub Py<PyAny>);
+
+impl Clone for PyPair {
+    fn clone(&self) -> Self {
+        Python::attach(|py| PyPair(self.0.clone_ref(py)))
+    }
+}
+
+/// Python `==` with the identity shortcut, a `ValueError` from the
+/// comparison or its truth value counting as unequal and any other
+/// exception unwinding the engine.
+fn same_or_equal_lenient(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> bool {
+    if a.is(b) {
+        return true;
+    }
+    match a.rich_compare(b, CompareOp::Eq).and_then(|r| r.is_truthy()) {
+        Ok(equal) => equal,
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyValueError>(a.py()) => false,
+        Err(e) => or_stash(Err(e)),
+    }
+}
+
+impl PartialEq for PyPair {
+    /// Tuple `==` item by item, which calls a differing row's `__eq__`
+    /// once where `tuple.__eq__` calls it twice.
+    fn eq(&self, other: &Self) -> bool {
+        Python::attach(|py| {
+            self.0.bind(py).is(other.0.bind(py))
+                || (0..2).all(|i| {
+                    same_or_equal_lenient(&pair_item(self, py, i), &pair_item(other, py, i))
+                })
+        })
+    }
+}
+
+impl Eq for PyPair {}
+
+impl Hash for PyPair {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key_hash(state);
+    }
+}
+
+/// `row_eq` matches rows as the pairs' `==` does.
+impl Pair<PyKey, PyValue> for PyPair {
     fn new(key: PyKey, row: PyValue) -> Self {
         Python::attach(|py| {
-            PyValue(
+            PyPair(
                 or_stash(PyTuple::new(py, [key.0, row.0]))
                     .into_any()
                     .unbind(),
@@ -411,7 +459,7 @@ impl Pair<PyKey, PyValue> for PyValue {
     }
 
     fn row_eq(&self, row: &PyValue) -> bool {
-        Python::attach(|py| same_or_equal(&pair_item(self, py, 1), row.0.bind(py)))
+        Python::attach(|py| same_or_equal_lenient(&pair_item(self, py, 1), row.0.bind(py)))
     }
 }
 
