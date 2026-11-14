@@ -27,11 +27,14 @@
 //! different thread trips over the resulting Failed node it gets a
 //! `RuntimeError` carrying the engine's message instead.
 
+mod persist;
+
 use pyo3::marker::Ungil;
 use pyo3::prelude::*;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use ::incr_concurrent as engine;
@@ -279,7 +282,7 @@ impl PyRuntimeRef {
 #[pyclass(name = "NodeTable")]
 struct PyNodeTable {
     inner: NodeTable<PyValue, PyValue>,
-    rt: Arc<Runtime>,
+    rt: RtRef,
 }
 
 #[pymethods]
@@ -354,7 +357,7 @@ impl PyNodeTable {
 #[pyclass(name = "Collection")]
 struct PyCollection {
     inner: IncrCollection<PyValue>,
-    rt: Arc<Runtime>,
+    rt: RtRef,
     bridges: Arc<VersionBridges>,
 }
 
@@ -384,7 +387,7 @@ impl PyCollection {
         })?;
         Ok(PyCollection {
             inner: filtered,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -397,7 +400,7 @@ impl PyCollection {
         })?;
         Ok(PyCollection {
             inner: mapped,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -467,7 +470,7 @@ impl PyCollection {
         })?;
         Ok(PySortedCollection {
             inner: sorted,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -481,7 +484,7 @@ impl PyCollection {
         })?;
         Ok(PyGroupedCollection {
             inner: grouped,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -521,7 +524,7 @@ impl PyCollection {
         })?;
         Ok(PyCollection {
             inner: mapped,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -537,7 +540,7 @@ impl PyCollection {
 #[pyclass(name = "SortedCollection")]
 struct PySortedCollection {
     inner: SortedCollection<PyValue, PyValue>,
-    rt: Arc<Runtime>,
+    rt: RtRef,
     bridges: Arc<VersionBridges>,
 }
 
@@ -559,7 +562,7 @@ impl PySortedCollection {
         })?;
         Ok(PyCollection {
             inner: mapped,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -579,7 +582,7 @@ impl PySortedCollection {
         })?;
         Ok(PyCollection {
             inner: mapped,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -608,7 +611,7 @@ impl PySortedCollection {
 #[pyclass(name = "GroupedCollection")]
 struct PyGroupedCollection {
     inner: engine::GroupedCollection<PyValue, PyValue>,
-    rt: Arc<Runtime>,
+    rt: RtRef,
     bridges: Arc<VersionBridges>,
 }
 
@@ -628,7 +631,7 @@ impl PyGroupedCollection {
         let group = engine_call(py, &self.rt, || self.inner.get_group(&py_key))?;
         Ok(group.map(|collection| PyCollection {
             inner: collection,
-            rt: Arc::clone(&self.rt),
+            rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
         }))
     }
@@ -645,9 +648,27 @@ impl PyGroupedCollection {
     }
 }
 
+/// The runtime a Python object reads: one it owns, or a store's.
+#[derive(Clone)]
+enum RtRef {
+    Own(Arc<Runtime>),
+    Store(Arc<persist::Core>),
+}
+
+impl Deref for RtRef {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        match self {
+            RtRef::Own(rt) => rt,
+            RtRef::Store(core) => core.runtime(),
+        }
+    }
+}
+
 #[pyclass(name = "Runtime")]
 struct PyRuntime {
-    inner: Arc<Runtime>,
+    inner: RtRef,
     bridges: Arc<VersionBridges>,
 }
 
@@ -663,12 +684,21 @@ const _: () = {
     assert!(align_of::<PyRuntime>() <= 16);
 };
 
+impl PyRuntime {
+    fn of_store(core: Arc<persist::Core>) -> Self {
+        PyRuntime {
+            inner: RtRef::Store(core),
+            bridges: Arc::default(),
+        }
+    }
+}
+
 #[pymethods]
 impl PyRuntime {
     #[new]
     fn new() -> Self {
         PyRuntime {
-            inner: Arc::new(Runtime::new()),
+            inner: RtRef::Own(Arc::new(Runtime::new())),
             bridges: Arc::default(),
         }
     }
@@ -804,7 +834,7 @@ impl PyRuntime {
         })?;
         Ok(PyNodeTable {
             inner: table,
-            rt: Arc::clone(&self.inner),
+            rt: RtRef::clone(&self.inner),
         })
     }
 
@@ -831,7 +861,7 @@ impl PyRuntime {
         })?;
         Ok(PyCollection {
             inner: col,
-            rt: Arc::clone(&self.inner),
+            rt: RtRef::clone(&self.inner),
             bridges: Arc::clone(&self.bridges),
         })
     }
@@ -961,5 +991,6 @@ fn incr_concurrent(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCollection>()?;
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
+    persist::register(m)?;
     Ok(())
 }

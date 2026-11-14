@@ -2,7 +2,7 @@
 name = "incr-concurrent-python"
 version.workspace = true
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Python bindings for the thread-safe incr incremental computation engine"
 license = "Apache-2.0"
 publish = false
@@ -14,5 +14,6 @@ doc = false
 
 [dependencies]
 incr_concurrent = { package = "incr-concurrent", version = "=0.2.0-beta.7", path = "../incr-concurrent" }
+incr-python-persist = { path = "../incr-python-persist" }
 incr-python-protocol = { path = "../incr-python-protocol" }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }

@@ -147,6 +147,14 @@ impl<E: PersistExceptions> Registry<E> {
     ) -> PyResult<R> {
         drop(self.take_failure());
         let result = self.scoped(f);
+        self.finish(py, result)
+    }
+
+    /// The outcome of a store call that ran in this registry's scope on
+    /// this thread, its failure raised as the exception a codec raised
+    /// during it, else through `describe`. Clear the stash with
+    /// [`Self::take_failure`] before the call.
+    pub fn finish<R>(&self, py: Python<'_>, result: incr_persist::Result<R>) -> PyResult<R> {
         let failure = self.take_failure();
         match result {
             Ok(value) => Ok(value),

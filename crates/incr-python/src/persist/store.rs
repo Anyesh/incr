@@ -8,12 +8,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use incr_core::Local;
-use incr_persist::memo::{fingerprint, Memo, MemoBuilder};
-use incr_persist::{Durability, Input, Options, PersistedCollection, Store};
+use incr_persist::memo::{Memo, MemoBuilder};
+use incr_persist::{Input, Options, PersistedCollection, Store};
+use incr_python_persist::store::{auto_checkpoint_of, build_id_of, durability_of};
 use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
+use pyo3::types::PyDict;
 
 use super::batch::PyBatch;
 use super::keyed::Pending;
@@ -140,23 +141,6 @@ impl PyStore {
     }
 }
 
-fn build_id_of(build_id: &Bound<'_, PyAny>) -> PyResult<u128> {
-    if let Ok(text) = build_id.downcast::<PyString>() {
-        return Ok(fingerprint(text.to_str()?.as_bytes()));
-    }
-    build_id.extract::<u128>()
-}
-
-fn durability_of(durability: &str) -> PyResult<Durability> {
-    match durability {
-        "sync" => Ok(Durability::Sync),
-        "buffered" => Ok(Durability::Buffered),
-        other => Err(PyValueError::new_err(format!(
-            "durability must be 'sync' or 'buffered', not {other:?}"
-        ))),
-    }
-}
-
 #[pymethods]
 impl PyStore {
     /// Opens a store over `backend`, replaying its log. `build_id`, an int
@@ -176,11 +160,7 @@ impl PyStore {
         auto_checkpoint_records: Option<u64>,
     ) -> PyResult<PyStore> {
         let build_id = build_id_of(build_id)?;
-        if auto_checkpoint_records == Some(0) {
-            return Err(PyValueError::new_err(
-                "auto_checkpoint_records must be a positive count or None",
-            ));
-        }
+        let auto_checkpoint_records = auto_checkpoint_of(auto_checkpoint_records)?;
         let registry = Arc::new(Registry::default());
         let options = Options {
             durability: durability_of(durability)?,

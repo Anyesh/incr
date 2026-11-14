@@ -7,11 +7,16 @@
 //! per persisted slot.
 
 pub mod backend;
+pub mod binding;
 pub mod codec;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod memo_backend;
+mod memory;
+pub mod store;
 
+#[doc(hidden)]
+pub use incr_persist;
 #[doc(hidden)]
 pub use pyo3;
 
