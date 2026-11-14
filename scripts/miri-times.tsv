@@ -303,6 +303,8 @@
 5	keyed::tests::local::runtime_calls_from_key_or_row_eq_are_refused
 5	keyed::tests::local::settled_stats_are_read_without_the_lock
 164	keyed::tests::local::user_panics_leave_everything_unchanged
+39	keyed::tests::rows_local::one_upsert_among_many_keys_reruns_one_reader
+39	keyed::tests::rows_shared::one_upsert_among_many_keys_reruns_one_reader
 5	keyed::tests::shared::a_held_key_object_is_kept
 5	keyed::tests::shared::a_key_with_two_pairs_reads_the_smallest_rank
 5	keyed::tests::shared::a_remove_then_insert_of_one_key_reports_two_changes

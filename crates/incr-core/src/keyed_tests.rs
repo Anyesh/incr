@@ -1177,12 +1177,12 @@ fn a_keyed_write_inside_a_compute_is_refused<C: Cells>() {
 }
 
 fn one_upsert_among_many_keys_reruns_one_reader<C: Cells>() {
-    const KEYS: u32 = 240_000;
+    let keys: u32 = if cfg!(miri) { 960 } else { 240_000 };
     let rt = Runtime::<C>::new();
     let kc = KeyedCollection::<u32, u32, C>::new(&rt);
-    kc.reconcile(&rt, (0..KEYS).map(|key| (key, key)));
+    kc.reconcile(&rt, (0..keys).map(|key| (key, key)));
     let runs: Runs = Arc::default();
-    let readers: Vec<Incr<Option<u32>>> = (0..KEYS)
+    let readers: Vec<Incr<Option<u32>>> = (0..keys)
         .step_by(240)
         .map(|key| {
             let counted = Arc::clone(&runs);
