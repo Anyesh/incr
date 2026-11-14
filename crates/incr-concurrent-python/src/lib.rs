@@ -36,12 +36,14 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use ::incr_concurrent as engine;
 use engine::{
-    DeleteError, Incr, IncrCollection, NodeTable, PropagationTrace, Runtime, SortedCollection,
+    DeleteError, ErasedIncr, Incr, IncrCollection, NodeTable, PropagationTrace, Runtime,
+    SortedCollection,
 };
+use incr_python_persist::incr_core::StateStats;
 use incr_python_persist::ready;
 use incr_python_persist::state::RtState;
 use incr_python_protocol::notready::{
@@ -208,6 +210,9 @@ impl VersionBridges {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
+
+/// A labelled keyed collection's index, label and pair version node.
+type KeyedLabel = (Weak<dyn StateStats + Send + Sync>, String, ErasedIncr);
 
 /// Token for an observer registration; pass to `Runtime.unobserve`.
 #[pyclass(name = "ObserverId")]
@@ -799,6 +804,10 @@ struct PyRuntime {
     inner: RtRef,
     bridges: Arc<VersionBridges>,
     state: RtState<SharedBinding>,
+    /// The labelled keyed collections `graph_summary` reports key counts
+    /// for. Taken only for a push or a sweep, never across an engine call
+    /// that may wait or a drop of user values.
+    keyed_labels: Mutex<Vec<KeyedLabel>>,
 }
 
 const _: () = {
@@ -819,6 +828,7 @@ impl PyRuntime {
             inner: RtRef::Store(core),
             bridges: Arc::default(),
             state: RtState::default(),
+            keyed_labels: Mutex::default(),
         }
     }
 }
@@ -831,6 +841,7 @@ impl PyRuntime {
             inner: RtRef::Own(Arc::new(Runtime::new())),
             bridges: Arc::default(),
             state: RtState::default(),
+            keyed_labels: Mutex::default(),
         }
     }
 
@@ -1080,14 +1091,43 @@ impl PyRuntime {
     /// "count"}]}` over the live graph, grouped by the label up to its
     /// first `/` (`None` for unlabelled nodes); `kind` is "input",
     /// "compute" or "mixed". An edge inside one group has `from == to`.
+    /// A group a labelled `KeyedCollection` names also has `"keys"`, the
+    /// collection's key count (summed over such collections).
     /// One walk of every node under the engine's read lock: it takes time
     /// linear in the node count and holds off node creation, deletion and
     /// labelling meanwhile, while `set` runs alongside it.
     fn graph_summary(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let summary = engine_call(py, &self.inner, || self.inner.graph_summary())?;
-        let none = std::collections::HashMap::new();
+        let (summary, keys, spent) = engine_call(py, &self.inner, || {
+            let summary = self.inner.graph_summary();
+            let mut live = Vec::new();
+            let mut spent = Vec::new();
+            self.keyed_labels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(index, label, node)| {
+                    let Some(index) = index.upgrade() else {
+                        return false;
+                    };
+                    let alive = self.inner.is_alive(*node);
+                    if alive {
+                        live.push((index, label.clone()));
+                    } else {
+                        spent.push(index);
+                    }
+                    alive
+                });
+            let mut keys: HashMap<String, usize> = HashMap::new();
+            for (index, label) in &live {
+                *keys
+                    .entry(incr_python_protocol::inspect::label_group(label).to_owned())
+                    .or_default() += index.state_stats().elements;
+            }
+            spent.extend(live.into_iter().map(|(index, _)| index));
+            (summary, keys, spent)
+        })?;
+        drop(spent);
         Ok(
-            incr_python_protocol::inspect::graph_summary_dict(py, summary, &none)?
+            incr_python_protocol::inspect::graph_summary_dict(py, summary, &keys)?
                 .into_any()
                 .unbind(),
         )

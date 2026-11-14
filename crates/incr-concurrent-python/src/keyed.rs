@@ -4,12 +4,14 @@
 use incr_python_persist::classes::{
     key_counts, keyed_rows_refusal, reconcile_pairs, KeyCounts, KeyedSource, PlainKeyed,
 };
+use incr_python_persist::incr_core::StateStats;
 use incr_python_persist::incr_persist::Shared;
 use incr_python_persist::store::Keyed;
 use incr_python_protocol::{PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+use std::sync::Weak;
 
 use ::incr_concurrent::{IncrCollection, Runtime};
 
@@ -59,10 +61,12 @@ impl PyKeyedCollection {
         kind: KeyedKind,
         pairs: IncrCollection<PyPair>,
         rows: IncrCollection<PyValue>,
+        stats: Weak<dyn StateStats + Send + Sync>,
         label: Option<String>,
     ) -> PyResult<Self> {
         if let Some(label) = &label {
-            let rt = runtime.get().inner.clone();
+            let runtime = runtime.get();
+            let rt = runtime.inner.clone();
             let slots = [pairs.version_node().slot(), rows.version_node().slot()];
             let label = label.clone();
             engine_call(py, &rt, || {
@@ -70,6 +74,11 @@ impl PyKeyedCollection {
                     rt.set_label(slot, label.clone());
                 }
             })?;
+            runtime
+                .keyed_labels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((stats, label, pairs.version_node().erase()));
         }
         Ok(PyKeyedCollection {
             kind,
@@ -88,12 +97,14 @@ impl PyKeyedCollection {
         let py = runtime.py();
         let pairs = persisted.pairs();
         let rows = persisted.rows().clone();
+        let stats = persisted.index_weak();
         Self::wrap(
             py,
             runtime,
             KeyedKind::Persisted(persisted),
             pairs,
             rows,
+            stats,
             label,
         )
     }
@@ -177,7 +188,16 @@ impl PyKeyedCollection {
         let keyed = engine_call(py, &rt, || PlainKeyed::<Shared>::new(&rt))?;
         let pairs = keyed.pairs();
         let rows = keyed.rows().clone();
-        Self::wrap(py, runtime, KeyedKind::Plain(keyed), pairs, rows, label)
+        let stats = keyed.index_weak();
+        Self::wrap(
+            py,
+            runtime,
+            KeyedKind::Plain(keyed),
+            pairs,
+            rows,
+            stats,
+            label,
+        )
     }
 
     /// Hold `row` for `key`: nothing happens if the held row is `==` to
