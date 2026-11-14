@@ -7,6 +7,8 @@ use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
 use incr_core::{Cells, ErasedIncr, Incr, Local, NodeTable, Runtime, Shared};
 
+use super::dirty::Dirty;
+
 use super::table_core::ErasedTable;
 use super::{
     decode_entry, key_hash, write_checkpoint, CheckpointInput, Checkpointed, Entry, GenId,
@@ -16,9 +18,27 @@ use crate::store::dep_index::{DepIndex, External};
 use crate::value_context::EncodeMismatch;
 use crate::Result;
 
-/// Restores and checkpoints by count, since the memo opened.
+/// Restores and checkpoints by count since the memo opened, and what the
+/// backend holds and lacks now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoStats {
+    /// Entries in the current generation.
+    pub entries: u64,
+    /// The current generation's summed entry frame lengths, the size
+    /// `max_bytes` bounds.
+    pub bytes: u64,
+    /// Entries computed since the last checkpoint attempt that no
+    /// checkpoint has saved. Entries left dirty by an earlier checkpoint,
+    /// unsaveable or evicted, are not counted until they compute again.
+    pub unsaved_entries: u64,
+    /// Entries the last checkpoint found but could not save: a dep that
+    /// maps to nothing or to an entry not kept, a cycle group, a key or
+    /// value that does not round-trip, or a frame too large. They stay
+    /// dirty, so every checkpoint tries them again.
+    pub unsaveable: u64,
+    /// Entries the last checkpoint evicted to fit `max_bytes`. Live ones
+    /// are dirty again, and a reopen recomputes the others.
+    pub evicted_last_checkpoint: u64,
     /// Entries seeded to verify without running when their deps are
     /// unchanged.
     pub reused: u64,
@@ -68,6 +88,8 @@ pub(crate) struct IndexGen {
     /// every table when the build differs.
     to_gen: Vec<Option<u32>>,
     to_live: HashMap<u32, u32>,
+    /// The generation's [`Generation::entry_bytes`].
+    pub(crate) bytes: u64,
 }
 
 impl IndexGen {
@@ -87,6 +109,7 @@ impl IndexGen {
             .filter_map(|(live, gen)| Some((((*gen)?), live as u32)))
             .collect();
         IndexGen {
+            bytes: generation.entry_bytes(),
             generation,
             to_gen,
             to_live,
@@ -167,6 +190,9 @@ pub(crate) struct MemoCore<C: MemoCells> {
     checkpoint: Mutex<()>,
     memo: Mutex<MemoState>,
     index: RwLock<Arc<IndexGen>>,
+    /// A leaf lock outside the lock order: computes on any thread take it
+    /// to record themselves, so nothing may be taken while it is held.
+    dirty: Mutex<Dirty>,
 }
 
 impl<C: MemoCells> MemoCore<C> {
@@ -182,6 +208,7 @@ impl<C: MemoCells> MemoCore<C> {
         max_bytes: u64,
         index: IndexGen,
     ) -> Self {
+        let catalog_len = catalog.len();
         MemoCore {
             id,
             build,
@@ -194,6 +221,7 @@ impl<C: MemoCells> MemoCore<C> {
             checkpoint: Mutex::new(()),
             memo: Mutex::new(MemoState::default()),
             index: RwLock::new(Arc::new(index)),
+            dirty: Mutex::new(Dirty::new(catalog_len)),
         }
     }
 
@@ -212,6 +240,25 @@ impl<C: MemoCells> MemoCore<C> {
         Ordered::take(LockKind::Memo, || {
             self.memo.lock().unwrap_or_else(PoisonError::into_inner)
         })
+    }
+
+    pub(crate) fn lock_dirty(&self) -> MutexGuard<'_, Dirty> {
+        self.dirty.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records that `table`'s entry `handle` computed.
+    pub(crate) fn computed(&self, table: u32, handle: ErasedIncr) {
+        self.lock_dirty().computed(table, handle);
+    }
+
+    /// The stats with what the backend holds and lacks now.
+    pub(crate) fn stats(&self) -> MemoStats {
+        let mut stats = self.lock_memo().stats.clone();
+        let index = self.index();
+        stats.entries = index.generation.items().len() as u64;
+        stats.bytes = index.bytes;
+        stats.unsaved_entries = self.lock_dirty().unsaved();
+        stats
     }
 
     pub(crate) fn index(&self) -> Arc<IndexGen> {

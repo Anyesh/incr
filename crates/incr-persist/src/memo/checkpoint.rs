@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use super::{
-    decode_entry, key_hash, EncodedEntry, Entry, GenHeader, GenId, Generation, MemoBackend,
-    StoredDep, TableDesc,
+    decode_entry, fingerprint, key_hash, EncodedEntry, Entry, GenHeader, GenId, Generation,
+    IndexItem, MemoBackend, StoredDep, TableDesc,
 };
 use crate::{Error, Result};
 
@@ -42,6 +44,30 @@ pub struct CheckpointStats {
     /// Entries dropped because their frame would exceed the frame length
     /// limit, each with every entry that reads it transitively.
     pub oversized: usize,
+    pub times: CheckpointTimes,
+}
+
+/// Wall time of a checkpoint's steps. [`write_checkpoint`] alone leaves
+/// `snapshot` zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointTimes {
+    /// Finding and encoding the live entries to write, under the memo's
+    /// locks for the part that reads the runtime.
+    pub snapshot: Duration,
+    /// Loading the base generation, reading and decoding every base frame
+    /// and keeping fresh entries to the query-dep fixpoint.
+    pub merge: Duration,
+    /// Framing every entry, evicting, and the backend's durable write.
+    pub write: Duration,
+}
+
+/// What became of one [`CheckpointInput::fresh`] entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fate {
+    Written,
+    Unkept,
+    Oversized,
+    Evicted,
 }
 
 #[derive(Debug)]
@@ -52,12 +78,19 @@ pub struct Checkpointed {
     /// reads it any more.
     pub replaced: Option<GenId>,
     pub stats: CheckpointStats,
+    /// Per `fresh` entry, in input order.
+    pub(crate) fates: Vec<Fate>,
+    /// The `(table, key)` of every base entry eviction dropped, tables in
+    /// the input catalog's numbering extended by carried-over tables.
+    pub(crate) evicted_base: Vec<(u32, Vec<u8>)>,
 }
 
 /// Runs a checkpoint's write step against `backend`: takes the checkpoint
 /// lock, loads the current generation as the base, keeps the fresh entries
-/// whose query deps are kept (to a fixpoint), stamps them with the new
-/// sequence number, merges the base entries that were not rewritten, drops
+/// whose query deps are kept fresh entries or base entries at the same fp
+/// (to a fixpoint),
+/// stamps them with the new sequence number, merges the base entries that
+/// were not rewritten, drops
 /// the entries too large for a frame and evicts by oldest `last_used`, each
 /// with transitive dependents, down to `max_bytes`, and writes the result as
 /// the next generation.
@@ -83,6 +116,7 @@ fn write_with<B: MemoBackend + ?Sized>(
     encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
 ) -> Result<Checkpointed> {
     let _guard = backend.lock_checkpoint()?;
+    let started = Instant::now();
     let base = backend.load()?;
     let id = base
         .as_ref()
@@ -97,61 +131,149 @@ fn write_with<B: MemoBackend + ?Sized>(
     let seq = next_seq.unwrap_or(1);
     let mut stats = CheckpointStats::default();
 
-    let unkept = unkept(&input.fresh);
-    let mut entries: Vec<Entry> = Vec::with_capacity(input.fresh.len());
-    for (mut entry, drop) in input.fresh.into_iter().zip(unkept) {
+    let mut tables = input.tables;
+    let mergeable = |g: &&Generation| next_seq.is_some() && g.header().build == input.build;
+    let based = match base.as_ref().filter(mergeable) {
+        Some(base) => read_base(backend, base, &mut tables, &mut stats)?,
+        None => Vec::new(),
+    };
+    let unkept = unkept(&input.fresh, &Held::new(&based));
+    let mut fates = vec![Fate::Written; input.fresh.len()];
+    let mut entries: Vec<Entry> = Vec::with_capacity(input.fresh.len() + based.len());
+    let mut origin: Vec<Option<usize>> = Vec::with_capacity(entries.capacity());
+    for (i, (mut entry, drop)) in input.fresh.into_iter().zip(unkept).enumerate() {
         if drop {
             stats.unkept += 1;
+            fates[i] = Fate::Unkept;
         } else {
             entry.last_used = seq;
             entries.push(entry);
+            origin.push(Some(i));
         }
     }
-
-    let mut tables = input.tables;
-    let mergeable = |g: &&Generation| next_seq.is_some() && g.header().build == input.build;
-    if let Some(base) = base.as_ref().filter(mergeable) {
-        merge(backend, base, &mut tables, &mut entries, &mut stats)?;
+    let mut present: HashSet<(u32, Vec<u8>)> =
+        entries.iter().map(|e| (e.table, e.key.clone())).collect();
+    for entry in based {
+        if present.insert((entry.table, entry.key.clone())) {
+            stats.merged += 1;
+            entries.push(entry);
+            origin.push(None);
+        }
     }
+    drop(present);
+    let merged_at = Instant::now();
+    stats.times.merge = merged_at - started;
+
     let header = GenHeader {
         build: input.build,
         seq,
         tables,
     };
-
     let tag = header.frame_tag();
     let encode = |entry: &Entry| encode(entry, tag);
-    let (entries, encoded) = encode_fitting(entries, encode, &mut stats.oversized)?;
+    let frames = encode_fitting(&entries, encode, &mut stats.oversized)?;
+    let mut fitting = Vec::with_capacity(entries.len());
+    let mut fitting_origin = Vec::with_capacity(entries.len());
+    let mut encoded = Vec::with_capacity(entries.len());
+    for ((entry, from), frame) in entries.into_iter().zip(origin).zip(frames) {
+        match frame {
+            Some(frame) => {
+                fitting.push(entry);
+                fitting_origin.push(from);
+                encoded.push(frame);
+            }
+            None => {
+                if let Some(i) = from {
+                    fates[i] = Fate::Oversized;
+                }
+            }
+        }
+    }
     let sizes: Vec<u64> = encoded.iter().map(|e| e.frame.len() as u64).collect();
-    let evicted = evict(&entries, &sizes, input.max_bytes);
-    let encoded: Vec<_> = encoded
+    let evicted = evict(&fitting, &sizes, input.max_bytes);
+    let mut evicted_base = Vec::new();
+    let mut kept = Vec::with_capacity(encoded.len());
+    for (((entry, from), frame), gone) in fitting
         .into_iter()
-        .zip(&evicted)
-        .filter_map(|(entry, &gone)| (!gone).then_some(entry))
-        .collect();
-    stats.evicted = entries.len() - encoded.len();
-    stats.written = encoded.len();
+        .zip(fitting_origin)
+        .zip(encoded)
+        .zip(evicted)
+    {
+        if !gone {
+            kept.push(frame);
+            continue;
+        }
+        stats.evicted += 1;
+        match from {
+            Some(i) => fates[i] = Fate::Evicted,
+            None => evicted_base.push((entry.table, entry.key)),
+        }
+    }
+    stats.written = kept.len();
     let base_id = base.as_ref().map(Generation::id);
-    let generation = backend.write_generation(base_id, id, &header, &encoded)?;
+    let generation = backend.write_generation(base_id, id, &header, &kept)?;
+    stats.times.write = merged_at.elapsed();
     Ok(Checkpointed {
         generation,
         replaced: base_id,
         stats,
+        fates,
+        evicted_base,
     })
 }
 
 type Identity<'a> = (u32, &'a [u8]);
 
-fn query_deps(entry: &Entry) -> impl Iterator<Item = Identity<'_>> {
+fn query_deps(entry: &Entry) -> impl Iterator<Item = (Identity<'_>, u128)> {
     entry.deps.iter().filter_map(|dep| match dep {
-        StoredDep::Query { table, key, .. } => Some((*table, key.as_slice())),
+        StoredDep::Query { table, key, fp } => Some(((*table, key.as_slice()), *fp)),
         _ => None,
     })
 }
 
+/// The base entries a fresh entry's query dep may name instead of a
+/// fresh one: only at the fp of the stored value, which is what a restore
+/// compares, so a dep whose rewrite was not kept does not count.
+struct Held<'a> {
+    at: HashMap<Identity<'a>, &'a Entry>,
+    fps: RefCell<HashMap<Identity<'a>, u128>>,
+}
+
+impl<'a> Held<'a> {
+    fn new(based: &'a [Entry]) -> Self {
+        Held {
+            at: based
+                .iter()
+                .map(|e| ((e.table, e.key.as_slice()), e))
+                .collect(),
+            fps: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn none() -> Self {
+        Held {
+            at: HashMap::new(),
+            fps: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn holds(&self, dep: Identity<'a>, fp: u128) -> bool {
+        let Some(entry) = self.at.get(&dep) else {
+            return false;
+        };
+        let stored = *self
+            .fps
+            .borrow_mut()
+            .entry(dep)
+            .or_insert_with(|| fingerprint(&entry.value));
+        stored == fp
+    }
+}
+
 /// The reverse query-dep edges among `entries`, and which entries read a
-/// query that is not among them.
-fn query_edges(entries: &[Entry]) -> (Vec<Vec<usize>>, Vec<bool>) {
+/// query that is not among them. A dep in `held` is satisfied without an
+/// edge.
+fn query_edges<'a>(entries: &'a [Entry], held: &Held<'a>) -> (Vec<Vec<usize>>, Vec<bool>) {
     let at: HashMap<Identity, usize> = entries
         .iter()
         .enumerate()
@@ -160,7 +282,10 @@ fn query_edges(entries: &[Entry]) -> (Vec<Vec<usize>>, Vec<bool>) {
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
     let mut dangling = vec![false; entries.len()];
     for (i, entry) in entries.iter().enumerate() {
-        for dep in query_deps(entry) {
+        for (dep, fp) in query_deps(entry) {
+            if held.holds(dep, fp) {
+                continue;
+            }
             match at.get(&dep) {
                 Some(&j) => dependents[j].push(i),
                 None => dangling[i] = true,
@@ -194,10 +319,12 @@ fn mark_with_dependents(
     }
 }
 
-/// Index `i` is `true` when `entries[i]` reads, transitively, a query that
-/// is not in `entries`. Linear in entries plus edges.
-fn unkept(entries: &[Entry]) -> Vec<bool> {
-    let (dependents, dangling) = query_edges(entries);
+/// Index `i` is `true` when `entries[i]` reads, transitively through
+/// `entries`, a query that neither `entries` nor `held` has. A dep `held`
+/// has is kept whatever becomes of its fresh rewrite. Linear in entries
+/// plus edges.
+fn unkept<'a>(entries: &'a [Entry], held: &Held<'a>) -> Vec<bool> {
+    let (dependents, dangling) = query_edges(entries, held);
     let mut out = vec![false; entries.len()];
     for (i, _) in dangling.iter().enumerate().filter(|(_, &d)| d) {
         mark_with_dependents(&dependents, &mut out, i, |_| {});
@@ -205,13 +332,14 @@ fn unkept(entries: &[Entry]) -> Vec<bool> {
     out
 }
 
-fn merge<B: MemoBackend + ?Sized>(
+/// Every base entry whose table survives, decoded and renumbered into
+/// `tables`, which gains the base tables with no live namesake.
+fn read_base<B: MemoBackend + ?Sized>(
     backend: &B,
     base: &Generation,
     tables: &mut Vec<TableDesc>,
-    entries: &mut Vec<Entry>,
     stats: &mut CheckpointStats,
-) -> Result<()> {
+) -> Result<Vec<Entry>> {
     let remap: Vec<Option<u32>> = base
         .header()
         .tables
@@ -229,9 +357,10 @@ fn merge<B: MemoBackend + ?Sized>(
         .collect();
     let remap_table = |table: u32| remap.get(table as usize).copied().flatten();
 
-    let mut present: HashSet<(u32, Vec<u8>)> =
-        entries.iter().map(|e| (e.table, e.key.clone())).collect();
-    for item in base.items() {
+    let mut by_table: Vec<Vec<Entry>> = vec![Vec::new(); tables.len()];
+    let mut items: Vec<&IndexItem> = base.items().iter().collect();
+    items.sort_unstable_by_key(|item| item.loc);
+    for item in items {
         let Some(frame) = backend.read_entry(base.id(), item)? else {
             // Another handle removed the base; nothing more can be merged.
             break;
@@ -252,41 +381,40 @@ fn merge<B: MemoBackend + ?Sized>(
             StoredDep::Query { table, .. } => remap_table(*table).map(|t| *table = t).is_some(),
             _ => true,
         });
-        if deps_remapped && present.insert((entry.table, entry.key.clone())) {
-            stats.merged += 1;
-            entries.push(entry);
+        if deps_remapped {
+            by_table[entry.table as usize].push(entry);
         }
     }
-    Ok(())
+    Ok(by_table.into_iter().flatten().collect())
 }
 
-/// Encodes `entries`, dropping each whose frame would be too long with
-/// every entry that reads it transitively, and counting them in `oversized`.
+/// Each entry's frame, `None` for one whose frame would be too long and
+/// for every entry that reads it transitively, all counted in `oversized`.
 fn encode_fitting(
-    entries: Vec<Entry>,
+    entries: &[Entry],
     encode: impl Fn(&Entry) -> Result<EncodedEntry>,
     oversized: &mut usize,
-) -> Result<(Vec<Entry>, Vec<EncodedEntry>)> {
-    let encoded = entries
+) -> Result<Vec<Option<EncodedEntry>>> {
+    let mut encoded = entries
         .iter()
         .map(|entry| match encode(entry) {
             Err(Error::FrameTooLarge { .. }) => Ok(None),
             other => other.map(Some),
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut dropped = vec![false; entries.len()];
     if encoded.iter().any(Option::is_none) {
-        let (dependents, _) = query_edges(&entries);
+        let mut dropped = vec![false; entries.len()];
+        let (dependents, _) = query_edges(entries, &Held::none());
         for (i, _) in encoded.iter().enumerate().filter(|(_, e)| e.is_none()) {
             mark_with_dependents(&dependents, &mut dropped, i, |_| *oversized += 1);
         }
+        for (frame, gone) in encoded.iter_mut().zip(dropped) {
+            if gone {
+                *frame = None;
+            }
+        }
     }
-    Ok(entries
-        .into_iter()
-        .zip(encoded)
-        .zip(dropped)
-        .filter_map(|((entry, frame), gone)| Some((entry, frame.filter(|_| !gone)?)))
-        .unzip())
+    Ok(encoded)
 }
 
 /// Index `i` is `true` when `entries[i]` must go so that the summed `sizes`
@@ -298,7 +426,7 @@ fn evict(entries: &[Entry], sizes: &[u64], max_bytes: u64) -> Vec<bool> {
     if total <= max_bytes {
         return out;
     }
-    let (dependents, _) = query_edges(entries);
+    let (dependents, _) = query_edges(entries, &Held::none());
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&i| (entries[i].last_used, i));
     for i in order {

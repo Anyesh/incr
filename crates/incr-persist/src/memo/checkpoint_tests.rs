@@ -1,5 +1,5 @@
 use super::*;
-use crate::memo::{decode_entry, encode_entry, MemoryMemo, StoredDep, TableDesc};
+use crate::memo::{decode_entry, encode_entry, fingerprint, MemoryMemo, StoredDep, TableDesc};
 use crate::Error;
 
 const BUILD: u128 = 77;
@@ -140,6 +140,52 @@ fn a_base_entry_is_merged_when_its_fresh_rewrite_was_not_kept() {
         write_checkpoint(&memo, input(tables, vec![entry(0, 1, 11, vec![on(0, 9)])])).unwrap();
     assert_eq!(done.stats.unkept, 1);
     assert_eq!(done.stats.merged, 1);
+    assert_eq!(ids(&stored(&memo)), [(0, 1, 10, 1)]);
+}
+
+fn on_fp(table: u32, key: u8, value: u8) -> StoredDep {
+    StoredDep::Query {
+        table,
+        key: vec![key],
+        fp: fingerprint(&[value]),
+    }
+}
+
+#[test]
+fn a_query_dep_the_base_holds_at_its_fp_counts_as_kept() {
+    let memo = MemoryMemo::new();
+    let tables = vec![desc("a", 1)];
+    write_checkpoint(&memo, input(tables.clone(), vec![entry(0, 1, 10, vec![])])).unwrap();
+    let fresh = vec![
+        entry(0, 2, 20, vec![on_fp(0, 1, 10)]),
+        entry(0, 3, 30, vec![on(0, 2)]),
+        entry(0, 4, 40, vec![on_fp(0, 1, 11)]),
+        entry(0, 5, 50, vec![on(0, 4)]),
+    ];
+    let done = write_checkpoint(&memo, input(tables, fresh)).unwrap();
+    assert_eq!(done.stats.unkept, 2);
+    assert_eq!(done.stats.merged, 1);
+    assert_eq!(
+        ids(&stored(&memo)),
+        [(0, 1, 10, 1), (0, 2, 20, 2), (0, 3, 30, 2)]
+    );
+    assert_eq!(
+        done.fates,
+        [Fate::Written, Fate::Written, Fate::Unkept, Fate::Unkept]
+    );
+}
+
+#[test]
+fn a_dep_whose_rewrite_was_not_kept_does_not_count_as_held() {
+    let memo = MemoryMemo::new();
+    let tables = vec![desc("a", 1)];
+    write_checkpoint(&memo, input(tables.clone(), vec![entry(0, 1, 10, vec![])])).unwrap();
+    let fresh = vec![
+        entry(0, 1, 11, vec![on(0, 9)]),
+        entry(0, 2, 20, vec![on_fp(0, 1, 11)]),
+    ];
+    let done = write_checkpoint(&memo, input(tables, fresh)).unwrap();
+    assert_eq!(done.stats.unkept, 2);
     assert_eq!(ids(&stored(&memo)), [(0, 1, 10, 1)]);
 }
 

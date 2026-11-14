@@ -205,7 +205,7 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
 
     pub fn stats(&self) -> MemoStats {
         check_value_code();
-        self.core.lock_memo().stats.clone()
+        self.core.stats()
     }
 
     /// The entries checkpoints left out since the last call because their
