@@ -30,7 +30,8 @@ struct Marked {
 struct Shard {
     /// Per entry, its table, key and the mark of its latest compute.
     marks: HashMap<ErasedIncr, Marked>,
-    /// Entries [`Dirty::carry`] counted again, until they compute again.
+    /// Entries [`Dirty::carry`] counted again, until they compute again or
+    /// the attempt fails.
     carried: HashSet<ErasedIncr>,
 }
 
@@ -104,9 +105,16 @@ impl Dirty {
         }
     }
 
-    /// Keeps `handle` dirty without counting it as unsaved: an entry the
-    /// backend lost rather than one that computed.
-    pub(crate) fn lost(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) {
+    /// Marks a clean entry the backend lost dirty and counts it as unsaved,
+    /// as a compute would; returns the unsaved count after it.
+    pub(crate) fn lost(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) -> u64 {
+        let key: KeyPart = Arc::new(Encoded(key));
+        self.computed(table, handle, &key)
+    }
+
+    /// Keeps `handle` dirty without counting it as unsaved: an entry a
+    /// checkpoint evicted, which may be evicted again at every checkpoint.
+    pub(crate) fn evicted(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) {
         self.shard(handle)
             .marks
             .entry(handle)
@@ -117,10 +125,16 @@ impl Dirty {
             });
     }
 
-    /// Starts a checkpoint attempt: drops entries `alive` refuses and
+    /// Starts a checkpoint attempt: removes entries `alive` refuses and
     /// returns a copy of the rest, by table and then mark, so a checkpoint
-    /// writes a table's entries together and in a repeatable order.
-    pub(crate) fn attempt(&self, alive: impl Fn(ErasedIncr) -> bool) -> Vec<Record> {
+    /// writes a table's entries together and in a repeatable order. The
+    /// removed entries' keys go to `dead`: a dead node's may be the last
+    /// reference to a user key, so the caller drops them outside its locks.
+    pub(crate) fn attempt(
+        &self,
+        alive: impl Fn(ErasedIncr) -> bool,
+        dead: &mut Vec<KeyPart>,
+    ) -> Vec<Record> {
         let mut shards = self.all();
         let (previous, attempt) = (self.previous.load(Relaxed), self.attempt.load(Relaxed));
         self.undo.0.store(previous, Relaxed);
@@ -130,7 +144,12 @@ impl Dirty {
         self.unsaved.store(0, Relaxed);
         let mut out = Vec::new();
         for shard in shards.iter_mut() {
-            shard.marks.retain(|&handle, _| alive(handle));
+            shard.marks.retain(|&handle, marked| {
+                alive(handle) || {
+                    dead.push(Arc::clone(&marked.key));
+                    false
+                }
+            });
             shard.carried.retain(|&handle| alive(handle));
             out.extend(shard.marks.iter().map(|(&handle, marked)| Record {
                 table: marked.table,
@@ -144,9 +163,13 @@ impl Dirty {
     }
 
     /// Takes back the latest attempt, which saved nothing: every entry
-    /// computed since the attempt before it counts as unsaved again.
+    /// computed since the attempt before it counts as unsaved again, and
+    /// the next attempt may carry what this one carried.
     pub(crate) fn failed(&self) {
-        let shards = self.all();
+        let mut shards = self.all();
+        for shard in shards.iter_mut() {
+            shard.carried.clear();
+        }
         let attempt = self.undo.1.load(Relaxed);
         self.previous.store(self.undo.0.load(Relaxed), Relaxed);
         self.attempt.store(attempt, Relaxed);
@@ -179,14 +202,19 @@ impl Dirty {
     }
 
     /// `handle` reached the backend as of `mark`; a later compute keeps it.
-    pub(crate) fn saved(&self, handle: ErasedIncr, mark: u64) {
+    /// Returns the removed entry's key, which may be the last reference to
+    /// a user key, for the caller to drop outside its locks.
+    #[must_use]
+    pub(crate) fn saved(&self, handle: ErasedIncr, mark: u64) -> Option<KeyPart> {
         let mut shard = self.shard(handle);
         if shard
             .marks
             .get(&handle)
             .is_some_and(|marked| marked.mark == mark)
         {
-            shard.marks.remove(&handle);
+            shard.marks.remove(&handle).map(|marked| marked.key)
+        } else {
+            None
         }
     }
 
@@ -221,16 +249,28 @@ mod tests {
         assert_eq!(dirty.computed(0, h[0], &key()), 1);
         assert_eq!(dirty.computed(0, h[0], &key()), 1);
         assert_eq!(dirty.computed(0, h[1], &key()), 2);
-        let marks = dirty.attempt(|_| true);
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
         assert_eq!(dirty.unsaved(), 0);
         assert_eq!(dirty.computed(0, h[0], &key()), 1);
-        dirty.lost(0, h[2], Vec::new());
+        dirty.evicted(0, h[2], Vec::new());
         assert_eq!(dirty.unsaved(), 1);
-        dirty.saved(h[0], mark(&marks, h[0]).mark);
-        dirty.saved(h[1], mark(&marks, h[1]).mark);
-        let left = dirty.attempt(|_| true);
+        drop(dirty.saved(h[0], mark(&marks, h[0]).mark));
+        drop(dirty.saved(h[1], mark(&marks, h[1]).mark));
+        let left = dirty.attempt(|_| true, &mut Vec::new());
         assert_eq!(left.len(), 2);
         assert!(left.iter().any(|r| r.handle == h[0]) && left.iter().any(|r| r.handle == h[2]));
+    }
+
+    #[test]
+    fn a_lost_entry_counts_once_until_the_next_attempt() {
+        let (_rt, h) = handles(2);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        dirty.attempt(|_| true, &mut Vec::new());
+        assert_eq!(dirty.lost(0, h[1], Vec::new()), 1);
+        assert_eq!(dirty.lost(0, h[1], Vec::new()), 1);
+        assert_eq!(dirty.lost(0, h[0], Vec::new()), 2);
+        assert_eq!(dirty.attempt(|_| true, &mut Vec::new()).len(), 2);
     }
 
     #[test]
@@ -239,7 +279,7 @@ mod tests {
         let dirty = Dirty::new();
         dirty.computed(0, h[0], &key());
         dirty.computed(0, h[1], &key());
-        dirty.attempt(|_| true);
+        dirty.attempt(|_| true, &mut Vec::new());
         dirty.computed(0, h[1], &key());
         dirty.computed(0, h[2], &key());
         dirty.failed();
@@ -252,16 +292,30 @@ mod tests {
         let (_rt, h) = handles(2);
         let dirty = Dirty::new();
         dirty.computed(0, h[0], &key());
-        dirty.lost(0, h[1], Vec::new());
-        let marks = dirty.attempt(|_| true);
+        dirty.evicted(0, h[1], Vec::new());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
         dirty.carry(&mark(&marks, h[0]));
         dirty.carry(&mark(&marks, h[1]));
         assert_eq!(dirty.unsaved(), 1);
-        let marks = dirty.attempt(|_| true);
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
         dirty.carry(&mark(&marks, h[0]));
         assert_eq!(dirty.unsaved(), 0);
         dirty.computed(0, h[0], &key());
-        let marks = dirty.attempt(|_| true);
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        dirty.carry(&mark(&marks, h[0]));
+        assert_eq!(dirty.unsaved(), 1);
+    }
+
+    #[test]
+    fn a_failed_attempt_lets_its_carried_entries_be_carried_again() {
+        let (_rt, h) = handles(1);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        dirty.carry(&mark(&marks, h[0]));
+        dirty.failed();
+        assert_eq!(dirty.unsaved(), 1);
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
         dirty.carry(&mark(&marks, h[0]));
         assert_eq!(dirty.unsaved(), 1);
     }

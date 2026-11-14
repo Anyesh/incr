@@ -30,8 +30,10 @@ pub struct MemoStats {
     /// `max_bytes` bounds.
     pub bytes: u64,
     /// Entries computed since the last checkpoint attempt that no
-    /// checkpoint has saved. Entries left dirty by an earlier checkpoint,
-    /// unsaveable or evicted, are not counted until they compute again.
+    /// checkpoint has saved, and clean entries a checkpoint found missing
+    /// from the base it replaced. Entries left dirty by an earlier
+    /// checkpoint, unsaveable or evicted, are not counted until they
+    /// compute again.
     pub unsaved_entries: u64,
     /// Entries the last checkpoint found but could not save: a dep that
     /// maps to nothing or to an entry not kept, a cycle group, a key or
@@ -246,7 +248,7 @@ impl Wake {
     }
 
     /// [`Self::due`] once per [`Self::arm`].
-    fn due_once(&self) {
+    pub(crate) fn due_once(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
             self.due();
         }
@@ -343,6 +345,16 @@ impl<C: MemoCells> MemoCore<C> {
     /// checkpoint, wakes it at the next compute.
     pub(crate) fn computed(&self, table: u32, handle: ErasedIncr, key: &KeyPart) {
         let unsaved = self.dirty.computed(table, handle, key);
+        self.reached(unsaved);
+    }
+
+    /// [`Self::computed`] for a clean entry the backend lost.
+    pub(crate) fn lost(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) {
+        let unsaved = self.dirty.lost(table, handle, key);
+        self.reached(unsaved);
+    }
+
+    fn reached(&self, unsaved: u64) {
         if self.trigger.is_some_and(|trigger| unsaved >= trigger) {
             self.wake.due_once();
         }

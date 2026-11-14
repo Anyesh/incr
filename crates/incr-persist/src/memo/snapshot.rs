@@ -63,6 +63,7 @@ impl<C: MemoCells> CoreRef<C> {
             saved: false,
         };
         let mut bag = Deferred::<C>::new();
+        let mut dead = Vec::new();
         let (snaps, clean, moved) = {
             let mut state = self.lock_memo();
             // Dead nodes never match a live handle, so pruning them can
@@ -73,7 +74,7 @@ impl<C: MemoCells> CoreRef<C> {
                 state.seed_keys.retain(|&handle, _| rt.is_alive(handle));
                 state.pruned_at = state.seed_info.len();
             }
-            let dirty = self.dirty.attempt(|handle| rt.is_alive(handle));
+            let dirty = self.dirty.attempt(|handle| rt.is_alive(handle), &mut dead);
             attempt.started = true;
             // The read hold excludes every mapped write, and each finishes
             // its walk inside its own hold, so a Clean entry over mapped
@@ -138,6 +139,7 @@ impl<C: MemoCells> CoreRef<C> {
             (snaps, clean, moved)
         };
         drop(moved);
+        drop(dead);
         bag.drain(rt);
         let mut mismatches = Vec::new();
         let index = self.index();
@@ -180,12 +182,13 @@ impl<C: MemoCells> CoreRef<C> {
         self.swap_index(IndexGen::new(done.generation, self.build, &self.catalog));
         state.stats.checkpoints += 1;
         let mut unsaveable = found.unsaveable;
+        let mut saved = Vec::new();
         {
             let dirty = &self.dirty;
             for (fate, origin) in done.fates.iter().zip(&found.origin) {
                 match fate {
                     Fate::Written => {
-                        dirty.saved(origin.handle, origin.mark);
+                        saved.extend(dirty.saved(origin.handle, origin.mark));
                         state
                             .seed_info
                             .insert(origin.handle, (origin.fp, origin.stamp));
@@ -197,7 +200,7 @@ impl<C: MemoCells> CoreRef<C> {
                     Fate::Unkept => {
                         unsaveable += 1;
                         for (table, handle, key) in &origin.clean {
-                            dirty.lost(*table, *handle, key.clone());
+                            self.lost(*table, *handle, key.clone());
                         }
                     }
                     Fate::Oversized => unsaveable += 1,
@@ -211,7 +214,7 @@ impl<C: MemoCells> CoreRef<C> {
                 continue;
             };
             if let Ok(Some(handle)) = t.probe_bytes(rt, key, &mut bag) {
-                self.dirty.lost(*table, handle, key.clone());
+                self.dirty.evicted(*table, handle, key.clone());
             }
         }
         state.stats.unsaveable = unsaveable;
@@ -225,6 +228,7 @@ impl<C: MemoCells> CoreRef<C> {
             }
         }
         drop(state);
+        drop(saved);
         bag.drain(rt);
         Ok(done.stats)
     }

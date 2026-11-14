@@ -55,6 +55,7 @@ both!(
     an_undefined_table_fails_open,
     a_restore_drops_no_key_under_the_memo_lock,
     a_checkpoint_drops_no_key_under_the_memo_lock,
+    a_dead_entry_drops_its_key_outside_the_memo_lock,
 );
 
 const BUILD: u128 = 0xb1d;
@@ -655,6 +656,25 @@ fn a_checkpoint_drops_no_key_under_the_memo_lock<C: MemoCells>() {
     store.set(x, 2).unwrap();
     let (drops, under_m) = watch(|| {
         assert_eq!(memo.checkpoint().unwrap().written, 1);
+    });
+    assert!(drops > 0);
+    assert_eq!(under_m, 0);
+}
+
+/// A deleted node's closure is gone, so the dirty set holds the last
+/// reference to its key, which the checkpoint's prune of dead entries drops.
+fn a_dead_entry_drops_its_key_outside_the_memo_lock<C: MemoCells>() {
+    let backends = Backends::new();
+    let store = backends.store::<C>();
+    let mut builder = MemoBuilder::new(options());
+    let t = builder.table::<Watched, u64>("t", 1);
+    builder.define(t, |_, k| u64::from(k.0));
+    let memo = builder.open(&store, backends.memo.clone()).unwrap();
+    let q = memo.get_or_insert(t, Watched(7));
+    assert_eq!(memo.runtime().get(q), 7);
+    memo.runtime().delete_node(q);
+    let (drops, under_m) = watch(|| {
+        memo.checkpoint().unwrap();
     });
     assert!(drops > 0);
     assert_eq!(under_m, 0);
