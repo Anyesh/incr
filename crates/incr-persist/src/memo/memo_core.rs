@@ -11,7 +11,7 @@ use incr_core::{Cells, ErasedIncr, Incr, Local, NodeTable, Runtime, Shared};
 
 use super::dirty::Dirty;
 
-use super::table_core::ErasedTable;
+use super::table_core::{ErasedTable, KeyPart};
 use super::{
     decode_entry, key_hash, write_checkpoint, CheckpointInput, Checkpointed, Entry, GenId,
     Generation, IndexItem, MemoBackend, TableDesc,
@@ -167,6 +167,10 @@ pub(crate) struct MemoState {
     /// and the stamp it seeded at. A removed or recycled node never matches
     /// a live handle; checkpoints prune them.
     pub(crate) seed_info: HashMap<ErasedIncr, (u128, u64)>,
+    /// Per node in `seed_info`, its live table and stored key bytes.
+    pub(crate) seed_keys: HashMap<ErasedIncr, (u32, Vec<u8>)>,
+    /// `seed_info`'s length after checkpoints last pruned it.
+    pub(crate) pruned_at: usize,
     pub(crate) stats: MemoStats,
     pub(crate) mismatches: Vec<EncodeMismatch>,
 }
@@ -337,8 +341,8 @@ impl<C: MemoCells> MemoCore<C> {
     /// automatic-checkpoint thread when a checkpoint is due. A count that
     /// reached the trigger without a compute, carried or left by a failed
     /// checkpoint, wakes it at the next compute.
-    pub(crate) fn computed(&self, table: u32, handle: ErasedIncr) {
-        let unsaved = self.dirty.computed(table, handle);
+    pub(crate) fn computed(&self, table: u32, handle: ErasedIncr, key: &KeyPart) {
+        let unsaved = self.dirty.computed(table, handle, key);
         if self.trigger.is_some_and(|trigger| unsaved >= trigger) {
             self.wake.due_once();
         }

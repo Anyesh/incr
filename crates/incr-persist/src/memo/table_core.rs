@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use incr_core::persist_hooks::{
@@ -10,6 +9,7 @@ use incr_core::{with_value_code, ErasedIncr, Incr, NodeTable, QueryOpts, Runtime
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use super::dirty::Record;
 use super::handle::{MemoCtx, MemoKey, MemoValue};
 use super::mapping::{map_live, LiveDep};
 use super::memo_core::{CoreRef, MemoCells};
@@ -44,6 +44,7 @@ pub(crate) struct Snap {
     /// The fp the entry was last written or seeded with, if it has kept
     /// that stamp since: its value still equals those stored bytes.
     pub(crate) seeded: Option<u128>,
+    pub(crate) key: KeyPart,
     pub(crate) deps: Vec<LiveDep>,
     pub(crate) in_group: bool,
     pub(crate) value: Box<dyn Encode>,
@@ -78,10 +79,16 @@ impl<X: Serialize + DeserializeOwned + PartialEq> Encode for Part<X> {
     }
 }
 
-/// A live entry's key, found by handle for a checkpoint.
-pub(crate) struct KeyOf {
-    pub(crate) table: u32,
-    pub(crate) key: Box<dyn Encode>,
+/// A live entry's key as its compute records it in the dirty set.
+pub(crate) type KeyPart = Arc<dyn Encode + Send + Sync>;
+
+/// A key already encoded, for an entry the backend lost.
+pub(crate) struct Encoded(pub(crate) Vec<u8>);
+
+impl Encode for Encoded {
+    fn encode(&self) -> Result<Vec<u8>, EncodeMismatch> {
+        Ok(self.0.clone())
+    }
 }
 
 pub(crate) fn encode<X: Serialize>(table: &str, part: MemoPart, x: &X) -> Option<Vec<u8>> {
@@ -140,17 +147,8 @@ pub(crate) trait ErasedTable<C: MemoCells> {
         rt: &Runtime<C>,
         map: &DepMap,
         memo: u64,
-        handle: ErasedIncr,
-        mark: u64,
+        record: &Record,
     ) -> Option<Snap>;
-
-    /// The keys of the live entries in `wanted`, cloned into `out`.
-    fn keys_of(
-        &self,
-        rt: &Runtime<C>,
-        wanted: &HashSet<ErasedIncr>,
-        out: &mut HashMap<ErasedIncr, KeyOf>,
-    );
 }
 
 pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
@@ -170,18 +168,24 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
         let core = core.clone();
         let (memo, index) = (core.id, self.index);
         let node = OnceLock::new();
+        let key = Arc::new(Part {
+            table: Arc::clone(&self.name),
+            part: MemoPart::Key,
+            x: key,
+        });
+        let part: KeyPart = key.clone();
         move |rt| {
-            let value = f(&MemoCtx { rt, core: &core }, &key);
+            let value = f(&MemoCtx { rt, core: &core }, &key.x);
             let handle = match node.get() {
                 Some(&handle) => Some(handle),
                 None => {
                     let table: &TableCore<K, T, C> = core.table(memo, index);
-                    let handle = table.probe(rt, &key).map(Incr::erase);
+                    let handle = table.probe(rt, &key.x).map(Incr::erase);
                     handle.map(|handle| *node.get_or_init(|| handle))
                 }
             };
             if let Some(handle) = handle {
-                core.computed(index, handle);
+                core.computed(index, handle, &part);
             }
             value
         }
@@ -315,10 +319,9 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         rt: &Runtime<C>,
         map: &DepMap,
         memo: u64,
-        handle: ErasedIncr,
-        mark: u64,
+        record: &Record,
     ) -> Option<Snap> {
-        let typed = rt.typed_handle::<T>(handle)?;
+        let typed = rt.typed_handle::<T>(record.handle)?;
         let seen = inspect(rt, typed)?;
         // Read after `inspect` returns, so an input's stamp check sees at
         // least the run whose value was cloned.
@@ -329,10 +332,11 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
             .collect();
         Some(Snap {
             table: self.index,
-            handle,
-            mark,
+            handle: record.handle,
+            mark: record.mark,
             stamp: seen.changed_at,
             seeded: None,
+            key: Arc::clone(&record.key),
             deps,
             in_group: seen.in_group,
             value: Box::new(Part {
@@ -341,31 +345,6 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
                 x: seen.value,
             }),
         })
-    }
-
-    fn keys_of(
-        &self,
-        rt: &Runtime<C>,
-        wanted: &HashSet<ErasedIncr>,
-        out: &mut HashMap<ErasedIncr, KeyOf>,
-    ) {
-        self.nodes.for_each(rt, |key, handle| {
-            let handle = handle.erase();
-            if wanted.contains(&handle) {
-                let key = Part {
-                    table: Arc::clone(&self.name),
-                    part: MemoPart::Key,
-                    x: with_value_code(|| key.clone()),
-                };
-                out.insert(
-                    handle,
-                    KeyOf {
-                        table: self.index,
-                        key: Box::new(key),
-                    },
-                );
-            }
-        });
     }
 }
 

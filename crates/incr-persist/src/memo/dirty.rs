@@ -2,25 +2,34 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::ErasedIncr;
 
+use super::table_core::{Encoded, KeyPart};
+
 const SHARDS: usize = 16;
 
 /// A dirty entry as an attempt copies it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct Record {
     pub(crate) table: u32,
     pub(crate) handle: ErasedIncr,
     pub(crate) mark: u64,
+    pub(crate) key: KeyPart,
+}
+
+struct Marked {
+    table: u32,
+    mark: u64,
+    key: KeyPart,
 }
 
 #[derive(Default)]
 struct Shard {
-    /// Per entry, its table and the mark of its latest compute.
-    marks: HashMap<ErasedIncr, (u32, u64)>,
+    /// Per entry, its table, key and the mark of its latest compute.
+    marks: HashMap<ErasedIncr, Marked>,
     /// Entries [`Dirty::carry`] counted again, until they compute again.
     carried: HashSet<ErasedIncr>,
 }
@@ -76,12 +85,19 @@ impl Dirty {
     }
 
     /// Records a compute of `handle`; returns the unsaved count after it.
-    pub(crate) fn computed(&self, table: u32, handle: ErasedIncr) -> u64 {
+    pub(crate) fn computed(&self, table: u32, handle: ErasedIncr, key: &KeyPart) -> u64 {
         let mut shard = self.shard(handle);
         let mark = self.marks.fetch_add(1, Relaxed) + 1;
         shard.carried.remove(&handle);
-        let previous = shard.marks.insert(handle, (table, mark));
-        if previous.is_none_or(|(_, mark)| mark <= self.attempt.load(Relaxed)) {
+        let previous = match shard.marks.get_mut(&handle) {
+            Some(marked) => Some(std::mem::replace(&mut marked.mark, mark)),
+            None => {
+                let key = Arc::clone(key);
+                shard.marks.insert(handle, Marked { table, mark, key });
+                None
+            }
+        };
+        if previous.is_none_or(|mark| mark <= self.attempt.load(Relaxed)) {
             self.unsaved.fetch_add(1, Relaxed) + 1
         } else {
             self.unsaved.load(Relaxed)
@@ -90,12 +106,20 @@ impl Dirty {
 
     /// Keeps `handle` dirty without counting it as unsaved: an entry the
     /// backend lost rather than one that computed.
-    pub(crate) fn lost(&self, table: u32, handle: ErasedIncr) {
-        self.shard(handle).marks.entry(handle).or_insert((table, 0));
+    pub(crate) fn lost(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) {
+        self.shard(handle)
+            .marks
+            .entry(handle)
+            .or_insert_with(|| Marked {
+                table,
+                mark: 0,
+                key: Arc::new(Encoded(key)),
+            });
     }
 
     /// Starts a checkpoint attempt: drops entries `alive` refuses and
-    /// returns a copy of the rest.
+    /// returns a copy of the rest, by table and then mark, so a checkpoint
+    /// writes a table's entries together and in a repeatable order.
     pub(crate) fn attempt(&self, alive: impl Fn(ErasedIncr) -> bool) -> Vec<Record> {
         let mut shards = self.all();
         let (previous, attempt) = (self.previous.load(Relaxed), self.attempt.load(Relaxed));
@@ -108,12 +132,14 @@ impl Dirty {
         for shard in shards.iter_mut() {
             shard.marks.retain(|&handle, _| alive(handle));
             shard.carried.retain(|&handle| alive(handle));
-            out.extend(shard.marks.iter().map(|(&handle, &(table, mark))| Record {
-                table,
+            out.extend(shard.marks.iter().map(|(&handle, marked)| Record {
+                table: marked.table,
                 handle,
-                mark,
+                mark: marked.mark,
+                key: Arc::clone(&marked.key),
             }));
         }
+        out.sort_unstable_by_key(|record| (record.table, record.mark));
         out
     }
 
@@ -127,7 +153,7 @@ impl Dirty {
         let unsaved = shards
             .iter()
             .flat_map(|shard| shard.marks.values())
-            .filter(|&&(_, mark)| mark > attempt)
+            .filter(|marked| marked.mark > attempt)
             .count();
         self.unsaved.store(unsaved as u64, Relaxed);
     }
@@ -136,26 +162,30 @@ impl Dirty {
     /// not inspect, if it computed since the attempt before: its compute
     /// may not have landed yet. Once per compute, so an entry left stale
     /// is not counted at every attempt.
-    pub(crate) fn carry(&self, record: Record) {
+    pub(crate) fn carry(&self, record: &Record) {
         let mut shard = self.shard(record.handle);
         let Shard { marks, carried } = &mut *shard;
         let Some(current) = marks
             .get_mut(&record.handle)
-            .filter(|(_, mark)| *mark == record.mark)
+            .filter(|marked| marked.mark == record.mark)
         else {
             return;
         };
         if record.mark <= self.previous.load(Relaxed) || !carried.insert(record.handle) {
             return;
         }
-        current.1 = self.marks.fetch_add(1, Relaxed) + 1;
+        current.mark = self.marks.fetch_add(1, Relaxed) + 1;
         self.unsaved.fetch_add(1, Relaxed);
     }
 
     /// `handle` reached the backend as of `mark`; a later compute keeps it.
     pub(crate) fn saved(&self, handle: ErasedIncr, mark: u64) {
         let mut shard = self.shard(handle);
-        if shard.marks.get(&handle).is_some_and(|&(_, m)| m == mark) {
+        if shard
+            .marks
+            .get(&handle)
+            .is_some_and(|marked| marked.mark == mark)
+        {
             shard.marks.remove(&handle);
         }
     }
@@ -177,20 +207,24 @@ mod tests {
     }
 
     fn mark(records: &[Record], handle: ErasedIncr) -> Record {
-        *records.iter().find(|r| r.handle == handle).unwrap()
+        records.iter().find(|r| r.handle == handle).unwrap().clone()
+    }
+
+    fn key() -> KeyPart {
+        Arc::new(Encoded(Vec::new()))
     }
 
     #[test]
     fn unsaved_counts_entries_computed_since_the_attempt() {
         let (_rt, h) = handles(3);
         let dirty = Dirty::new();
-        assert_eq!(dirty.computed(0, h[0]), 1);
-        assert_eq!(dirty.computed(0, h[0]), 1);
-        assert_eq!(dirty.computed(0, h[1]), 2);
+        assert_eq!(dirty.computed(0, h[0], &key()), 1);
+        assert_eq!(dirty.computed(0, h[0], &key()), 1);
+        assert_eq!(dirty.computed(0, h[1], &key()), 2);
         let marks = dirty.attempt(|_| true);
         assert_eq!(dirty.unsaved(), 0);
-        assert_eq!(dirty.computed(0, h[0]), 1);
-        dirty.lost(0, h[2]);
+        assert_eq!(dirty.computed(0, h[0], &key()), 1);
+        dirty.lost(0, h[2], Vec::new());
         assert_eq!(dirty.unsaved(), 1);
         dirty.saved(h[0], mark(&marks, h[0]).mark);
         dirty.saved(h[1], mark(&marks, h[1]).mark);
@@ -203,32 +237,32 @@ mod tests {
     fn a_failed_attempt_counts_its_entries_again_once() {
         let (_rt, h) = handles(3);
         let dirty = Dirty::new();
-        dirty.computed(0, h[0]);
-        dirty.computed(0, h[1]);
+        dirty.computed(0, h[0], &key());
+        dirty.computed(0, h[1], &key());
         dirty.attempt(|_| true);
-        dirty.computed(0, h[1]);
-        dirty.computed(0, h[2]);
+        dirty.computed(0, h[1], &key());
+        dirty.computed(0, h[2], &key());
         dirty.failed();
         assert_eq!(dirty.unsaved(), 3);
-        assert_eq!(dirty.computed(0, h[0]), 3);
+        assert_eq!(dirty.computed(0, h[0], &key()), 3);
     }
 
     #[test]
     fn an_entry_not_yet_landed_is_carried_once_per_compute() {
         let (_rt, h) = handles(2);
         let dirty = Dirty::new();
-        dirty.computed(0, h[0]);
-        dirty.lost(0, h[1]);
+        dirty.computed(0, h[0], &key());
+        dirty.lost(0, h[1], Vec::new());
         let marks = dirty.attempt(|_| true);
-        dirty.carry(mark(&marks, h[0]));
-        dirty.carry(mark(&marks, h[1]));
+        dirty.carry(&mark(&marks, h[0]));
+        dirty.carry(&mark(&marks, h[1]));
         assert_eq!(dirty.unsaved(), 1);
         let marks = dirty.attempt(|_| true);
-        dirty.carry(mark(&marks, h[0]));
+        dirty.carry(&mark(&marks, h[0]));
         assert_eq!(dirty.unsaved(), 0);
-        dirty.computed(0, h[0]);
+        dirty.computed(0, h[0], &key());
         let marks = dirty.attempt(|_| true);
-        dirty.carry(mark(&marks, h[0]));
+        dirty.carry(&mark(&marks, h[0]));
         assert_eq!(dirty.unsaved(), 1);
     }
 }

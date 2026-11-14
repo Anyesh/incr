@@ -12,15 +12,28 @@ use incr_core::{check_value_code, ErasedIncr, Runtime};
 use super::checkpoint::Fate;
 use super::mapping::LiveDep;
 use super::memo_core::{CoreRef, IndexGen, MemoCells};
-use super::table_core::{KeyOf, Snap};
+use super::table_core::Snap;
 use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, StoredDep};
 use crate::value_context::EncodeMismatch;
 use crate::{Error, Result};
 
-/// A clean query dep of a dirty entry: its key, and the fp of the bytes
-/// it was last written or seeded with, which is what restore compares.
+#[cfg(test)]
+thread_local! {
+    /// Keys a checkpoint on this thread read from live entries or stored.
+    pub(crate) static KEYS_TOUCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn touched_key() {
+    KEYS_TOUCHED.with(|n| n.set(n.get() + 1));
+}
+
+/// A clean query dep of a dirty entry: its table and stored key, and the
+/// fp of the bytes it was last written or seeded with, which is what
+/// restore compares.
 struct Clean {
-    key: KeyOf,
+    table: u32,
+    key: Vec<u8>,
     fp: u128,
 }
 
@@ -43,9 +56,16 @@ impl<C: MemoCells> CoreRef<C> {
             started: false,
             saved: false,
         };
-        let (snaps, mut keys, clean, moved) = {
+        let (snaps, clean, moved) = {
             let mut state = self.lock_memo();
-            state.seed_info.retain(|&handle, _| rt.is_alive(handle));
+            // Dead nodes never match a live handle, so pruning them can
+            // wait until the map has doubled: linear time per prune,
+            // amortized over the inserts since the last one.
+            if state.seed_info.len() >= 2 * state.pruned_at.max(1024) {
+                state.seed_info.retain(|&handle, _| rt.is_alive(handle));
+                state.seed_keys.retain(|&handle, _| rt.is_alive(handle));
+                state.pruned_at = state.seed_info.len();
+            }
             let dirty = self.dirty.attempt(|handle| rt.is_alive(handle));
             attempt.started = true;
             // The read hold excludes every mapped write, and each finishes
@@ -55,7 +75,7 @@ impl<C: MemoCells> CoreRef<C> {
             let mut snaps = Vec::new();
             for record in &dirty {
                 let table = &self.tables[record.table as usize];
-                snaps.extend(table.inspect_dirty(rt, &map, self.id, record.handle, record.mark));
+                snaps.extend(table.inspect_dirty(rt, &map, self.id, record));
             }
             // A node that landed again since its `inspect`, which only a
             // write around the store allows, may have dependents inspected
@@ -67,7 +87,7 @@ impl<C: MemoCells> CoreRef<C> {
                 let taken: HashSet<ErasedIncr> = snaps.iter().map(|snap| snap.handle).collect();
                 for record in &dirty {
                     if !taken.contains(&record.handle) {
-                        self.dirty.carry(*record);
+                        self.dirty.carry(record);
                     }
                 }
             }
@@ -82,7 +102,7 @@ impl<C: MemoCells> CoreRef<C> {
             let is_dirty = |handle: &ErasedIncr| dirty.contains(handle);
             // A clean entry has not run since it was written or seeded,
             // so while it keeps that stamp its value is the stored one.
-            let mut clean: HashMap<ErasedIncr, u128> = HashMap::new();
+            let mut clean: HashMap<ErasedIncr, Clean> = HashMap::new();
             for snap in &snaps {
                 for dep in &snap.deps {
                     let LiveDep::Query(handle) = *dep else {
@@ -91,45 +111,35 @@ impl<C: MemoCells> CoreRef<C> {
                     if is_dirty(&handle) {
                         continue;
                     }
-                    if let Some(&(fp, stamp)) = state.seed_info.get(&handle) {
-                        if changed_at_erased(rt, handle) == Some(stamp) {
-                            clean.insert(handle, fp);
-                        }
+                    if clean.contains_key(&handle) {
+                        continue;
+                    }
+                    let Some(&(fp, stamp)) = state.seed_info.get(&handle) else {
+                        continue;
+                    };
+                    let Some((table, key)) = state.seed_keys.get(&handle) else {
+                        continue;
+                    };
+                    if changed_at_erased(rt, handle) == Some(stamp) {
+                        #[cfg(test)]
+                        touched_key();
+                        let (table, key) = (*table, key.clone());
+                        clean.insert(handle, Clean { table, key, fp });
                     }
                 }
             }
-            let mut wanted: HashSet<ErasedIncr> = snaps.iter().map(|snap| snap.handle).collect();
-            wanted.extend(clean.keys());
-            let mut keys = HashMap::new();
-            if !wanted.is_empty() {
-                for table in &self.tables {
-                    table.keys_of(rt, &wanted, &mut keys);
-                }
-            }
-            (snaps, keys, clean, moved)
+            (snaps, clean, moved)
         };
         drop(moved);
-        let clean: HashMap<ErasedIncr, Clean> = clean
-            .into_iter()
-            .filter_map(|(handle, fp)| {
-                Some((
-                    handle,
-                    Clean {
-                        key: keys.remove(&handle)?,
-                        fp,
-                    },
-                ))
-            })
-            .collect();
         let mut mismatches = Vec::new();
         let index = self.index();
         let stored = |table: u32, key: &[u8], fp: u128| {
             let entry = index.read(&*self.backend, table, key).ok()??;
             (fingerprint(&entry.value) == fp).then_some(entry.value)
         };
-        let found = fresh(snaps, &mut keys, &clean, &stored, &mut mismatches);
+        let found = fresh(snaps, &clean, &stored, &mut mismatches);
         drop(index);
-        drop((keys, clean));
+        drop(clean);
         let snapshot = started.elapsed();
         if found.entries.is_empty() {
             attempt.saved = true;
@@ -171,12 +181,15 @@ impl<C: MemoCells> CoreRef<C> {
                         state
                             .seed_info
                             .insert(origin.handle, (origin.fp, origin.stamp));
+                        state
+                            .seed_keys
+                            .insert(origin.handle, (origin.table, origin.key.clone()));
                     }
                     // Nothing else rewrites a clean dep the base lacks.
                     Fate::Unkept => {
                         unsaveable += 1;
-                        for &(table, handle) in &origin.clean {
-                            dirty.lost(table, handle);
+                        for (table, handle, key) in &origin.clean {
+                            dirty.lost(*table, *handle, key.clone());
                         }
                     }
                     Fate::Oversized => unsaveable += 1,
@@ -190,7 +203,7 @@ impl<C: MemoCells> CoreRef<C> {
                 continue;
             };
             if let Ok(Some(handle)) = t.probe_bytes(rt, key, &mut bag) {
-                self.dirty.lost(*table, handle);
+                self.dirty.lost(*table, handle, key.clone());
             }
         }
         state.stats.unsaveable = unsaveable;
@@ -237,12 +250,14 @@ struct Found {
 
 /// The live entry behind a [`Found::entries`] entry.
 struct Origin {
+    table: u32,
+    key: Vec<u8>,
     handle: ErasedIncr,
     mark: u64,
     stamp: u64,
     fp: u128,
-    /// Its query deps that were clean, by table and handle.
-    clean: Vec<(u32, ErasedIncr)>,
+    /// Its query deps that were clean, by table, handle and stored key.
+    clean: Vec<(u32, ErasedIncr, Vec<u8>)>,
 }
 
 /// The snapshot's entries that every keep rule but the query-dep fixpoint
@@ -254,7 +269,6 @@ struct Origin {
 /// finds at its seeded fp, which clean dependents in the base name.
 fn fresh(
     snaps: Vec<Snap>,
-    keys: &mut HashMap<ErasedIncr, KeyOf>,
     clean: &HashMap<ErasedIncr, Clean>,
     stored: &dyn Fn(u32, &[u8], u128) -> Option<Vec<u8>>,
     mismatches: &mut Vec<EncodeMismatch>,
@@ -269,7 +283,9 @@ fn fresh(
     let encoded: Vec<Option<(Vec<u8>, Vec<u8>)>> = snaps
         .iter()
         .map(|snap| {
-            let key = note(keys.remove(&snap.handle)?.key.encode())?;
+            #[cfg(test)]
+            touched_key();
+            let key = note(snap.key.encode())?;
             let value = note(snap.value.encode())?;
             let value = match snap.seeded {
                 Some(fp) if fingerprint(&value) != fp => {
@@ -289,9 +305,7 @@ fn fresh(
         })
         .collect();
     for (&handle, dep) in clean {
-        if let Some(key) = note(dep.key.key.encode()) {
-            by_handle.insert(handle, (dep.key.table, key, dep.fp));
-        }
+        by_handle.insert(handle, (dep.table, dep.key.clone(), dep.fp));
     }
     let mut found = Found {
         entries: Vec::new(),
@@ -324,6 +338,8 @@ fn fresh(
             continue;
         };
         found.origin.push(Origin {
+            table: snap.table,
+            key: key.clone(),
             handle: snap.handle,
             mark: snap.mark,
             stamp: snap.stamp,
@@ -332,7 +348,10 @@ fn fresh(
                 .deps
                 .iter()
                 .filter_map(|dep| match dep {
-                    LiveDep::Query(handle) => Some((clean.get(handle)?.key.table, *handle)),
+                    LiveDep::Query(handle) => {
+                        let dep = clean.get(handle)?;
+                        Some((dep.table, *handle, dep.key.clone()))
+                    }
                     _ => None,
                 })
                 .collect(),
@@ -347,3 +366,7 @@ fn fresh(
     }
     found
 }
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod tests;
