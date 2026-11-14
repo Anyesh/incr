@@ -103,7 +103,7 @@ macro_rules! persist_classes {
 
     (full, binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
         use std::collections::HashMap;
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
         use $crate::classes::{key_counts, keyed_of, reconcile_pairs, FullStoreRuntime, KeyCounts, StoreRuntime};
         use $crate::incr_core::Runtime;
@@ -132,8 +132,8 @@ macro_rules! persist_classes {
         /// `insert`, `delete`, `extend` and `replace` raise `RuntimeError`.
         #[pyclass(name = "Store", module = $module, $($flag),*)]
         pub(crate) struct PyStore {
-            core: Option<Arc<$crate::store::StoreCore<$b>>>,
-            memo: MemoCore<$b>,
+            core: Mutex<Option<Arc<$crate::store::StoreCore<$b>>>>,
+            memo: Mutex<Option<Arc<MemoCore<$b>>>>,
             runtime: Py<$rt>,
         }
 
@@ -142,15 +142,25 @@ macro_rules! persist_classes {
         impl PyStore {
             fn new(core: Arc<$crate::store::StoreCore<$b>>, runtime: Py<$rt>) -> Self {
                 PyStore {
-                    core: Some(core),
-                    memo: MemoCore::default(),
+                    core: Mutex::new(Some(core)),
+                    memo: Mutex::new(Some(Arc::new(MemoCore::default()))),
                     runtime,
                 }
             }
 
-            fn core(&self) -> PyResult<&Arc<$crate::store::StoreCore<$b>>> {
+            fn core(&self) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
                 self.core
-                    .as_ref()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                    .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
+            }
+
+            fn memo(&self) -> PyResult<Arc<MemoCore<$b>>> {
+                self.memo
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
                     .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
             }
 
@@ -158,7 +168,7 @@ macro_rules! persist_classes {
             /// a failed overlay restore refuses every store call, since a
             /// checkpoint would fold the half-restored collections.
             fn core_live(&self, py: Python<'_>) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
-                let core = Arc::clone(self.core()?);
+                let core = self.core()?;
                 self.runtime.bind(py).borrow().rt()?;
                 Ok(core)
             }
@@ -169,7 +179,9 @@ macro_rules! persist_classes {
             }
 
             fn after_write(&self, core: &$crate::store::StoreCore<$b>, py: Python<'_>) {
-                self.memo.after_write(core, py)
+                if let Ok(memo) = self.memo() {
+                    memo.after_write(core, py);
+                }
             }
 
             fn maker(&self, py: Python<'_>) -> impl Fn(Py<PyAny>) -> $crate::memo::MemoFn<<$b as $crate::binding::PyBinding>::C> {
@@ -358,10 +370,10 @@ macro_rules! persist_classes {
             fn batch(slf: &Bound<'_, Self>, apply: &str) -> PyResult<PyBatch> {
                 let py = slf.py();
                 let apply = $crate::batch::Apply::parse(apply)?;
-                slf.try_borrow()?.core_outside_overlay(py)?;
+                slf.borrow().core_outside_overlay(py)?;
                 Ok(PyBatch {
                     store: slf.clone().unbind(),
-                    batch: $crate::batch::Batch::new(apply),
+                    batch: Mutex::new($crate::batch::Batch::new(apply)),
                 })
             }
 
@@ -382,9 +394,9 @@ macro_rules! persist_classes {
                 func: Py<PyAny>,
             ) -> PyResult<PyMemoTable> {
                 let py = slf.py();
-                let store = slf.try_borrow()?;
+                let store = slf.borrow();
                 let core = store.core_outside_overlay(py)?;
-                let handle = store.memo.declare_table(
+                let handle = store.memo()?.declare_table(
                     &core,
                     py,
                     name,
@@ -428,9 +440,9 @@ macro_rules! persist_classes {
             ) -> PyResult<PyMemo> {
                 let py = slf.py();
                 let options = $crate::memo::OpenOptions::new(max_bytes, checkpoint_after_entries)?;
-                let store = slf.try_borrow()?;
+                let store = slf.borrow();
                 let core = store.core_outside_overlay(py)?;
-                store.memo.open(&core, py, backend, options, store.maker(py))?;
+                store.memo()?.open(&core, py, backend, options, store.maker(py))?;
                 Ok(PyMemo {
                     store: slf.clone().unbind(),
                 })
@@ -462,14 +474,10 @@ macro_rules! persist_classes {
             }
 
             /// Closes the store and its runtime: every later call on either raises.
-            fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
-                let py = slf.py();
-                let runtime = slf.try_borrow()?.runtime.clone_ref(py);
-                <$rt as FullStoreRuntime<$b>>::close_store_runtime(runtime.bind(py))?;
-                let (core, memo) = {
-                    let mut store = slf.try_borrow_mut()?;
-                    (store.core.take(), std::mem::take(&mut store.memo))
-                };
+            fn close(&self, py: Python<'_>) -> PyResult<()> {
+                <$rt as FullStoreRuntime<$b>>::close_store_runtime(self.runtime.bind(py))?;
+                let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let core = self.core.lock().unwrap_or_else(PoisonError::into_inner).take();
                 drop(memo);
                 drop(core);
                 Ok(())
@@ -488,7 +496,19 @@ macro_rules! persist_classes {
         #[pyclass(name = "Batch", module = $module, $($flag),*)]
         pub(crate) struct PyBatch {
             store: Py<PyStore>,
-            batch: $crate::batch::Batch<$b>,
+            batch: Mutex<$crate::batch::Batch<$b>>,
+        }
+
+        impl PyBatch {
+            fn batch(&self) -> PyResult<MutexGuard<'_, $crate::batch::Batch<$b>>> {
+                match self.batch.try_lock() {
+                    Ok(batch) => Ok(batch),
+                    Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+                    Err(TryLockError::WouldBlock) => Err(PyRuntimeError::new_err(
+                        "the batch is in use by another call",
+                    )),
+                }
+            }
         }
 
         fn batch_core(store: &Py<PyStore>, py: Python<'_>) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
@@ -500,27 +520,25 @@ macro_rules! persist_classes {
             fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
                 let py = slf.py();
                 let core = batch_core(&slf.borrow().store, py)?;
-                slf.try_borrow_mut()?.batch.enter(py, &core)?;
+                slf.borrow().batch()?.enter(py, &core)?;
                 Ok(slf)
             }
 
             #[pyo3(signature = (exc_type, _exc, _traceback))]
             fn __exit__(
-                &mut self,
+                &self,
                 py: Python<'_>,
                 exc_type: Option<&Bound<'_, PyAny>>,
                 _exc: Option<&Bound<'_, PyAny>>,
                 _traceback: Option<&Bound<'_, PyAny>>,
             ) -> PyResult<bool> {
                 if exc_type.is_some() {
-                    let core = self.store.bind(py).borrow().core().ok().cloned();
-                    self.batch.abandon(py, core.as_deref())?;
+                    let core = self.store.bind(py).borrow().core().ok();
+                    self.batch()?.abandon(py, core.as_deref())?;
                 } else {
                     let core = batch_core(&self.store, py)?;
-                    self.batch.exit(py, &core)?;
-                    if let Ok(store) = self.store.bind(py).try_borrow() {
-                        store.after_write(&core, py);
-                    }
+                    self.batch()?.exit(py, &core)?;
+                    self.store.bind(py).borrow().after_write(&core, py);
                 }
                 Ok(false)
             }
@@ -531,53 +549,51 @@ macro_rules! persist_classes {
             /// the run for another retry; `PersistError` once the run has landed;
             /// `RuntimeError` for an `on_exit` batch, inside the block, or after a
             /// block that raised.
-            fn retry(&mut self, py: Python<'_>) -> PyResult<u64> {
+            fn retry(&self, py: Python<'_>) -> PyResult<u64> {
                 let core = batch_core(&self.store, py)?;
-                let position = self.batch.retry(py, &core)?;
-                if let Ok(store) = self.store.bind(py).try_borrow() {
-                        store.after_write(&core, py);
-                    }
+                let position = self.batch()?.retry(py, &core)?;
+                self.store.bind(py).borrow().after_write(&core, py);
                 Ok(position)
             }
 
-            fn set(&mut self, py: Python<'_>, node: <$rt as StoreRuntime<$b>>::Node, value: Py<PyAny>) -> PyResult<()> {
+            fn set(&self, py: Python<'_>, node: <$rt as StoreRuntime<$b>>::Node, value: Py<PyAny>) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
-                self.batch.set(py, &core, <$rt as StoreRuntime<$b>>::node_inner(&node), value)
+                self.batch()?.set(py, &core, <$rt as StoreRuntime<$b>>::node_inner(&node), value)
             }
 
             fn insert(
-                &mut self,
+                &self,
                 py: Python<'_>,
                 collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
                 row: Py<PyAny>,
             ) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
-                self.batch.insert(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
+                self.batch()?.insert(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
             }
 
             fn delete(
-                &mut self,
+                &self,
                 py: Python<'_>,
                 collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
                 row: Py<PyAny>,
             ) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
-                self.batch.delete(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
+                self.batch()?.delete(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
             }
 
             fn replace(
-                &mut self,
+                &self,
                 py: Python<'_>,
                 collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
                 old: Py<PyAny>,
                 new: Py<PyAny>,
             ) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
-                self.batch.replace(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), old, new)
+                self.batch()?.replace(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), old, new)
             }
 
             fn upsert(
-                &mut self,
+                &self,
                 py: Python<'_>,
                 kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
                 key: Py<PyAny>,
@@ -585,29 +601,29 @@ macro_rules! persist_classes {
             ) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
-                self.batch.upsert(py, &core, &keyed, key, row)
+                self.batch()?.upsert(py, &core, &keyed, key, row)
             }
 
             fn remove(
-                &mut self,
+                &self,
                 py: Python<'_>,
                 kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
                 key: Py<PyAny>,
             ) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
-                self.batch.remove(py, &core, &keyed, key)
+                self.batch()?.remove(py, &core, &keyed, key)
             }
 
             fn reconcile(
-                &mut self,
+                &self,
                 py: Python<'_>,
                 kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
                 rows: &Bound<'_, PyAny>,
             ) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
-                self.batch.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)
+                self.batch()?.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)
             }
         }
 
@@ -631,9 +647,9 @@ macro_rules! persist_classes {
                 rt: &Runtime<<$b as $crate::binding::PyBinding>::C>,
                 key: PyValue,
             ) -> PyResult<PyValue> {
-                let store = self.store.bind(py).try_borrow()?;
+                let store = self.store.bind(py).borrow();
                 let core = store.core()?;
-                store.memo.value_of(core, py, rt, &self.name, &self.handle, key)
+                store.memo()?.value_of(&core, py, rt, &self.name, &self.handle, key)
             }
         }
 
@@ -670,15 +686,15 @@ macro_rules! persist_classes {
                 table: PyRef<'_, PyMemoTable>,
                 key: Py<PyAny>,
             ) -> PyResult<<$rt as StoreRuntime<$b>>::Node> {
-                let core = self.store.bind(py).try_borrow()?.core_live(py)?;
+                let core = self.store.bind(py).borrow().core_live(py)?;
                 if !table.store.is(&self.store) {
                     return Err(PyValueError::new_err(format!(
                         "memo table '{}' belongs to another store",
                         table.name
                     )));
                 }
-                let store = self.store.bind(py).try_borrow()?;
-                let inner = store.memo.get_or_insert(&core, py, &table.handle, key)?;
+                let store = self.store.bind(py).borrow();
+                let inner = store.memo()?.get_or_insert(&core, py, &table.handle, key)?;
                 Ok(<$rt as StoreRuntime<$b>>::node(inner))
             }
 
@@ -690,8 +706,9 @@ macro_rules! persist_classes {
             /// through its codec: the generation was still written, without that
             /// entry, which is recomputed on the next run.
             fn checkpoint(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, usize>> {
-                let core = self.store.bind(py).try_borrow()?.core_outside_overlay(py)?;
-                self.store.bind(py).try_borrow()?.memo.checkpoint(&core, py)
+                let store = self.store.bind(py).borrow();
+                let core = store.core_outside_overlay(py)?;
+                store.memo()?.checkpoint(&core, py)
             }
 
             /// Runs `checkpoint()` when `checkpoint_after_entries` entries are
@@ -699,8 +716,9 @@ macro_rules! persist_classes {
             /// always when `open_memo` set no trigger. For after a read-only
             /// rebuild, since reads never checkpoint.
             fn checkpoint_if_due(&self, py: Python<'_>) -> PyResult<Option<HashMap<&'static str, usize>>> {
-                let core = self.store.bind(py).try_borrow()?.core_outside_overlay(py)?;
-                self.store.bind(py).try_borrow()?.memo.checkpoint_if_due(&core, py)
+                let store = self.store.bind(py).borrow();
+                let core = store.core_outside_overlay(py)?;
+                store.memo()?.checkpoint_if_due(&core, py)
             }
 
             /// `entries` and `bytes` of the current generation, `unsaved_entries`
@@ -711,8 +729,9 @@ macro_rules! persist_classes {
             /// latest such failure a write ran, as text, or `None`), read without
             /// touching the backend.
             fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-                let store = self.store.bind(py).try_borrow()?;
-                let stats = store.memo.stats(store.core()?, py)?;
+                let store = self.store.bind(py).borrow();
+                let core = store.core()?;
+                let stats = store.memo()?.stats(&core, py)?;
                 let dict = PyDict::new(py);
                 for (name, count) in stats.counts() {
                     dict.set_item(name, count)?;
