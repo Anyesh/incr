@@ -45,8 +45,9 @@ pub trait ValueSlot<T: Value>: 'static {
     /// What a write hands back for the value it displaced: the value
     /// itself under `Local`, a retire token under `Shared`. Dropping it
     /// runs the value's `Drop`, or retires it so hazard-protected readers
-    /// finish first, so the caller drops it outside every lock.
-    type Displaced;
+    /// finish first, so the caller drops it outside every lock, possibly
+    /// on another thread.
+    type Displaced: Send;
 
     fn new_empty() -> Self;
     fn new_with(v: T) -> Self;
@@ -403,6 +404,10 @@ impl<T: Value> Drop for SharedValueSlot<T> {
 /// Dropping it retires the value through the global haphazard domain,
 /// which runs its `Drop` once no reader still references it.
 pub struct RetiredValue<T: Value>(Replaced<T, Global, Box<T>>);
+
+// SAFETY: the token alone owns its value's box, displaced exactly once,
+// `T` is `Send`, and the global haphazard domain retires from any thread.
+unsafe impl<T: Value> Send for RetiredValue<T> {}
 
 impl<T: Value> Drop for RetiredValue<T> {
     fn drop(&mut self) {

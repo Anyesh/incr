@@ -131,6 +131,10 @@ impl<T: Value> LoomValueSlot<T> {
 /// slot drops; [`ValueSlot::restore`] takes it back out.
 pub struct LoomDisplaced<T>(*mut T);
 
+// SAFETY: the pointer only names a value its slot keeps parked; the token
+// never dereferences or frees it, so moving it across threads is sound.
+unsafe impl<T> Send for LoomDisplaced<T> {}
+
 impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
     type Displaced = LoomDisplaced<T>;
     fn new_empty() -> Self {
