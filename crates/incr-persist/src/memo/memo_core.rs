@@ -1,7 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
@@ -193,6 +194,69 @@ pub(crate) struct MemoCore<C: MemoCells> {
     /// A leaf lock outside the lock order: computes on any thread take it
     /// to record themselves, so nothing may be taken while it is held.
     dirty: Mutex<Dirty>,
+    /// `MemoOptions::checkpoint_after_entries`.
+    pub(crate) trigger: Option<u64>,
+    pub(crate) wake: Arc<Wake>,
+}
+
+/// What the automatic-checkpoint thread waits on. A leaf lock outside the
+/// lock order, like the dirty set's.
+#[derive(Default)]
+pub(crate) struct Wake {
+    state: Mutex<Waking>,
+    cond: Condvar,
+}
+
+#[derive(Default)]
+struct Waking {
+    stop: bool,
+    due: bool,
+}
+
+impl Wake {
+    fn lock(&self) -> MutexGuard<'_, Waking> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn due(&self) {
+        self.lock().due = true;
+        self.cond.notify_all();
+    }
+
+    pub(crate) fn stop(&self) {
+        self.lock().stop = true;
+        self.cond.notify_all();
+    }
+
+    /// Waits until a checkpoint is due, `every` has passed, or a stop:
+    /// `true` for a stop. `None` waits without an interval.
+    pub(crate) fn wait(&self, every: Option<Duration>) -> bool {
+        let deadline = every.map(|every| Instant::now() + every);
+        let mut waking = self.lock();
+        loop {
+            if waking.stop {
+                return true;
+            }
+            if std::mem::take(&mut waking.due) {
+                return false;
+            }
+            waking = match deadline {
+                None => self
+                    .cond
+                    .wait(waking)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(deadline) => {
+                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                        return false;
+                    };
+                    self.cond
+                        .wait_timeout(waking, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
+        }
+    }
 }
 
 impl<C: MemoCells> MemoCore<C> {
@@ -206,6 +270,7 @@ impl<C: MemoCells> MemoCore<C> {
         deps: Arc<DepIndex>,
         externals: NodeTable<String, u128, C>,
         max_bytes: u64,
+        trigger: Option<u64>,
         index: IndexGen,
     ) -> Self {
         let catalog_len = catalog.len();
@@ -222,6 +287,8 @@ impl<C: MemoCells> MemoCore<C> {
             memo: Mutex::new(MemoState::default()),
             index: RwLock::new(Arc::new(index)),
             dirty: Mutex::new(Dirty::new(catalog_len)),
+            trigger,
+            wake: Arc::default(),
         }
     }
 
@@ -246,9 +313,19 @@ impl<C: MemoCells> MemoCore<C> {
         self.dirty.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records that `table`'s entry `handle` computed.
+    /// Records that `table`'s entry `handle` computed, and wakes the
+    /// automatic-checkpoint thread when that makes a checkpoint due.
     pub(crate) fn computed(&self, table: u32, handle: ErasedIncr) {
-        self.lock_dirty().computed(table, handle);
+        let unsaved = self.lock_dirty().computed(table, handle);
+        if self.trigger == Some(unsaved) {
+            self.wake.due();
+        }
+    }
+
+    /// Whether `checkpoint_after_entries` entries are unsaved.
+    pub(crate) fn checkpoint_due(&self) -> bool {
+        self.trigger
+            .is_some_and(|trigger| self.lock_dirty().unsaved() >= trigger)
     }
 
     /// The stats with what the backend holds and lacks now.

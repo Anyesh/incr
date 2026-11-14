@@ -58,6 +58,17 @@ impl<C: MemoCells> CoreRef<C> {
             let (snaps, moved): (Vec<_>, Vec<_>) = snaps
                 .into_iter()
                 .partition(|snap| changed_at_erased(rt, snap.handle) == Some(snap.stamp));
+            {
+                let taken: HashSet<ErasedIncr> = snaps.iter().map(|snap| snap.handle).collect();
+                let mut counts = self.lock_dirty();
+                for (table, marks) in dirty.iter().enumerate() {
+                    for (&handle, &mark) in marks {
+                        if !taken.contains(&handle) {
+                            counts.carry(table as u32, handle, mark);
+                        }
+                    }
+                }
+            }
             let is_dirty = |handle: &ErasedIncr| dirty.iter().any(|t| t.contains_key(handle));
             // A clean entry has not run since it was written or seeded,
             // so while it keeps that stamp its value is the stored one.

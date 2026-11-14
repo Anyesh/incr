@@ -25,6 +25,7 @@ pub struct MemoOptions {
     pub(crate) salt: Vec<u8>,
     pub(crate) max_bytes: u64,
     pub(crate) auto_checkpoint_secs: Option<u64>,
+    pub(crate) checkpoint_after_entries: Option<u64>,
 }
 
 impl MemoOptions {
@@ -34,6 +35,7 @@ impl MemoOptions {
             salt: Vec::new(),
             max_bytes: DEFAULT_MAX_BYTES,
             auto_checkpoint_secs: None,
+            checkpoint_after_entries: None,
         }
     }
 
@@ -60,6 +62,21 @@ impl MemoOptions {
             "incr-persist: auto_checkpoint_secs must be at least 1"
         );
         self.auto_checkpoint_secs = Some(secs);
+        self
+    }
+
+    /// Makes a checkpoint due once `entries` entries have computed since
+    /// the last checkpoint attempt (`MemoStats::unsaved_entries`).
+    /// [`Memo::checkpoint_if_due`](super::Memo::checkpoint_if_due) runs it
+    /// then; on `Shared` the automatic-checkpoint thread also wakes for it,
+    /// started even without [`Self::auto_checkpoint_secs`]. A read never
+    /// checkpoints on its own thread. Panics if `entries` is 0.
+    pub fn checkpoint_after_entries(mut self, entries: u64) -> Self {
+        assert!(
+            entries > 0,
+            "incr-persist: checkpoint_after_entries must be at least 1"
+        );
+        self.checkpoint_after_entries = Some(entries);
         self
     }
 
