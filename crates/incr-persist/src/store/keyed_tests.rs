@@ -973,6 +973,41 @@ fn a_row_restored_in_a_scope_at_the_default_rank_does_not_checkpoint<C: MemoCell
     assert_eq!(p.runs(), 1);
 }
 
+/// A compute's first read of a key creates its version input. Every path
+/// to the store mutex refuses a running compute, so the read takes none.
+fn a_key_read_in_a_compute_creates_its_input_without_the_store<C: Cells>() {
+    let store = open::<C, _>(MemoryBackend::new());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let reader = Reader::new(&store, &kc, 1);
+    assert_eq!(kc.version_input(&1), None);
+    assert_eq!(store.runtime().get(reader.query), Some(s("a")));
+    assert!(kc.version_input(&1).is_some());
+}
+
+local_and_shared!(a_key_read_in_a_compute_creates_its_input_without_the_store);
+
+#[test]
+fn a_key_read_in_a_compute_runs_while_another_thread_holds_the_store() {
+    let store = Arc::new(open::<Shared, _>(MemoryBackend::new()));
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let reader = Reader::new(&store, &kc, 1);
+    let held = store.state().unwrap();
+    let (sent, read) = std::sync::mpsc::channel();
+    let reading = Arc::clone(&store);
+    let thread = std::thread::spawn(move || {
+        sent.send(reading.runtime().get(reader.query)).unwrap();
+    });
+    let row = read
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the read waited on the store mutex");
+    drop(held);
+    thread.join().unwrap();
+    assert_eq!(row, Some(s("a")));
+    assert!(kc.version_input(&1).is_some());
+}
+
 macro_rules! memo_local_and_shared {
     ($($name:ident),* $(,)?) => {
         $(
