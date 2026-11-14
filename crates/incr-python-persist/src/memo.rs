@@ -6,9 +6,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use incr_core::{Incr, Runtime};
-use incr_persist::memo::{BuildId, Memo, MemoBuilder, MemoCtx, MemoOptions, MemoTable};
-use incr_persist::MemoPart;
+use incr_core::{Cells, Incr, Runtime};
+use incr_persist::memo::{
+    BuildId, CheckpointStats, Memo, MemoBuilder, MemoCtx, MemoOptions, MemoStats, MemoTable,
+};
+use incr_persist::{Error, MemoPart};
 use incr_python_protocol::PyValue;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -92,8 +94,68 @@ fn mismatch_message(tables: &[(String, &'static str)]) -> String {
     )
 }
 
-fn new_memo_builder<B: PyBinding>(core: &StoreCore<B>) -> MemoBuilder<B::C> {
-    MemoBuilder::new(MemoOptions::new(BuildId::Fixed(core.build_id())))
+fn default_options<B: PyBinding>(core: &StoreCore<B>) -> MemoOptions {
+    MemoOptions::new(BuildId::Fixed(core.build_id()))
+}
+
+/// The options `store.open_memo` takes beyond the backend.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenOptions {
+    /// The size a checkpoint evicts the oldest entries down to; incr's
+    /// default when `None`.
+    pub max_bytes: Option<u64>,
+    /// The unsaved entries that make a checkpoint due; none when `None`.
+    pub checkpoint_after_entries: Option<u64>,
+}
+
+impl OpenOptions {
+    /// Raises `ValueError` for a `checkpoint_after_entries` of 0.
+    pub fn new(max_bytes: Option<u64>, checkpoint_after_entries: Option<u64>) -> PyResult<Self> {
+        if checkpoint_after_entries == Some(0) {
+            return Err(PyValueError::new_err(
+                "checkpoint_after_entries must be at least 1",
+            ));
+        }
+        Ok(OpenOptions {
+            max_bytes,
+            checkpoint_after_entries,
+        })
+    }
+
+    fn memo_options(self, core: &StoreCore<impl PyBinding>) -> MemoOptions {
+        let mut options = default_options(core);
+        if let Some(max_bytes) = self.max_bytes {
+            options = options.max_bytes(max_bytes);
+        }
+        if let Some(entries) = self.checkpoint_after_entries {
+            options = options.checkpoint_after_entries(entries);
+        }
+        options
+    }
+}
+
+/// `stats` as the dict `memo.checkpoint()` returns.
+fn checkpoint_counts(stats: &CheckpointStats) -> HashMap<&'static str, usize> {
+    HashMap::from([
+        ("written", stats.written),
+        ("unkept", stats.unkept),
+        ("merged", stats.merged),
+        ("corrupt", stats.corrupt),
+        ("evicted", stats.evicted),
+        ("oversized", stats.oversized),
+        ("unchanged", usize::from(stats.unchanged)),
+    ])
+}
+
+/// The fields of `stats` that `memo.stats()` returns.
+pub fn stats_counts(stats: &MemoStats) -> [(&'static str, u64); 5] {
+    [
+        ("entries", stats.entries),
+        ("bytes", stats.bytes),
+        ("unsaved_entries", stats.unsaved_entries),
+        ("unsaveable", stats.unsaveable),
+        ("evicted_last_checkpoint", stats.evicted_last_checkpoint),
+    ]
 }
 
 impl<B: PyBinding> MemoCore<B> {
@@ -155,7 +217,7 @@ impl<B: PyBinding> MemoCore<B> {
         let f = make(func.clone_ref(py));
         let handle = {
             let mut builder = self.builder();
-            let builder = builder.get_or_insert_with(|| new_memo_builder(core));
+            let builder = builder.get_or_insert_with(|| MemoBuilder::new(default_options(core)));
             let table = builder.table::<PyValue, PyValue>(name, version);
             builder.define(table, f);
             TableHandle(Arc::new(Mutex::new(table)))
@@ -169,21 +231,21 @@ impl<B: PyBinding> MemoCore<B> {
         Ok(handle)
     }
 
-    /// Makes the builder again from the declarations, after a failed open
-    /// consumed it.
-    fn restore_builder(
+    /// A builder over `options` made from the declarations, which their
+    /// table handles name from now on.
+    fn builder_from_decls(
         &self,
-        core: &StoreCore<B>,
         py: Python<'_>,
-        make: impl Fn(Py<PyAny>) -> MemoFn<B::C>,
-    ) {
-        let mut builder = new_memo_builder(core);
+        options: MemoOptions,
+        make: &impl Fn(Py<PyAny>) -> MemoFn<B::C>,
+    ) -> MemoBuilder<B::C> {
+        let mut builder = MemoBuilder::new(options);
         for decl in self.decls().iter() {
             let table = builder.table::<PyValue, PyValue>(&decl.name, decl.version);
             builder.define(table, make(decl.func.clone_ref(py)));
             decl.handle.set(table);
         }
-        *self.builder() = Some(builder);
+        builder
     }
 }
 
@@ -224,23 +286,24 @@ where
         Ok(value)
     }
 
-    /// Opens the memo over the Python memo `backend`, loading its current
-    /// generation. On failure the builder is made again with `make`, so
-    /// a later open can succeed.
+    /// Opens the memo over the Python memo `backend` with `options`,
+    /// loading its current generation. The builder is made from the
+    /// declarations with `make`, so a later open can succeed after a
+    /// failed one.
     pub fn open(
         &self,
         core: &StoreCore<B>,
         py: Python<'_>,
         backend: Py<PyAny>,
+        options: OpenOptions,
         make: impl Fn(Py<PyAny>) -> MemoFn<B::C>,
     ) -> PyResult<()> {
         if self.is_open() {
             return Err(PyRuntimeError::new_err("the memo is already open"));
         }
-        let builder = self
-            .builder()
-            .take()
-            .unwrap_or_else(|| new_memo_builder(core));
+        let declared = self.builder().take();
+        drop(declared);
+        let builder = self.builder_from_decls(py, options.memo_options(core), &make);
         let builder = carry::<B, _>(builder);
         let opened = core.write(py, move |store, _| {
             builder
@@ -254,7 +317,8 @@ where
                 .set(memo.into_inner())
                 .map_err(|_| PyRuntimeError::new_err("the memo is already open")),
             Err(e) => {
-                self.restore_builder(core, py, make);
+                let builder = self.builder_from_decls(py, default_options(core), &make);
+                *self.builder() = Some(builder);
                 Err(e)
             }
         }
@@ -287,12 +351,54 @@ where
         core: &StoreCore<B>,
         py: Python<'_>,
     ) -> PyResult<HashMap<&'static str, usize>> {
+        let done = self.run_checkpoint(core, py, |memo| memo.checkpoint().map(Some))?;
+        Ok(done.unwrap_or_default())
+    }
+
+    /// [`Self::checkpoint`] when `checkpoint_after_entries` entries are
+    /// unsaved; `None` otherwise, and always when no trigger is set.
+    pub fn checkpoint_if_due(
+        &self,
+        core: &StoreCore<B>,
+        py: Python<'_>,
+    ) -> PyResult<Option<HashMap<&'static str, usize>>> {
+        self.run_checkpoint(core, py, OpenMemo::<B>::checkpoint_if_due)
+    }
+
+    /// Runs a due checkpoint after a logged write or batch commit on a
+    /// single-threaded runtime; a Shared memo's checkpoint thread runs it
+    /// instead. Does nothing when no memo is open. A checkpoint another
+    /// handle holds (`Busy`) is left for the next write, which finds it
+    /// still due; any other failure raises, after the write has landed.
+    pub fn after_write(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<()> {
+        if !<B::C as Cells>::SINGLE_THREADED || !self.is_open() {
+            return Ok(());
+        }
+        self.run_checkpoint(core, py, |memo| match memo.checkpoint_if_due() {
+            Err(Error::Busy) => Ok(None),
+            done => done,
+        })
+        .map(drop)
+    }
+
+    /// The memo's counts, read without touching the backend.
+    pub fn stats(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<MemoStats> {
+        let memo = carry::<B, _>(self.memo()?);
+        B::read(py, core.store(), move |_, _| memo.into_inner().stats())
+    }
+
+    fn run_checkpoint(
+        &self,
+        core: &StoreCore<B>,
+        py: Python<'_>,
+        checkpoint: impl FnOnce(&OpenMemo<B>) -> Result<Option<CheckpointStats>, Error> + Send,
+    ) -> PyResult<Option<HashMap<&'static str, usize>>> {
         let memo = self.memo()?;
         drop(core.registry().take_failure());
         let registry = core.registry();
         let task = carry::<B, _>(memo);
         let done = B::write(py, core.store(), move |_, _| {
-            registry.scoped(|| task.into_inner().checkpoint())
+            registry.scoped(|| checkpoint(task.into_inner()))
         })?;
         let cause = core.registry().take_failure();
         let stats = done.map_err(|error| crate::persist_error::<B::Exceptions>(py, error))?;
@@ -312,13 +418,6 @@ where
             err.set_cause(py, cause);
             return Err(err);
         }
-        Ok(HashMap::from([
-            ("written", stats.written),
-            ("unkept", stats.unkept),
-            ("merged", stats.merged),
-            ("corrupt", stats.corrupt),
-            ("evicted", stats.evicted),
-            ("oversized", stats.oversized),
-        ]))
+        Ok(stats.as_ref().map(checkpoint_counts))
     }
 }

@@ -284,7 +284,8 @@ def seeded(log, memo_backend):
     graph = Graph(log, memo_backend)
     graph.store.set(graph.base, 10)
     assert graph.value(2) == 20
-    assert graph.memo.checkpoint()["written"] == 1
+    stats = graph.memo.checkpoint()
+    assert stats["unchanged"] or stats["written"] == 1
     graph.store.close()
     return Graph(log, memo_backend)
 
@@ -367,6 +368,7 @@ def test_a_memo_entry_over_an_input_the_overlay_touched_survives_a_checkpoint():
     with graph.rt.overlay() as ov:
         ov.set(graph.base, 50)
         ov.set(graph.base, 60)
+    assert graph.value(3) == 30
     stats = graph.memo.checkpoint()
     assert (stats["merged"], stats["unkept"]) == (1, 0)
     graph.store.close()

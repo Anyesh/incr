@@ -770,10 +770,20 @@
     "kind": "method_descriptor",
     "signature": "(self, /)"
    },
+   "checkpoint_if_due": {
+    "doc": "Runs `checkpoint()` when `checkpoint_after_entries` entries are\nunsaved and returns its counts; `None` when none is due, and\nalways when `open_memo` set no trigger. For after a read-only\nrebuild, since reads never checkpoint.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
    "get_or_insert": {
     "doc": "The node of `table`'s entry for `key`: the live one, or one restored\nfrom the memo, or a new one. Read it with `runtime.get`. Inside an\noverlay it computes fresh and records nothing, so no candidate value\nis restored from the memo or reaches it.",
     "kind": "method_descriptor",
     "signature": "(self, /, table, key)"
+   },
+   "stats": {
+    "doc": "`entries` and `bytes` of the current generation, `unsaved_entries`\ncomputed since the last checkpoint and not saved,\n`unsaveable` entries the last checkpoint could not save, and\n`evicted_last_checkpoint`, read without touching the backend.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
    }
   },
   "signature": "()"
@@ -986,9 +996,9 @@
     "signature": "(backend, *, build_id, durability='sync', auto_checkpoint_records=None)"
    },
    "open_memo": {
-    "doc": "Opens the memo over `backend`, an object that implements the memo\nbackend protocol (see `incr.persist.MemoryMemo`), and loads its\ncurrent generation. Entries written under another `build_id`, or by\na table of another name, version or type, are ignored.",
+    "doc": "Opens the memo over `backend`, an object that implements the memo\nbackend protocol (see `incr.persist.MemoryMemo`), and loads its\ncurrent generation. Entries written under another `build_id`, or by\na table of another name, version or type, are ignored.\n\nA checkpoint evicts the oldest entries down to `max_bytes` of\nencoded entries (512 MiB by default). With\n`checkpoint_after_entries=n` a checkpoint is due once `n` entries\ncomputed since the last one are unsaved: on a Local runtime each\nlogged store write and batch commit runs a due checkpoint after it\nlands, and a read never does (call `memo.checkpoint_if_due()` after\na read-only rebuild); a Shared memo's checkpoint thread runs it. A\ntriggered checkpoint that fails raises from the write that ran it,\nafter the write landed, except `Busy`, which leaves it due for the\nnext write.",
     "kind": "method_descriptor",
-    "signature": "(self, /, backend)"
+    "signature": "(self, /, backend, *, max_bytes=None, checkpoint_after_entries=None)"
    },
    "reconcile": {
     "doc": "Makes a persisted keyed collection hold exactly `rows`, as\n`KeyedCollection.reconcile` does, in one logged step. Returns how\nmany keys were `(inserted, replaced, removed)`.",
