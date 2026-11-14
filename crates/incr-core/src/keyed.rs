@@ -120,11 +120,15 @@ impl ElementRank for () {
     }
 }
 
-/// The fingerprint of the bytes a persisted pair was applied from; 0 marks
-/// a pair no logged bytes back, which identifies nothing.
+/// The `u128` rank that never identifies a pair: no logged bytes back the
+/// pair, so equal ranks of this value say nothing about the pairs.
+pub const UNIDENTIFYING_RANK: u128 = 0;
+
+/// The fingerprint of the bytes a persisted pair was applied from;
+/// [`UNIDENTIFYING_RANK`] marks a pair no logged bytes back.
 impl ElementRank for u128 {
     fn identifies(&self) -> bool {
-        *self != 0
+        *self != UNIDENTIFYING_RANK
     }
 }
 

@@ -28,7 +28,7 @@ type Ranked<P> = (P, u128);
 
 /// The rank `KeyedCollection::upsert` and `reconcile` give a pair, which
 /// an unlogged scope's writes leave behind: no logged bytes back it.
-const UNLOGGED_RANK: u128 = 0;
+const UNLOGGED_RANK: u128 = incr_core::UNIDENTIFYING_RANK;
 
 /// A key's bytes and its row's fingerprint, `None` for no row.
 pub(crate) type RowDep = (Vec<u8>, Option<u128>);
