@@ -528,7 +528,7 @@ impl PyCollection {
             return Ok(Cow::Borrowed(&self.inner));
         }
         self.state(py)
-            .journal_with(|overlay| overlay.writable_collection(self))
+            .journal_with(|overlay| overlay.writable_collection(self.inner.version_node().slot()))
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(
                     "collection is persisted: write it with store.insert, store.delete, store.replace or store.extend",
@@ -1452,7 +1452,7 @@ impl PyRuntime {
     ) -> PyResult<()> {
         if first && persisted {
             self.state
-                .journal_with(|overlay| overlay.touch(node))
+                .journal_with(|overlay| overlay.touch(node.inner))
                 .transpose()?;
         }
         let old = if first {

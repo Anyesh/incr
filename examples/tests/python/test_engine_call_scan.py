@@ -223,7 +223,8 @@ def test_the_local_scan_covers_the_files_with_pymethods():
 def test_every_local_engine_call_goes_through_the_entry_its_kind_needs(source):
     text = (LOCAL / source).read_text()
     others = [p.read_text() for p in sorted(LOCAL.rglob("*.rs")) if p != LOCAL / source]
-    problems = local_violations(text, others)
+    shared = [p.read_text() for p in sorted(SHARED.rglob("*.rs"))]
+    problems = local_violations(text, others + shared)
     assert not problems, "\n".join(problems)
 
 

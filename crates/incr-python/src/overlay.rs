@@ -1,180 +1,19 @@
-//! The journal behind `Runtime.overlay()`: every mutation the binding
-//! exposes records its inverse while an overlay is active, and exit applies
-//! the inverses newest first, deletes the nodes the overlay created, and
-//! reads the watched outputs and creators the overlay disturbed so the base
-//! graph comes back exactly and drains report nothing the overlay caused.
+//! `Runtime.overlay()` over the journal in incr-python-persist: exit
+//! restores the journal, then reads the watched outputs and creators the
+//! overlay disturbed so the base graph comes back exactly and drains report
+//! nothing the overlay caused.
 
-use std::cell::Cell;
-use std::collections::HashSet;
-use std::rc::Rc;
-
-use incr_compute::{Change, ErasedIncr, Incr, IncrCollection, Runtime};
-use incr_core::PairOp;
+use incr_compute::{ErasedIncr, Runtime};
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 
-use crate::persist::{OverlayScope, PyPersistedKeyed};
-use crate::{engine_read, CoreKeyed, PersistedCore, PyCollection, PyNodeId, PyRuntime};
+use crate::persist::{LocalBinding, OverlayScope};
+use crate::{engine_read, PyNodeId, PyRuntime};
 
-/// Set when the overlay that created an object ends, after which the
-/// object's nodes are gone and every use of it raises.
-#[derive(Clone, Default)]
-pub(crate) struct Born(Option<Rc<Cell<bool>>>);
+pub(crate) use incr_python_persist::overlay::Born;
 
-impl Born {
-    pub(crate) fn check(&self) -> PyResult<()> {
-        match &self.0 {
-            Some(dead) if dead.get() => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "collection was created inside an overlay and deleted at its exit",
-            )),
-            _ => Ok(()),
-        }
-    }
-}
-
-pub(crate) enum Undo {
-    Set(Incr<PyValue>, PyValue),
-    Collection(IncrCollection<PyValue>, Vec<Change<PyValue>>),
-    /// The pair ops a plain keyed collection's write journalled, undone
-    /// by applying their inverses newest first.
-    Keyed(CoreKeyed, Vec<PairOp<PyValue, ()>>),
-    /// The same for a persisted keyed collection's unlogged writes.
-    PersistedKeyed(PersistedCore, Vec<PairOp<PyValue, u128>>),
-    Label(u32, Option<String>),
-}
-
-#[derive(Default)]
-pub(crate) struct Overlay {
-    undo: Vec<Undo>,
-    set_seen: HashSet<Incr<PyValue>>,
-    created: Vec<ErasedIncr>,
-    dead: Vec<Rc<Cell<bool>>>,
-    pub(crate) reported_at_entry: HashSet<ErasedIncr>,
-    persist: Option<OverlayScope>,
-}
-
-fn no_scope() -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err("the overlay holds no persisted scope")
-}
-
-impl Overlay {
-    pub(crate) fn push(&mut self, undo: Undo) {
-        self.undo.push(undo);
-    }
-
-    /// True the first time `node` is set in this overlay, which is the
-    /// only set whose old value the exit restores.
-    pub(crate) fn first_set(&mut self, node: Incr<PyValue>) -> bool {
-        self.set_seen.insert(node)
-    }
-
-    pub(crate) fn forget_set(&mut self, node: Incr<PyValue>) {
-        self.set_seen.remove(&node);
-    }
-
-    pub(crate) fn with_scope(&mut self, scope: Option<OverlayScope>) {
-        self.persist = scope;
-    }
-
-    pub(crate) fn take_scope(&mut self) -> Option<OverlayScope> {
-        self.persist.take()
-    }
-
-    pub(crate) fn touch(&mut self, node: &PyNodeId) -> PyResult<()> {
-        self.persist
-            .as_mut()
-            .ok_or_else(no_scope)?
-            .touch(node.inner)
-    }
-
-    pub(crate) fn writable_collection(
-        &mut self,
-        collection: &PyCollection,
-    ) -> PyResult<IncrCollection<PyValue>> {
-        self.persist
-            .as_mut()
-            .ok_or_else(no_scope)?
-            .collection(collection.inner.version_node().slot())
-    }
-
-    pub(crate) fn writable_keyed(
-        &mut self,
-        persisted: &PyPersistedKeyed,
-    ) -> PyResult<PersistedCore> {
-        self.persist.as_ref().ok_or_else(no_scope)?.keyed(persisted)
-    }
-
-    pub(crate) fn created(&mut self, node: ErasedIncr) {
-        self.created.push(node);
-    }
-
-    pub(crate) fn born(&mut self) -> Born {
-        let dead = Rc::new(Cell::new(false));
-        self.dead.push(Rc::clone(&dead));
-        Born(Some(dead))
-    }
-
-    /// Applies the inverses newest first, deletes the created nodes newest
-    /// first and marks their objects dead. The first failure stops the
-    /// restore and is returned with the base half restored.
-    pub(crate) fn restore(&mut self, rt: &Runtime) -> PyResult<()> {
-        let result = self.apply_inverses(rt);
-        for node in self.created.drain(..).rev() {
-            rt.delete_with_dependents(node);
-        }
-        result
-    }
-
-    fn apply_inverses(&mut self, rt: &Runtime) -> PyResult<()> {
-        while let Some(undo) = self.undo.pop() {
-            match undo {
-                Undo::Set(node, old) => rt.set(node, old),
-                Undo::Collection(collection, applied) => {
-                    collection.apply(rt, inverse(applied));
-                }
-                Undo::Keyed(keyed, ops) => {
-                    keyed.apply_pairs_with(
-                        rt,
-                        ops.into_iter().rev().map(PairOp::inverse),
-                        &mut (),
-                        None,
-                    );
-                }
-                Undo::PersistedKeyed(keyed, ops) => {
-                    keyed.apply_pairs_with(
-                        rt,
-                        ops.into_iter().rev().map(PairOp::inverse),
-                        &mut (),
-                        None,
-                    );
-                }
-                Undo::Label(slot, Some(old)) => rt.set_label(slot, old),
-                Undo::Label(slot, None) => rt.clear_label(slot),
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Overlay {
-    fn drop(&mut self) {
-        for dead in &self.dead {
-            dead.set(true);
-        }
-    }
-}
-
-/// The batch that undoes `applied`: each change flipped, last first.
-pub(crate) fn inverse(applied: Vec<Change<PyValue>>) -> Vec<Change<PyValue>> {
-    applied
-        .into_iter()
-        .rev()
-        .map(|change| match change {
-            Change::Insert(v) => Change::Delete(v),
-            Change::Delete(v) => Change::Insert(v),
-        })
-        .collect()
-}
+pub(crate) type Undo = incr_python_persist::overlay::Undo<LocalBinding>;
+pub(crate) type Overlay = incr_python_persist::overlay::Overlay<LocalBinding>;
 
 /// `with rt.overlay() as ov:` runs candidate changes against the live
 /// graph and puts the base graph back exactly on exit, also when the body
