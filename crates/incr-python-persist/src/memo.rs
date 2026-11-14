@@ -454,13 +454,13 @@ where
 
     fn note_auto_failure(&self, core: &StoreCore<B>, py: Python<'_>, error: &PyErr) {
         let text = error.to_string();
-        let unsaved = self
-            .memo_stats(core, py)
-            .map_or(0, |stats| stats.unsaved_entries);
+        let unsaved = self.memo_stats(core, py).map(|stats| stats.unsaved_entries);
         let mut auto = self.auto();
         auto.errors += 1;
         auto.last_error = Some(text);
-        auto.retry_above = Some(unsaved);
+        if let Ok(unsaved) = unsaved {
+            auto.retry_above = Some(unsaved);
+        }
     }
 
     fn memo_stats(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<MemoStats> {
@@ -494,6 +494,9 @@ where
         })?;
         let cause = core.registry().take_failure();
         let stats = done.map_err(|error| crate::persist_error::<B::Exceptions>(py, error))?;
+        if stats.is_some() {
+            self.auto().retry_above = None;
+        }
         let mismatches = memo.take_encode_mismatches();
         if !mismatches.is_empty() {
             let tables = mismatches

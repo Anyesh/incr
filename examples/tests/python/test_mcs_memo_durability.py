@@ -333,3 +333,18 @@ def test_explicit_checkpoints_still_raise(triggered_by_writes, failing):
     with pytest.raises(OSError, match="memo disk full"):
         graph.memo.checkpoint()
     assert graph.memo.stats()["auto_checkpoint_errors"] == 0
+
+
+def test_an_explicit_checkpoint_rearms_the_trigger(triggered_by_writes, failing):
+    graph, memo_backend = failing
+    for k in range(10, 20):
+        graph.read(k)
+    graph.store.set(graph.tick, 1)
+    assert memo_backend.writes == 1
+    memo_backend.fail = False
+    graph.memo.checkpoint()
+    for k in range(20, 23):
+        graph.read(k)
+    graph.store.set(graph.tick, 2)
+    assert memo_backend.writes == 3
+    assert graph.unsaved() == 0
