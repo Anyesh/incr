@@ -688,3 +688,52 @@ def test_a_write_removing_a_row_a_replay_could_not_match_is_refused(persist):
     again = open_store(persist, backend)
     kc2 = again.keyed_collection("rows", PickleCodec(), AlternatingCodec())
     assert sorted(kc2.keys()) == ["a", "b", "c"]
+
+
+class CallsStore:
+    store = None
+    outcomes = []
+
+    def __init__(self, n):
+        self.n = n
+
+    def __eq__(self, other):
+        return isinstance(other, CallsStore) and other.n == self.n
+
+    def __hash__(self):
+        return hash(self.n)
+
+    def __reduce__(self):
+        return (CallsStore, (self.n,))
+
+    def __del__(self):
+        store = CallsStore.store
+        if store is None:
+            return
+        try:
+            store.stats()
+            CallsStore.outcomes.append("ok")
+        except RuntimeError as error:
+            CallsStore.outcomes.append(str(error))
+
+
+def test_a_row_whose_del_calls_the_store_survives_replace_and_refresh(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
+    kc_leader = declare(leader)
+    kc_standby = declare(standby)
+    leader.upsert(kc_leader, "a", CallsStore(1))
+    standby.refresh()
+    CallsStore.outcomes = []
+    CallsStore.store = standby
+    try:
+        leader.upsert(kc_leader, "a", CallsStore(2))
+        standby.refresh()
+        standby.upsert(kc_standby, "a", CallsStore(3))
+        standby.upsert(kc_standby, "a", CallsStore(4))
+    finally:
+        CallsStore.store = None
+    assert CallsStore.outcomes, "no row was dropped"
+    assert set(CallsStore.outcomes) == {"ok"}
+    assert kc_standby.get("a") == CallsStore(4)
