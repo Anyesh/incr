@@ -207,6 +207,21 @@ pub fn inspect<T: Value, C: Cells>(rt: &Runtime<C>, q: Incr<T>) -> Option<Inspec
     rt.inspect(q)
 }
 
+/// [`inspect`] for each of `qs`, with every value cloned inside the one
+/// call of `stretch`, which must run its argument exactly once on this
+/// thread (a binding takes its value-code lock around it). The stretch
+/// holds no engine lock. A value read but refused by the second read goes
+/// to `bag`. Panics inside a compute of `rt`, or if `stretch` does not run
+/// its argument.
+pub fn inspect_many<T: Value, C: Cells>(
+    rt: &Runtime<C>,
+    qs: &[Incr<T>],
+    stretch: impl FnOnce(&mut dyn FnMut()),
+    bag: &mut Deferred<C>,
+) -> Vec<Option<Inspected<T>>> {
+    rt.inspect_many(qs, stretch, bag)
+}
+
 /// [`NodeTable::get_or_insert_query_with`] that hands a node the miss
 /// creates to `seed` before publishing it. A hit never calls `seed`.
 /// Everything the call does not keep, a failed seed's value among it,

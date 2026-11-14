@@ -1425,12 +1425,41 @@ where
 
     /// A copy of the key whose version input is `handle`.
     pub fn key_of_version(&self, handle: ErasedIncr) -> Option<K> {
+        self.keys_of_versions(&[handle], |f| f()).pop().flatten()
+    }
+
+    /// [`Self::key_of_version`] for each of `handles`, under one read of
+    /// the version map, with every key cloned inside the one call of
+    /// `stretch`, which must run its argument exactly once on this thread
+    /// (a binding takes its value-code lock around it). Panics if it does
+    /// not.
+    pub fn keys_of_versions(
+        &self,
+        handles: &[ErasedIncr],
+        stretch: impl FnOnce(&mut dyn FnMut()),
+    ) -> Vec<Option<K>> {
         refuse_value_code();
         if !self.versions.any() {
-            return None;
+            return handles.iter().map(|_| None).collect();
         }
         let map = self.versions.map.read();
-        value_code::run(|| map.by_handle.get(&handle).cloned())
+        let mut keys = Vec::with_capacity(handles.len());
+        stretch(&mut || {
+            keys.clear();
+            value_code::run(|| {
+                keys.extend(
+                    handles
+                        .iter()
+                        .map(|handle| map.by_handle.get(handle).cloned()),
+                );
+            });
+        });
+        assert_eq!(
+            keys.len(),
+            handles.len(),
+            "incr-core: keys_of_versions' stretch did not run its argument"
+        );
+        keys
     }
 
     /// Every version input, in no particular order.
@@ -1441,13 +1470,37 @@ where
     /// The rank of the pair read for `key`. Records no dependency and
     /// marks nothing on a running compute.
     pub fn read_rank(&self, key: &K) -> Option<R> {
+        self.read_ranks(&[key], |f| f()).pop().flatten()
+    }
+
+    /// [`Self::read_rank`] for each of `keys`, under one read of the
+    /// table, with every key hashed and compared inside the one call of
+    /// `stretch`, which must run its argument exactly once on this thread.
+    /// Panics if it does not.
+    pub fn read_ranks(
+        &self,
+        keys: &[&K],
+        stretch: impl FnOnce(&mut dyn FnMut()),
+    ) -> Vec<Option<R>> {
         refuse_value_code();
         let table = self.index.table.read();
-        value_code::run(|| {
-            table
-                .find_key(self.index.hasher.hash_one(key), key)
-                .map(|s| table.bucket(s).read().1)
-        })
+        let mut ranks = Vec::with_capacity(keys.len());
+        stretch(&mut || {
+            ranks.clear();
+            value_code::run(|| {
+                ranks.extend(keys.iter().map(|&key| {
+                    table
+                        .find_key(self.index.hasher.hash_one(key), key)
+                        .map(|s| table.bucket(s).read().1)
+                }));
+            });
+        });
+        assert_eq!(
+            ranks.len(),
+            keys.len(),
+            "incr-core: read_ranks' stretch did not run its argument"
+        );
+        ranks
     }
 
     /// Runs `f` on the table as value code, under its read guard. Records
