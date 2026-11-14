@@ -3,7 +3,7 @@
 use incr_core::persist_hooks::{changed_at_erased, Deferred};
 use incr_core::{Cells, ErasedIncr, Runtime};
 
-use super::StoredDep;
+use super::{StoredDep, VALUE_BATCH};
 use crate::store::dep_index::{DepFp, DepMap};
 use crate::store::keyed::rows_of;
 use crate::Kind;
@@ -51,7 +51,10 @@ pub(crate) fn map_live<C: Cells>(
             break;
         }
         let trusted = trusted(map, collection);
-        let found = rows_of::<C>(rows).live_rows(&pending, bag);
+        let source = rows_of::<C>(rows);
+        let found = pending
+            .chunks(VALUE_BATCH)
+            .flat_map(|chunk| source.live_rows(chunk, bag));
         for (i, row) in at.into_iter().zip(found) {
             let Some(row) = row else {
                 continue;

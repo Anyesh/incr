@@ -14,13 +14,9 @@ use super::dirty::Record;
 use super::mapping::LiveDep;
 use super::memo_core::{CoreRef, IndexGen, MemoCells};
 use super::table_core::Snap;
-use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, StoredDep};
+use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, StoredDep, VALUE_BATCH};
 use crate::value_context::{hold, EncodeMismatch, ValueScope};
 use crate::{Error, Result};
-
-/// Entries whose values a checkpoint clones or encodes inside one hold of
-/// the store's value scope; between batches other threads take its lock.
-const VALUE_BATCH: usize = 256;
 
 #[cfg(test)]
 thread_local! {
