@@ -738,7 +738,9 @@ macro_rules! persist_classes {
         /// may hold its elements in another order, so `aggregate` combines must be
         /// associative and commutative, `sort_by_key` output is exact up to the
         /// order among equal keys, and `group_by` keeps a group a candidate
-        /// emptied or created.
+        /// emptied or created. The version input a `ctx.get_key` read creates
+        /// for a key inside the block stays after exit, so a query that first
+        /// read its key there still reruns when that key changes later.
         #[pyclass(name = "Overlay", $($flag),*)]
         pub(crate) struct PyOverlay {
             rt: Py<$rt>,

@@ -241,6 +241,41 @@ def test_a_plain_reader_sees_an_overlay_upsert_and_its_undo(with_overlay, pkg):
     assert reader.value() == 1
 
 
+def test_a_plain_reader_first_run_in_an_overlay_still_tracks_its_key_after_exit(
+    with_overlay, pkg
+):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
+    kc.upsert("a", 1)
+    reader = Reader(rt, kc, "a")
+    with rt.overlay():
+        kc.upsert("a", 2)
+        assert reader.value() == 2
+    assert reader.value() == 1
+    runs = reader.runs
+    kc.upsert("a", 5)
+    assert reader.value() == 5
+    assert reader.runs == runs + 1
+
+
+def test_a_persisted_reader_first_run_in_an_overlay_still_tracks_its_key_after_exit(
+    with_overlay, persist
+):
+    store = open_store(persist, persist.MemoryBackend())
+    kc = declare(store)
+    store.upsert(kc, "a", 1)
+    rt = store.runtime
+    reader = Reader(rt, kc, "a")
+    with rt.overlay():
+        kc.upsert("a", 2)
+        assert reader.value() == 2
+    assert reader.value() == 1
+    runs = reader.runs
+    store.upsert(kc, "a", 5)
+    assert reader.value() == 5
+    assert reader.runs == runs + 1
+
+
 def test_published_240k_keys_one_upsert_reruns_one_reader(pkg, capsys):
     keys = 240_000
     rt = pkg.Runtime()
@@ -278,7 +313,9 @@ def test_published_240k_keys_one_upsert_reruns_one_reader(pkg, capsys):
         )
 
 
-def test_a_labelled_persisted_collection_labels_the_key_nodes_a_memo_restore_creates(persist):
+def test_a_labelled_persisted_collection_labels_the_key_nodes_a_memo_restore_creates(
+    persist,
+):
     log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
     calls = []
 
@@ -304,5 +341,7 @@ def test_a_labelled_persisted_collection_labels_the_key_nodes_a_memo_restore_cre
     entry = memo.get_or_insert(table, "a")
     assert store.runtime.get(entry) == 8
     assert calls == []
-    snapshot = store.runtime.graph_snapshot(roots=[entry], depth=1, label_prefix="shifts/")
+    snapshot = store.runtime.graph_snapshot(
+        roots=[entry], depth=1, label_prefix="shifts/"
+    )
     assert [n["label"] for n in snapshot["nodes"]] == ["shifts/a"]

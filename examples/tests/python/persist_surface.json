@@ -271,7 +271,7 @@
   "bases": [
    "object"
   ],
-  "doc": "`with rt.overlay() as ov:` runs candidate changes against the live\ngraph and puts the base graph back exactly on exit, also when the body\nraises. Mutations journal their inverse; operations that cannot be\nundone raise inside the block. Inverses re-run user `Hash` and `Eq`, so\nthose must be deterministic and must not raise; if one does, the\nruntime is poisoned and only `close` still works. A restored collection\nmay hold its elements in another order, so `aggregate` combines must be\nassociative and commutative, `sort_by_key` output is exact up to the\norder among equal keys, and `group_by` keeps a group a candidate\nemptied or created.",
+  "doc": "`with rt.overlay() as ov:` runs candidate changes against the live\ngraph and puts the base graph back exactly on exit, also when the body\nraises. Mutations journal their inverse; operations that cannot be\nundone raise inside the block. Inverses re-run user `Hash` and `Eq`, so\nthose must be deterministic and must not raise; if one does, the\nruntime is poisoned and only `close` still works. A restored collection\nmay hold its elements in another order, so `aggregate` combines must be\nassociative and commutative, `sort_by_key` output is exact up to the\norder among equal keys, and `group_by` keeps a group a candidate\nemptied or created. The version input a `ctx.get_key` read creates\nfor a key inside the block stays after exit, so a query that first\nread its key there still reruns when that key changes later.",
   "members": {
    "__enter__": {
     "doc": null,
