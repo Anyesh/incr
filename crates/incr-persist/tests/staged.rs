@@ -527,7 +527,7 @@ fn a_rolled_away_value_misses_on_restore<C: MemoCells>() {
     assert_eq!(memo.runtime().get(q3), 6);
     drop(staged);
     assert_poisoned("set after the batch rolled away", store.set(x, 5));
-    assert_refused(
+    assert_poisoned(
         "memo checkpoint after the batch rolled away",
         memo.checkpoint(),
     );
@@ -542,6 +542,18 @@ fn a_rolled_away_value_misses_on_restore<C: MemoCells>() {
     assert_eq!(memo.runtime().get(q3), 3);
     assert_eq!(memo.runtime().get(q4), 4);
     assert_eq!(runs.load(SeqCst), 1, "only the rolled-away entry runs");
+}
+
+fn a_memo_checkpoint_reports_poisoned_after_a_batch_is_dropped<C: MemoCells>() {
+    let store = Arc::new(open::<C, _>(MemoryBackend::new()));
+    let x = store.input("x", 1_u64).unwrap();
+    let builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0xb1d)));
+    let memo = builder.open(&store, MemoryMemo::new()).unwrap();
+    let mut staged = store.staged_batch().unwrap();
+    staged.set(x, 2).unwrap();
+    assert_refused("memo checkpoint", memo.checkpoint());
+    drop(staged);
+    assert_poisoned("memo checkpoint", memo.checkpoint());
 }
 
 type SharedMemo = (
@@ -690,4 +702,5 @@ both!(
     a_memo_checkpoint_refuses_while_a_batch_is_staged,
     a_shared_staged_batch_keeps_the_store_alive,
     a_rolled_away_value_misses_on_restore,
+    a_memo_checkpoint_reports_poisoned_after_a_batch_is_dropped,
 );

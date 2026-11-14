@@ -186,7 +186,7 @@ impl<C: Cells, B: Backend> Drop for UnloggedScope<'_, C, B> {
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .poisoned = true;
+                .poison();
         }
     }
 }

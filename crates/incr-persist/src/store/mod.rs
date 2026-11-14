@@ -335,6 +335,19 @@ impl<C: Cells, B: Backend> Batch<'_, C, B> {
 }
 
 impl<C: Cells> State<C> {
+    /// Marks the store poisoned, for its memo too, and closes the staged
+    /// flag a staged batch left: nothing will commit.
+    fn poison(&mut self) {
+        self.poisoned = true;
+        if let Some(deps) = &self.deps {
+            deps.set_poisoned();
+            if self.staged {
+                deps.set_staged(false);
+            }
+        }
+        self.staged = false;
+    }
+
     /// Fails while an unlogged scope or a staged batch is open, during
     /// which the runtime holds changes the log has not received.
     fn refuse_in_scope(&self) -> Result<()> {
@@ -828,7 +841,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 Err(e @ (Error::InvalidCompaction { .. } | Error::ReadOnly)) => return Err(e),
                 Err(e) => {
                     if self.resync(state).is_err() {
-                        state.poisoned = true;
+                        state.poison();
                     }
                     return Err(e);
                 }
@@ -974,7 +987,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         match landed {
             Ok(()) => Ok(last),
             Err(e) => {
-                state.poisoned = true;
+                state.poison();
                 Err(e)
             }
         }
@@ -990,7 +1003,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         run: &mut Vec<Record>,
     ) -> Result<()> {
         if let Err(e) = self.apply(state, record.clone()) {
-            state.poisoned = true;
+            state.poison();
             return Err(e);
         }
         run.push(record);
@@ -1248,7 +1261,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         for key in &keys {
             let sink = notify.then_some(&mut changes);
             if let Err(e) = self.replace_key(state, key, logged.get_mut(key), sink) {
-                state.poisoned = true;
+                state.poison();
                 return Err(e);
             }
         }
