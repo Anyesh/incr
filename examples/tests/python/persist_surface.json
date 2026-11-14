@@ -456,7 +456,7 @@
     "signature": "(self, /, node)"
    },
    "graph_snapshot": {
-    "doc": "The graph as a list of `{\"id\", \"kind\", \"label\", \"dependencies\",\n\"dependents\"}` dicts. With any argument given, a breadth-first walk\nfrom `roots` (node handles or collections) returns\n`{\"nodes\": [...], \"truncated\": bool}` instead: `direction` is\n`\"dependencies\"` (default), `\"dependents\"` or `\"both\"`; `depth`\ncounts edges from a root; `label_prefix` filters the returned nodes\nwhile the walk still passes through the others; `limit` caps them.\nEach returned node keeps its full dependency and dependent lists.",
+    "doc": "The graph as a list of `{\"id\", \"kind\", \"label\", \"dependencies\",\n\"dependents\"}` dicts. With any argument given, a breadth-first walk\nfrom `roots` (node handles, collections, or `(keyed collection, key)`\nper-key reads, each that key's version input, skipped when no query\nhas read the key) returns\n`{\"nodes\": [...], \"truncated\": bool}` instead: `direction` is\n`\"dependencies\"` (default), `\"dependents\"` or `\"both\"`; `depth`\ncounts edges from a root; `label_prefix` filters the returned nodes\nwhile the walk still passes through the others; `limit` caps them.\nEach returned node keeps its full dependency and dependent lists.",
     "kind": "method_descriptor",
     "signature": "(self, /, roots=None, *, direction=None, depth=None, label_prefix=None, limit=None)"
    },

@@ -138,3 +138,22 @@ def test_bounded_call_is_much_faster_than_the_full_snapshot(mod):
     assert len(snap["nodes"]) == 300
     assert snap["truncated"] is True
     assert bounded_time < full_time / 10
+
+
+def test_a_keyed_read_root_is_the_keys_version_input_and_an_unread_key_is_skipped(mod):
+    rt = mod.Runtime()
+    kc = mod.KeyedCollection(rt)
+    kc.upsert("a", 1)
+    kc.upsert("b", 2)
+    reader = rt.create_query(lambda ctx: ctx.get_key(kc, "a"))
+    other = rt.create_query(lambda ctx: ctx.get_key(kc, "c"))
+    rt.get(reader)
+    rt.get(other)
+
+    snap = rt.graph_snapshot(roots=[(kc, "a")], direction="dependents")
+    assert ids(snap)[1:] == [reader.id]
+    assert snap["nodes"][0]["kind"] == "input"
+    assert snap["nodes"][0]["dependents"] == [reader.id]
+    assert rt.graph_snapshot(roots=[(kc, "b")]) == {"nodes": [], "truncated": False}
+    both = rt.graph_snapshot(roots=[(kc, "b"), (kc, "c")], direction="dependents")
+    assert ids(both)[1:] == [other.id]

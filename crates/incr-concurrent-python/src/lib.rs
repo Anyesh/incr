@@ -48,7 +48,7 @@ use incr_python_protocol::notready::{
     PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
 use incr_python_protocol::snapshot::{
-    bounded_snapshot_to_py, full_snapshot_to_py, SnapshotRequest,
+    bounded_snapshot_to_py, full_snapshot_to_py, Root, SnapshotRequest,
 };
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, routing_error,
@@ -1116,7 +1116,9 @@ impl PyRuntime {
 
     /// The graph as a list of `{"id", "kind", "label", "dependencies",
     /// "dependents"}` dicts. With any argument given, a breadth-first walk
-    /// from `roots` (node handles or collections) returns
+    /// from `roots` (node handles, collections, or `(keyed collection, key)`
+    /// per-key reads, each that key's version input, skipped when no query
+    /// has read the key) returns
     /// `{"nodes": [...], "truncated": bool}` instead: `direction` is
     /// `"dependencies"` (default), `"dependents"` or `"both"`; `depth`
     /// counts edges from a root; `label_prefix` filters the returned nodes
@@ -1133,9 +1135,15 @@ impl PyRuntime {
         limit: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
         let request = SnapshotRequest::parse(roots, direction, depth, label_prefix, limit, |o| {
-            o.extract::<PyRef<'_, PyNodeId>>()
-                .ok()
-                .map(|n| n.inner.slot())
+            if let Ok(node) = o.extract::<PyRef<'_, PyNodeId>>() {
+                return Ok(Some(Root::Node(node.inner.slot())));
+            }
+            let Ok((kc, key)) = o.extract::<(PyRef<'_, keyed::PyKeyedCollection>, Py<PyAny>)>()
+            else {
+                return Ok(None);
+            };
+            let slot = kc.key_version_slot(py, key)?;
+            Ok(Some(slot.map_or(Root::Skip, Root::Node)))
         })?;
         match request {
             None => {

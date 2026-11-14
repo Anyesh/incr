@@ -116,7 +116,10 @@ impl<B: PyBinding> KeyedSource<'_, B> {
         }
     }
 
-    fn version_input(&self, key: &PyKey) -> Option<Incr<u64>> {
+    /// `key`'s version input, if a read created one. Runs the key's
+    /// `__hash__` and `__eq__`: the caller runs it inside its package's
+    /// engine boundary.
+    pub fn version_input(&self, key: &PyKey) -> Option<Incr<u64>> {
         match self {
             KeyedSource::Plain(keyed) => keyed.version_input(key),
             KeyedSource::Persisted(persisted) => persisted.version_input(key),

@@ -125,6 +125,16 @@ impl PyKeyedCollection {
         Ok((source, self.label.as_deref()))
     }
 
+    /// The slot of `key`'s version input, `None` when no read created one.
+    pub(crate) fn key_version_slot(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<u32>> {
+        let rt = self.runtime();
+        let (source, _) = self.key_source(rt)?;
+        let key = PyKey(key);
+        engine_call(py, rt, || {
+            source.version_input(&key).map(|handle| handle.slot())
+        })
+    }
+
     fn runtime(&self) -> &RtRef {
         &self.rt.get().inner
     }

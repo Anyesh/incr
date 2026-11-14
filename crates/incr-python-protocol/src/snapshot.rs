@@ -7,6 +7,13 @@ use pyo3::types::{PyDict, PyList};
 
 use incr_core::{BoundedSnapshot, Direction, GraphQuery, NodeId, NodeInfo, NodeKindInfo};
 
+/// What a `graph_snapshot` root resolves to: a node, or nothing to walk
+/// from, as for a per-key read whose key no query has read.
+pub enum Root {
+    Node(u32),
+    Skip,
+}
+
 /// A validated bounded `graph_snapshot` call.
 pub struct SnapshotRequest {
     roots: Vec<NodeId>,
@@ -18,17 +25,20 @@ pub struct SnapshotRequest {
 
 impl SnapshotRequest {
     /// `Ok(None)` when every argument is unset, which asks for the full
-    /// snapshot. Otherwise `roots` is required, each root is a node handle
-    /// (`slot_of` yields its slot) or an object whose `version_node` is
-    /// one, and `direction` is `"dependencies"` (the default),
-    /// `"dependents"` or `"both"`; anything else is a `ValueError`.
+    /// snapshot. Otherwise `roots` is required, each root is one `slot_of`
+    /// resolves (a node handle, or a `(keyed collection, key)` per-key
+    /// read, which it may resolve to [`Root::Skip`]) or an object whose
+    /// `version_node` is a node handle, and `direction` is
+    /// `"dependencies"` (the default), `"dependents"` or `"both"`;
+    /// anything else is a `ValueError`, and an error `slot_of` raises is
+    /// raised.
     pub fn parse<'py>(
         roots: Option<Vec<Bound<'py, PyAny>>>,
         direction: Option<&str>,
         depth: Option<u32>,
         label_prefix: Option<String>,
         limit: Option<usize>,
-        slot_of: impl Fn(&Bound<'py, PyAny>) -> Option<u32>,
+        slot_of: impl Fn(&Bound<'py, PyAny>) -> PyResult<Option<Root>>,
     ) -> PyResult<Option<Self>> {
         if roots.is_none()
             && direction.is_none()
@@ -55,17 +65,22 @@ impl SnapshotRequest {
         };
         let mut slots = Vec::with_capacity(roots.len());
         for root in &roots {
-            let slot = match slot_of(root) {
-                Some(slot) => Some(slot),
-                None => root
-                    .getattr("version_node")
-                    .ok()
-                    .and_then(|version| slot_of(&version)),
+            let resolved = match slot_of(root)? {
+                Some(resolved) => Some(resolved),
+                None => match root.getattr("version_node") {
+                    Ok(version) => slot_of(&version)?,
+                    Err(_) => None,
+                },
             };
-            let slot = slot.ok_or_else(|| {
-                PyValueError::new_err("roots must be node handles or collections")
-            })?;
-            slots.push(NodeId(slot));
+            match resolved {
+                Some(Root::Node(slot)) => slots.push(NodeId(slot)),
+                Some(Root::Skip) => {}
+                None => {
+                    return Err(PyValueError::new_err(
+                        "roots must be node handles, collections or (keyed collection, key) tuples",
+                    ))
+                }
+            }
         }
         Ok(Some(Self {
             roots: slots,
