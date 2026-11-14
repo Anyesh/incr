@@ -49,6 +49,9 @@ pub trait PersistExceptions: Send + Sync + 'static {
     /// A compaction outside the snapshot and the tail, constructed as
     /// `InvalidCompaction(upto, snapshot_at, tail)`.
     fn invalid_compaction(py: Python<'_>) -> Bound<'_, PyType>;
+    /// A conditional append that found the log's tail elsewhere and wrote
+    /// nothing.
+    fn tail_moved(py: Python<'_>) -> Bound<'_, PyType>;
 }
 
 /// The Python exception for `error`: the exception a Python backend
@@ -62,6 +65,7 @@ pub fn persist_error<E: PersistExceptions>(py: Python<'_>, error: Error) -> PyEr
     match error {
         Error::Busy => return PyErr::from_type(E::busy(py), error.to_string()),
         Error::ReadOnly => return PyErr::from_type(E::read_only(py), error.to_string()),
+        Error::TailMoved { .. } => return PyErr::from_type(E::tail_moved(py), error.to_string()),
         Error::KeyedContention { .. } => {
             return pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
         }
@@ -86,8 +90,8 @@ pub fn persist_error<E: PersistExceptions>(py: Python<'_>, error: Error) -> PyEr
 
 /// Declares a package's `persist` exceptions under the Python module path
 /// `$module` (such as `incr.persist`) and a unit type `$name` implementing
-/// [`PersistExceptions`] for them. Defines `PersistError`, `Busy`, `ReadOnly` and
-/// `InvalidCompaction` in the calling module.
+/// [`PersistExceptions`] for them. Defines `PersistError`, `Busy`, `ReadOnly`,
+/// `InvalidCompaction` and `TailMoved` in the calling module.
 #[macro_export]
 macro_rules! persist_exceptions {
     ($name:ident, $module:expr) => {
@@ -119,6 +123,13 @@ macro_rules! persist_exceptions {
             "`compact(upto, ..)` was given an `upto` below the snapshot position or beyond the tail; constructed as `InvalidCompaction(upto, snapshot_at, tail)`."
         );
 
+        $crate::pyo3::create_exception!(
+            $module,
+            TailMoved,
+            PersistError,
+            "A backend's `append_at(after, records)` found the log's tail somewhere other than `after` and wrote nothing. A Python backend raises it to say so."
+        );
+
         pub(crate) struct $name;
 
         impl $crate::PersistExceptions for $name {
@@ -144,6 +155,12 @@ macro_rules! persist_exceptions {
                 py: $crate::pyo3::Python<'_>,
             ) -> $crate::pyo3::Bound<'_, $crate::pyo3::types::PyType> {
                 py.get_type::<InvalidCompaction>()
+            }
+
+            fn tail_moved(
+                py: $crate::pyo3::Python<'_>,
+            ) -> $crate::pyo3::Bound<'_, $crate::pyo3::types::PyType> {
+                py.get_type::<TailMoved>()
             }
         }
     };

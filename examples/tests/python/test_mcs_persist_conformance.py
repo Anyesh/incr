@@ -56,6 +56,17 @@ class DictBackend:
                 self.state.records.append((self.state.tail, record))
             return self.state.tail
 
+    def append_at(self, after, records):
+        if not self._writable:
+            raise ReadOnly("handle is read-only")
+        with self.state.lock:
+            if self.state.tail != after:
+                raise persist.TailMoved(f"tail is {self.state.tail}, not {after}")
+            for record in records:
+                self.state.tail += 1
+                self.state.records.append((self.state.tail, record))
+            return self.state.tail
+
     def sync(self, upto):
         pass
 
@@ -163,6 +174,24 @@ class SqliteLog:
             if self.epoch is not None and self._meta(db, "epoch") != self.epoch:
                 raise EpochMismatch(f"epoch {self.epoch} is no longer current")
             tail = self._meta(db, "tail")
+            for record in records:
+                tail += 1
+                db.execute("insert into log values (?, ?)", (tail, record))
+            self._set_meta(db, "tail", tail)
+            return tail
+
+        return self._write(body)
+
+    def append_at(self, after, records):
+        if not self._writable:
+            raise ReadOnly("handle is read-only")
+
+        def body(db):
+            if self.epoch is not None and self._meta(db, "epoch") != self.epoch:
+                raise EpochMismatch(f"epoch {self.epoch} is no longer current")
+            tail = self._meta(db, "tail")
+            if tail != after:
+                raise persist.TailMoved(f"tail is {tail}, not {after}")
             for record in records:
                 tail += 1
                 db.execute("insert into log values (?, ?)", (tail, record))

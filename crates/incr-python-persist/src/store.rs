@@ -83,7 +83,8 @@ impl<B: PyBinding> StoreCore<B> {
             auto_checkpoint_records: auto_checkpoint_of(auto_checkpoint_records)?,
             value_scope: Some(registry.value_scope()),
         };
-        let store = registry.run(py, || Store::open(PyBackend::new(backend), options))?;
+        let backend = PyBackend::new(py, backend)?;
+        let store = registry.run(py, || Store::open(backend, options))?;
         Ok(StoreCore {
             store: Arc::new(store),
             registry,

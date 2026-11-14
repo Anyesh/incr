@@ -47,12 +47,13 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
     }
 
     fn open(&mut self, log: &Self::Log) -> PyBackend<E> {
-        PyBackend::new(self.call("open", Some(log)))
+        wrap(self.call("open", Some(log)))
     }
 
     fn open_read_only(&mut self, log: &Self::Log) -> Option<PyBackend<E>> {
         let handle = self.call("open_read_only", Some(log));
-        Python::attach(|py| (!handle.is_none(py)).then(|| PyBackend::new(handle)))
+        let none = Python::attach(|py| handle.is_none(py));
+        (!none).then(|| wrap(handle))
     }
 
     fn multi_writer(&self) -> bool {
@@ -77,6 +78,13 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
         }
         has_fence
     }
+}
+
+fn wrap<E: PersistExceptions>(handle: Py<PyAny>) -> PyBackend<E> {
+    Python::attach(|py| {
+        PyBackend::new(py, handle)
+            .unwrap_or_else(|e| panic!("looking up the handle's append_at raised: {e}"))
+    })
 }
 
 struct MemoFactory<E>(StoreFactory<E>);
@@ -140,6 +148,9 @@ fn store_table<E: PersistExceptions>() -> Vec<Case> {
         snapshot_id_survives_reopen,
         read_only_handle_sees_the_snapshot_id,
         fenced_append_lands_nothing,
+        append_at_a_stale_position_writes_nothing,
+        racing_append_at_one_position_lands_exactly_one,
+        append_at_right_after_compacting_to_the_tail_lands,
     )
 }
 

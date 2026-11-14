@@ -792,6 +792,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /, records)"
    },
+   "append_at": {
+    "doc": "Appends `records` right after `after` if the log's tail is\nstill `after`, returning the last position; raises\n`TailMoved`, writing nothing, when the tail is elsewhere.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, after, records)"
+   },
    "compact": {
     "doc": null,
     "kind": "method_descriptor",
@@ -1006,6 +1011,14 @@
    }
   },
   "signature": "()"
+ },
+ "incr.persist.TailMoved": {
+  "bases": [
+   "PersistError"
+  ],
+  "doc": "A backend's `append_at(after, records)` found the log's tail somewhere other than `after` and wrote nothing. A Python backend raises it to say so.",
+  "members": {},
+  "signature": null
  },
  "incr.persist._conformance": {
   "doc": "Runs the cases of `kind` (`\"store\"` or `\"memo\"`), or only `case`.\nReturns each case's name mapped to `None` on a pass or the panic\nmessage.",
