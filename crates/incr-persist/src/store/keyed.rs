@@ -253,8 +253,9 @@ where
         self.keyed.get_key(rt, key)
     }
 
-    #[cfg(test)]
-    pub(super) fn version_input(&self, key: &K) -> Option<Incr<u64>> {
+    /// `key`'s version input, if a read with [`Self::get_key`] or a memo
+    /// restore created one.
+    pub fn version_input(&self, key: &K) -> Option<Incr<u64>> {
         self.keyed.version_input(key)
     }
 

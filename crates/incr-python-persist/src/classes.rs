@@ -91,23 +91,35 @@ impl<B: PyBinding> KeyedSource<'_, B> {
     /// `key`'s row as [`incr_core::KeyedCollection::get_key`] reads it:
     /// inside a compute of `rt`, a dependency on that key alone; outside
     /// one, the row, creating nothing. With `label`, the version input
-    /// this read creates for a plain collection is labelled
-    /// `<label>/<str(key)>`; a key whose `__str__` raises leaves it
-    /// unlabelled and the error is reported as unraisable. Persisted
-    /// collections are not labelled, since incr-persist does not expose
-    /// their version inputs. Takes the GIL only to label. Engine
-    /// calls: the caller runs it inside its package's engine boundary.
+    /// this read creates is labelled `<label>/<str(key)>`; a key whose
+    /// `__str__` raises leaves it unlabelled and the error is reported as
+    /// unraisable. Takes the GIL only to label. Engine calls: the caller
+    /// runs it inside its package's engine boundary.
     pub fn get_key(&self, rt: &Runtime<B::C>, key: &PyKey, label: Option<&str>) -> Option<PyValue> {
-        match (self, label) {
-            (KeyedSource::Plain(keyed), Some(label)) if keyed.version_input(key).is_none() => {
-                let row = keyed.get_key(rt, key);
-                if let Some(handle) = keyed.version_input(key) {
-                    label_key(rt, handle.slot(), label, key);
-                }
-                row
-            }
-            (KeyedSource::Plain(keyed), _) => keyed.get_key(rt, key),
-            (KeyedSource::Persisted(persisted), _) => persisted.get_key(rt, key),
+        let Some(label) = label else {
+            return self.read_key(rt, key);
+        };
+        if self.version_input(key).is_some() {
+            return self.read_key(rt, key);
+        }
+        let row = self.read_key(rt, key);
+        if let Some(handle) = self.version_input(key) {
+            label_key(rt, handle.slot(), label, key);
+        }
+        row
+    }
+
+    fn read_key(&self, rt: &Runtime<B::C>, key: &PyKey) -> Option<PyValue> {
+        match self {
+            KeyedSource::Plain(keyed) => keyed.get_key(rt, key),
+            KeyedSource::Persisted(persisted) => persisted.get_key(rt, key),
+        }
+    }
+
+    fn version_input(&self, key: &PyKey) -> Option<Incr<u64>> {
+        match self {
+            KeyedSource::Plain(keyed) => keyed.version_input(key),
+            KeyedSource::Persisted(persisted) => persisted.version_input(key),
         }
     }
 }

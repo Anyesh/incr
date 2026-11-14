@@ -161,6 +161,31 @@ def test_a_labelled_collection_labels_each_read_key(pkg):
     assert [n["label"] for n in snapshot["nodes"]] == ["shifts/a"]
 
 
+def test_a_labelled_persisted_collection_labels_each_read_key(persist):
+    store = open_store(persist, persist.MemoryBackend())
+    kc = declare(store, label="shifts")
+    store.upsert(kc, "a", 1)
+    rt = store.runtime
+    reader = Reader(rt, kc, "a")
+    reader.value()
+    snapshot = rt.graph_snapshot(roots=[reader.node], depth=1, label_prefix="shifts/")
+    assert [n["label"] for n in snapshot["nodes"]] == ["shifts/a"]
+
+
+def test_set_label_inside_a_running_query(pkg):
+    rt = pkg.Runtime()
+    x = rt.create_input(1)
+
+    def labelled(ctx):
+        rt.set_label(x, "x")
+        return ctx.get(x)
+
+    query = rt.create_query(labelled)
+    assert rt.get(query) == 1
+    snapshot = rt.graph_snapshot(roots=[query], depth=1, label_prefix="x")
+    assert [n["label"] for n in snapshot["nodes"]] == ["x"]
+
+
 def test_a_persisted_keyed_collection_after_reopen(persist):
     backend = persist.MemoryBackend()
     store = open_store(persist, backend)
