@@ -201,7 +201,9 @@ def test_two_inputs_and_a_progress_input_land_in_one_append(persist):
     store.close()
 
     again = open_store(persist, inner)
-    values = [again.runtime.get(again.input(k, 0, codec)) for k in ("a", "b", "progress")]
+    values = [
+        again.runtime.get(again.input(k, 0, codec)) for k in ("a", "b", "progress")
+    ]
     assert values == [1, 2, 99]
 
 

@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import pickle
@@ -5,11 +6,26 @@ import sqlite3
 import subprocess
 import sys
 
-import incr
+import incr.persist
+import incr_concurrent.persist
 import pytest
-from incr.persist import Busy, MemoryBackend, MemoryMemo, PersistError, Store
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
+
+
+@pytest.fixture(params=PACKAGES)
+def persist(request):
+    return request.param
+
+
+@pytest.fixture
+def pkg(persist):
+    return importlib.import_module(persist.__name__.rpartition(".")[0])
 
 
 class JsonCodec:
@@ -38,7 +54,10 @@ class SqliteGuard:
 
 class SqliteMemo:
     """A memo backend whose generations live in a sqlite file, so they
-    cross processes."""
+    cross processes. `busy` is the `Busy` class of the package whose store
+    it serves."""
+
+    busy = incr.persist.Busy
 
     def __init__(self, path):
         self.db = sqlite3.connect(path, isolation_level=None)
@@ -60,7 +79,7 @@ class SqliteMemo:
         try:
             self.db.execute("insert into meta values ('lock', 1)")
         except sqlite3.IntegrityError:
-            raise Busy("checkpoint lock held") from None
+            raise self.busy("checkpoint lock held") from None
         current = self._current()
         self.db.execute("delete from items where gen is not ?", (current,))
         self.db.execute("delete from gens where id is not ?", (current,))
@@ -89,7 +108,7 @@ class SqliteMemo:
         self.db.execute("begin immediate")
         try:
             if self._current() != base:
-                raise Busy("another handle wrote a generation")
+                raise self.busy("another handle wrote a generation")
             self.db.execute("insert into gens values (?, ?)", (generation, header))
             items = []
             for loc, (table, key_hash, frame) in enumerate(entries):
@@ -156,9 +175,11 @@ class Graph:
     """A store with a persisted input `base` and memo table `scaled`, which
     multiplies `base` by its key and records each call."""
 
-    def __init__(self, log, memo_backend, build_id="b1"):
+    def __init__(self, persist, log, memo_backend, build_id="b1"):
+        if isinstance(memo_backend, SqliteMemo):
+            memo_backend.busy = persist.Busy
         self.calls = []
-        self.store = Store.open(log, build_id=build_id)
+        self.store = persist.Store.open(log, build_id=build_id)
         self.rt = self.store.runtime
         self.base = self.store.input("base", 1, JsonCodec())
         self.table = self.store.memo_table(
@@ -181,9 +202,9 @@ def log_records(log):
 def child_main(memo_path, log_path, set_base, keys):
     with open(log_path, "rb") as f:
         records = pickle.load(f)
-    log = MemoryBackend()
+    log = incr.persist.MemoryBackend()
     log.append(records)
-    graph = Graph(log, SqliteMemo(memo_path))
+    graph = Graph(incr.persist, log, SqliteMemo(memo_path))
     if set_base is not None:
         graph.store.set(graph.base, set_base)
     values = [graph.value(key) for key in keys]
@@ -219,8 +240,8 @@ def run_child(memo_path, log_path, set_base, keys):
 def first_run(tmp_path):
     memo_path = str(tmp_path / "memo.db")
     log_path = str(tmp_path / "log.pkl")
-    log = MemoryBackend()
-    graph = Graph(log, SqliteMemo(memo_path))
+    log = incr.persist.MemoryBackend()
+    graph = Graph(incr.persist, log, SqliteMemo(memo_path))
     graph.store.set(graph.base, 10)
     assert [graph.value(3), graph.value(4)] == [30, 40]
     assert graph.calls == [3, 4]
@@ -243,36 +264,36 @@ def test_a_memo_whose_input_changed_recomputes(first_run):
     assert result == {"base": 11, "values": [33, 44], "calls": [3, 4]}
 
 
-def test_a_memo_restores_in_process_and_a_new_key_computes():
-    log, memo_backend = MemoryBackend(), MemoryMemo()
-    graph = Graph(log, memo_backend)
+def test_a_memo_restores_in_process_and_a_new_key_computes(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
+    graph = Graph(persist, log, memo_backend)
     graph.store.set(graph.base, 5)
     assert graph.value(2) == 10
     stats = graph.memo.checkpoint()
     assert stats["written"] == 1
     graph.store.close()
 
-    again = Graph(log, memo_backend)
+    again = Graph(persist, log, memo_backend)
     assert again.value(2) == 10
     assert again.calls == []
     assert again.value(7) == 35
     assert again.calls == [7]
 
 
-def test_a_build_id_change_drops_the_entries():
-    log, memo_backend = MemoryBackend(), MemoryMemo()
-    graph = Graph(log, memo_backend, build_id="old")
+def test_a_build_id_change_drops_the_entries(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
+    graph = Graph(persist, log, memo_backend, build_id="old")
     assert graph.value(2) == 2
     graph.memo.checkpoint()
     graph.store.close()
 
-    again = Graph(log, memo_backend, build_id="new")
+    again = Graph(persist, log, memo_backend, build_id="new")
     assert again.value(2) == 2
     assert again.calls == [2]
 
 
-def test_a_codec_that_does_not_round_trip_raises_after_the_checkpoint():
-    log, memo_backend = MemoryBackend(), MemoryMemo()
+def test_a_codec_that_does_not_round_trip_raises_after_the_checkpoint(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
     calls = []
 
     def declare(store):
@@ -283,25 +304,25 @@ def test_a_codec_that_does_not_round_trip_raises_after_the_checkpoint():
         table = store.memo_table("pairs", 1, JsonCodec(), JsonCodec(), pair)
         return table, store.open_memo(memo_backend)
 
-    store = Store.open(log, build_id="b1")
+    store = persist.Store.open(log, build_id="b1")
     table, memo = declare(store)
     assert store.runtime.get(memo.get_or_insert(table, 1)) == (1, 1)
     with pytest.raises(ValueError, match="'pairs'"):
         memo.checkpoint()
     store.close()
 
-    again = Store.open(log, build_id="b1")
+    again = persist.Store.open(log, build_id="b1")
     table, memo = declare(again)
     assert again.runtime.get(memo.get_or_insert(table, 1)) == (1, 1)
     assert calls == [1, 1]
 
 
-def test_every_checkpoint_raises_while_the_unencodable_entry_is_live():
-    store = Store.open(MemoryBackend(), build_id=1)
+def test_every_checkpoint_raises_while_the_unencodable_entry_is_live(persist):
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     table = store.memo_table(
         "pairs", 1, JsonCodec(), JsonCodec(), lambda ctx, key: (key, key)
     )
-    memo = store.open_memo(MemoryMemo())
+    memo = store.open_memo(persist.MemoryMemo())
     store.runtime.get(memo.get_or_insert(table, 1))
     with pytest.raises(ValueError):
         memo.checkpoint()
@@ -316,58 +337,58 @@ def test_every_checkpoint_raises_while_the_unencodable_entry_is_live():
         ((JsonCodec(), None), "values of memo table 't'"),
     ],
 )
-def test_a_memo_table_with_no_codec_raises_naming_the_slot(codecs, slot):
-    store = Store.open(MemoryBackend(), build_id=1)
+def test_a_memo_table_with_no_codec_raises_naming_the_slot(persist, codecs, slot):
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     with pytest.raises(ValueError, match=slot):
         store.memo_table("t", 1, *codecs, lambda ctx, key: key)
 
 
-def test_memo_table_declaration_rules():
-    store = Store.open(MemoryBackend(), build_id=1)
+def test_memo_table_declaration_rules(persist):
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     codec = JsonCodec()
     table = store.memo_table("t", 1, codec, codec, lambda ctx, key: key)
     with pytest.raises(ValueError, match="'t'"):
         store.memo_table("t", 2, codec, codec, lambda ctx, key: key)
-    memo = store.open_memo(MemoryMemo())
+    memo = store.open_memo(persist.MemoryMemo())
     with pytest.raises(RuntimeError, match="open_memo"):
         store.memo_table("u", 1, codec, codec, lambda ctx, key: key)
     with pytest.raises(RuntimeError, match="already"):
-        store.open_memo(MemoryMemo())
-    other = Store.open(MemoryBackend(), build_id=1)
+        store.open_memo(persist.MemoryMemo())
+    other = persist.Store.open(persist.MemoryBackend(), build_id=1)
     foreign = other.memo_table("t", 1, codec, codec, lambda ctx, key: key)
-    other.open_memo(MemoryMemo())
+    other.open_memo(persist.MemoryMemo())
     with pytest.raises(ValueError, match="another store"):
         memo.get_or_insert(foreign, 1)
     assert store.runtime.get(memo.get_or_insert(table, 5)) == 5
 
 
-def test_a_raising_release_is_logged_not_raised(monkeypatch):
+def test_a_raising_release_is_logged_not_raised(persist, monkeypatch):
     reports = []
     monkeypatch.setattr(sys, "unraisablehook", reports.append)
 
     def fail():
         raise RuntimeError("release failed")
 
-    store = Store.open(MemoryBackend(), build_id=1)
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     table = store.memo_table("t", 1, JsonCodec(), JsonCodec(), lambda ctx, key: key)
-    memo = store.open_memo(Wrapped(MemoryMemo(), release=fail))
+    memo = store.open_memo(Wrapped(persist.MemoryMemo(), release=fail))
     store.runtime.get(memo.get_or_insert(table, 1))
     memo.checkpoint()
     assert [str(report.exc_value) for report in reports] == ["release failed"]
 
 
-def test_a_backend_exception_surfaces_with_its_message():
-    inner = MemoryMemo()
+def test_a_backend_exception_surfaces_with_its_message(persist):
+    inner = persist.MemoryMemo()
 
     def refuse(*args):
         raise OSError("disk gone")
 
-    store = Store.open(MemoryBackend(), build_id=1)
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     table = store.memo_table("t", 1, JsonCodec(), JsonCodec(), lambda ctx, key: key)
     with pytest.raises(OSError, match="disk gone"):
         store.open_memo(Wrapped(inner, hooks={"load": refuse}))
 
-    store = Store.open(MemoryBackend(), build_id=1)
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     table = store.memo_table("t", 1, JsonCodec(), JsonCodec(), lambda ctx, key: key)
     memo = store.open_memo(Wrapped(inner, hooks={"write_generation": refuse}))
     store.runtime.get(memo.get_or_insert(table, 1))
@@ -375,38 +396,38 @@ def test_a_backend_exception_surfaces_with_its_message():
         memo.checkpoint()
 
 
-def test_a_busy_backend_raises_busy_and_the_next_checkpoint_succeeds():
-    inner = MemoryMemo()
+def test_a_busy_backend_raises_busy_and_the_next_checkpoint_succeeds(persist):
+    inner = persist.MemoryMemo()
     busy = {"on": True}
 
     def lock():
         if busy["on"]:
-            raise Busy("held elsewhere")
+            raise persist.Busy("held elsewhere")
         return inner.lock_checkpoint()
 
-    store = Store.open(MemoryBackend(), build_id=1)
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     table = store.memo_table("t", 1, JsonCodec(), JsonCodec(), lambda ctx, key: key)
     memo = store.open_memo(Wrapped(inner, hooks={"lock_checkpoint": lock}))
     store.runtime.get(memo.get_or_insert(table, 1))
-    with pytest.raises(Busy):
+    with pytest.raises(persist.Busy):
         memo.checkpoint()
-    assert issubclass(Busy, PersistError)
+    assert issubclass(persist.Busy, persist.PersistError)
     busy["on"] = False
     assert memo.checkpoint()["written"] == 1
 
 
-def test_a_memo_backend_of_the_wrong_shape_raises_type_error():
-    store = Store.open(MemoryBackend(), build_id=1)
+def test_a_memo_backend_of_the_wrong_shape_raises_type_error(persist):
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     store.memo_table("t", 1, JsonCodec(), JsonCodec(), lambda ctx, key: key)
     with pytest.raises(TypeError, match="load"):
-        store.open_memo(Wrapped(MemoryMemo(), hooks={"load": lambda: 5}))
+        store.open_memo(Wrapped(persist.MemoryMemo(), hooks={"load": lambda: 5}))
 
 
-def test_incomplete_and_pending_memo_values_restore_as_themselves():
-    log, memo_backend = MemoryBackend(), MemoryMemo()
+def test_incomplete_and_pending_memo_values_restore_as_themselves(pkg, persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
 
     def build():
-        store = Store.open(log, build_id="b1")
+        store = persist.Store.open(log, build_id="b1")
         partial = store.input("partial", None, PickleCodec())
         waiting = store.input("waiting", None, PickleCodec())
         calls = []
@@ -419,16 +440,16 @@ def test_incomplete_and_pending_memo_values_restore_as_themselves():
         return store, partial, waiting, table, store.open_memo(memo_backend), calls
 
     store, partial, waiting, table, memo, calls = build()
-    store.set(partial, incr.Incomplete(5, 2))
-    store.set(waiting, incr.Pending("k"))
+    store.set(partial, pkg.Incomplete(5, 2))
+    store.set(waiting, pkg.Pending("k"))
     for key in ("partial", "waiting"):
         store.runtime.get(memo.get_or_insert(table, key))
     expected = {
         key: store.runtime.get_with_status(memo.get_or_insert(table, key))
         for key in ("partial", "waiting")
     }
-    assert expected["partial"][1] == incr.Incomplete(6, 2)
-    assert expected["waiting"][1] == incr.Pending("k")
+    assert expected["partial"][1] == pkg.Incomplete(6, 2)
+    assert expected["waiting"][1] == pkg.Pending("k")
     memo.checkpoint()
     store.close()
 
@@ -439,12 +460,12 @@ def test_incomplete_and_pending_memo_values_restore_as_themselves():
     assert calls == []
 
 
-def test_ctx_memo_inside_a_query_and_a_memo_function():
-    log, memo_backend = MemoryBackend(), MemoryMemo()
+def test_ctx_memo_inside_a_query_and_a_memo_function(persist):
+    log, memo_backend = persist.MemoryBackend(), persist.MemoryMemo()
     calls = []
 
     def build():
-        store = Store.open(log, build_id="b1")
+        store = persist.Store.open(log, build_id="b1")
         offset = store.input("offset", 0, JsonCodec())
 
         def fib(ctx, n):
@@ -472,20 +493,20 @@ def test_ctx_memo_inside_a_query_and_a_memo_function():
     assert calls == []
 
 
-def test_ctx_memo_rejects_a_table_of_another_runtime():
-    store = Store.open(MemoryBackend(), build_id=1)
+def test_ctx_memo_rejects_a_table_of_another_runtime(pkg, persist):
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     table = store.memo_table("t", 1, JsonCodec(), JsonCodec(), lambda ctx, key: key)
-    store.open_memo(MemoryMemo())
-    rt = incr.Runtime()
+    store.open_memo(persist.MemoryMemo())
+    rt = pkg.Runtime()
     node = rt.create_query(lambda ctx: ctx.memo(table, 1))
     with pytest.raises(ValueError, match="runtime"):
         rt.get(node)
 
 
-def test_a_closed_store_refuses_memo_calls():
-    store = Store.open(MemoryBackend(), build_id=1)
+def test_a_closed_store_refuses_memo_calls(persist):
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
     table = store.memo_table("t", 1, JsonCodec(), JsonCodec(), lambda ctx, key: key)
-    memo = store.open_memo(MemoryMemo())
+    memo = store.open_memo(persist.MemoryMemo())
     store.close()
     with pytest.raises(RuntimeError, match="closed"):
         memo.get_or_insert(table, 1)
@@ -493,11 +514,11 @@ def test_a_closed_store_refuses_memo_calls():
         memo.checkpoint()
 
 
-def test_memory_memo_protocol():
-    backend = MemoryMemo()
+def test_memory_memo_protocol(persist):
+    backend = persist.MemoryMemo()
     assert backend.load() is None
     guard = backend.lock_checkpoint()
-    with pytest.raises(Busy):
+    with pytest.raises(persist.Busy):
         backend.lock_checkpoint()
     guard.release()
     guard.release()
@@ -528,8 +549,8 @@ class LoadFailsOnce:
         return self.inner.remove_generation(generation)
 
 
-def test_a_failed_open_memo_keeps_the_declared_tables_for_the_retry():
-    store = Store.open(MemoryBackend(), build_id="b1")
+def test_a_failed_open_memo_keeps_the_declared_tables_for_the_retry(persist):
+    store = persist.Store.open(persist.MemoryBackend(), build_id="b1")
     base = store.input("base", 2, JsonCodec())
     first = store.memo_table(
         "first", 1, JsonCodec(), JsonCodec(), lambda ctx, key: ctx.get(base) * key
@@ -537,7 +558,7 @@ def test_a_failed_open_memo_keeps_the_declared_tables_for_the_retry():
     second = store.memo_table(
         "second", 1, JsonCodec(), JsonCodec(), lambda ctx, key: ctx.memo(first, key) + 1
     )
-    backend = LoadFailsOnce(MemoryMemo())
+    backend = LoadFailsOnce(persist.MemoryMemo())
     with pytest.raises(OSError, match="load refused"):
         store.open_memo(backend)
     memo = store.open_memo(backend)
