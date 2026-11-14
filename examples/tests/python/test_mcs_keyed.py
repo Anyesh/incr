@@ -1,4 +1,5 @@
 import importlib
+import pickle
 
 import incr.persist
 import incr_concurrent.persist
@@ -19,6 +20,14 @@ def persist(request):
 @pytest.fixture
 def pkg(persist):
     return importlib.import_module(persist.__name__.rpartition(".")[0])
+
+
+class PickleCodec:
+    def encode(self, obj):
+        return pickle.dumps(obj, protocol=4)
+
+    def decode(self, data):
+        return pickle.loads(data)
 
 
 class Boom(Exception):
@@ -344,3 +353,47 @@ def test_row_hash_calls_per_upsert_meet_the_documented_bound(pkg, read_rows):
     assert calls(lambda: kc.upsert("b", Row(3))) == (2 * per_row, 4 + per_row)
     assert calls(lambda: kc.upsert("b", Row(3))) == (0, 1)
     assert calls(lambda: kc.remove("b")) == (per_row, per_row)
+
+
+WRITES = {
+    "upsert": lambda kc: kc.upsert("a", 99),
+    "upsert-new": lambda kc: kc.upsert("z", 1),
+    "remove": lambda kc: kc.remove("a"),
+    "reconcile": lambda kc: kc.reconcile({"a": 5, "q": 6}),
+}
+
+
+@pytest.mark.parametrize("op", WRITES)
+def test_a_keyed_write_from_inside_a_query_raises_and_leaves_the_rows(pkg, op):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
+    kc.reconcile({"a": 1, "b": 2})
+    q = rt.create_query(lambda ctx: WRITES[op](kc))
+    with pytest.raises(RuntimeError, match="written from inside a compute"):
+        rt.get(q)
+    assert sorted(kc.items()) == [("a", 1), ("b", 2)]
+    kc.upsert("c", 3)
+    assert len(kc) == 3
+
+
+PERSISTED_WRITES = {
+    "upsert": lambda store, kc: store.upsert(kc, "a", 99),
+    "remove": lambda store, kc: store.remove(kc, "a"),
+    "reconcile": lambda store, kc: store.reconcile(kc, {"a": 5, "q": 6}),
+}
+
+
+@pytest.mark.parametrize("op", PERSISTED_WRITES)
+def test_a_store_keyed_write_from_inside_a_query_raises_and_leaves_the_rows(
+    persist, op
+):
+    store = persist.Store.open(persist.MemoryBackend(), build_id=1)
+    codec = PickleCodec()
+    kc = store.keyed_collection("rows", codec, codec)
+    store.reconcile(kc, {"a": 1, "b": 2})
+    position = store.stats()["position"]
+    q = store.runtime.create_query(lambda ctx: PERSISTED_WRITES[op](store, kc))
+    with pytest.raises(RuntimeError):
+        store.runtime.get(q)
+    assert sorted(kc.items()) == [("a", 1), ("b", 2)]
+    assert store.stats()["position"] == position
