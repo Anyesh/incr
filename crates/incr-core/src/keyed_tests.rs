@@ -309,12 +309,25 @@ fn write<C: Cells>(rt: &Runtime<C>, kc: &Kc<C>, which: usize) {
     }
 }
 
-const WRITES: usize = 5;
+/// The sweep builds one runtime per panic point, at about a second each
+/// under Miri, so Miri runs the upsert, reconcile and batch writes against
+/// the key equality and clone calls only.
+fn panic_sweep() -> (&'static [Call], &'static [usize]) {
+    if cfg!(miri) {
+        (&[Call::KeyEq, Call::Clone], &[0, 3, 4])
+    } else {
+        (
+            &[Call::KeyHash, Call::KeyEq, Call::RowEq, Call::Clone],
+            &[0, 1, 2, 3, 4],
+        )
+    }
+}
 
 fn user_panics_leave_everything_unchanged<C: Cells>() {
-    for call in [Call::KeyHash, Call::KeyEq, Call::RowEq, Call::Clone] {
+    let (calls, writes) = panic_sweep();
+    for &call in calls {
         let mut panicked = 0;
-        for which in 0..WRITES {
+        for &which in writes {
             for nth in 1.. {
                 let rt = Runtime::<C>::new();
                 let kc = populated(&rt);
@@ -331,7 +344,7 @@ fn user_panics_leave_everything_unchanged<C: Cells>() {
             }
         }
         assert!(
-            panicked >= WRITES,
+            panicked >= writes.len(),
             "{call:?} panicked only {panicked} times"
         );
     }
@@ -791,7 +804,11 @@ fn run_steps<C: Cells>(steps: Vec<Step>) {
 }
 
 fn model_matches<C: Cells>() {
-    let config = ProptestConfig::with_cases(64);
+    let config = ProptestConfig {
+        cases: if cfg!(miri) { 6 } else { 64 },
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
     proptest!(config, |(steps in prop::collection::vec(step(), 1..12))| {
         run_steps::<C>(steps);
     });
