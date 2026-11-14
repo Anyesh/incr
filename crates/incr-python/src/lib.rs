@@ -32,7 +32,6 @@ mod lookups;
 mod memory;
 mod overlay;
 mod persist;
-mod ready;
 mod state;
 
 use pyo3::prelude::*;
@@ -52,6 +51,7 @@ use overlay::{Born, Undo};
 use persist::PyPersistedKeyed;
 use state::{PyCallable, RtState};
 
+use incr_python_persist::ready::{self, _NotReadySignal};
 use incr_python_protocol::notready::{
     lookup_failed, PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
@@ -62,7 +62,6 @@ use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, raise_into_engine,
     routing_error, try_read, Exceptions, PyFixpoint, PyKey, PyValue,
 };
-use ready::_NotReadySignal;
 
 pyo3::create_exception!(
     incr,

@@ -6,7 +6,7 @@
 
 use std::cell::Cell;
 
-use incr_compute::Runtime;
+use incr_core::{Cells, Runtime};
 use incr_python_protocol::notready::{incomplete, plainly_ready, status, with_missing, Status};
 use incr_python_protocol::raise_into_engine;
 use pyo3::intern;
@@ -21,7 +21,7 @@ pyo3::create_exception!(
 
 /// `value` read inside a query whose missing contributions are `missing`.
 #[inline(always)]
-pub(crate) fn read(py: Python<'_>, value: Py<PyAny>, missing: &Cell<u64>) -> PyResult<Py<PyAny>> {
+pub fn read(py: Python<'_>, value: Py<PyAny>, missing: &Cell<u64>) -> PyResult<Py<PyAny>> {
     if plainly_ready(value.bind(py)) {
         return Ok(value);
     }
@@ -44,9 +44,9 @@ fn read_any(py: Python<'_>, value: Py<PyAny>, missing: &Cell<u64>) -> PyResult<P
 /// The value a query of `rt` lands from calling `f(rt_ref)`, where
 /// `missing` is the count `rt_ref`'s reads add to.
 #[inline]
-pub(crate) fn call_query(
+pub fn call_query<C: Cells>(
     py: Python<'_>,
-    rt: &Runtime,
+    rt: &Runtime<C>,
     f: &Py<PyAny>,
     rt_ref: Py<PyAny>,
     missing: &Cell<u64>,
@@ -62,9 +62,9 @@ pub(crate) fn call_query(
 
 /// [`call_query`] for a memo table's function, which takes the entry's
 /// `key` after the ref.
-pub(crate) fn call_memo(
+pub fn call_memo<C: Cells>(
     py: Python<'_>,
-    rt: &Runtime,
+    rt: &Runtime<C>,
     f: &Py<PyAny>,
     rt_ref: Py<PyAny>,
     key: Py<PyAny>,
@@ -85,7 +85,7 @@ pub(crate) fn call_memo(
 /// other exception unwinds the engine, failing the node as before.
 #[cold]
 #[inline(never)]
-pub(crate) fn not_ready_or_raise(py: Python<'_>, rt: &Runtime, e: PyErr) -> Py<PyAny> {
+pub fn not_ready_or_raise<C: Cells>(py: Python<'_>, rt: &Runtime<C>, e: PyErr) -> Py<PyAny> {
     if !e.is_instance_of::<_NotReadySignal>(py) {
         raise_into_engine(e);
     }
@@ -101,13 +101,13 @@ pub(crate) fn not_ready_or_raise(py: Python<'_>, rt: &Runtime, e: PyErr) -> Py<P
 /// contributions short.
 #[cold]
 #[inline(never)]
-pub(crate) fn short_by(py: Python<'_>, value: Py<PyAny>, missing: u64) -> Py<PyAny> {
+pub fn short_by(py: Python<'_>, value: Py<PyAny>, missing: u64) -> Py<PyAny> {
     with_missing(py, value, missing).unwrap_or_else(|e| raise_into_engine(e))
 }
 
 /// `(value, status)`: the value a top-level read returns, and `None`, the
 /// `NotReady` value or the `Incomplete` value.
-pub(crate) fn with_status(py: Python<'_>, value: Py<PyAny>) -> (Py<PyAny>, Py<PyAny>) {
+pub fn with_status(py: Python<'_>, value: Py<PyAny>) -> (Py<PyAny>, Py<PyAny>) {
     match status(value.bind(py)) {
         Status::Ready => (value, py.None()),
         Status::NotReady => (value.clone_ref(py), value),
@@ -121,7 +121,7 @@ pub(crate) fn with_status(py: Python<'_>, value: Py<PyAny>) -> (Py<PyAny>, Py<Py
 /// The value a top-level read returns: an `Incomplete` value's `value`,
 /// anything else as stored.
 #[inline(always)]
-pub(crate) fn unwrapped(py: Python<'_>, value: Py<PyAny>) -> Py<PyAny> {
+pub fn unwrapped(py: Python<'_>, value: Py<PyAny>) -> Py<PyAny> {
     if plainly_ready(value.bind(py)) {
         return value;
     }

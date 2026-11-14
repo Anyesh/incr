@@ -20,7 +20,9 @@ use pyo3::prelude::*;
 use super::store::PyStore;
 use super::StoreCore;
 use crate::state::{PyCallable, RtState};
-use crate::{ready, InvalidateRef, PyNodeId, PyRuntimeRef};
+use incr_python_persist::ready;
+
+use crate::{InvalidateRef, PyNodeId, PyRuntimeRef};
 
 /// The closure the engine runs for a memo table: `py_func` called with a
 /// `RuntimeRef` that is invalidated when it returns, and the entry's key.
