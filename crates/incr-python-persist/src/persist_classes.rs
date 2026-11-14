@@ -105,6 +105,7 @@ macro_rules! persist_classes {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
+        use $crate::binding::PyBinding;
         use $crate::classes::{key_counts, keyed_of, reconcile_pairs, FullStoreRuntime, KeyCounts, StoreRuntime};
         use $crate::incr_core::Runtime;
         use $crate::keyed::Pending;
@@ -139,6 +140,12 @@ macro_rules! persist_classes {
 
         const _: () = assert!(std::mem::align_of::<PyStore>() <= 16);
 
+        impl Drop for PyStore {
+            fn drop(&mut self) {
+                Python::attach(|py| self.release(py));
+            }
+        }
+
         impl PyStore {
             fn new(core: Arc<$crate::store::StoreCore<$b>>, runtime: Py<$rt>) -> Self {
                 PyStore {
@@ -154,6 +161,14 @@ macro_rules! persist_classes {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone()
                     .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
+            }
+
+            /// Drops the memo, stopping its checkpoint thread, and the core,
+            /// through the binding's [`drop_detached`](PyBinding::drop_detached).
+            fn release(&self, py: Python<'_>) {
+                let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let core = self.core.lock().unwrap_or_else(PoisonError::into_inner).take();
+                <$b as PyBinding>::drop_detached(py, (memo, core));
             }
 
             fn memo(&self) -> PyResult<Arc<MemoCore<$b>>> {
@@ -479,10 +494,7 @@ macro_rules! persist_classes {
             /// the values it holds, since other threads may be reading it.
             fn close(&self, py: Python<'_>) -> PyResult<()> {
                 <$rt as FullStoreRuntime<$b>>::close_store_runtime(self.runtime.bind(py))?;
-                let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner).take();
-                let core = self.core.lock().unwrap_or_else(PoisonError::into_inner).take();
-                drop(memo);
-                drop(core);
+                self.release(py);
                 Ok(())
             }
         });
@@ -504,6 +516,16 @@ macro_rules! persist_classes {
             store: Py<PyStore>,
             batch: Mutex<$crate::batch::Batch<$b>>,
             opener: std::thread::ThreadId,
+        }
+
+        impl Drop for PyBatch {
+            fn drop(&mut self) {
+                let batch = std::mem::replace(
+                    self.batch.get_mut().unwrap_or_else(PoisonError::into_inner),
+                    $crate::batch::Batch::new($crate::batch::Apply::OnExit),
+                );
+                Python::attach(|py| <$b as PyBinding>::drop_detached(py, batch));
+            }
         }
 
         impl PyBatch {

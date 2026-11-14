@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use ::incr_concurrent::{Incr, IncrCollection, Runtime};
-use incr_python_persist::binding::{CoreStore, Detached, Plain, PyBinding};
+use incr_python_persist::binding::{Carry, CoreStore, Detached, Plain, PyBinding};
 use incr_python_persist::classes::{FullStoreRuntime, StoreRuntime};
 use incr_python_persist::incr_persist::memo::MemoCtx;
 use incr_python_persist::incr_persist::Shared;
@@ -57,6 +57,14 @@ impl PyBinding for SharedBinding {
         f: impl FnOnce(&Arc<CoreStore<Self>>, Detached) -> R + Send,
     ) -> PyResult<R> {
         engine_call(py, store.runtime(), move || f(store, Detached::assume()))
+    }
+
+    fn drop_detached<T>(py: Python<'_>, value: T)
+    where
+        Plain<T>: Send,
+    {
+        let value = Plain::new(value);
+        py.detach(move || drop(value.into_inner()));
     }
 }
 

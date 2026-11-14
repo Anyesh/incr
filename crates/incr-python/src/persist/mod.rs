@@ -50,6 +50,13 @@ impl PyBinding for LocalBinding {
     ) -> PyResult<R> {
         crate::engine_read(store.runtime(), || f(store, Detached::assume()))
     }
+
+    fn drop_detached<T>(_py: Python<'_>, value: T)
+    where
+        LocalTask<T>: Send,
+    {
+        drop(value);
+    }
 }
 
 /// A Local engine handle carried into or out of a store call.

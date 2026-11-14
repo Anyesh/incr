@@ -77,6 +77,14 @@ pub trait PyBinding: Sized + 'static {
         store: &Arc<CoreStore<Self>>,
         f: impl FnOnce(&Arc<CoreStore<Self>>, Detached) -> R + Send,
     ) -> PyResult<R>;
+
+    /// Drops `value`, whose drop may take the store mutex (a staged batch
+    /// that has not landed poisons the store) or join a memo's checkpoint
+    /// thread, both of which may wait on a thread that needs the GIL.
+    /// Shared releases the GIL for the drop; Local drops in place.
+    fn drop_detached<T>(py: Python<'_>, value: T)
+    where
+        Self::Task<T>: Send;
 }
 
 /// `value` wrapped for a task of `B`.
