@@ -30,7 +30,8 @@ struct Marked {
 struct Shard {
     /// Per entry, its table, key and the mark of its latest compute.
     marks: HashMap<ErasedIncr, Marked>,
-    /// Entries [`Dirty::carry`] counted again, until they compute again.
+    /// Entries [`Dirty::carry`] counted again, until they compute again or
+    /// the attempt fails.
     carried: HashSet<ErasedIncr>,
 }
 
@@ -155,9 +156,13 @@ impl Dirty {
     }
 
     /// Takes back the latest attempt, which saved nothing: every entry
-    /// computed since the attempt before it counts as unsaved again.
+    /// computed since the attempt before it counts as unsaved again, and
+    /// the next attempt may carry what this one carried.
     pub(crate) fn failed(&self) {
-        let shards = self.all();
+        let mut shards = self.all();
+        for shard in shards.iter_mut() {
+            shard.carried.clear();
+        }
         let attempt = self.undo.1.load(Relaxed);
         self.previous.store(self.undo.0.load(Relaxed), Relaxed);
         self.attempt.store(attempt, Relaxed);
@@ -277,6 +282,20 @@ mod tests {
         dirty.carry(&mark(&marks, h[0]));
         assert_eq!(dirty.unsaved(), 0);
         dirty.computed(0, h[0], &key());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        dirty.carry(&mark(&marks, h[0]));
+        assert_eq!(dirty.unsaved(), 1);
+    }
+
+    #[test]
+    fn a_failed_attempt_lets_its_carried_entries_be_carried_again() {
+        let (_rt, h) = handles(1);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        dirty.carry(&mark(&marks, h[0]));
+        dirty.failed();
+        assert_eq!(dirty.unsaved(), 1);
         let marks = dirty.attempt(|_| true, &mut Vec::new());
         dirty.carry(&mark(&marks, h[0]));
         assert_eq!(dirty.unsaved(), 1);
