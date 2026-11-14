@@ -626,9 +626,10 @@ fn a_reader_never_sees_a_position_ahead_of_its_values_while_batches_commit() {
     let y = store.input("y", 0_u64).unwrap();
     let base = store.stats().unwrap().position;
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let reader = {
-        let (store, done) = (Arc::clone(&store), Arc::clone(&done));
+        let (store, done, started) = (Arc::clone(&store), Arc::clone(&done), Arc::clone(&started));
         std::thread::spawn(move || {
             let rt = store.runtime();
             let (mut seen, mut refused, mut last) = (0_u64, 0_u64, (0_u64, 0_u64));
@@ -654,12 +655,17 @@ fn a_reader_never_sees_a_position_ahead_of_its_values_while_batches_commit() {
                 let now = (rt.get(x.handle()), rt.get(y.handle()));
                 assert!(now.0 >= last.0 && now.1 >= last.1, "a value went backwards");
                 last = now;
+                started.store(true, SeqCst);
             }
             (seen, refused)
         })
     };
 
+    while !started.load(SeqCst) {
+        std::thread::yield_now();
+    }
     for round in 1..=ROUNDS {
+        std::thread::yield_now();
         let mut staged = store.staged_batch().unwrap();
         staged.set(x, round).unwrap();
         staged.set(y, round).unwrap();
