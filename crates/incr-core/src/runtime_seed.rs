@@ -184,18 +184,22 @@ impl<C: Cells> Runtime<C> {
                 self.park(ParkPoint::InspectBetweenHolds(NodeId(q.slot())));
             }
         }
-        C::fence_acquire();
         let mut values: Vec<Option<T>> = Vec::with_capacity(qs.len());
         stretch(&mut || {
             values.clear();
             values.extend(qs.iter().zip(&first).map(|(q, first)| {
                 first.as_ref()?;
                 let node = self.nodes.get(q.slot());
+                // The reader half of `reinit_recycled`'s protocol: fields,
+                // then the fence, then the generation.
+                let type_tag = node.type_tag();
+                let arena_slot = node.arena_slot();
+                C::fence_acquire();
                 if node.generation() != q.generation() {
                     return None;
                 }
-                let arena = self.arenas.tagged_arena::<T>(node.type_tag())?;
-                value_code::run(|| arena.try_read(node.arena_slot()))
+                let arena = self.arenas.tagged_arena::<T>(type_tag)?;
+                value_code::run(|| arena.try_read(arena_slot))
             }));
         });
         assert_eq!(
