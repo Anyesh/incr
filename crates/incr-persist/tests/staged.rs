@@ -544,6 +544,17 @@ fn a_rolled_away_value_misses_on_restore<C: MemoCells>() {
     assert_eq!(runs.load(SeqCst), 1, "only the rolled-away entry runs");
 }
 
+fn subscribing_refuses_while_a_batch_is_staged<C: Cells>() {
+    let store = open::<C, _>(MemoryBackend::new());
+    let x = store.input("x", 0_u32).unwrap();
+    let mut staged = store.staged_batch().unwrap();
+    staged.set(x, 1).unwrap();
+    assert_refused("subscribe", store.subscribe(|_, _, _| {}));
+    staged.commit().unwrap();
+    drop(staged);
+    store.subscribe(|_, _, _| {}).unwrap();
+}
+
 fn a_memo_checkpoint_reports_poisoned_after_a_batch_is_dropped<C: MemoCells>() {
     let store = Arc::new(open::<C, _>(MemoryBackend::new()));
     let x = store.input("x", 1_u64).unwrap();
@@ -702,5 +713,6 @@ both!(
     a_memo_checkpoint_refuses_while_a_batch_is_staged,
     a_shared_staged_batch_keeps_the_store_alive,
     a_rolled_away_value_misses_on_restore,
+    subscribing_refuses_while_a_batch_is_staged,
     a_memo_checkpoint_reports_poisoned_after_a_batch_is_dropped,
 );

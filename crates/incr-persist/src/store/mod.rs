@@ -704,6 +704,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         f: impl FnMut(Position, &Record, Origin) + Send + 'static,
     ) -> Result<SubscriptionId> {
         let mut state = self.state()?;
+        if state.staged {
+            return Err(Error::StagedBatchOpen);
+        }
         let id = SubscriptionId(state.next_subscription);
         state.next_subscription += 1;
         state.subscribers.push((id, Box::new(f)));
