@@ -234,8 +234,9 @@ macro_rules! persist_classes {
             /// and catches up as one row. A write that would remove a held row
             /// which is not `==` to its decoded copy and whose codec now encodes
             /// it to different bytes (a set pickled under another hash seed, say)
-            /// raises `ValueError` and writes nothing, since a replay could not
-            /// find it.
+            /// raises `ValueError`, since a replay could not find it. A refusal
+            /// before the write is appended writes nothing; one found while
+            /// repairing after the append leaves the appended records applied.
             #[pyo3(signature = (key, key_codec, codec, label=None))]
             fn keyed_collection(
                 &self,

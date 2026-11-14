@@ -112,12 +112,14 @@ pub enum Error {
     /// A keyed write would remove a held pair whose codec now encodes it to
     /// other bytes than it was applied from, and whose decoded copy is not
     /// `==` to it, so a replay of the log (a reopen, or another process)
-    /// could not match the removal to the pair and would keep it. Nothing
-    /// was written and the store is not poisoned.
+    /// could not match the removal to the pair and would keep it. A refusal
+    /// before the run is appended writes nothing; one found while repairing
+    /// after the append leaves the appended records applied, as for
+    /// [`Error::KeyedContention`]. The store is not poisoned.
     #[error(
         "keyed collection {key:?} holds a row that does not equal its decoded copy, and its codec \
          encodes it differently from the logged bytes, so a replay would not find it: the write \
-         was refused"
+         was refused, and records appended before the refusal stay applied"
     )]
     UnstableRow {
         /// The collection's key.

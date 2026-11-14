@@ -81,7 +81,8 @@ pub fn persist_error<E: PersistExceptions>(py: Python<'_>, error: Error) -> PyEr
             return pyo3::exceptions::PyValueError::new_err(format!(
                 "keyed collection '{key}', key {row_key}: the held row does not equal its decoded \
                  copy and its codec encodes it differently from the logged bytes, so a replay \
-                 would not find it; nothing was written"
+                 would not find it; a write refused before its append wrote nothing, and one \
+                 refused while repairing leaves the records it appended applied"
             ));
         }
         Error::InvalidCompaction {
