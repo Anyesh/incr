@@ -28,6 +28,36 @@ pub(crate) fn touched_key() {
     KEYS_TOUCHED.with(|n| n.set(n.get() + 1));
 }
 
+/// Where a checkpoint calls [`CHECKPOINT_PARK`] on its thread.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CheckpointPark {
+    /// One dirty entry is inspected under the `DepIndex` read hold; its
+    /// deps, row fingerprints included, are not mapped yet.
+    Inspected,
+    /// Every snapshot entry and its deps' fingerprints are taken and the
+    /// hold is released; nothing is encoded yet.
+    Snapshotted,
+}
+
+#[cfg(test)]
+type CheckpointParkHook = Box<dyn Fn(CheckpointPark)>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CHECKPOINT_PARK: std::cell::RefCell<Option<CheckpointParkHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn park(point: CheckpointPark) {
+    CHECKPOINT_PARK.with(|hook| {
+        if let Some(hook) = &*hook.borrow() {
+            hook(point);
+        }
+    });
+}
+
 /// A clean query dep of a dirty entry: its table and stored key, and the
 /// fp of the bytes it was last written or seeded with, which is what
 /// restore compares.
@@ -141,6 +171,8 @@ impl<C: MemoCells> CoreRef<C> {
         drop(moved);
         drop(dead);
         bag.drain(rt);
+        #[cfg(test)]
+        park(CheckpointPark::Snapshotted);
         let mut mismatches = Vec::new();
         let index = self.index();
         let stored = |table: u32, key: &[u8], fp: u128| {
