@@ -1,8 +1,8 @@
 //! Opt-in measurement of computes: the flags `get_traced` and compute
 //! stats arm, the per-run timer, and the counters both read.
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::cell::RefCell;
-
 use std::collections::HashMap;
 
 use crate::fx::FxBuildHasher;
