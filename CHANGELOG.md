@@ -30,7 +30,7 @@ All notable changes to this project are documented here. Format roughly follows 
 - **The memo format is 3.** A memo written as format 1 or 2 is not read: the open is a cold run, and the first checkpoint writes format 3, which stores `StoredDep::Row`.
 - **A memo checkpoint with nothing fresh writes nothing.** It no longer writes a new generation that only repeats the base, and a failed checkpoint counts its entries as unsaved again so the next one writes them.
 - **Keyed writes from inside a compute are refused**, on any compute running on the thread, not only the keyed collection's own.
-- **The memo's auto-checkpoint thread skips an open unlogged scope or staged batch**, and runs again afterwards if computes passed the trigger meanwhile.
+- **The memo's auto-checkpoint thread skips an open unlogged scope or staged batch**, and on Shared the skipped checkpoint runs as soon as the last of them closes, with no further compute; a close that follows no skipped checkpoint wakes nothing.
 - **Replacing a row runs two row `__eq__` calls** instead of one.
 - **Python: writes through a keyed collection's `collection` raise** on both packages; write with `upsert`, `remove`, `reconcile` or a batch, which keep the key index and the log in step.
 - **Python: `get_traced` on Shared returns an `Incomplete` value's value**, as `get` does and as Local did.
