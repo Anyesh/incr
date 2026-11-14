@@ -14,7 +14,7 @@ use crate::{Error, Result};
 /// The leading bytes of a header frame's body.
 pub const MAGIC: [u8; 8] = *b"incrmemo";
 /// The format version this build writes and reads, stored after [`MAGIC`].
-pub const FORMAT: u8 = 2;
+pub const FORMAT: u8 = 3;
 /// The bytes before a frame's body.
 pub const FRAME_HEADER_LEN: usize = 8;
 
