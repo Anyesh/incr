@@ -53,6 +53,11 @@ local_and_shared!(
     an_upsert_back_to_the_held_row_still_wins_over_a_foreign_write,
     a_reconcile_overtaken_by_a_foreign_insert_removes_it,
     a_reconcile_keeps_keys_staged_earlier_in_the_write,
+    key_readers_rerun_for_local_and_foreign_writes_to_their_key,
+    a_snapshot_converge_reruns_only_the_changed_keys,
+    delete_and_forget_rerun_key_readers,
+    a_scope_write_and_its_undo_rerun_key_readers,
+    undeclare_is_refused_while_a_query_reads_a_key,
 );
 
 fn open<C: Cells, B: Backend>(backend: B) -> Store<C, B> {
@@ -648,4 +653,173 @@ fn a_reconcile_keeps_keys_staged_earlier_in_the_write<C: Cells>() {
     pending.reconcile(&kc, [(3, s("z"))]);
     store.write_pending(pending).unwrap();
     assert_eq!(pairs(&store, &kc), [pair(2, "y"), pair(3, "z")]);
+}
+
+/// Lets a query closure, which must be `Send + Sync`, capture a keyed
+/// collection.
+struct Captured<T>(T);
+
+// SAFETY: every test runs a `Local` store and its handles on the one
+// thread that opened it; `Shared` handles are `Send + Sync` anyway.
+unsafe impl<T> Send for Captured<T> {}
+// SAFETY: see `Send`.
+unsafe impl<T> Sync for Captured<T> {}
+
+impl<T> Captured<T> {
+    fn get(&self) -> &T {
+        &self.0
+    }
+}
+
+/// A query reading `key` through `get_key`, and how often it ran.
+struct Reader {
+    query: incr_core::Incr<Option<String>>,
+    runs: Arc<AtomicUsize>,
+}
+
+impl Reader {
+    fn new<C: Cells, B: Backend>(store: &Store<C, B>, kc: &Kc<C>, key: u32) -> Self {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let kc = Captured(kc.clone());
+        let query = store.runtime().create_query(move |rt| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            kc.get().get_key(rt, &key)
+        });
+        Reader { query, runs }
+    }
+
+    /// The row read and how often the query has run, after reading it.
+    fn read<C: Cells, B: Backend>(&self, store: &Store<C, B>) -> (Option<String>, usize) {
+        let row = store.runtime().get(self.query);
+        (row, self.runs.load(Ordering::SeqCst))
+    }
+}
+
+fn key_readers_rerun_for_local_and_foreign_writes_to_their_key<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka = keyed(&a);
+    let b = open::<C, _>(log.clone());
+    let kb = keyed(&b);
+    a.upsert(&ka, 1, s("a")).unwrap();
+    a.upsert(&ka, 2, s("b")).unwrap();
+    let one = Reader::new(&a, &ka, 1);
+    let two = Reader::new(&a, &ka, 2);
+    assert_eq!(one.read(&a), (Some(s("a")), 1));
+    assert_eq!(two.read(&a), (Some(s("b")), 1));
+
+    a.upsert(&ka, 1, s("c")).unwrap();
+    assert_eq!(one.read(&a), (Some(s("c")), 2));
+    assert_eq!(two.read(&a), (Some(s("b")), 1));
+
+    a.upsert(&ka, 1, s("c")).unwrap();
+    assert_eq!(one.read(&a), (Some(s("c")), 2), "an equal row");
+
+    b.refresh().unwrap();
+    b.upsert(&kb, 2, s("d")).unwrap();
+    a.refresh().unwrap();
+    assert_eq!(two.read(&a), (Some(s("d")), 2));
+    assert_eq!(one.read(&a), (Some(s("c")), 2));
+
+    a.remove(&ka, &1).unwrap();
+    assert_eq!(one.read(&a), (None, 3));
+    a.upsert(&ka, 1, s("e")).unwrap();
+    assert_eq!(one.read(&a), (Some(s("e")), 4));
+}
+
+fn a_snapshot_converge_reruns_only_the_changed_keys<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka = keyed(&a);
+    let b = open::<C, _>(log.clone());
+    let kb = keyed(&b);
+    for (k, v) in [(1, "a"), (2, "b"), (4, "d")] {
+        a.upsert(&ka, k, s(v)).unwrap();
+    }
+    b.refresh().unwrap();
+    let readers: Vec<Reader> = (1..=4).map(|k| Reader::new(&b, &kb, k)).collect();
+    for reader in &readers {
+        reader.read(&b);
+    }
+
+    a.upsert(&ka, 1, s("c")).unwrap();
+    a.remove(&ka, &2).unwrap();
+    a.upsert(&ka, 3, s("e")).unwrap();
+    a.checkpoint().unwrap();
+    b.refresh().unwrap();
+
+    let read: Vec<(Option<String>, usize)> = readers.iter().map(|r| r.read(&b)).collect();
+    assert_eq!(
+        read,
+        [
+            (Some(s("c")), 2),
+            (None, 2),
+            (Some(s("e")), 2),
+            (Some(s("d")), 1),
+        ]
+    );
+}
+
+fn delete_and_forget_rerun_key_readers<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let one = Reader::new(&store, &kc, 1);
+    assert_eq!(one.read(&store), (Some(s("a")), 1));
+    store.delete(&kc).unwrap();
+    assert_eq!(one.read(&store), (None, 2));
+    store.upsert(&kc, 1, s("b")).unwrap();
+    assert_eq!(one.read(&store), (Some(s("b")), 3));
+    log.append(&[Record::Forget { key: s("k") }]).unwrap();
+    store.refresh().unwrap();
+    assert_eq!(one.read(&store), (None, 4));
+}
+
+fn a_scope_write_and_its_undo_rerun_key_readers<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let one = Reader::new(&store, &kc, 1);
+    assert_eq!(one.read(&store), (Some(s("a")), 1));
+    let rt = store.runtime();
+
+    let scope = store.unlogged_scope().unwrap();
+    let overlay = scope.keyed(&kc).unwrap();
+    let mut journal = Vec::new();
+    overlay.upsert_journaled(rt, 1, s("z"), Some(&mut journal));
+    assert_eq!(one.read(&store), (Some(s("z")), 2));
+    let absent = Reader::new(&store, &kc, 9);
+    assert_eq!(absent.read(&store), (None, 1));
+    overlay.apply_pairs_with(
+        rt,
+        journal.into_iter().rev().map(PairOp::inverse),
+        &mut (),
+        None,
+    );
+    scope.close().unwrap();
+    assert_eq!(one.read(&store), (Some(s("a")), 3));
+    assert!(
+        kc.version_input(&9).is_some(),
+        "a version input created inside the scope stays"
+    );
+}
+
+fn undeclare_is_refused_while_a_query_reads_a_key<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let kc = keyed(&store);
+    store.upsert(&kc, 1, s("a")).unwrap();
+    let one = Reader::new(&store, &kc, 1);
+    one.read(&store);
+    assert!(matches!(
+        store.undeclare(&kc),
+        Err(Error::HasDependents { key }) if key == "k"
+    ));
+    let version = kc.version_input(&1).unwrap();
+    store.runtime().delete_node(one.query);
+    store.undeclare(&kc).unwrap();
+    assert!(!store.runtime().is_alive(version));
 }

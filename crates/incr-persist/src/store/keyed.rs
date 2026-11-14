@@ -37,6 +37,7 @@ type Ranked<P> = (P, u128);
 /// [`UnloggedScope::keyed`]: super::UnloggedScope::keyed
 pub struct PersistedKeyed<K, V, C, P = (K, V)>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -49,6 +50,7 @@ where
 /// pairs are the key's element multiset, by decoded value.
 pub(super) struct KeyedBinding<K, V, C, P>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -65,6 +67,7 @@ where
 // under `Local` the binding never leaves the store's thread.
 unsafe impl<K, V, C, P> Send for KeyedBinding<K, V, C, P>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -73,6 +76,7 @@ where
 // SAFETY: see `Send`.
 unsafe impl<K, V, C, P> Sync for KeyedBinding<K, V, C, P>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -89,6 +93,17 @@ where
     /// A copy of the row read for `key`.
     pub fn row(&self, key: &K) -> Option<V> {
         self.keyed.row(key)
+    }
+
+    /// The row read for `key`, as [`KeyedCollection::get_key`] reads it:
+    /// inside a query, a dependency on this key alone.
+    pub fn get_key(&self, rt: &Runtime<C>, key: &K) -> Option<V> {
+        self.keyed.get_key(rt, key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn version_input(&self, key: &K) -> Option<Incr<u64>> {
+        self.keyed.version_input(key)
     }
 
     pub fn contains(&self, key: &K) -> bool {
@@ -156,6 +171,7 @@ where
 
 impl<K, V, C, P> Clone for PersistedKeyed<K, V, C, P>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -413,6 +429,7 @@ impl<K, P> StagedKey<K, P> {
 
 struct KeyedStage<K, V, C, P>
 where
+    K: 'static,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V>,
@@ -730,8 +747,8 @@ where
                 map.store_fp(&self.key, fp);
             }
         }
-        // Per-key version bumps for `change.changed` belong here: inside
-        // the hold, before the guard disarms.
+        // The keyed write set the changed keys' version inputs inside the
+        // hold, so a memo checkpoint never pairs a row with an older entry.
         guard.disarm();
         drop(hold);
         drop((change, spent, read));
@@ -828,8 +845,12 @@ where
         self.keyed.pairs().version_node().erase()
     }
 
+    /// Deletes the key's version inputs with the collection, so a query
+    /// reading any key through `get_key` counts as a dependent.
     fn delete_nodes(&self, rt: &Runtime<C>) -> std::result::Result<(), DeleteError> {
-        rt.try_delete_nodes(&[self.node(), self.keyed.rows().version_node().erase()])
+        let mut nodes = vec![self.node(), self.keyed.rows().version_node().erase()];
+        nodes.extend(self.keyed.version_inputs());
+        rt.try_delete_nodes(&nodes)
     }
 
     fn unbind(&self, rt: &Runtime<C>) -> Result<Option<Elements>> {
