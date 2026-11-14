@@ -12,7 +12,11 @@ pub(crate) struct Dirty {
     marks: u64,
     attempt: u64,
     previous: u64,
+    /// Equals the number of entries whose mark is above `attempt`.
     unsaved: u64,
+    /// `previous` and `attempt` before the latest attempt, for
+    /// [`Self::failed`].
+    undo: (u64, u64),
     tables: Vec<HashMap<ErasedIncr, u64>>,
     /// Entries [`Self::carry`] counted again, until they compute again.
     carried: HashSet<ErasedIncr>,
@@ -25,6 +29,7 @@ impl Dirty {
             attempt: 0,
             previous: 0,
             unsaved: 0,
+            undo: (0, 0),
             tables: vec![HashMap::new(); tables],
             carried: HashSet::new(),
         }
@@ -53,6 +58,7 @@ impl Dirty {
         &mut self,
         alive: impl Fn(ErasedIncr) -> bool,
     ) -> Vec<HashMap<ErasedIncr, u64>> {
+        self.undo = (self.previous, self.attempt);
         self.previous = self.attempt;
         self.attempt = self.marks;
         self.unsaved = 0;
@@ -61,6 +67,19 @@ impl Dirty {
         }
         self.carried.retain(|&handle| alive(handle));
         self.tables.clone()
+    }
+
+    /// Takes back the latest attempt, which saved nothing: every entry
+    /// computed since the attempt before it counts as unsaved again.
+    pub(crate) fn failed(&mut self) {
+        (self.previous, self.attempt) = self.undo;
+        let attempt = self.attempt;
+        self.unsaved = self
+            .tables
+            .iter()
+            .flat_map(HashMap::values)
+            .filter(|&&mark| mark > attempt)
+            .count() as u64;
     }
 
     /// Counts again an entry the attempt found dirty at `mark` but could
@@ -121,6 +140,20 @@ mod tests {
         let left = dirty.attempt(|_| true);
         assert_eq!(left[0].len(), 2);
         assert!(left[0].contains_key(&h[0]) && left[0].contains_key(&h[2]));
+    }
+
+    #[test]
+    fn a_failed_attempt_counts_its_entries_again_once() {
+        let (_rt, h) = handles(3);
+        let mut dirty = Dirty::new(1);
+        dirty.computed(0, h[0]);
+        dirty.computed(0, h[1]);
+        dirty.attempt(|_| true);
+        dirty.computed(0, h[1]);
+        dirty.computed(0, h[2]);
+        dirty.failed();
+        assert_eq!(dirty.unsaved(), 3);
+        assert_eq!(dirty.computed(0, h[0]), 3);
     }
 
     #[test]

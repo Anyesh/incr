@@ -38,10 +38,16 @@ impl<C: MemoCells> CoreRef<C> {
         }
         let _checkpoint = self.lock_checkpoint();
         let started = Instant::now();
+        let mut attempt = Attempt {
+            core: self,
+            started: false,
+            saved: false,
+        };
         let (snaps, mut keys, clean, moved) = {
             let mut state = self.lock_memo();
             state.seed_info.retain(|&handle, _| rt.is_alive(handle));
             let dirty = self.lock_dirty().attempt(|handle| rt.is_alive(handle));
+            attempt.started = true;
             // The read hold excludes every mapped write, and each finishes
             // its walk inside its own hold, so a Clean entry over mapped
             // deps equals its closure of the current mapped values.
@@ -126,6 +132,7 @@ impl<C: MemoCells> CoreRef<C> {
             state.record_mismatch(mismatch);
         }
         let mut done = done?;
+        attempt.saved = true;
         done.stats.times.snapshot = snapshot;
         self.swap_index(IndexGen::new(done.generation, self.build, &self.catalog));
         state.stats.checkpoints += 1;
@@ -165,6 +172,22 @@ impl<C: MemoCells> CoreRef<C> {
         drop(state);
         bag.drain(rt);
         Ok(done.stats)
+    }
+}
+
+/// Takes back a started dirty-set attempt unless the checkpoint saved,
+/// on an error return and on a panic alike.
+struct Attempt<'a, C: MemoCells> {
+    core: &'a CoreRef<C>,
+    started: bool,
+    saved: bool,
+}
+
+impl<C: MemoCells> Drop for Attempt<'_, C> {
+    fn drop(&mut self) {
+        if self.started && !self.saved {
+            self.core.lock_dirty().failed();
+        }
     }
 }
 

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 
 use incr_persist::memo::{
-    BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo,
+    BuildId, Memo, MemoBackend, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo,
 };
-use incr_persist::{Input, Local, MemoryBackend, Options, Shared, Store};
+use incr_persist::{Error, Input, Local, MemoryBackend, Options, Shared, Store};
 use serde::{Deserialize, Serialize, Serializer};
 
 macro_rules! both {
@@ -40,6 +40,7 @@ both!(
     a_clean_dep_keeps_the_fingerprint_it_was_stored_with,
     an_unsaveable_entry_stays_dirty_and_is_counted,
     evicted_entries_are_dirtied_again_and_a_reopen_recomputes_them,
+    a_failed_checkpoint_leaves_its_entries_unsaved,
 );
 
 const BUILD: u128 = 0xd1;
@@ -354,4 +355,20 @@ fn evicted_entries_are_dirtied_again_and_a_reopen_recomputes_them<C: MemoCells>(
         assert_eq!(w.read(k), 100 + u64::from(k));
     }
     assert_eq!(w.runs() as u64, evicted);
+}
+
+fn a_failed_checkpoint_leaves_its_entries_unsaved<C: MemoCells>() {
+    let backends = Backends::new();
+    let w = Leaves::<C>::open(&backends, options());
+    w.read(1);
+    w.read(2);
+    {
+        let _other = MemoBackend::lock_checkpoint(&backends.memo).unwrap();
+        assert!(matches!(w.memo.checkpoint(), Err(Error::Busy)));
+    }
+    assert_eq!(w.memo.stats().unsaved_entries, 2);
+    w.read(3);
+    assert_eq!(w.memo.stats().unsaved_entries, 3);
+    assert_eq!(w.memo.checkpoint().unwrap().written, 3);
+    assert_eq!(w.memo.stats().unsaved_entries, 0);
 }
