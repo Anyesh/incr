@@ -109,6 +109,11 @@ pub enum Error {
     #[error("keyed collection {key:?} kept changing under other writers: refresh and retry")]
     KeyedContention { key: String },
 
+    /// [`ConditionalAppend::append_at`](crate::ConditionalAppend::append_at)
+    /// found the log's tail somewhere other than `after`, and wrote nothing.
+    #[error("the log's tail is no longer at position {after}")]
+    TailMoved { after: Position },
+
     /// `BuildId::CurrentExe` could not read the running executable.
     #[error("cannot fingerprint the running executable for the memo build id")]
     BuildIdUnavailable(#[source] std::io::Error),

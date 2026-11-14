@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::flock::Flock;
-use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
+use crate::{Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use format::{
     decode_frames, header, journal_path, parse_header, push_frames, read_current, read_header,
@@ -367,27 +367,7 @@ impl FileBackend {
 impl Backend for FileBackend {
     fn append(&self, records: &[Record]) -> Result<Position> {
         let mut guard = self.writer_state()?;
-        let state = &mut *guard;
-        if records.is_empty() {
-            return Ok(Position(state.journal.tail()));
-        }
-        let mut frames = Vec::new();
-        let offsets = push_frames(&mut frames, records)?;
-        let journal = &mut state.journal;
-        let at = journal.end;
-        if let Err(e) = write_all_at(&journal.file, &frames, at) {
-            // Readers never index an incomplete append, but a partial one
-            // must not stay on disk where the next append would land.
-            if journal.file.set_len(at).is_err() {
-                state.failed = true;
-            }
-            return Err(e.into());
-        }
-        journal
-            .offsets
-            .extend(offsets.iter().map(|&offset| at + offset as u64));
-        journal.end += frames.len() as u64;
-        Ok(Position(journal.tail()))
+        append_locked(&mut guard, records)
     }
 
     /// Fsyncs the journal. Fails with [`Error::ReadOnly`] on a read-only
@@ -510,7 +490,44 @@ impl Backend for FileBackend {
         self.compact_steps(upto, folded, COMPACTION_STEPS)
     }
 
+    fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {
+        Some(self)
+    }
+
     fn writable(&self) -> bool {
         self.lock.is_some()
     }
+}
+
+impl ConditionalAppend for FileBackend {
+    fn append_at(&self, after: Position, records: &[Record]) -> Result<Position> {
+        let mut state = self.writer_state()?;
+        if state.journal.tail() != after.0 {
+            return Err(Error::TailMoved { after });
+        }
+        append_locked(&mut state, records)
+    }
+}
+
+fn append_locked(state: &mut State, records: &[Record]) -> Result<Position> {
+    if records.is_empty() {
+        return Ok(Position(state.journal.tail()));
+    }
+    let mut frames = Vec::new();
+    let offsets = push_frames(&mut frames, records)?;
+    let journal = &mut state.journal;
+    let at = journal.end;
+    if let Err(e) = write_all_at(&journal.file, &frames, at) {
+        // Readers never index an incomplete append, but a partial one
+        // must not stay on disk where the next append would land.
+        if journal.file.set_len(at).is_err() {
+            state.failed = true;
+        }
+        return Err(e.into());
+    }
+    journal
+        .offsets
+        .extend(offsets.iter().map(|&offset| at + offset as u64));
+    journal.end += frames.len() as u64;
+    Ok(Position(journal.tail()))
 }

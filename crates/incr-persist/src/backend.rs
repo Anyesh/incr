@@ -126,4 +126,29 @@ pub trait Backend: Send + Sync {
 
     /// `false` for a read-only open, on which `append` and `compact` fail.
     fn writable(&self) -> bool;
+
+    /// This handle's [`ConditionalAppend`], or `None` for a backend that
+    /// does not offer one. A store's staged batch is refused on a backend
+    /// returning `None`.
+    fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {
+        None
+    }
+}
+
+/// An append that lands only after the tail the caller last saw, which
+/// makes the position range the idempotency key of a run: a run retried
+/// after an ambiguous failure can never land twice.
+pub trait ConditionalAppend: Send + Sync {
+    /// Appends `records` as one contiguous run at `after + 1 ..` if the
+    /// log's tail is still `after`, and returns the position of the last
+    /// one, as [`Backend::append`] does.
+    ///
+    /// Fails with [`Error::TailMoved`](crate::Error::TailMoved), writing
+    /// nothing, when the tail is anywhere else, including after a
+    /// compaction that left no records, whose tail is the compacted
+    /// position. An empty run writes nothing and returns `after` when the
+    /// tail is `after`. Other errors are as for [`Backend::append`]: the
+    /// run may or may not have landed, and calling again with the same
+    /// `after` either lands it once or reports the tail moved.
+    fn append_at(&self, after: Position, records: &[Record]) -> Result<Position>;
 }

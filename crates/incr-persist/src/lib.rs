@@ -25,7 +25,7 @@ mod sqlite;
 mod store;
 mod value_context;
 
-pub use backend::{Backend, Position, ReadOutcome, SnapshotId};
+pub use backend::{Backend, ConditionalAppend, Position, ReadOutcome, SnapshotId};
 pub use error::{Error, Result};
 pub use file::FileBackend;
 pub use incr_core::{Cells, Local, Shared};
