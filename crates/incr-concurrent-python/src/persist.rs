@@ -144,6 +144,7 @@ impl FullStoreRuntime<SharedBinding> for PyRuntime {
             inner: handle,
             rt: runtime.inner.clone(),
             bridges: Arc::clone(&runtime.bridges),
+            keyed_rows: None,
         }
     }
 

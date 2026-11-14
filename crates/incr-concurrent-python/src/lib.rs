@@ -458,12 +458,18 @@ struct PyCollection {
     inner: IncrCollection<PyValue>,
     rt: RtRef,
     bridges: Arc<VersionBridges>,
+    /// For a keyed collection's rows, which only the keyed collection's
+    /// writes change, the message a direct write raises.
+    keyed_rows: Option<String>,
 }
 
 impl PyCollection {
-    /// Raises for a collection a store persists, which only the store
-    /// writes.
+    /// Raises for a keyed collection's rows, and for a collection a store
+    /// persists, which only the store writes.
     fn check_writable(&self) -> PyResult<()> {
+        if let Some(message) = &self.keyed_rows {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(message.clone()));
+        }
         if let RtRef::Store(core) = &self.rt {
             if core.collection_of(self.inner.version_node().slot()).is_ok() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -505,6 +511,7 @@ impl PyCollection {
             inner: filtered,
             rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
+            keyed_rows: None,
         })
     }
 
@@ -518,6 +525,7 @@ impl PyCollection {
             inner: mapped,
             rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
+            keyed_rows: None,
         })
     }
 
@@ -642,6 +650,7 @@ impl PyCollection {
             inner: mapped,
             rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
+            keyed_rows: None,
         })
     }
 
@@ -680,6 +689,7 @@ impl PySortedCollection {
             inner: mapped,
             rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
+            keyed_rows: None,
         })
     }
 
@@ -700,6 +710,7 @@ impl PySortedCollection {
             inner: mapped,
             rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
+            keyed_rows: None,
         })
     }
 
@@ -749,6 +760,7 @@ impl PyGroupedCollection {
             inner: collection,
             rt: RtRef::clone(&self.rt),
             bridges: Arc::clone(&self.bridges),
+            keyed_rows: None,
         }))
     }
 
@@ -1027,6 +1039,7 @@ impl PyRuntime {
             inner: col,
             rt: RtRef::clone(&self.inner),
             bridges: Arc::clone(&self.bridges),
+            keyed_rows: None,
         })
     }
 

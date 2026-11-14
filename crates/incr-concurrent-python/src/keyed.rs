@@ -2,7 +2,7 @@
 //! by a store.
 
 use incr_python_persist::classes::{
-    key_counts, reconcile_pairs, KeyCounts, KeyedSource, PlainKeyed,
+    key_counts, keyed_rows_refusal, reconcile_pairs, KeyCounts, KeyedSource, PlainKeyed,
 };
 use incr_python_persist::incr_persist::Shared;
 use incr_python_persist::store::Keyed;
@@ -246,10 +246,17 @@ impl PyKeyedCollection {
     #[getter]
     fn collection(&self) -> PyCollection {
         let runtime = self.rt.get();
+        let how = match &self.kind {
+            KeyedKind::Plain(_) => "kc.upsert, kc.remove or kc.reconcile",
+            KeyedKind::Persisted(_) => {
+                "store.upsert, store.remove, store.reconcile or a store.batch"
+            }
+        };
         PyCollection {
             inner: self.rows.clone(),
             rt: runtime.inner.clone(),
             bridges: runtime.bridges.clone(),
+            keyed_rows: Some(keyed_rows_refusal(self.label.as_deref(), how)),
         }
     }
 }

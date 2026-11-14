@@ -82,7 +82,7 @@ impl FullStoreRuntime<LocalBinding> for PyRuntime {
             inner: handle,
             rt: slf.clone().unbind(),
             born: Born::default(),
-            persisted: true,
+            writer: crate::Writer::Store,
         }
     }
 

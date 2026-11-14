@@ -351,3 +351,41 @@ def test_a_row_whose_re_encode_differs_replaces_to_one_pair(persist):
     g = g.reopen(persist)
     assert g.kc.get("k") == {"a": 1, "b": 2, "c": 4}
     assert g.pairs_held() == 1
+
+
+WRITE_METHODS = {
+    "insert": lambda c: c.insert(5),
+    "delete": lambda c: c.delete(1),
+    "replace": lambda c: c.replace(1, 5),
+    "extend": lambda c: c.extend([5]),
+}
+
+
+@pytest.mark.parametrize("method", WRITE_METHODS)
+@pytest.mark.parametrize("persisted", [False, True], ids=["plain", "persisted"])
+def test_a_write_through_kc_collection_is_refused_naming_the_keyed_collection(
+    persist, pkg, persisted, method
+):
+    if persisted:
+        g = Graph(persist, persist.MemoryBackend())
+        rt, kc = g.rt, g.kc
+        g.store.upsert(kc, "a", 1)
+        how = "store.upsert"
+    else:
+        rt = pkg.Runtime()
+        kc = pkg.KeyedCollection(rt, label="shifts")
+        kc.upsert("a", 1)
+        how = "kc.upsert"
+    rows = kc.collection
+    if not hasattr(rows, method):
+        pytest.skip(f"this package's Collection has no {method}")
+    count = rows.count()
+    assert rt.get(count) == 1
+
+    with pytest.raises(RuntimeError, match="keyed collection") as raised:
+        WRITE_METHODS[method](rows)
+    assert how in str(raised.value)
+    if not persisted:
+        assert "'shifts'" in str(raised.value)
+    assert rt.get(count) == 1
+    assert kc.items() == [("a", 1)]

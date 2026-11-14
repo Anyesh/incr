@@ -179,6 +179,17 @@ pub fn reconcile_pairs(rows: &Bound<'_, PyAny>) -> PyResult<Vec<(PyKey, PyValue)
 /// How many keys an operation inserted, gave a new row, and removed.
 pub type KeyCounts = (usize, usize, usize);
 
+/// The message a write through a keyed collection's `collection` raises:
+/// it would bypass the key index and, for a persisted one, the log. `how`
+/// names the writes to use instead.
+pub fn keyed_rows_refusal(label: Option<&str>, how: &str) -> String {
+    let named = label.map_or_else(
+        || "a keyed collection".to_owned(),
+        |label| format!("keyed collection '{label}'"),
+    );
+    format!("collection is the rows of {named}: write it with {how}")
+}
+
 pub fn key_counts(counts: incr_core::KeyCounts) -> KeyCounts {
     (counts.inserted, counts.replaced, counts.removed)
 }

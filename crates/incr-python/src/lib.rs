@@ -48,7 +48,7 @@ use incr_compute::{
 use incr_core::{Local, RoutingFailed};
 use incr_core::{PairOp, StateStats};
 use incr_python_persist::classes::KeyedSource;
-use incr_python_persist::classes::{key_counts, reconcile_pairs, KeyCounts};
+use incr_python_persist::classes::{key_counts, keyed_rows_refusal, reconcile_pairs, KeyCounts};
 use overlay::{Born, Undo};
 use persist::PyPersistedKeyed;
 use state::{LocalState, PyCallable, RtState};
@@ -542,8 +542,17 @@ struct PyCollection {
     inner: IncrCollection<PyValue>,
     rt: Py<PyRuntime>,
     born: Born,
-    /// Set for a collection a store persists, which only the store writes.
-    persisted: bool,
+    writer: Writer,
+}
+
+/// Who writes a collection's elements.
+enum Writer {
+    Caller,
+    /// A store persists the collection and writes it.
+    Store,
+    /// It is a keyed collection's rows, which only the keyed collection's
+    /// writes change; the message a direct write raises.
+    Keyed(String),
 }
 
 impl OnRuntime for PyCollection {
@@ -562,8 +571,12 @@ impl PyCollection {
     /// overlay's scope gives out.
     #[inline]
     fn target(&self, py: Python<'_>) -> PyResult<Cow<'_, IncrCollection<PyValue>>> {
-        if !self.persisted {
-            return Ok(Cow::Borrowed(&self.inner));
+        match &self.writer {
+            Writer::Caller => return Ok(Cow::Borrowed(&self.inner)),
+            Writer::Keyed(message) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(message.clone()))
+            }
+            Writer::Store => {}
         }
         self.state(py)
             .journal_with(|overlay| overlay.writable_collection(py, self.inner.version_node().slot()))
@@ -583,7 +596,7 @@ impl PyCollection {
             inner,
             rt: parent.runtime().clone_ref(py),
             born: parent.state(py).born(),
-            persisted: false,
+            writer: Writer::Caller,
         }
     }
 
@@ -1190,11 +1203,17 @@ impl PyKeyedCollection {
     #[getter]
     fn collection(&self, py: Python<'_>) -> PyResult<PyCollection> {
         self.check_open(py)?;
+        let how = match &self.kind {
+            KeyedKind::Plain(_) => "kc.upsert, kc.remove or kc.reconcile",
+            KeyedKind::Persisted(_) => {
+                "store.upsert, store.remove, store.reconcile or a store.batch"
+            }
+        };
         Ok(PyCollection {
             inner: self.rows.clone(),
             rt: self.rt.clone_ref(py),
             born: self.born.clone(),
-            persisted: false,
+            writer: Writer::Keyed(keyed_rows_refusal(self.label.as_deref(), how)),
         })
     }
 }
@@ -1319,7 +1338,7 @@ impl PyGroupedCollection {
             inner: collection,
             rt: self.rt.clone_ref(py),
             born: self.born.clone(),
-            persisted: false,
+            writer: Writer::Caller,
         }))
     }
 
@@ -1783,7 +1802,7 @@ impl PyRuntime {
             inner: col,
             rt,
             born,
-            persisted: false,
+            writer: Writer::Caller,
         })
     }
 
