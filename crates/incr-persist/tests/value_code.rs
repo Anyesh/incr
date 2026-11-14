@@ -238,16 +238,23 @@ fn shared_store_call_from_another_runtimes_compute() {
 }
 
 /// A hang test: the element's `Hash` runs under the store mutex, so a
-/// `Store::input` from it would wait on that mutex forever. It panics
-/// with the contract message instead, and the child exits.
+/// `Store::input` from it would wait on that mutex forever. It returns
+/// [`Error::Reentrant`] instead, the insert lands, and the child exits.
 fn insert_whose_element_hash_declares_an_input<C: Cells>() {
     let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
     let tags = store.collection::<Hooked>("tags").unwrap();
     let hooked = Rc::clone(&store);
+    let refused = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&refused);
     arm(Op::Hash, move || {
-        hooked.input("other", 0u32).unwrap();
+        let declared = hooked.input("other", 0u32);
+        seen.borrow_mut()
+            .push(matches!(declared, Err(Error::Reentrant)));
     });
     tags.insert(&store, Hooked(1)).unwrap();
+    let refused = refused.borrow();
+    assert!(!refused.is_empty(), "the element's Hash never ran");
+    assert!(refused.iter().all(|&r| r), "a nested declare was allowed");
 }
 
 #[test]
@@ -256,7 +263,7 @@ fn local_insert_whose_element_hash_declares_an_input() {
     run_in_child("local_insert_whose_element_hash_declares_an_input", || {
         insert_whose_element_hash_declares_an_input::<Local>();
     })
-    .assert_panicked_with(CONTRACT_MESSAGE);
+    .assert_clean();
 }
 
 #[test]
@@ -265,7 +272,7 @@ fn shared_insert_whose_element_hash_declares_an_input() {
     run_in_child("shared_insert_whose_element_hash_declares_an_input", || {
         insert_whose_element_hash_declares_an_input::<Shared>();
     })
-    .assert_panicked_with(CONTRACT_MESSAGE);
+    .assert_clean();
 }
 
 fn assert_contract_panic(what: &str, op: impl FnOnce()) {
