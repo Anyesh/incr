@@ -65,6 +65,9 @@ local_and_shared!(
     a_snapshot_converge_keeps_identity_compared_rows_and_reruns_no_reader,
     an_overtaken_identity_compared_write_repairs_to_one_pair,
     a_re_encoded_row_replaced_then_reopened_holds_one_pair,
+    a_removal_a_replay_could_not_match_is_refused,
+    a_reconcile_removal_a_replay_could_not_match_is_refused,
+    a_repair_removal_a_replay_could_not_match_is_refused,
 );
 
 fn open<C: Cells, B: Backend>(backend: B) -> Store<C, B> {
@@ -1282,4 +1285,100 @@ fn a_re_encoded_row_replaced_then_reopened_holds_one_pair<C: Cells>() {
     let c = open::<C, _>(log.clone());
     let kc: PersistedKeyed<u32, Noisy, C> = c.keyed_collection("k").unwrap();
     assert_eq!(kc.pairs().values(c.runtime()), [(1, Noisy(s("c")))]);
+}
+
+/// A row whose every encoding differs and whose decoded copy is not `==`
+/// to it, as a Python row holding `nan` is.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Skewed(String, usize);
+
+impl Skewed {
+    fn new(value: &str) -> Self {
+        Skewed(s(value), 0)
+    }
+}
+
+impl Serialize for Skewed {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        (&self.0, ENCODES.fetch_add(1, Ordering::Relaxed) + 1).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Skewed {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        <(String, usize)>::deserialize(deserializer)
+            .map(|(value, encoding)| Skewed(value, encoding))
+    }
+}
+
+type SkewedKc<C> = PersistedKeyed<u32, Skewed, C>;
+
+fn assert_refused<T: std::fmt::Debug>(written: Result<T>, key: u32) {
+    match written {
+        Err(Error::UnstableRow {
+            key: collection,
+            row_key,
+        }) => {
+            assert_eq!(collection, "k");
+            assert_eq!(row_key.downcast_ref::<u32>(), Some(&key));
+        }
+        other => panic!("expected the write to be refused, got {other:?}"),
+    }
+}
+
+fn a_removal_a_replay_could_not_match_is_refused<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: SkewedKc<C> = a.keyed_collection("k").unwrap();
+    a.upsert(&ka, 1, Skewed::new("a")).unwrap();
+    a.upsert(&ka, 2, Skewed::new("x")).unwrap();
+    let logged = records(&log);
+    let held = ka.items();
+
+    assert_refused(a.upsert(&ka, 1, Skewed::new("b")), 1);
+    assert_refused(a.remove(&ka, &1), 1);
+    assert_eq!(records(&log), logged, "a refused write logs nothing");
+    assert_eq!(ka.items(), held);
+
+    a.upsert(&ka, 3, Skewed::new("c")).unwrap();
+    assert_eq!(
+        records(&log).len(),
+        logged.len() + 1,
+        "the store stays usable"
+    );
+    drop((ka, a));
+    let b = open::<C, _>(log.clone());
+    let kb: SkewedKc<C> = b.keyed_collection("k").unwrap();
+    assert_eq!(kb.len(), 3);
+}
+
+fn a_reconcile_removal_a_replay_could_not_match_is_refused<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: SkewedKc<C> = a.keyed_collection("k").unwrap();
+    a.upsert(&ka, 1, Skewed::new("a")).unwrap();
+    let logged = records(&log);
+
+    assert_refused(a.reconcile(&ka, [(2, Skewed::new("b"))]), 1);
+    assert_eq!(records(&log), logged);
+    assert_eq!(ka.len(), 1);
+}
+
+fn a_repair_removal_a_replay_could_not_match_is_refused<C: Cells>() {
+    let log = MemoryBackend::new();
+    let a = open::<C, _>(log.clone());
+    let ka: SkewedKc<C> = a.keyed_collection("k").unwrap();
+    let b = open::<C, _>(log.clone());
+    let kb: SkewedKc<C> = b.keyed_collection("k").unwrap();
+
+    let mut pending = PendingWrite::new();
+    pending.upsert(&kb, 1, Skewed::new("b"));
+    a.upsert(&ka, 1, Skewed::new("a")).unwrap();
+    assert_refused(b.write_pending(pending), 1);
+    b.upsert(&kb, 2, Skewed::new("c")).unwrap();
 }

@@ -784,8 +784,8 @@ where
                 Next::Row(pair) => Some(pair),
                 Next::Gone => None,
             };
-            for (pair, _) in &staged.held {
-                out.push(remove_record(&key, pair)?);
+            for (pair, rank) in &staged.held {
+                out.push(logged_remove_record(&key, pair, *rank)?);
             }
             if let Some(pair) = next {
                 out.push(insert_record(&key, pair)?);
@@ -815,22 +815,21 @@ where
             if let (Some(target), None) = (target, keep) {
                 fixes.push(insert_record(&key, target)?);
             }
-            for (at, (pair, _)) in held.iter().enumerate() {
+            for (at, (pair, rank)) in held.iter().enumerate() {
                 if Some(at) != keep {
-                    fixes.push(remove_record(&key, pair)?);
+                    fixes.push(logged_remove_record(&key, pair, *rank)?);
                 }
             }
         }
         if self.complete {
             let held = self.keyed.keyed.ranked_pairs();
-            let unnamed: Vec<&P> = with_value_code(|| {
+            let unnamed: Vec<&Ranked<P>> = with_value_code(|| {
                 held.iter()
-                    .map(|(pair, _)| pair)
-                    .filter(|pair| !self.by_key.contains_key(&pair.key()))
+                    .filter(|(pair, _)| !self.by_key.contains_key(&pair.key()))
                     .collect()
             });
-            for pair in unnamed {
-                fixes.push(remove_record(&key, pair)?);
+            for (pair, rank) in unnamed {
+                fixes.push(logged_remove_record(&key, pair, *rank)?);
             }
         }
         Ok(fixes)
@@ -855,6 +854,36 @@ fn insert_record<P: PersistValue>(key: &str, pair: &P) -> Result<Record> {
     Ok(Record::Insert {
         key: key.to_owned(),
         element: encode(key, pair)?,
+    })
+}
+
+/// The `Remove` of `pair`, held at `rank`, that a replay must match to it.
+/// Replay matches by rank, the fingerprint of the bytes the pair was
+/// applied from, or by `==` to the decoded removal; when the pair now
+/// encodes to bytes with another fingerprint and is not `==` to their
+/// decoded copy, neither matches, so the write fails with
+/// [`Error::UnstableRow`] instead of leaving the pair held by a replay. A
+/// pair at the unlogged rank has no logged bytes to match.
+fn logged_remove_record<K, V, P>(key: &str, pair: &P, rank: u128) -> Result<Record>
+where
+    K: Value + Hash + Eq,
+    V: Value + Hash + Eq,
+    P: Pair<K, V> + PersistValue,
+{
+    let element = encode(key, pair)?;
+    if rank != UNLOGGED_RANK && fp_of(&element) != rank {
+        let decoded: P = decode(key, &element)?;
+        if with_value_code(|| *pair != decoded) {
+            let row_key = with_value_code(|| pair.key());
+            return Err(Error::UnstableRow {
+                key: key.to_owned(),
+                row_key: Box::new(row_key),
+            });
+        }
+    }
+    Ok(Record::Remove {
+        key: key.to_owned(),
+        element,
     })
 }
 

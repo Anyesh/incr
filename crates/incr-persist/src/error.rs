@@ -109,6 +109,23 @@ pub enum Error {
     #[error("keyed collection {key:?} kept changing under other writers: refresh and retry")]
     KeyedContention { key: String },
 
+    /// A keyed write would remove a held pair whose codec now encodes it to
+    /// other bytes than it was applied from, and whose decoded copy is not
+    /// `==` to it, so a replay of the log (a reopen, or another process)
+    /// could not match the removal to the pair and would keep it. Nothing
+    /// was written and the store is not poisoned.
+    #[error(
+        "keyed collection {key:?} holds a row that does not equal its decoded copy, and its codec \
+         encodes it differently from the logged bytes, so a replay would not find it: the write \
+         was refused"
+    )]
+    UnstableRow {
+        /// The collection's key.
+        key: String,
+        /// The key of the row, a clone of the collection's key type.
+        row_key: Box<dyn std::any::Any + Send + Sync>,
+    },
+
     /// [`ConditionalAppend::append_at`](crate::ConditionalAppend::append_at)
     /// found the log's tail somewhere other than `after`, and wrote nothing.
     #[error("the log's tail is no longer at position {after}")]
