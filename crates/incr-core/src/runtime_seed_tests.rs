@@ -928,3 +928,73 @@ fn inspect_refuses_a_dep_change_between_its_holds() {
         vec![x.erase(), pick.erase(), b.erase()] as Vec<ErasedIncr>
     );
 }
+
+static NEW_VALUE_CLONES: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Counted(u64);
+
+impl Clone for Counted {
+    fn clone(&self) -> Self {
+        if self.0 == 999 {
+            NEW_VALUE_CLONES.fetch_add(1, SeqCst);
+        }
+        Counted(self.0)
+    }
+}
+
+/// While `inspect_many` is parked between its holds, q1's deps change
+/// without moving its stamp and q2 is deleted and its slot reused by a
+/// query of the same type. The batch answers q0 alone, reads nothing from
+/// the recycled slot, and leaves the new node intact.
+#[test]
+fn inspect_many_refuses_a_dep_change_and_a_recycled_slot_between_its_holds() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let pick = rt.create_input(false);
+    let a = rt.create_input(5_u64);
+    let b = rt.create_input(5_u64);
+    let q0 = rt.create_query(move |rt: &Rt| Counted(rt.get(x) + 10));
+    let q1 = rt.create_query(move |rt: &Rt| {
+        let side = if rt.get(pick) { b } else { a };
+        Counted(rt.get(x) + rt.get(side))
+    });
+    let q2 = rt.create_query(move |rt: &Rt| Counted(rt.get(x) + 20));
+    assert_eq!(rt.get(q0), Counted(11));
+    assert_eq!(rt.get(q1), Counted(6));
+    assert_eq!(rt.get(q2), Counted(21));
+    let stamp = rt.nodes.get(q1.slot()).changed_at();
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::InspectBetweenHolds(id(q1)), gate.clone())],
+    );
+    let inspector = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            let mut bag = Deferred::<Shared>::new();
+            let seen = inspect_many(&rt, &[q0, q1, q2], |f| f(), &mut bag);
+            bag.drain(&rt);
+            seen.into_iter()
+                .map(|s| s.map(|s| s.value))
+                .collect::<Vec<_>>()
+        })
+    };
+    gate.wait_parked();
+    rt.set(pick, true);
+    assert_eq!(rt.get(q1), Counted(6));
+    assert_eq!(rt.nodes.get(q1.slot()).changed_at(), stamp, "not a cutoff");
+    rt.delete_node(q2);
+    let fresh = rt.create_query(move |_: &Rt| Counted(999));
+    assert_eq!(fresh.slot(), q2.slot(), "the slot is reused");
+    assert_eq!(rt.get(fresh), Counted(999));
+    let clones = NEW_VALUE_CLONES.load(SeqCst);
+    gate.release();
+    assert_eq!(
+        inspector.join().unwrap(),
+        vec![Some(Counted(11)), None, None]
+    );
+    assert_eq!(NEW_VALUE_CLONES.load(SeqCst), clones);
+    assert_eq!(rt.state_of(fresh), NodeState::Clean);
+    assert_eq!(rt.get(fresh), Counted(999));
+}
