@@ -91,7 +91,7 @@ impl<C: MemoCells> CoreRef<C> {
             corrupt(state);
             return t.cold_into(self, rt, key, bag);
         }
-        let Some((deps, reuse)) = walk.seed_deps(state, root) else {
+        let Some((deps, reuse)) = walk.seed_deps(state, root, bag) else {
             state.stats.cold += 1;
             return t.cold_into(self, rt, key, bag);
         };
@@ -321,7 +321,7 @@ impl<C: MemoCells> Walk<'_, C> {
         if self.visits[id].handle.is_some() {
             return;
         }
-        let Some((deps, reuse)) = self.seed_deps(state, id) else {
+        let Some((deps, reuse)) = self.seed_deps(state, id, bag) else {
             if self.cold(state, id, bag) {
                 state.stats.cold += 1;
             }
@@ -353,8 +353,14 @@ impl<C: MemoCells> Walk<'_, C> {
 
     /// An entry's deps as seed deps, with the `Reuse` they allow; `None`
     /// when a dep maps to nothing, so the entry goes cold. Mapped fps are
-    /// read here, after the restore took its base.
-    fn seed_deps(&self, state: &MemoState, id: usize) -> Option<(Vec<SeedDep>, Reuse)> {
+    /// read here, after the restore took its base. The row keys decoded
+    /// to map row deps go to `bag`.
+    fn seed_deps(
+        &self,
+        state: &MemoState,
+        id: usize,
+        bag: &mut Deferred<C>,
+    ) -> Option<(Vec<SeedDep>, Reuse)> {
         let visit = &self.visits[id];
         let entry = visit.entry.as_ref()?;
         let mut deps = Vec::with_capacity(entry.deps.len());
@@ -373,8 +379,10 @@ impl<C: MemoCells> Walk<'_, C> {
                     let rows = {
                         let map = self.core.deps.read();
                         map.rows(collection).map(|rows| rows_of::<C>(rows).clone())
-                    };
-                    rows?.prepare(self.rt, key_bytes)?;
+                    }?;
+                    let prepared = rows.prepare(self.rt, key_bytes, bag);
+                    bag.push(rows);
+                    prepared?;
                 }
                 StoredDep::Input { .. }
                 | StoredDep::Collection { .. }
@@ -399,7 +407,7 @@ impl<C: MemoCells> Walk<'_, C> {
                     });
                 }
                 stored => {
-                    let (handle, same) = map_stored(&map, self.rt, self.core.id, stored)?;
+                    let (handle, same) = map_stored(&map, self.rt, self.core.id, stored, bag)?;
                     unchanged &= same;
                     deps.push(SeedDep {
                         dep: handle,

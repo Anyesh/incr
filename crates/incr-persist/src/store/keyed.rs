@@ -4,6 +4,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use incr_core::persist_hooks::Deferred;
 use incr_core::{
     with_value_code, Cells, DeleteError, ErasedIncr, Incr, IncrCollection, KeyCounts, KeyedChange,
     KeyedCollection, KeyedSpent, Pair, PairOp, Runtime, Value,
@@ -34,21 +35,34 @@ pub(crate) type RowDep = (Vec<u8>, Option<u128>);
 /// fingerprint is the rank of the pair read for its key: the fingerprint
 /// of the bytes that pair was applied from, `None` for a key holding no
 /// row.
+///
+/// Callers hold the memo lock or a `DepIndex` hold, under which a user
+/// `Drop` must not run, so every key a method materialises goes to `bag`.
 pub(crate) trait RowSource<C: Cells>: Send + Sync {
     /// For a version input of this collection, its key's bytes and its
     /// row's fingerprint, or `Ok(None)` when its row is not a logged one;
     /// `None` for any other node.
-    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<RowDep>>>;
+    fn live_row(&self, dep: ErasedIncr, bag: &mut Deferred<C>) -> Option<Result<Option<RowDep>>>;
 
     /// The version input of the key `key_bytes` encode, created if no read
     /// created it; `None` when they do not decode. Takes the version lock,
     /// so not under a `DepIndex` hold.
-    fn prepare(&self, rt: &Runtime<C>, key_bytes: &[u8]) -> Option<ErasedIncr>;
+    fn prepare(
+        &self,
+        rt: &Runtime<C>,
+        key_bytes: &[u8],
+        bag: &mut Deferred<C>,
+    ) -> Option<ErasedIncr>;
 
     /// The version input of the key `key_bytes` encode and whether its
     /// row's fingerprint is `fp`; `None` when it has none or they do not
     /// decode.
-    fn stored_row(&self, key_bytes: &[u8], fp: Option<u128>) -> Option<(ErasedIncr, bool)>;
+    fn stored_row(
+        &self,
+        key_bytes: &[u8],
+        fp: Option<u128>,
+        bag: &mut Deferred<C>,
+    ) -> Option<(ErasedIncr, bool)>;
 }
 
 /// A [`RowSource`] as a `DepIndex` holds it, behind `Any`.
@@ -120,23 +134,41 @@ where
     C: Cells,
     P: Pair<K, V> + PersistValue,
 {
-    fn live_row(&self, dep: ErasedIncr) -> Option<Result<Option<RowDep>>> {
+    fn live_row(&self, dep: ErasedIncr, bag: &mut Deferred<C>) -> Option<Result<Option<RowDep>>> {
         let key = self.keyed.key_of_version(dep)?;
-        let Some(fp) = self.row_fp(&key) else {
-            return Some(Ok(None));
+        let row = match self.row_fp(&key) {
+            Some(fp) => encode(&self.key, &key).map(|bytes| Some((bytes, fp))),
+            None => Ok(None),
         };
-        Some(encode(&self.key, &key).map(|bytes| Some((bytes, fp))))
+        bag.push(key);
+        Some(row)
     }
 
-    fn prepare(&self, rt: &Runtime<C>, key_bytes: &[u8]) -> Option<ErasedIncr> {
+    fn prepare(
+        &self,
+        rt: &Runtime<C>,
+        key_bytes: &[u8],
+        bag: &mut Deferred<C>,
+    ) -> Option<ErasedIncr> {
         let key = self.decode_key(key_bytes)?;
-        Some(self.keyed.version_input_or_create(rt, &key).erase())
+        let handle = self.keyed.version_input_or_create(rt, &key);
+        bag.push(key);
+        Some(handle.erase())
     }
 
-    fn stored_row(&self, key_bytes: &[u8], fp: Option<u128>) -> Option<(ErasedIncr, bool)> {
+    fn stored_row(
+        &self,
+        key_bytes: &[u8],
+        fp: Option<u128>,
+        bag: &mut Deferred<C>,
+    ) -> Option<(ErasedIncr, bool)> {
         let key = self.decode_key(key_bytes)?;
-        let handle = self.keyed.version_input(&key)?;
-        Some((handle.erase(), self.row_fp(&key) == Some(fp)))
+        let row = self
+            .keyed
+            .version_input(&key)
+            .map(|handle| (handle.erase(), self.row_fp(&key) == Some(fp)));
+        bag.push(key);
+        row
     }
 }
 

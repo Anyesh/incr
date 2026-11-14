@@ -62,6 +62,7 @@ impl<C: MemoCells> CoreRef<C> {
             started: false,
             saved: false,
         };
+        let mut bag = Deferred::<C>::new();
         let (snaps, clean, moved) = {
             let mut state = self.lock_memo();
             // Dead nodes never match a live handle, so pruning them can
@@ -81,7 +82,7 @@ impl<C: MemoCells> CoreRef<C> {
             let mut snaps = Vec::new();
             for record in &dirty {
                 let table = &self.tables[record.table as usize];
-                snaps.extend(table.inspect_dirty(rt, &map, self.id, record));
+                snaps.extend(table.inspect_dirty(rt, &map, self.id, record, &mut bag));
             }
             // A node that landed again since its `inspect`, which only a
             // write around the store allows, may have dependents inspected
@@ -137,6 +138,7 @@ impl<C: MemoCells> CoreRef<C> {
             (snaps, clean, moved)
         };
         drop(moved);
+        bag.drain(rt);
         let mut mismatches = Vec::new();
         let index = self.index();
         let stored = |table: u32, key: &[u8], fp: u128| {

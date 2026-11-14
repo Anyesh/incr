@@ -148,6 +148,7 @@ pub(crate) trait ErasedTable<C: MemoCells> {
         map: &DepMap,
         memo: u64,
         record: &Record,
+        bag: &mut Deferred<C>,
     ) -> Option<Snap>;
 }
 
@@ -320,6 +321,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         map: &DepMap,
         memo: u64,
         record: &Record,
+        bag: &mut Deferred<C>,
     ) -> Option<Snap> {
         let typed = rt.typed_handle::<T>(record.handle)?;
         let seen = inspect(rt, typed)?;
@@ -328,7 +330,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         let deps = seen
             .deps
             .iter()
-            .map(|&d| map_live(map, rt, memo, d))
+            .map(|&d| map_live(map, rt, memo, d, bag))
             .collect();
         Some(Snap {
             table: self.index,

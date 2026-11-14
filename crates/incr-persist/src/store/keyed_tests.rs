@@ -1,7 +1,9 @@
 use std::cell::{Cell, RefCell};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use incr_core::lock_order::{acquire, LockKind};
 use incr_core::PairOp;
 use serde::{Deserialize, Serialize};
 
@@ -467,7 +469,8 @@ thread_local! {
 }
 
 /// Counts its drops while an index is watched, and those that run while
-/// the watched index is held for writing.
+/// the watched index is held, for reading or writing, or under the memo
+/// lock or any lock the debug lock-order checker ranks after it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Watched(String);
 
@@ -475,11 +478,17 @@ impl Drop for Watched {
     fn drop(&mut self) {
         WATCHED.with(|watched| {
             if let Some(deps) = watched.borrow().as_ref() {
-                let (all, held) = DROPS.get();
-                DROPS.set((all + 1, held + u32::from(deps.is_held())));
+                let under_memo = catch_unwind(AssertUnwindSafe(|| drop(acquire(LockKind::Memo))));
+                let held = deps.is_held() || under_memo.is_err();
+                let (all, under) = DROPS.get();
+                DROPS.set((all + 1, under + u32::from(held)));
             }
         });
     }
+}
+
+fn watch(deps: Option<Arc<DepIndex>>) {
+    WATCHED.with(|watched| *watched.borrow_mut() = deps);
 }
 
 fn w(value: &str) -> Watched {
@@ -496,7 +505,7 @@ fn user_drops_run_after_the_dep_index_hold<C: Cells>() {
     a.upsert(&ka, 2, w("b")).unwrap();
     let b = open::<C, _>(log.clone());
     let deps = b.open_dep_index().unwrap();
-    WATCHED.with(|watched| *watched.borrow_mut() = Some(Arc::clone(&deps)));
+    watch(Some(Arc::clone(&deps)));
     DROPS.set((0, 0));
 
     let kb = b
@@ -533,7 +542,7 @@ fn user_drops_run_after_the_dep_index_hold<C: Cells>() {
     }
     assert!(DROPS.get().0 > reclaimed);
 
-    WATCHED.with(|watched| *watched.borrow_mut() = None);
+    watch(None);
     let (all, held) = DROPS.get();
     assert!(all > 0, "the writes dropped no Watched value");
     assert_eq!(held, 0, "{held} of {all} drops ran under the hold");
@@ -1027,8 +1036,64 @@ macro_rules! memo_local_and_shared {
 }
 
 memo_local_and_shared!(
+    row_dep_key_drops_run_outside_every_hold,
     row_deps_verify_after_reopen_while_rows_match,
     a_changed_row_reruns_and_a_removed_key_runs_after_reopen,
     a_key_read_before_the_memo_opens_still_maps,
     a_row_restored_in_a_scope_at_the_default_rank_does_not_checkpoint,
 );
+
+/// A memo whose table `price` reads row `k` of the keyed collection `kw`,
+/// keyed by `Watched`, through `get_key`.
+struct WatchedMemo<C: MemoCells> {
+    kw: PersistedKeyed<Watched, String, C, (Watched, String)>,
+    memo: Memo<C, MemoryBackend>,
+    price: MemoTable<u32, Option<String>>,
+}
+
+fn watched_memo<C: MemoCells>(
+    store: &Arc<Store<C, MemoryBackend>>,
+    memo: &MemoryMemo,
+) -> WatchedMemo<C> {
+    let kw = store
+        .keyed_collection::<Watched, String, (Watched, String)>("w")
+        .unwrap();
+    let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0x57)));
+    let price = builder.table::<u32, Option<String>>("price", 1);
+    let captured = Captured(kw.clone());
+    builder.define(price, move |ctx, k| {
+        captured.get().get_key(ctx.rt(), &w(&k.to_string()))
+    });
+    let memo = builder.open(store, memo.clone()).unwrap();
+    WatchedMemo { kw, memo, price }
+}
+
+/// A key's `Drop` may take the store mutex, ranked before the memo lock
+/// and the `DepIndex`, so mapping a row dep at checkpoint and restore
+/// drops no key under either.
+fn row_dep_key_drops_run_outside_every_hold<C: MemoCells>() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    DROPS.set((0, 0));
+    {
+        let store = Arc::new(open::<C, _>(log.clone()));
+        let WatchedMemo { kw, memo: m, price } = watched_memo(&store, &memo);
+        store.upsert(&kw, w("1"), s("a")).unwrap();
+        let q = m.get_or_insert(price, 1);
+        assert_eq!(m.runtime().get(q), Some(s("a")));
+        watch(Some(store.open_dep_index().unwrap()));
+        assert_eq!(m.checkpoint().unwrap().written, 1);
+        watch(None);
+    }
+    let checkpointed = DROPS.get().0;
+    assert!(checkpointed > 0, "the checkpoint dropped no key");
+    let store = Arc::new(open::<C, _>(log.clone()));
+    let WatchedMemo { memo: m, price, .. } = watched_memo(&store, &memo);
+    watch(Some(store.open_dep_index().unwrap()));
+    let q = m.get_or_insert(price, 1);
+    assert_eq!(m.runtime().get(q), Some(s("a")));
+    watch(None);
+    assert_eq!(m.stats().reused, 1);
+    let (all, held) = DROPS.get();
+    assert!(all > checkpointed, "the restore dropped no key");
+    assert_eq!(held, 0, "{held} of {all} key drops ran under a hold");
+}
