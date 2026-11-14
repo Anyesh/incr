@@ -30,10 +30,7 @@ macro_rules! both {
     };
 }
 
-both!(
-    checkpoint_if_due_runs_once_the_trigger_is_reached,
-    checkpoint_if_due_without_a_trigger_does_nothing,
-);
+both!(checkpoint_if_due_without_a_trigger_does_nothing);
 
 const BUILD: u128 = 0x7e1;
 
@@ -74,8 +71,11 @@ impl<C: MemoCells> World<C> {
     }
 }
 
-fn checkpoint_if_due_runs_once_the_trigger_is_reached<C: MemoCells>() {
-    let w = World::<C>::open(options().checkpoint_after_entries(2));
+/// Local only: on Shared the trigger also wakes the automatic thread,
+/// which races these checkpoints.
+#[test]
+fn checkpoint_if_due_runs_once_the_trigger_is_reached() {
+    let w = World::<Local>::open(options().checkpoint_after_entries(2));
     w.read(1);
     assert!(w.memo.checkpoint_if_due().unwrap().is_none());
     w.read(2);
