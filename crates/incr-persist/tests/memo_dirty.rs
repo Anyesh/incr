@@ -41,6 +41,7 @@ both!(
     an_unsaveable_entry_stays_dirty_and_is_counted,
     evicted_entries_are_dirtied_again_and_a_reopen_recomputes_them,
     a_failed_checkpoint_leaves_its_entries_unsaved,
+    a_checkpoint_with_nothing_fresh_writes_nothing,
 );
 
 const BUILD: u128 = 0xd1;
@@ -314,7 +315,7 @@ fn an_unsaveable_entry_stays_dirty_and_is_counted<C: MemoCells>() {
     let stats = w.memo.stats();
     assert_eq!((stats.unsaveable, stats.unsaved_entries), (1, 0));
     assert_eq!(
-        encodes(|| assert_eq!(w.memo.checkpoint().unwrap().written, 1)),
+        encodes(|| assert!(w.memo.checkpoint().unwrap().unchanged)),
         1
     );
     let stats = w.memo.stats();
@@ -371,4 +372,33 @@ fn a_failed_checkpoint_leaves_its_entries_unsaved<C: MemoCells>() {
     assert_eq!(w.memo.stats().unsaved_entries, 3);
     assert_eq!(w.memo.checkpoint().unwrap().written, 3);
     assert_eq!(w.memo.stats().unsaved_entries, 0);
+}
+
+fn generation_id(backends: &Backends) -> Option<u64> {
+    MemoBackend::load(&backends.memo)
+        .unwrap()
+        .map(|generation| generation.id().0)
+}
+
+fn a_checkpoint_with_nothing_fresh_writes_nothing<C: MemoCells>() {
+    let backends = Backends::new();
+    let w = Leaves::<C>::open(&backends, options());
+    let done = w.memo.checkpoint().unwrap();
+    assert!(done.unchanged);
+    assert_eq!(generation_id(&backends), None);
+    w.read(1);
+    assert!(!w.memo.checkpoint().unwrap().unchanged);
+    let id = generation_id(&backends);
+    let done = w.memo.checkpoint().unwrap();
+    assert!(done.unchanged);
+    assert_eq!((done.written, done.merged), (0, 0));
+    w.memo.runtime().set(w.x.handle(), 5);
+    w.read(0);
+    assert!(w.memo.checkpoint().unwrap().unchanged);
+    let stats = w.memo.stats();
+    assert_eq!(
+        (stats.checkpoints, stats.unsaveable, stats.entries),
+        (1, 1, 1)
+    );
+    assert_eq!(generation_id(&backends), id);
 }

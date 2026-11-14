@@ -510,6 +510,8 @@ fn a_checkpoint_removes_the_generation_it_replaces<C: MemoCells>() {
         .read_entry(first.id(), &item)
         .unwrap()
         .is_some());
+    w.store.set(w.x, 2).unwrap();
+    assert_eq!(read(&w, 2), 4);
     w.memo.checkpoint().unwrap();
     let second = backends.memo.load().unwrap().unwrap();
     assert_ne!(second.id(), first.id());

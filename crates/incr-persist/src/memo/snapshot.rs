@@ -121,6 +121,21 @@ impl<C: MemoCells> CoreRef<C> {
         let found = fresh(snaps, &mut keys, &clean, &mut mismatches);
         drop((keys, clean));
         let snapshot = started.elapsed();
+        if found.entries.is_empty() {
+            attempt.saved = true;
+            let mut state = self.lock_memo();
+            for mismatch in mismatches {
+                state.record_mismatch(mismatch);
+            }
+            state.stats.unsaveable = found.unsaveable;
+            state.stats.evicted_last_checkpoint = 0;
+            let mut stats = CheckpointStats {
+                unchanged: true,
+                ..CheckpointStats::default()
+            };
+            stats.times.snapshot = snapshot;
+            return Ok(stats);
+        }
         let done = self.backend.checkpoint(CheckpointInput {
             build: self.build,
             tables: self.catalog.clone(),

@@ -199,7 +199,10 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
 
     /// Writes every live entry whose deps all map into the next
     /// generation, merged with the current one and evicted down to
-    /// `max_bytes`. `Err(Busy)` if another handle is checkpointing.
+    /// `max_bytes`. Writes nothing, and reports
+    /// [`CheckpointStats::unchanged`], when no entry computed since it was
+    /// last saved can be saved. `Err(Busy)` if another handle is
+    /// checkpointing.
     pub fn checkpoint(&self) -> Result<CheckpointStats> {
         self.core.checkpoint(self.runtime())
     }

@@ -44,6 +44,9 @@ pub struct CheckpointStats {
     /// Entries dropped because their frame would exceed the frame length
     /// limit, each with every entry that reads it transitively.
     pub oversized: usize,
+    /// No entry was fresh, so `Memo::checkpoint` wrote nothing: the
+    /// current generation stays and every count is zero.
+    pub unchanged: bool,
     pub times: CheckpointTimes,
 }
 
