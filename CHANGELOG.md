@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.9] - Unreleased
+
+### Fixed
+
+- **A value's `Drop` that calls its store no longer hangs.** The values a store call displaces, removes, decodes or clones (input values on Local, defaults, collection elements, keyed rows and keys, the values a `PendingWrite` or batch captured) now drop after the store releases its lock, on every write, apply, refresh, reconcile, checkpoint and undeclare path. Before, they dropped under the lock, so a row whose `Drop` (or Python `__del__`) called the same store deadlocked. On Shared they drop inside the binding's value-scope hold, so Python decrefs run attached.
+- **A store call from inside one of its own calls returns `Error::Reentrant`** (Python `RuntimeError`) instead of deadlocking, in release builds too. This covers a subscriber calling its store and a `Drop` the engine runs under the store's lock (see Known limitations). A staged batch or unlogged scope dropped on such a thread poisons the store through the call that holds it.
+
+### Changed
+
+- **A memo checkpoint's value-scope holds are bounded and skipped when idle.** Mapping a checkpoint's row dependencies runs at most 256 deps per hold, as encoding and inspecting already did, so on Shared one GIL hold no longer covers every row dependency of the checkpoint. A batch whose entries are all Dirty, or whose dependencies include no keyed row, takes no hold for inspecting or mapping them.
+- **Intended change: a value method that calls its store under the store's lock gets `Error::Reentrant`.** A `Hash`, `Eq`, `Clone` or codec method that calls the store whose lock is running it (an element's `__hash__` declaring an input during an insert) now gets the error, and the outer call goes on; before, it panicked with the value-code message. Value code calling a store from anywhere else still panics as before.
+- **`ValueScope::holding` also wraps the drop of a store call's spent values.** A `Drop` that calls a store from inside `hold` must first release what `hold` took, as the Python bindings release the GIL.
+
+### Known limitations
+
+- The known limitations listed under 0.2.0-beta.8 still apply.
+- **Some values may still drop under a store lock.** The values of the nodes `undeclare` deletes drop inside the engine's delete, and on Shared an input's displaced value is reclaimed by the engine later, on any thread, possibly inside another store call; values decoded before a failed write also drop in place. A store call from such a `Drop` into the store whose lock is held returns `Error::Reentrant` instead of hanging.
+
 ## [0.2.0-beta.8] - 2026-11-15
 
 ### Added
