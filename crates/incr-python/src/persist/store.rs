@@ -30,7 +30,7 @@ pub(super) type PyPersistedCollection = PersistedCollection<PyValue, Local>;
 /// binding must keep direct writes off.
 pub(crate) struct StoreCore {
     pub(super) store: Arc<Store<Local, PyBackend>>,
-    pub(super) registry: Rc<Registry>,
+    pub(super) registry: Arc<Registry>,
     pub(super) build_id: u128,
     pub(super) memo_builder: RefCell<Option<MemoBuilder<Local>>>,
     pub(super) memo_decls: RefCell<Vec<super::memo::MemoDecl>>,
@@ -181,11 +181,12 @@ impl PyStore {
                 "auto_checkpoint_records must be a positive count or None",
             ));
         }
+        let registry = Arc::new(Registry::default());
         let options = Options {
             durability: durability_of(durability)?,
             auto_checkpoint_records,
+            value_scope: Some(registry.value_scope()),
         };
-        let registry = Rc::new(Registry::default());
         let store = registry.run(py, || Store::open(PyBackend::new(backend), options))?;
         #[expect(
             clippy::arc_with_non_send_sync,

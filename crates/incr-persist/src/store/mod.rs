@@ -11,7 +11,8 @@ use incr_core::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, SnapshotId};
+use crate::value_context::{enter_value_scope, ValueScopeGuard};
+use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, SnapshotId, ValueScope};
 
 use binding::{decode, encode, Binding, InputBinding};
 use dep_index::{fp_of, DepFp, DepIndex};
@@ -82,6 +83,12 @@ pub struct Options {
     /// none falls between its records, and its commit never triggers one.
     /// `None`, the default, compacts only on explicit calls.
     pub auto_checkpoint_records: Option<u64>,
+    /// The scope this store's value code finds through
+    /// [`current_value_scope`](crate::current_value_scope): it is current
+    /// on the thread holding the store's lock, so encodes and decodes the
+    /// store runs, on any thread, see it. Value code the caller runs
+    /// outside a store call enters it with [`Store::enter_value_scope`].
+    pub value_scope: Option<ValueScope>,
 }
 
 /// What [`Store::stats`] reports.
@@ -199,6 +206,7 @@ pub struct Store<C: Cells, B: Backend> {
 struct Locked<'a, C: Cells> {
     guard: Ordered<MutexGuard<'a, State<C>>>,
     _routing: RoutingHold<'a, C>,
+    _scope: Option<ValueScopeGuard>,
 }
 
 impl<C: Cells> std::ops::Deref for Locked<'_, C> {
@@ -475,6 +483,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         state.deps = Some(Arc::clone(&deps));
         Ok(deps)
+    }
+
+    /// Makes [`Options::value_scope`] current on this thread until the
+    /// guard drops; `None` when the store has no scope.
+    pub fn enter_value_scope(&self) -> Option<ValueScopeGuard> {
+        self.options.value_scope.clone().map(enter_value_scope)
     }
 
     /// The runtime the store keeps in sync with the log. Create queries and
@@ -954,6 +968,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         Ok(Locked {
             guard,
             _routing: routing,
+            _scope: self.enter_value_scope(),
         })
     }
 

@@ -517,3 +517,67 @@ fn a_shared_store_is_usable_across_threads() {
         assert_eq!(reopened.runtime().get(k.handle()), 50);
     }
 }
+
+struct ScopeMarker;
+
+static SCOPED_ENCODES: AtomicUsize = AtomicUsize::new(0);
+static UNSCOPED_ENCODES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, PartialEq)]
+struct ScopeProbe(u32);
+
+impl ScopeProbe {
+    fn note() {
+        let scoped = incr_persist::current_value_scope()
+            .and_then(|scope| scope.downcast::<ScopeMarker>())
+            .is_some();
+        let counter = if scoped {
+            &SCOPED_ENCODES
+        } else {
+            &UNSCOPED_ENCODES
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl serde::Serialize for ScopeProbe {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        ScopeProbe::note();
+        s.serialize_u32(self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ScopeProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        ScopeProbe::note();
+        u32::deserialize(d).map(ScopeProbe)
+    }
+}
+
+fn scoped_options() -> Options {
+    Options {
+        value_scope: Some(incr_persist::ValueScope::new(Arc::new(ScopeMarker))),
+        ..Options::default()
+    }
+}
+
+#[test]
+fn value_code_sees_the_store_scope_on_every_thread_that_writes() {
+    let log = MemoryBackend::new();
+    let store = Arc::new(Store::<Shared, _>::open(log.clone(), scoped_options()).unwrap());
+    let input = store.input("probe", ScopeProbe(0)).unwrap();
+    thread::scope(|s| {
+        for value in 1..=3 {
+            let store = Arc::clone(&store);
+            s.spawn(move || store.set(input, ScopeProbe(value)).unwrap());
+        }
+    });
+    let reopened = Store::<Local, _>::open(log, scoped_options()).unwrap();
+    let probe = reopened.input("probe", ScopeProbe(0)).unwrap();
+    assert!(reopened.runtime().get(probe.handle()).0 > 0);
+    assert!(SCOPED_ENCODES.load(Ordering::SeqCst) > 0);
+    assert_eq!(UNSCOPED_ENCODES.load(Ordering::SeqCst), 0);
+    assert!(incr_persist::current_value_scope().is_none());
+    let _entered = reopened.enter_value_scope().unwrap();
+    assert!(incr_persist::current_value_scope().is_some());
+}

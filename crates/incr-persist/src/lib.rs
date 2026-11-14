@@ -39,6 +39,6 @@ pub use store::{
     UnloggedScope,
 };
 pub use value_context::{
-    current_value_context, enter_value_context, EncodeMismatch, MemoPart, ValueContext,
-    ValueContextGuard,
+    current_value_context, current_value_scope, enter_value_context, enter_value_scope,
+    EncodeMismatch, MemoPart, ValueContext, ValueContextGuard, ValueScope, ValueScopeGuard,
 };

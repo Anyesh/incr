@@ -1,4 +1,7 @@
+use std::any::Any;
 use std::cell::RefCell;
+use std::fmt;
+use std::sync::Arc;
 
 /// Which slot a user value is being encoded or decoded for, visible to its
 /// `Serialize` and `Deserialize` impls through [`current_value_context`].
@@ -51,6 +54,58 @@ impl Drop for ValueContextGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
         let _ = CURRENT.try_with(|current| current.replace(previous));
+    }
+}
+
+/// A binding's own state for its value code, such as a table of codecs,
+/// that a [`Store`](crate::Store) makes current through
+/// [`current_value_scope`] while it holds its lock, on whichever thread
+/// takes it. Set it in [`Options::value_scope`](crate::Options::value_scope).
+#[derive(Clone)]
+pub struct ValueScope(Arc<dyn Any + Send + Sync>);
+
+impl ValueScope {
+    pub fn new<T: Any + Send + Sync>(state: Arc<T>) -> Self {
+        ValueScope(state)
+    }
+
+    /// The state this scope was created with, if it is a `T`.
+    pub fn downcast<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        Arc::clone(&self.0).downcast().ok()
+    }
+}
+
+impl fmt::Debug for ValueScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ValueScope(..)")
+    }
+}
+
+thread_local! {
+    static SCOPE: RefCell<Option<ValueScope>> = const { RefCell::new(None) };
+}
+
+/// The value scope entered on this thread, if any.
+pub fn current_value_scope() -> Option<ValueScope> {
+    SCOPE.with(|scope| scope.borrow().clone())
+}
+
+/// Makes `scope` current on this thread until dropped, then restores the
+/// previous one, also when unwinding.
+pub fn enter_value_scope(scope: ValueScope) -> ValueScopeGuard {
+    let previous = SCOPE.with(|current| current.replace(Some(scope)));
+    ValueScopeGuard { previous }
+}
+
+#[must_use = "the scope ends when the guard is dropped"]
+pub struct ValueScopeGuard {
+    previous: Option<ValueScope>,
+}
+
+impl Drop for ValueScopeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = SCOPE.try_with(|current| current.replace(previous));
     }
 }
 

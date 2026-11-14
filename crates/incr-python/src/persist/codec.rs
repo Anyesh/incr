@@ -19,11 +19,14 @@
 //! through the user codec, so a `row`, `key`, `reason` or `value` is
 //! whatever the codec handles.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
 
-use incr_persist::{current_value_context, MemoPart, ValueContext};
+use incr_persist::{
+    current_value_context, current_value_scope, enter_value_scope, MemoPart, ValueContext,
+    ValueScope,
+};
 use incr_python_protocol::notready::{
     self, PyIncomplete, PyLookupFailed, PyPending, PyUnavailable,
 };
@@ -73,32 +76,34 @@ impl Slot {
     }
 }
 
-/// One store's codecs, and the exception a codec raised during the call in
-/// progress, which incr-persist can only report as a bare serde error.
+/// One store's codecs, and per thread the exception a codec raised during
+/// the call in progress there, which incr-persist can only report as a bare
+/// serde error. The store finds it through its value scope on any thread.
+/// No Python runs under either lock.
 #[derive(Default)]
 pub(crate) struct Registry {
-    codecs: RefCell<HashMap<Slot, Py<PyAny>>>,
-    failure: RefCell<Option<PyErr>>,
-}
-
-thread_local! {
-    static ACTIVE: RefCell<Option<Rc<Registry>>> = const { RefCell::new(None) };
-}
-
-struct Restore(Option<Rc<Registry>>);
-
-impl Drop for Restore {
-    fn drop(&mut self) {
-        let previous = self.0.take();
-        let _ = ACTIVE.try_with(|active| active.replace(previous));
-    }
+    codecs: Mutex<HashMap<Slot, Py<PyAny>>>,
+    failures: Mutex<HashMap<ThreadId, PyErr>>,
 }
 
 impl Registry {
+    /// The value scope a store opened with these codecs carries.
+    pub(crate) fn value_scope(self: &Arc<Self>) -> ValueScope {
+        ValueScope::new(Arc::clone(self))
+    }
+
+    fn codecs(&self) -> MutexGuard<'_, HashMap<Slot, Py<PyAny>>> {
+        self.codecs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn failures(&self) -> MutexGuard<'_, HashMap<ThreadId, PyErr>> {
+        self.failures.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Registers `codec` for `slot`. Returns whether it is new: a slot keeps
     /// the codec it was declared with, and a different one is an error.
     pub(crate) fn register(&self, slot: Slot, codec: Py<PyAny>) -> PyResult<bool> {
-        let mut codecs = self.codecs.borrow_mut();
+        let mut codecs = self.codecs();
         match codecs.get(&slot) {
             Some(held) if held.is(&codec) => Ok(false),
             Some(_) => Err(PyValueError::new_err(format!(
@@ -113,45 +118,49 @@ impl Registry {
     }
 
     pub(crate) fn unregister(&self, slot: &Slot) {
-        self.codecs.borrow_mut().remove(slot);
+        let removed = self.codecs().remove(slot);
+        drop(removed);
     }
 
     pub(crate) fn is_registered(&self, slot: &Slot) -> bool {
-        self.codecs.borrow().contains_key(slot)
+        self.codecs().contains_key(slot)
     }
 
     /// Runs a store call with this registry's codecs active. A failure is
-    /// raised as the exception a codec raised during it, else through
-    /// `describe`.
+    /// raised as the exception a codec raised during it on this thread,
+    /// else through `describe`.
     pub(crate) fn run<R>(
-        self: &Rc<Self>,
+        self: &Arc<Self>,
         py: Python<'_>,
         f: impl FnOnce() -> incr_persist::Result<R>,
     ) -> PyResult<R> {
-        self.failure.borrow_mut().take();
+        drop(self.take_failure());
         let result = self.scoped(f);
-        let failure = self.failure.borrow_mut().take();
+        let failure = self.take_failure();
         match result {
             Ok(value) => Ok(value),
             Err(error) => Err(failure.unwrap_or_else(|| super::persist_error(py, error))),
         }
     }
 
-    /// Runs `f` with this registry's codecs active.
-    pub(crate) fn scoped<R>(self: &Rc<Self>, f: impl FnOnce() -> R) -> R {
-        let _restore = Restore(ACTIVE.with(|active| active.replace(Some(Rc::clone(self)))));
+    /// Runs `f` with this registry's codecs active on this thread.
+    pub(crate) fn scoped<R>(self: &Arc<Self>, f: impl FnOnce() -> R) -> R {
+        let _scope = enter_value_scope(self.value_scope());
         f()
     }
 
-    /// The exception a codec raised since the last [`Self::run`] or call
-    /// to this, for a decode that went through serde directly.
+    /// The exception a codec raised on this thread since the last
+    /// [`Self::run`] or call to this, for a decode that went through serde
+    /// directly.
     pub(crate) fn take_failure(&self) -> Option<PyErr> {
-        self.failure.borrow_mut().take()
+        self.failures().remove(&std::thread::current().id())
     }
 
     fn stash(&self, err: PyErr) -> String {
         let message = Python::attach(|py| err.value(py).to_string());
-        self.failure.borrow_mut().get_or_insert(err);
+        self.failures()
+            .entry(std::thread::current().id())
+            .or_insert(err);
         message
     }
 
@@ -162,19 +171,19 @@ impl Registry {
             ))
         })?;
         let slot = Slot::of(context);
-        match self.codecs.borrow().get(&slot) {
-            Some(codec) => Ok(codec.clone_ref(py)),
-            None => Err(self.stash(PersistError::new_err(format!(
+        let codec = self.codecs().get(&slot).map(|codec| codec.clone_ref(py));
+        codec.ok_or_else(|| {
+            self.stash(PersistError::new_err(format!(
                 "no codec is registered for {}",
                 slot.describe()
-            )))),
-        }
+            )))
+        })
     }
 }
 
-fn active() -> Result<Rc<Registry>, String> {
-    ACTIVE
-        .with(|active| active.borrow().clone())
+fn active() -> Result<Arc<Registry>, String> {
+    current_value_scope()
+        .and_then(|scope| scope.downcast::<Registry>())
         .ok_or_else(|| "a persisted value was used outside a store call".to_owned())
 }
 
