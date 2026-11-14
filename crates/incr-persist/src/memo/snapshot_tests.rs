@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::KEYS_TOUCHED;
 use crate::memo::{BuildId, MemoBuilder, MemoOptions, MemoryMemo};
-use crate::{Local, MemoryBackend, Options, Store};
+use crate::{MemoryBackend, Options, Shared, Store};
 
 /// `top(1) = leaf(1) + y` over 200 stored leaves `leaf(k) = k`. After `y`
 /// moves only `top(1)` is dirty, with one clean dep: the checkpoint reads
@@ -10,7 +10,7 @@ use crate::{Local, MemoryBackend, Options, Store};
 #[test]
 fn a_checkpoint_touches_only_the_keys_of_dirty_entries_and_their_clean_deps() {
     let store =
-        Arc::new(Store::<Local, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+        Arc::new(Store::<Shared, _>::open(MemoryBackend::new(), Options::default()).unwrap());
     let y = store.input("y", 10_u64).unwrap();
     let yh = y.handle();
     let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0x5a)));

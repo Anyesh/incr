@@ -248,6 +248,10 @@ struct Found {
     unsaveable: u64,
 }
 
+/// The base's value bytes for a live table and key, if they have the
+/// given fp.
+type StoredAt<'a> = dyn Fn(u32, &[u8], u128) -> Option<Vec<u8>> + 'a;
+
 /// The live entry behind a [`Found::entries`] entry.
 struct Origin {
     table: u32,
@@ -270,7 +274,7 @@ struct Origin {
 fn fresh(
     snaps: Vec<Snap>,
     clean: &HashMap<ErasedIncr, Clean>,
-    stored: &dyn Fn(u32, &[u8], u128) -> Option<Vec<u8>>,
+    stored: &StoredAt<'_>,
     mismatches: &mut Vec<EncodeMismatch>,
 ) -> Found {
     let mut note = |r: Result<Vec<u8>, EncodeMismatch>| match r {
