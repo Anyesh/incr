@@ -567,15 +567,25 @@ where
         drop(core.registry().take_failure());
         let registry = core.registry();
         let task = carry::<B, _>(memo);
-        let done = B::write(py, core.store(), move |_, _| {
-            registry.scoped(|| checkpoint(task.into_inner()))
+        let (done, mismatches) = B::write(py, core.store(), move |_, _| {
+            registry.scoped(|| {
+                let memo = task.into_inner();
+                let done = checkpoint(memo);
+                // Takes the memo lock, which a Shared checkpoint thread holds
+                // while it needs the GIL: never with the GIL held.
+                let mismatches = if done.is_ok() {
+                    memo.take_encode_mismatches()
+                } else {
+                    Vec::new()
+                };
+                (done, mismatches)
+            })
         })?;
         let cause = core.registry().take_failure();
         let stats = done.map_err(|error| crate::persist_error::<B::Exceptions>(py, error))?;
         if stats.is_some() {
             self.auto().retry_above = None;
         }
-        let mismatches = memo.take_encode_mismatches();
         if !mismatches.is_empty() {
             let tables = mismatches
                 .into_iter()
