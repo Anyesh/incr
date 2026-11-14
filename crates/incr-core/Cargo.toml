@@ -39,6 +39,10 @@ name = "graph"
 harness = false
 
 [[bench]]
+name = "compute_stats"
+harness = false
+
+[[bench]]
 name = "icount"
 harness = false
 
