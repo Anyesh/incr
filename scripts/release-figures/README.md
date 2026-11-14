@@ -46,3 +46,17 @@ The pure-form row runs as one gh-cmd line, `pure 1.96.1 bash scripts/release-fig
 ## Last run
 
 gh-cmd 73362faa-370c46 ran `rerun.sh` (kit at 73362faa1) on release 8e1a2f8ab against beta.5 c61be873c and main b9f0d0bf3, 3 rounds on one runner (1000018649), and every probe line in the CHANGELOG takes its figures from it; the table rows above give the values. `grid_memory` printed FIG-MISSING there, since 8e1a2f8ab predates it; its values come from gh-cmd 73362faa-a0bfc5 on 73362faa1 (t11 line), and `memory_ceiling` gave 250.09 B per pair on both. Earlier runs, kept for the cross-runner spread: 050fc3f0-370c46 (runner 1000018097) and b27f8617-370c46 (runner 1000022061) on the same release tree gave 54 to 56 ms and 75 to 78 ms for the 8k second read that this run gives 76 to 79 ms, so absolute times move by runner while the ratios to the comparison tree hold. The freeze rerun on the final release sha replaces every figure again.
+
+## Round 2 harnesses (0.2.0-beta.8)
+
+These run on a quiet machine at the full sizes below; the criterion benches also take `-- --quick` for a smoke run. Run each on the release sha with `CARGO_TARGET_DIR` set and `nice`. The file backends write under the workspace `target/` (or `INCR_PERSIST_BENCH_DIR`), never a tmpfs `/tmp`.
+
+| Request | Command | Size variables (default is the full size) |
+|---|---|---|
+| R10 reopen of a memo with Row deps, by step (`store_open`, `memo_open`, `first_reads`, `total`) | `cargo bench -p incr-persist --bench memo_reopen` | `INCR_REOPEN_ENTRIES` (240000) |
+| R11 log checkpoint stall (`Store::checkpoint` reports no per-step times, so one total; `reopen` on the memory backend; peak RSS printed) | `cargo bench -p incr-persist --bench log_checkpoint` | `INCR_LOG_CKPT_BYTES` (1073741824), `INCR_LOG_CKPT_VALUE` (1000), `INCR_LOG_CKPT_DIRTY` (1000) |
+| R5 compute stats and tracing overhead (off, stats, trace) on a chain and a fan-out | `cargo bench -p incr-core --bench compute_stats` | `INCR_STATS_CHAIN` (1000), `INCR_STATS_FANOUT` (1000) |
+| R7 `graph_summary` at 1M nodes | `cargo bench -p incr-core --bench graph_summary` | `INCR_SUMMARY_NODES` (1000000), `INCR_SUMMARY_GROUPS` (20) |
+| End to end per package (240k keys, on_write units, reopen, stats; four reader threads on `incr_concurrent`) | `python examples/python/mcs_round2_e2e.py --package incr` and `--package incr_concurrent`, after `maturin develop --release` of `crates/incr-python` and `crates/incr-concurrent-python` | `--keys` (240000), `--units` (20), `--per-unit` (5), `--readers` (4) |
+
+The R3 memo checkpoint stall at 1 GiB is `crates/incr-persist/benches/memo_stall.rs` (`INCR_MEMO_STALL_BYTES`, `INCR_MEMO_STALL_VALUE`, `INCR_MEMO_STALL_DIRTY`).
