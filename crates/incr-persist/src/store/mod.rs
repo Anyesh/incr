@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::value_context::{enter_value_scope, ValueScopeGuard};
 use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, SnapshotId, ValueScope};
 
+use after_lock::{AfterLock, Drained, Holder, HolderMark};
 use binding::{decode, encode, Binding, InputBinding};
 use dep_index::{fp_of, DepFp, DepIndex};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
@@ -23,12 +24,16 @@ pub use keyed::{PendingWrite, PersistedKeyed};
 pub use scope::UnloggedScope;
 pub use staged::StagedBatch;
 
+mod after_lock;
 mod binding;
 mod collection;
 pub(crate) mod dep_index;
 #[cfg(test)]
 #[path = "dep_index_tests.rs"]
 mod dep_index_tests;
+#[cfg(test)]
+#[path = "drop_tests.rs"]
+mod drop_tests;
 pub(crate) mod keyed;
 #[cfg(test)]
 #[path = "keyed_tests.rs"]
@@ -187,6 +192,14 @@ pub struct Batch<'s, C: Cells, B: Backend> {
 /// that call may run under the store's own lock. Either call panics, in
 /// release builds too, before the store's lock is requested.
 ///
+/// A value's `Drop` may call the store. The values a store call displaces,
+/// decodes or clones drop after it releases its lock. Where the engine
+/// decides when a value drops (a node's values deleted by
+/// [`Store::undeclare`], and on `Shared` an input's displaced value, which
+/// the engine reclaims later on any thread), the `Drop` may run inside a
+/// store call; a call into that same store from it on that thread returns
+/// [`Error::Reentrant`] instead of deadlocking.
+///
 /// A `Store<Local, _>` is confined to its thread like its runtime:
 ///
 /// ```compile_fail
@@ -198,15 +211,29 @@ pub struct Store<C: Cells, B: Backend> {
     backend: B,
     options: Options,
     state: Mutex<State<C>>,
+    holder: Holder,
 }
 
 /// The store mutex with a routing hold taken before it. Fields drop in
-/// declaration order, so the mutex is released before the hold routes
-/// what the writes under it queued.
+/// declaration order: the holder mark clears before the mutex is
+/// released, the mutex before the hold routes what the writes under it
+/// queued, and the values the call left in [`State::after`], moved out
+/// by `drop`, last.
 struct Locked<'a, C: Cells> {
+    _holder: HolderMark<'a>,
     guard: Ordered<MutexGuard<'a, State<C>>>,
     _routing: RoutingHold<'a, C>,
     _scope: Option<ValueScopeGuard>,
+    drained: Drained<'a>,
+}
+
+impl<C: Cells> Drop for Locked<'_, C> {
+    fn drop(&mut self) {
+        if self._holder.take_poison() {
+            self.guard.poison();
+        }
+        self.drained.take_from(&self.guard.after);
+    }
 }
 
 impl<C: Cells> std::ops::Deref for Locked<'_, C> {
@@ -249,6 +276,8 @@ struct State<C: Cells> {
     next_subscription: u64,
     /// Kept current by every mapped write once a memo has opened it.
     deps: Option<Arc<DepIndex>>,
+    /// Empty whenever the mutex is free.
+    after: AfterLock,
 }
 
 impl<T: 'static> Input<T> {
@@ -456,7 +485,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 subscribers: Vec::new(),
                 next_subscription: 0,
                 deps: None,
+                after: AfterLock::default(),
             }),
+            holder: Holder::default(),
         };
         {
             let mut state = store.state()?;
@@ -483,7 +514,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 key,
                 binding.node(),
                 binding.kind(),
-                binding.dep_fp(&self.runtime)?,
+                binding.dep_fp(&self.runtime, &state.after)?,
                 binding.mapped_stamp(),
                 binding.row_source(),
             ));
@@ -656,7 +687,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         };
         let binding = &state.bindings[&id];
         let key = binding.key().to_owned();
-        let held = binding.unbind(&self.runtime)?;
+        let held = binding.unbind(&self.runtime, &state.after)?;
         #[cfg(test)]
         UNDECLARE_PARK.with(|hook| {
             if let Some(hook) = &*hook.borrow() {
@@ -673,7 +704,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if let Some(deps) = state.deps.as_deref() {
             deps.write().unregister(&key);
         }
-        state.bindings.remove(&id);
+        if let Some(binding) = state.bindings.remove(&id) {
+            state.after.push(binding);
+        }
         state.bound.remove(&key);
         if let Some(elements) = held.filter(|elements| !elements.is_empty()) {
             state.logged.entry(key).or_default().elements = elements;
@@ -710,8 +743,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// `f` runs after the record is applied, so the runtime already
     /// reflects it, and it runs under the store mutex. A slow subscriber
     /// therefore blocks every writer and reader of this store; hand records
-    /// off to a channel when the work is not trivial. `f` must not call
-    /// back into the store, which would deadlock, and a panic in `f`
+    /// off to a channel when the work is not trivial. A call from `f` back
+    /// into the store fails with [`Error::Reentrant`], and a panic in `f`
     /// poisons the store until it is reopened.
     ///
     /// Records this store applied before subscribing are not replayed.
@@ -830,7 +863,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
             self.catch_up(state, None)?;
             #[cfg(debug_assertions)]
             for (key, id) in &state.bound {
-                state.bindings[id].check_bypass(&self.runtime, state.logged.get(key))?;
+                state.bindings[id].check_bypass(
+                    &self.runtime,
+                    state.logged.get(key),
+                    &state.after,
+                )?;
             }
             let upto = state.applied;
             let (folded, forgotten) = self.fold_snapshot(state)?;
@@ -889,7 +926,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         for key in keys {
             let logged = state.logged.get(key);
             let records = match state.bound.get(key) {
-                Some(&id) => state.bindings[&id].fold(&self.runtime, logged)?,
+                Some(&id) => state.bindings[&id].fold(&self.runtime, logged, &state.after)?,
                 None => match logged {
                     Some(logged) if !logged.at_default() => logged.records(key),
                     _ => Vec::new(),
@@ -971,11 +1008,17 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.write(&mut state, vec![record])
     }
 
-    /// The only place the store mutex is locked. Both checks run in
-    /// release builds and before the lock: the holder may be waiting on a
-    /// claim the calling compute or value code's caller holds, and value
-    /// code may be running on the thread that holds the mutex.
+    /// The only place the store mutex is locked. The checks run in release
+    /// builds and before the lock: this thread may hold the mutex already,
+    /// the holder may be waiting on a claim the calling compute or value
+    /// code's caller holds, and value code may be running on the thread
+    /// that holds the mutex. Re-entry is checked first, so a `Drop` the
+    /// engine runs as value code under the mutex gets the error, not the
+    /// value-code panic.
     fn state(&self) -> Result<Locked<'_, C>> {
+        if self.holder.is_current() {
+            return Err(Error::Reentrant);
+        }
         assert!(
             !self.runtime.frame_active(),
             "incr-persist: Store methods must not be called from inside a query's compute",
@@ -991,10 +1034,26 @@ impl<C: Cells, B: Backend> Store<C, B> {
             return Err(Error::Poisoned);
         }
         Ok(Locked {
+            _holder: self.holder.mark(),
             guard,
             _routing: routing,
             _scope: self.enter_value_scope(),
+            drained: Drained::new(self.options.value_scope.as_ref()),
         })
+    }
+
+    /// Poisons the store from a `Drop`. On a thread already inside a call of
+    /// this store, that call poisons it before releasing the mutex, since
+    /// locking here would deadlock.
+    fn poison_from_drop(&self) {
+        if self.holder.is_current() {
+            self.holder.request_poison();
+        } else {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .poison();
+        }
     }
 
     /// The write path: append, sync per the durability option, then apply
@@ -1231,7 +1290,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if let Some(&id) = state.bound.get(record.key()) {
             let binding = bound_binding(&mut state.bindings, id);
             let deps = state.deps.as_deref();
-            binding.apply(&self.runtime, &record, state.logged.get(record.key()), deps)?;
+            binding.apply(
+                &self.runtime,
+                &record,
+                state.logged.get(record.key()),
+                deps,
+                &state.after,
+            )?;
             // A bound collection holds its elements by decoded value; folding
             // them by bytes as well would let the two disagree.
             if binding.kind() == Kind::Collection && is_element_change(&record) {
@@ -1328,7 +1393,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if let Some(id) = id {
             let changes = if rebuilt { None } else { changes };
             let deps = state.deps.as_deref();
-            bound_binding(&mut state.bindings, id).replace(&self.runtime, new, changes, deps)?;
+            bound_binding(&mut state.bindings, id).replace(
+                &self.runtime,
+                new,
+                changes,
+                deps,
+                &state.after,
+            )?;
         }
         Ok(())
     }
@@ -1368,7 +1439,7 @@ fn set_record<C: Cells, T: PersistValue>(
 ) -> Result<Record> {
     let binding = input_binding(state, input)?;
     #[cfg(debug_assertions)]
-    Binding::<C>::check_bypass(binding, rt, state.logged.get(&binding.key))?;
+    Binding::<C>::check_bypass(binding, rt, state.logged.get(&binding.key), &state.after)?;
     #[cfg(not(debug_assertions))]
     let _ = rt;
     Ok(Record::Set {

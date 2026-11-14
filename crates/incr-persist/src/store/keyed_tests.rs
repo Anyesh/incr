@@ -1385,7 +1385,7 @@ fn a_repair_removal_a_replay_could_not_match_is_refused<C: Cells>() {
 }
 
 thread_local! {
-    static PROBED: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+    pub(super) static PROBED: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
 }
 
 /// A row that counts its drops, and those that run with any incr lock held,
@@ -1393,14 +1393,14 @@ thread_local! {
 /// built `skewed` is not `==` to its decoded copy, and every encoding of it
 /// differs.
 #[derive(Clone, Debug, Eq)]
-struct Probed {
+pub(super) struct Probed {
     text: String,
     encoding: usize,
     skewed: bool,
 }
 
 impl Probed {
-    fn new(text: &str, skewed: bool) -> Self {
+    pub(super) fn new(text: &str, skewed: bool) -> Self {
         Probed {
             text: s(text),
             encoding: 0,

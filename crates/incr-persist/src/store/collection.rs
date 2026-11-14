@@ -8,6 +8,7 @@ use incr_core::{with_value_code, Cells, ErasedIncr, Incr, IncrCollection, Runtim
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use super::after_lock::AfterLock;
 use super::binding::{decode, encode, Binding};
 use super::dep_index::{fp_of, DepFp, DepIndex, DepMap, PanicGuard};
 use super::logged::{ElementOp, Elements, LoggedKey};
@@ -226,7 +227,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.declare(state, key, Kind::Collection, || Ok(Vec::new()))?;
         let logged = state.logged.get_mut(key);
         let elements = match &logged {
-            Some(logged) => decode_elements::<T>(key, &logged.elements)?,
+            Some(logged) => decode_elements::<T>(key, &logged.elements, &state.after)?,
             None => HashMap::new(),
         };
         if let Some(logged) = logged {
@@ -248,7 +249,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
             map.register(key, binding.node(), Kind::Collection, fp, None);
         }
         drop(hold);
-        drop(spent);
+        state.after.push(spent);
+        state.after.push(plan);
         let view = binding.collection.as_view();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedCollection { id, view })
@@ -380,7 +382,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
     }
 
     /// Applies one mutation as a mapped write.
-    fn apply_op(&self, rt: &Runtime<C>, op: Op<T>, deps: Option<&DepIndex>) {
+    fn apply_op(&self, rt: &Runtime<C>, op: Op<T>, deps: Option<&DepIndex>, bag: &AfterLock) {
         let mut spent = Spent::default();
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
@@ -395,7 +397,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         }
         guard.disarm();
         drop(hold);
-        drop(spent);
+        bag.push(spent);
     }
 
     /// The elements encoded, in byte order. A store that does not declare
@@ -403,13 +405,14 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
     /// listed, so hash order, which differs per process, would make what it
     /// reports differ too. The runtime stores one value per class of equal
     /// elements, so no order of them changes the state.
-    fn encoded_values(&self, rt: &Runtime<C>) -> Result<Vec<Vec<u8>>> {
-        let mut encoded = self
-            .collection
-            .values(rt)
+    fn encoded_values(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Vec<Vec<u8>>> {
+        let values = self.collection.values(rt);
+        let encoded = values
             .iter()
             .map(|value| encode(&self.key, value))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>();
+        bag.push(values);
+        let mut encoded = encoded?;
         encoded.sort_unstable();
         Ok(encoded)
     }
@@ -426,8 +429,9 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         target: HashMap<T, usize>,
         changes: Option<&mut Vec<Record>>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
-        let current = count(self.collection.values(rt));
+        let current = count(self.collection.values(rt), bag);
         let mut moved = HashSet::new();
         for stored in current.keys() {
             if let Some((wanted, _)) = with_value_code(|| target.get_key_value(stored)) {
@@ -471,7 +475,8 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
             }
         }
         drop(hold);
-        drop(spent);
+        bag.push(spent);
+        bag.push(plan);
         Ok(())
     }
 
@@ -543,26 +548,26 @@ where
         self.collection.version_node().erase()
     }
 
-    fn unbind(&self, rt: &Runtime<C>) -> Result<Option<Elements>> {
+    fn unbind(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Option<Elements>> {
         if !rt.is_alive(self.node()) {
             return Err(Error::UnknownHandle);
         }
-        Ok(Some(Elements::from_encoded(self.encoded_values(rt)?)))
+        Ok(Some(Elements::from_encoded(self.encoded_values(rt, bag)?)))
     }
 
     fn mapped_stamp(&self) -> Option<u64> {
         None
     }
 
-    fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp> {
+    fn dep_fp(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<DepFp> {
         // Deleted through the runtime: nothing can say what it holds.
         if !rt.is_alive(self.node()) {
             return Ok(DepFp::Untrusted);
         }
-        Ok(DepFp::Known(fp_of_elements(
-            &self.key,
-            &self.collection.values(rt),
-        )?))
+        let values = self.collection.values(rt);
+        let fp = fp_of_elements(&self.key, &values);
+        bag.push(values);
+        Ok(DepFp::Known(fp?))
     }
 
     fn apply(
@@ -571,6 +576,7 @@ where
         record: &Record,
         _before: Option<&LoggedKey>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
         let op = match record {
             Record::Insert { element, .. } => Op::Insert(decode(&self.key, element)?),
@@ -583,11 +589,11 @@ where
                 Op::Replace(old, decode(&self.key, new)?)
             }
             Record::Delete { .. } | Record::Forget { .. } => {
-                return self.converge(rt, HashMap::new(), None, deps);
+                return self.converge(rt, HashMap::new(), None, deps, bag);
             }
             Record::Declare { .. } | Record::Set { .. } => return Ok(()),
         };
-        self.apply_op(rt, op, deps);
+        self.apply_op(rt, op, deps, bag);
         Ok(())
     }
 
@@ -597,22 +603,28 @@ where
         logged: Option<&mut LoggedKey>,
         changes: Option<&mut Vec<Record>>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
         let target = match logged {
             Some(logged) => {
-                let target = decode_elements(&self.key, &logged.elements)?;
+                let target = decode_elements(&self.key, &logged.elements, bag)?;
                 logged.elements = Elements::default();
                 target
             }
             None => HashMap::new(),
         };
-        self.converge(rt, target, changes, deps)
+        self.converge(rt, target, changes, deps, bag)
     }
 
     // The handle a PersistedCollection exposes is a view whose mutators
     // panic, so a collection cannot be written around the store.
     #[cfg(debug_assertions)]
-    fn check_bypass(&self, _rt: &Runtime<C>, _logged: Option<&LoggedKey>) -> Result<()> {
+    fn check_bypass(
+        &self,
+        _rt: &Runtime<C>,
+        _logged: Option<&LoggedKey>,
+        _bag: &AfterLock,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -620,12 +632,18 @@ where
         &mut self,
         _rt: &Runtime<C>,
         _logged: Option<&LoggedKey>,
+        _bag: &AfterLock,
     ) -> Result<Option<(u128, u64)>> {
         Ok(None)
     }
 
-    fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {
-        let elements = self.encoded_values(rt)?;
+    fn fold(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+        bag: &AfterLock,
+    ) -> Result<Vec<Record>> {
+        let elements = self.encoded_values(rt, bag)?;
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
         if elements.is_empty() && !has_value {
             return Ok(Vec::new());
@@ -643,40 +661,61 @@ where
     }
 }
 
-fn count<T: Hash + Eq>(values: Vec<T>) -> HashMap<T, usize> {
+fn count<T: Hash + Eq + Send + 'static>(values: Vec<T>, bag: &AfterLock) -> HashMap<T, usize> {
     let mut counts = HashMap::new();
     with_value_code(|| {
         for value in values {
-            *counts.entry(value).or_insert(0) += 1;
+            add(&mut counts, value, 1, bag);
         }
     });
     counts
+}
+
+/// Adds `n` occurrences of `value`, moving it into `bag` when an equal
+/// element is already counted.
+fn add<T: Hash + Eq + Send + 'static>(
+    counts: &mut HashMap<T, usize>,
+    value: T,
+    n: usize,
+    bag: &AfterLock,
+) {
+    match counts.get_mut(&value) {
+        Some(have) => {
+            *have += n;
+            bag.push(value);
+        }
+        None => {
+            counts.insert(value, n);
+        }
+    }
 }
 
 /// Folds byte-level elements into a multiset by decoded value: the live
 /// bytes in the order first inserted, then the raw tail in order, removing
 /// by `T`'s equality. Each key is the first inserted of its equal elements,
 /// the value the runtime stores for them.
-fn decode_elements<T: Hash + Eq + DeserializeOwned>(
+fn decode_elements<T: Hash + Eq + DeserializeOwned + Send + 'static>(
     key: &str,
     elements: &Elements,
+    bag: &AfterLock,
 ) -> Result<HashMap<T, usize>> {
     let mut counts = HashMap::new();
     with_value_code(|| -> Result<()> {
         for (bytes, n) in elements.live() {
-            *counts.entry(decode(key, bytes)?).or_insert(0) += n;
+            add(&mut counts, decode(key, bytes)?, n, bag);
         }
         for op in elements.tail() {
             match op {
-                ElementOp::Insert(bytes) => *counts.entry(decode(key, bytes)?).or_insert(0) += 1,
+                ElementOp::Insert(bytes) => add(&mut counts, decode(key, bytes)?, 1, bag),
                 ElementOp::Remove(bytes) => {
                     let value: T = decode(key, bytes)?;
                     if let Some(n) = counts.get_mut(&value) {
                         *n -= 1;
                         if *n == 0 {
-                            counts.remove(&value);
+                            bag.push(counts.remove_entry(&value));
                         }
                     }
+                    bag.push(value);
                 }
             }
         }

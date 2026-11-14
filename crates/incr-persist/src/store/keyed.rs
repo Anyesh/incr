@@ -12,6 +12,7 @@ use incr_core::{
     Runtime, Shared, Value,
 };
 
+use super::after_lock::AfterLock;
 use super::binding::{decode, encode, Binding};
 use super::collection::{fp_of_elements, FpDelta};
 use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard};
@@ -405,7 +406,9 @@ where
     }
 }
 
-type PlainOp<C> = Box<dyn FnOnce(&State<C>, &Runtime<C>) -> Result<Record>>;
+/// Run by reference, so the values a plain op captures stay in its
+/// [`PendingWrite`] and drop with it, after the store lock.
+type PlainOp<C> = Box<dyn Fn(&State<C>, &Runtime<C>) -> Result<Record>>;
 
 pub(super) type WriteRun<'a, C> =
     dyn FnMut(&mut State<C>, Vec<Record>) -> Result<(Position, bool)> + 'a;
@@ -732,11 +735,15 @@ where
 
     fn push(&mut self, key: K, held: Vec<Ranked<P>>, next: Next<P>) -> usize {
         let at = self.keys.len();
-        let key = with_value_code(|| {
-            let key = held.first().map_or(key, |(pair, _)| pair.key());
-            self.by_key.insert(key.clone(), at);
-            key
-        });
+        let held_key = with_value_code(|| held.first().map(|(pair, _)| pair.key()));
+        let key = match held_key {
+            Some(held_key) => {
+                drop(key);
+                held_key
+            }
+            None => key,
+        };
+        with_value_code(|| self.by_key.insert(key.clone(), at));
         self.keys.push(StagedKey { key, held, next });
         at
     }
@@ -744,11 +751,11 @@ where
     fn upsert(&mut self, key: K, row: V) {
         let at = self.locate(key);
         let staged = &mut self.keys[at];
-        with_value_code(|| {
-            if !staged.target().is_some_and(|pair| pair.row_eq(&row)) {
-                staged.next = Next::Row(P::new(staged.key.clone(), row));
-            }
-        });
+        if with_value_code(|| staged.target().is_some_and(|pair| pair.row_eq(&row))) {
+            return;
+        }
+        let pair = with_value_code(|| P::new(staged.key.clone(), row));
+        staged.next = Next::Row(pair);
     }
 
     fn remove(&mut self, key: &K) -> bool {
@@ -766,15 +773,20 @@ where
         self.complete = true;
         let held = self.keyed.keyed.ranked_pairs();
         let mut rest: Vec<(K, Vec<Ranked<P>>)> = Vec::new();
+        let mut done: Vec<(K, Option<Ranked<P>>)> = Vec::new();
+        let mut at: HashMap<K, usize> = HashMap::new();
         with_value_code(|| {
-            let mut at: HashMap<K, usize> = HashMap::new();
             for ranked in held {
                 let key = ranked.0.key();
                 if self.by_key.contains_key(&key) {
+                    done.push((key, Some(ranked)));
                     continue;
                 }
                 match at.get(&key) {
-                    Some(&i) => rest[i].1.push(ranked),
+                    Some(&i) => {
+                        rest[i].1.push(ranked);
+                        done.push((key, None));
+                    }
                     None => {
                         at.insert(key.clone(), rest.len());
                         rest.push((key, vec![ranked]));
@@ -782,6 +794,7 @@ where
                 }
             }
         });
+        drop((done, at));
         for (key, held) in rest {
             self.push(key, held, Next::Gone);
         }
@@ -857,17 +870,26 @@ where
                     fixes.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
                 }
             }
+            state.after.push(held);
         }
         if self.complete {
             let held = self.keyed.keyed.ranked_pairs();
+            let mut keys = Vec::with_capacity(held.len());
             let unnamed: Vec<&Ranked<P>> = with_value_code(|| {
                 held.iter()
-                    .filter(|(pair, _)| !self.by_key.contains_key(&pair.key()))
+                    .filter(|(pair, _)| {
+                        let key = pair.key();
+                        let named = self.by_key.contains_key(&key);
+                        keys.push(key);
+                        !named
+                    })
                     .collect()
             });
+            state.after.push(keys);
             for (pair, rank) in unnamed {
                 fixes.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
             }
+            state.after.push(held);
         }
         Ok(fixes)
     }
@@ -970,7 +992,7 @@ fn element_ops<P: PersistValue>(key: &str, elements: &Elements) -> Result<Vec<Pa
 
 /// The ranked multiset `ops` build from nothing, a removal taking the
 /// held pair [`find_element`] names, as the index's own replay does.
-fn fold_ops<P: Eq>(ops: Vec<PairOp<P, u128>>) -> Vec<Ranked<P>> {
+fn fold_ops<P: Eq + Send + 'static>(ops: Vec<PairOp<P, u128>>, bag: &AfterLock) -> Vec<Ranked<P>> {
     let mut held: Vec<Ranked<P>> = Vec::new();
     with_value_code(|| {
         for op in ops {
@@ -979,8 +1001,9 @@ fn fold_ops<P: Eq>(ops: Vec<PairOp<P, u128>>) -> Vec<Ranked<P>> {
                 PairOp::Remove(pair, rank) => {
                     let found = find_element(held.iter().map(|(p, r)| (p, *r)), (&pair, rank));
                     if let Some(at) = found {
-                        held.swap_remove(at);
+                        bag.push(held.swap_remove(at));
                     }
+                    bag.push(pair);
                 }
             }
         }
@@ -1041,6 +1064,7 @@ where
         ops: Vec<PairOp<P, u128>>,
         recompute: bool,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) {
         let change: KeyedChange<K>;
         let mut spent = KeyedSpent::default();
@@ -1070,7 +1094,7 @@ where
         // hold, so a memo checkpoint never pairs a row with an older entry.
         guard.disarm();
         drop(hold);
-        drop((change, spent, read));
+        bag.push((change, spent, read));
     }
 
     /// Brings the pairs to exactly `target`, ranks included, removing
@@ -1082,6 +1106,7 @@ where
         target: Vec<Ranked<P>>,
         changes: Option<&mut Vec<Record>>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
         let current = self.keyed.ranked_pairs();
         let (removed, inserted) = with_value_code(|| {
@@ -1106,6 +1131,8 @@ where
             }
             (removed, inserted)
         });
+        bag.push(current);
+        bag.push(target);
         if let Some(changes) = changes {
             for (pair, _) in &removed {
                 changes.push(remove_record(&self.key, pair)?);
@@ -1123,20 +1150,20 @@ where
                     .map(|(pair, rank)| PairOp::Insert(pair, rank)),
             )
             .collect();
-        self.apply_ops(rt, ops, true, deps);
+        self.apply_ops(rt, ops, true, deps, bag);
         Ok(())
     }
 
     /// Every pair encoded, in byte order, as a plain collection binding
     /// lists its elements.
-    fn encoded(&self, rt: &Runtime<C>) -> Result<Vec<Vec<u8>>> {
-        let mut encoded = self
-            .keyed
-            .pairs()
-            .values(rt)
+    fn encoded(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Vec<Vec<u8>>> {
+        let pairs = self.keyed.pairs().values(rt);
+        let encoded = pairs
             .iter()
             .map(|pair| encode(&self.key, pair))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>();
+        bag.push(pairs);
+        let mut encoded = encoded?;
         encoded.sort_unstable();
         Ok(encoded)
     }
@@ -1173,21 +1200,21 @@ where
         rt.try_delete_nodes(&nodes)
     }
 
-    fn unbind(&self, rt: &Runtime<C>) -> Result<Option<Elements>> {
+    fn unbind(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Option<Elements>> {
         if !rt.is_alive(self.node()) {
             return Err(Error::UnknownHandle);
         }
-        Ok(Some(Elements::from_encoded(self.encoded(rt)?)))
+        Ok(Some(Elements::from_encoded(self.encoded(rt, bag)?)))
     }
 
-    fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp> {
+    fn dep_fp(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<DepFp> {
         if !rt.is_alive(self.node()) {
             return Ok(DepFp::Untrusted);
         }
-        Ok(DepFp::Known(fp_of_elements(
-            &self.key,
-            &self.keyed.pairs().values(rt),
-        )?))
+        let pairs = self.keyed.pairs().values(rt);
+        let fp = fp_of_elements(&self.key, &pairs);
+        bag.push(pairs);
+        Ok(DepFp::Known(fp?))
     }
 
     fn mapped_stamp(&self) -> Option<u64> {
@@ -1204,6 +1231,7 @@ where
         record: &Record,
         _before: Option<&LoggedKey>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
         let ops = match record {
             Record::Insert { element, .. } => {
@@ -1226,11 +1254,11 @@ where
                     .collect()
             }
             Record::Delete { .. } | Record::Forget { .. } => {
-                return self.converge(rt, Vec::new(), None, deps);
+                return self.converge(rt, Vec::new(), None, deps, bag);
             }
             Record::Declare { .. } | Record::Set { .. } => return Ok(()),
         };
-        self.apply_ops(rt, ops, false, deps);
+        self.apply_ops(rt, ops, false, deps, bag);
         Ok(())
     }
 
@@ -1240,22 +1268,28 @@ where
         logged: Option<&mut LoggedKey>,
         changes: Option<&mut Vec<Record>>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
         let target = match logged {
             Some(logged) => {
-                let target = fold_ops(element_ops(&self.key, &logged.elements)?);
+                let target = fold_ops(element_ops(&self.key, &logged.elements)?, bag);
                 logged.elements = Elements::default();
                 target
             }
             None => Vec::new(),
         };
-        self.converge(rt, target, changes, deps)
+        self.converge(rt, target, changes, deps, bag)
     }
 
     // The handle a PersistedKeyed exposes only reads, so the pairs cannot
     // be written around the store but in an unlogged scope.
     #[cfg(debug_assertions)]
-    fn check_bypass(&self, _rt: &Runtime<C>, _logged: Option<&LoggedKey>) -> Result<()> {
+    fn check_bypass(
+        &self,
+        _rt: &Runtime<C>,
+        _logged: Option<&LoggedKey>,
+        _bag: &AfterLock,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -1263,12 +1297,18 @@ where
         &mut self,
         _rt: &Runtime<C>,
         _logged: Option<&LoggedKey>,
+        _bag: &AfterLock,
     ) -> Result<Option<(u128, u64)>> {
         Ok(None)
     }
 
-    fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {
-        let elements = self.encoded(rt)?;
+    fn fold(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+        bag: &AfterLock,
+    ) -> Result<Vec<Record>> {
+        let elements = self.encoded(rt, bag)?;
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
         if elements.is_empty() && !has_value {
             return Ok(Vec::new());
@@ -1361,7 +1401,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         guard.disarm();
         drop(hold);
-        drop((change, spent, read));
+        state.after.push((change, spent, read));
         let keyed = binding.keyed.clone();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedKeyed { id, keyed })
@@ -1405,7 +1445,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     ) -> Result<Position> {
         let PendingWrite { ops, stages } = pending;
         let mut records = Vec::new();
-        for op in std::mem::take(&mut ops.0) {
+        for op in ops.iter() {
             records.push(op(state, &self.runtime)?);
         }
         let mut stale = false;

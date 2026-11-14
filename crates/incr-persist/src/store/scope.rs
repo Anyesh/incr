@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::Deref;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use incr_core::persist_hooks::changed_at_erased;
 use incr_core::{Cells, Incr, IncrCollection, KeyedCollection, Pair, Value};
@@ -157,7 +157,7 @@ impl<C: Cells, B: Backend> UnloggedScope<'_, C, B> {
                 continue;
             };
             let key = binding.key().to_owned();
-            match binding.restamp(rt, state.logged.get(&key)) {
+            match binding.restamp(rt, state.logged.get(&key), &state.after) {
                 Ok(Some((fp, stamp))) => restamped.push((key, fp, stamp)),
                 Ok(None) => {}
                 Err(e) => {
@@ -182,11 +182,7 @@ impl<C: Cells, B: Backend> UnloggedScope<'_, C, B> {
 impl<C: Cells, B: Backend> Drop for UnloggedScope<'_, C, B> {
     fn drop(&mut self) {
         if !self.closed {
-            self.store
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .poison();
+            self.store.poison_from_drop();
         }
     }
 }

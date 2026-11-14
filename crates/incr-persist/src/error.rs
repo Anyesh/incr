@@ -58,6 +58,13 @@ pub enum Error {
     #[error("store is poisoned by a failure after a write reached the log; reopen it")]
     Poisoned,
 
+    /// A store method was called on a thread that is already inside a call
+    /// of the same store, such as from the `Drop` of a value the store or
+    /// the engine dropped under the store's lock, or from a subscriber.
+    /// Nothing was done; the outer call is unaffected.
+    #[error("store called from inside one of its own calls on this thread")]
+    Reentrant,
+
     /// A key holds a value of a different type than the one requested: its
     /// logged bytes do not decode as that type, or this store already bound
     /// the key with another type. `postcard` is not self-describing, so a

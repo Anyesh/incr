@@ -67,7 +67,7 @@ pub fn persist_error<E: PersistExceptions>(py: Python<'_>, error: Error) -> PyEr
         Error::Busy => return PyErr::from_type(E::busy(py), error.to_string()),
         Error::ReadOnly => return PyErr::from_type(E::read_only(py), error.to_string()),
         Error::TailMoved { .. } => return PyErr::from_type(E::tail_moved(py), error.to_string()),
-        Error::KeyedContention { .. } => {
+        Error::KeyedContention { .. } | Error::Reentrant => {
             return pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
         }
         Error::UnstableRow {

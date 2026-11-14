@@ -8,11 +8,18 @@ use serde::Serialize;
 
 use crate::value_context::in_key;
 
+use super::after_lock::AfterLock;
 use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard};
 use super::logged::{Elements, LoggedKey};
 use crate::{Error, Kind, Record, Result};
 
 /// A key this process declared, tied to the runtime node that mirrors it.
+///
+/// Every method that runs under the store mutex takes the call's
+/// [`AfterLock`] and moves into it each user value it is done with
+/// (displaced values, decoded copies, clones) instead of dropping it, so
+/// no user `Drop` runs under the mutex. On an error return, values decoded
+/// so far may still drop in place.
 pub(crate) trait Binding<C: Cells>: Send + Sync {
     fn kind(&self) -> Kind;
 
@@ -37,11 +44,11 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// lacks. Taken before anything is removed, so a failure, such as
     /// [`Error::UnknownHandle`] for a collection whose node was deleted
     /// through the runtime and can no longer be read, changes nothing.
-    fn unbind(&self, rt: &Runtime<C>) -> Result<Option<Elements>>;
+    fn unbind(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Option<Elements>>;
 
     /// The key's fingerprint now, for registering it in a [`DepIndex`].
     /// Computed with no incr lock held and before the index is held.
-    fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp>;
+    fn dep_fp(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<DepFp>;
 
     /// An input's mapped stamp, which registering it in a [`DepIndex`]
     /// copies; `None` for a collection.
@@ -63,6 +70,7 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
         record: &Record,
         before: Option<&LoggedKey>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()>;
 
     /// Sets the node to exactly what `logged` holds, or to the binding's
@@ -79,12 +87,18 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
         logged: Option<&mut LoggedKey>,
         changes: Option<&mut Vec<Record>>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()>;
 
     /// Fails with [`Error::Bypassed`] when the node holds something other
     /// than what `logged`, the key's logged state, says it holds.
     #[cfg(debug_assertions)]
-    fn check_bypass(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()>;
+    fn check_bypass(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+        bag: &AfterLock,
+    ) -> Result<()>;
 
     /// After an unlogged scope in which the caller restored the node:
     /// when the node holds what `logged` says, moves the mapped stamp to
@@ -94,12 +108,18 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
         &mut self,
         rt: &Runtime<C>,
         logged: Option<&LoggedKey>,
+        bag: &AfterLock,
     ) -> Result<Option<(u128, u64)>>;
 
     /// The records a snapshot keeps for this key, given its logged state.
     /// Empty when the key holds only its logged default, compared by
     /// decoded value, which is how compaction forgets it.
-    fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>>;
+    fn fold(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+        bag: &AfterLock,
+    ) -> Result<Vec<Record>>;
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -125,12 +145,28 @@ pub(crate) struct InputBinding<T: 'static> {
 }
 
 impl<T: Value + Serialize + DeserializeOwned> InputBinding<T> {
-    fn holds_logged<C: Cells>(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<bool> {
+    fn holds_logged<C: Cells>(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+        bag: &AfterLock,
+    ) -> Result<bool> {
         let held = rt.get(self.handle);
-        let (applied, _) = self.value_of(logged)?;
+        let applied = match self.value_of(logged) {
+            Ok((applied, _)) => applied,
+            Err(e) => {
+                bag.push(held);
+                return Err(e);
+            }
+        };
         // Equal bytes cover values unequal to themselves, such as NaN.
-        Ok(with_value_code(|| held == applied)
-            || encode(&self.key, &held)? == encode(&self.key, &applied)?)
+        let holds: Result<bool> = (|| {
+            Ok(with_value_code(|| held == applied)
+                || encode(&self.key, &held)? == encode(&self.key, &applied)?)
+        })();
+        bag.push(held);
+        bag.push(applied);
+        holds
     }
 }
 
@@ -153,6 +189,7 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
         value: T,
         bytes: Option<&[u8]>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) {
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
@@ -167,7 +204,7 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
         }
         guard.disarm();
         drop(hold);
-        drop(compared);
+        bag.push(compared);
     }
 }
 
@@ -188,11 +225,11 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         self.handle.erase()
     }
 
-    fn unbind(&self, _rt: &Runtime<C>) -> Result<Option<Elements>> {
+    fn unbind(&self, _rt: &Runtime<C>, _bag: &AfterLock) -> Result<Option<Elements>> {
         Ok(None)
     }
 
-    fn dep_fp(&self, _rt: &Runtime<C>) -> Result<DepFp> {
+    fn dep_fp(&self, _rt: &Runtime<C>, _bag: &AfterLock) -> Result<DepFp> {
         Ok(DepFp::Known(self.fp))
     }
 
@@ -206,6 +243,7 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         record: &Record,
         before: Option<&LoggedKey>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
         let (value, bytes) = match record {
             Record::Set { value, .. } => (decode(&self.key, value)?, Some(value.as_slice())),
@@ -219,7 +257,10 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
             Record::Declare { default, .. }
                 if before.is_none_or(|logged| logged.declared.is_none()) =>
             {
-                self.default = decode(&self.key, default)?;
+                bag.push(std::mem::replace(
+                    &mut self.default,
+                    decode(&self.key, default)?,
+                ));
                 self.default_fp = fp_of(default);
                 if before.and_then(LoggedKey::current).is_some() {
                     return Ok(());
@@ -228,7 +269,7 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
             }
             _ => return Ok(()),
         };
-        self.write(rt, value, bytes, deps);
+        self.write(rt, value, bytes, deps, bag);
         Ok(())
     }
 
@@ -238,6 +279,7 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         logged: Option<&mut LoggedKey>,
         _changes: Option<&mut Vec<Record>>,
         deps: Option<&DepIndex>,
+        bag: &AfterLock,
     ) -> Result<()> {
         let logged = logged.as_deref();
         let declared = logged.and_then(|logged| logged.declared.as_ref());
@@ -247,18 +289,28 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
                     .map(|default| (default, fp_of(&declared.default)))
             })
             .transpose()?;
-        let (value, bytes) = self.value_of(logged)?;
+        let value = self.value_of(logged);
         if let Some((default, default_fp)) = default {
-            self.default = default;
-            self.default_fp = default_fp;
+            if value.is_err() {
+                bag.push(default);
+            } else {
+                bag.push(std::mem::replace(&mut self.default, default));
+                self.default_fp = default_fp;
+            }
         }
-        self.write(rt, value, bytes, deps);
+        let (value, bytes) = value?;
+        self.write(rt, value, bytes, deps, bag);
         Ok(())
     }
 
     #[cfg(debug_assertions)]
-    fn check_bypass(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()> {
-        if self.holds_logged(rt, logged)? {
+    fn check_bypass(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+        bag: &AfterLock,
+    ) -> Result<()> {
+        if self.holds_logged(rt, logged, bag)? {
             Ok(())
         } else {
             Err(Error::Bypassed {
@@ -271,15 +323,21 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         &mut self,
         rt: &Runtime<C>,
         logged: Option<&LoggedKey>,
+        bag: &AfterLock,
     ) -> Result<Option<(u128, u64)>> {
-        if !self.holds_logged(rt, logged)? {
+        if !self.holds_logged(rt, logged, bag)? {
             return Ok(None);
         }
         self.stamp = changed_at(rt, self.handle);
         Ok(Some((self.fp, self.stamp)))
     }
 
-    fn fold(&self, _rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {
+    fn fold(
+        &self,
+        _rt: &Runtime<C>,
+        logged: Option<&LoggedKey>,
+        bag: &AfterLock,
+    ) -> Result<Vec<Record>> {
         let Some(logged) = logged else {
             return Ok(Vec::new());
         };
@@ -288,8 +346,13 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
             (Some(_), None) => true,
             (Some(declared), Some(value)) => {
                 let value = decode::<T>(&self.key, value)?;
-                let default = decode::<T>(&self.key, &declared.default)?;
-                with_value_code(|| value == default)
+                let default = decode::<T>(&self.key, &declared.default);
+                let equal = default
+                    .as_ref()
+                    .is_ok_and(|default| with_value_code(|| value == *default));
+                bag.push(value);
+                bag.push(default?);
+                equal
             }
             (None, _) => false,
         };

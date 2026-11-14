@@ -1,5 +1,5 @@
 use std::hash::Hash;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use incr_core::{Cells, Runtime};
 
@@ -332,11 +332,7 @@ impl<C: Cells, B: Backend> StagedBatch<'_, C, B> {
 impl<C: Cells, B: Backend> Drop for StagedBatch<'_, C, B> {
     fn drop(&mut self) {
         if self.phase != Phase::Landed {
-            self.store
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .poison();
+            self.store.poison_from_drop();
         }
     }
 }
