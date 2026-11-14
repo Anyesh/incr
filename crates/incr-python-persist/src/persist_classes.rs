@@ -283,17 +283,38 @@ macro_rules! persist_classes {
                 Ok(counts)
             }
 
-            /// Starts a batch: `with store.batch() as b:` collects `b.set`,
-            /// `b.insert`, `b.delete`, `b.replace`, `b.upsert`, `b.remove` and
-            /// `b.reconcile`, and on leaving the block appends them all as one
-            /// run, so a restore sees all of them or none. A block that raises
-            /// writes nothing.
-            fn batch(slf: &Bound<'_, Self>) -> PyResult<PyBatch> {
+            /// Starts a batch of `b.set`, `b.insert`, `b.delete`, `b.replace`,
+            /// `b.upsert`, `b.remove` and `b.reconcile`, appended to the log as
+            /// one run, so a restore sees all of them or none.
+            ///
+            /// `apply="on_exit"` (the default) collects the writes and appends and
+            /// applies them on leaving the block; a block that raises writes
+            /// nothing, and reads inside it see the values from before it.
+            ///
+            /// `apply="on_write"` applies each write at once, so reads inside the
+            /// block see it, and appends the run on leaving the block with the
+            /// backend's `append_at`, right after the position the store had
+            /// applied; a backend without `append_at` refuses it with
+            /// `PersistError`. Entering catches up with the log and runs a due
+            /// `auto_checkpoint_records` checkpoint, so none falls between the
+            /// batch's records. Until the run lands every other store call that
+            /// writes, declares, refreshes or checkpoints, a memo checkpoint and a
+            /// second batch raise `PersistError`. If the append raises, the block
+            /// raises it and the batch keeps its run: `b.retry()` appends it again
+            /// and lands it at most once. A block that raises, or a batch dropped
+            /// before its run lands, poisons the store, since the runtime holds
+            /// writes the log never receives: every later store call raises
+            /// `PersistError` and the way out is to close the store and open the
+            /// log again. A backend that fences this writer keeps raising, so its
+            /// way out is the same.
+            #[pyo3(signature = (apply="on_exit"))]
+            fn batch(slf: &Bound<'_, Self>, apply: &str) -> PyResult<PyBatch> {
                 let py = slf.py();
+                let apply = $crate::batch::Apply::parse(apply)?;
                 slf.try_borrow()?.core_outside_overlay(py)?;
                 Ok(PyBatch {
                     store: slf.clone().unbind(),
-                    batch: $crate::batch::Batch::default(),
+                    batch: $crate::batch::Batch::new(apply),
                 })
             }
 
@@ -387,13 +408,15 @@ macro_rules! persist_classes {
             }
         });
 
-        /// The writes collected inside `with store.batch() as b:`.
+        /// The writes of a `with store.batch() as b:` block; see `Store.batch`.
         ///
-        /// Keyed writes compose per key against the rows each key held when first
-        /// staged, so `b.upsert` twice on one key, or `b.upsert` then `b.remove`,
-        /// leave exactly the final pair, and `b.remove` raises `KeyError` for a
-        /// key neither held nor staged. The collection takes the staged keys only
-        /// once the append has landed.
+        /// In an `on_exit` batch keyed writes compose per key against the rows
+        /// each key held when first staged, so `b.upsert` twice on one key, or
+        /// `b.upsert` then `b.remove`, leave exactly the final pair, and
+        /// `b.remove` raises `KeyError` for a key neither held nor staged; the
+        /// collection takes the staged keys only once the append has landed. In
+        /// an `on_write` batch each write applies at once, and `b.remove` raises
+        /// `KeyError` for a key holding no row at that point.
         #[pyclass(name = "Batch", module = $module, $($flag),*)]
         pub(crate) struct PyBatch {
             store: Py<PyStore>,
@@ -407,7 +430,9 @@ macro_rules! persist_classes {
         #[pymethods]
         impl PyBatch {
             fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
-                slf.try_borrow_mut()?.batch.enter()?;
+                let py = slf.py();
+                let core = batch_core(&slf.borrow().store, py)?;
+                slf.try_borrow_mut()?.batch.enter(py, &core)?;
                 Ok(slf)
             }
 
@@ -419,17 +444,30 @@ macro_rules! persist_classes {
                 _exc: Option<&Bound<'_, PyAny>>,
                 _traceback: Option<&Bound<'_, PyAny>>,
             ) -> PyResult<bool> {
-                let pending = self.batch.exit()?;
-                if exc_type.is_none() {
-                    batch_core(&self.store, py)?.write_pending(py, pending)?;
+                if exc_type.is_some() {
+                    let core = self.store.bind(py).borrow().core().ok().cloned();
+                    self.batch.abandon(py, core.as_deref())?;
+                } else {
+                    let core = batch_core(&self.store, py)?;
+                    self.batch.exit(py, &core)?;
                 }
                 Ok(false)
             }
 
-            fn set(&mut self, py: Python<'_>, node: <$rt as StoreRuntime<$b>>::Node, value: Py<PyAny>) -> PyResult<()> {
-                let pending = self.batch.pending()?;
+            /// Appends the run of an `on_write` batch whose append raised, with
+            /// the same `append_at`, so it lands at most once, and returns the
+            /// position of its last record. Raises what the append raises, keeping
+            /// the run for another retry; `PersistError` once the run has landed;
+            /// `RuntimeError` for an `on_exit` batch, inside the block, or after a
+            /// block that raised.
+            fn retry(&mut self, py: Python<'_>) -> PyResult<u64> {
                 let core = batch_core(&self.store, py)?;
-                pending.set(&core, <$rt as StoreRuntime<$b>>::node_inner(&node), value)
+                self.batch.retry(py, &core)
+            }
+
+            fn set(&mut self, py: Python<'_>, node: <$rt as StoreRuntime<$b>>::Node, value: Py<PyAny>) -> PyResult<()> {
+                let core = batch_core(&self.store, py)?;
+                self.batch.set(py, &core, <$rt as StoreRuntime<$b>>::node_inner(&node), value)
             }
 
             fn insert(
@@ -438,9 +476,8 @@ macro_rules! persist_classes {
                 collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
                 row: Py<PyAny>,
             ) -> PyResult<()> {
-                let pending = self.batch.pending()?;
                 let core = batch_core(&self.store, py)?;
-                pending.insert(&core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
+                self.batch.insert(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
             }
 
             fn delete(
@@ -449,9 +486,8 @@ macro_rules! persist_classes {
                 collection: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Collection>,
                 row: Py<PyAny>,
             ) -> PyResult<()> {
-                let pending = self.batch.pending()?;
                 let core = batch_core(&self.store, py)?;
-                pending.delete(&core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
+                self.batch.delete(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), row)
             }
 
             fn replace(
@@ -461,9 +497,8 @@ macro_rules! persist_classes {
                 old: Py<PyAny>,
                 new: Py<PyAny>,
             ) -> PyResult<()> {
-                let pending = self.batch.pending()?;
                 let core = batch_core(&self.store, py)?;
-                pending.replace(&core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), old, new)
+                self.batch.replace(py, &core, <$rt as FullStoreRuntime<$b>>::version_slot(&collection), old, new)
             }
 
             fn upsert(
@@ -473,10 +508,9 @@ macro_rules! persist_classes {
                 key: Py<PyAny>,
                 row: Py<PyAny>,
             ) -> PyResult<()> {
-                let pending = self.batch.pending()?;
                 let core = batch_core(&self.store, py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
-                pending.upsert(py, &core, &keyed, key, row)
+                self.batch.upsert(py, &core, &keyed, key, row)
             }
 
             fn remove(
@@ -485,10 +519,9 @@ macro_rules! persist_classes {
                 kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
                 key: Py<PyAny>,
             ) -> PyResult<()> {
-                let pending = self.batch.pending()?;
                 let core = batch_core(&self.store, py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
-                pending.remove(py, &core, &keyed, key)
+                self.batch.remove(py, &core, &keyed, key)
             }
 
             fn reconcile(
@@ -497,10 +530,9 @@ macro_rules! persist_classes {
                 kc: PyRef<'_, <$rt as FullStoreRuntime<$b>>::Keyed>,
                 rows: &Bound<'_, PyAny>,
             ) -> PyResult<()> {
-                let pending = self.batch.pending()?;
                 let core = batch_core(&self.store, py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
-                pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)
+                self.batch.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)
             }
         }
 
