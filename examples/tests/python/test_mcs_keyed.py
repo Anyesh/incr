@@ -1,8 +1,25 @@
+import importlib
 import sys
 
+import incr.persist
+import incr_concurrent.persist
 import pytest
 
-from incr import Collection, KeyedCollection, Runtime
+
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
+
+
+@pytest.fixture(params=PACKAGES)
+def persist(request):
+    return request.param
+
+
+@pytest.fixture
+def pkg(persist):
+    return importlib.import_module(persist.__name__.rpartition(".")[0])
 
 
 class Boom(Exception):
@@ -77,16 +94,16 @@ def state(rt, kc, nodes, keys):
     )
 
 
-def test_keyed_collection_is_registered_and_its_rows_are_a_collection():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
-    assert isinstance(kc.collection, Collection)
+def test_keyed_collection_is_registered_and_its_rows_are_a_collection(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
+    assert isinstance(kc.collection, pkg.Collection)
     assert len(kc) == 0
 
 
-def test_upsert_of_an_equal_row_recomputes_nothing_downstream():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_upsert_of_an_equal_row_recomputes_nothing_downstream(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert("a", 1)
     kc.upsert("b", 2)
 
@@ -124,9 +141,9 @@ def test_upsert_of_an_equal_row_recomputes_nothing_downstream():
     assert reads == [1]
 
 
-def test_upsert_of_a_changed_row_replaces_it():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_upsert_of_a_changed_row_replaces_it(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert("a", 1)
     kc.upsert("b", 2)
     nodes = readers(rt, kc)
@@ -139,9 +156,9 @@ def test_upsert_of_a_changed_row_replaces_it():
     assert read(rt, nodes) == {"values": [2, 5], "count": 2, "sum": 7}
 
 
-def test_get_and_remove_of_an_absent_key():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_get_and_remove_of_an_absent_key(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert("a", 1)
     nodes = readers(rt, kc)
 
@@ -160,9 +177,9 @@ def test_get_and_remove_of_an_absent_key():
         kc.remove("a")
 
 
-def test_keys_follow_python_equality_like_a_dict():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_keys_follow_python_equality_like_a_dict(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert(1, "one")
     kc.upsert(1.0, "uno")
     assert len(kc) == 1
@@ -170,23 +187,23 @@ def test_keys_follow_python_equality_like_a_dict():
     assert True in kc
 
 
-def build(rt, snapshot):
-    kc = KeyedCollection(rt)
+def build(pkg, rt, snapshot):
+    kc = pkg.KeyedCollection(rt)
     for key, row in snapshot.items():
         kc.upsert(key, row)
     return kc
 
 
-def test_reconcile_from_a_fresh_snapshot_equals_building_from_scratch():
-    rt = Runtime()
-    kc = build(rt, {"a": 1, "b": 2, "c": 3, "e": 5})
+def test_reconcile_from_a_fresh_snapshot_equals_building_from_scratch(pkg):
+    rt = pkg.Runtime()
+    kc = build(pkg, rt, {"a": 1, "b": 2, "c": 3, "e": 5})
     nodes = readers(rt, kc)
     version = kc.collection.version_node
 
     snapshot = {"a": 1, "b": 20, "d": 4, "e": 5, "f": 6}
     assert kc.reconcile(snapshot) == (2, 1, 1)
 
-    fresh = build(rt, snapshot)
+    fresh = build(pkg, rt, snapshot)
     fresh_nodes = readers(rt, fresh)
     assert read(rt, nodes) == read(rt, fresh_nodes)
     assert len(kc) == len(fresh) == 5
@@ -205,16 +222,16 @@ def test_reconcile_from_a_fresh_snapshot_equals_building_from_scratch():
         "e": None,
         "f": None,
     }
-    assert read(rt, nodes) == read(rt, readers(rt, build(rt, {"a": 9, "b": 7})))
+    assert read(rt, nodes) == read(rt, readers(rt, build(pkg, rt, {"a": 9, "b": 7})))
 
     assert kc.reconcile({}) == (0, 0, 2)
     assert len(kc) == 0
     assert read(rt, nodes) == {"values": [], "count": 0, "sum": 0}
 
 
-def test_group_by_and_aggregate_over_rows_track_upserts_and_removes():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_group_by_and_aggregate_over_rows_track_upserts_and_removes(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     groups = kc.collection.group_by(lambda row: row[0])
 
     def hours_by_worker():
@@ -246,9 +263,9 @@ def test_group_by_and_aggregate_over_rows_track_upserts_and_removes():
     assert rt.get(total) == 6
 
 
-def seeded():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def seeded(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.reconcile({Key("a"): Row(1), Key("b"): Row(2), Key("x"): Row(3)})
     return rt, kc, readers(rt, kc)
 
@@ -256,8 +273,8 @@ def seeded():
 KEYS = [Key("a"), Key("b"), Key("x"), Key("new")]
 
 
-def test_reconcile_whose_row_eq_raises_leaves_everything_unchanged():
-    rt, kc, nodes = seeded()
+def test_reconcile_whose_row_eq_raises_leaves_everything_unchanged(pkg):
+    rt, kc, nodes = seeded(pkg)
     before = state(rt, kc, nodes, KEYS)
 
     with pytest.raises(Boom):
@@ -292,8 +309,8 @@ OPERATIONS = {
 
 @pytest.mark.parametrize("op", OPERATIONS)
 @pytest.mark.parametrize("raising", RAISING_KEYS)
-def test_a_key_whose_hash_or_eq_raises_leaves_everything_unchanged(raising, op):
-    rt, kc, nodes = seeded()
+def test_a_key_whose_hash_or_eq_raises_leaves_everything_unchanged(pkg, raising, op):
+    rt, kc, nodes = seeded(pkg)
     before = state(rt, kc, nodes, KEYS)
 
     with pytest.raises(Boom):
@@ -305,9 +322,9 @@ def test_a_key_whose_hash_or_eq_raises_leaves_everything_unchanged(raising, op):
     assert read(rt, nodes) == {"values": [1, 2, 30], "count": 3, "sum": 33}
 
 
-def test_row_hash_calls_per_upsert_meet_the_documented_bound():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_row_hash_calls_per_upsert_meet_the_documented_bound(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     count = kc.collection.count()
     kc.upsert("a", Row(1))
     rt.get(count)

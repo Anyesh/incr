@@ -1,10 +1,26 @@
+import importlib
 import pickle
 import time
 
+import incr.persist
+import incr_concurrent.persist
 import pytest
 
-from incr import KeyedCollection, Runtime
-from incr.persist import MemoryBackend, Store
+
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
+
+
+@pytest.fixture(params=PACKAGES)
+def persist(request):
+    return request.param
+
+
+@pytest.fixture
+def pkg(persist):
+    return importlib.import_module(persist.__name__.rpartition(".")[0])
 
 
 # Decodes only bytes this test's own store wrote.
@@ -21,9 +37,9 @@ def declare(store, name="rows"):
     return store.keyed_collection(name, codec, codec)
 
 
-def test_keys_and_items_list_the_held_keys_after_upserts_and_a_remove():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_keys_and_items_list_the_held_keys_after_upserts_and_a_remove(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert("a", 1)
     kc.upsert("b", 2)
     kc.upsert("c", 3)
@@ -32,24 +48,24 @@ def test_keys_and_items_list_the_held_keys_after_upserts_and_a_remove():
     assert sorted(kc.items()) == [("a", 1), ("c", 3)]
 
 
-def test_keys_of_a_persisted_keyed_collection_after_a_reopen():
-    backend = MemoryBackend()
-    store = Store.open(backend, build_id=1)
+def test_keys_of_a_persisted_keyed_collection_after_a_reopen(persist):
+    backend = persist.MemoryBackend()
+    store = persist.Store.open(backend, build_id=1)
     kc = declare(store)
     for key in ("a", "b", "c"):
         store.upsert(kc, key, key.upper())
     store.remove(kc, "b")
     store.close()
 
-    again = Store.open(backend, build_id=1)
+    again = persist.Store.open(backend, build_id=1)
     kc2 = declare(again)
     assert sorted(kc2.keys()) == ["a", "c"]
     assert sorted(kc2.items()) == [("a", "A"), ("c", "C")]
 
 
-def test_mutating_while_iterating_a_returned_snapshot_does_not_raise():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_mutating_while_iterating_a_returned_snapshot_does_not_raise(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     for i in range(10):
         kc.upsert(i, i)
     for key in kc.keys():
@@ -60,9 +76,9 @@ def test_mutating_while_iterating_a_returned_snapshot_does_not_raise():
     assert sorted(kc.keys()) == list(range(100, 110))
 
 
-def test_keys_are_a_list_snapshot():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_keys_are_a_list_snapshot(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert("a", 1)
     keys = kc.keys()
     kc.upsert("b", 2)
@@ -70,9 +86,11 @@ def test_keys_are_a_list_snapshot():
     assert isinstance(kc.items(), list)
 
 
-def test_keys_raise_once_the_runtime_is_closed():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_keys_raise_once_the_runtime_is_closed(pkg):
+    if not hasattr(pkg.Runtime, "close"):
+        pytest.skip("a Shared runtime has no close")
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert("a", 1)
     rt.close()
     with pytest.raises(RuntimeError, match="closed"):
@@ -81,9 +99,9 @@ def test_keys_raise_once_the_runtime_is_closed():
         kc.items()
 
 
-def test_keys_from_a_key_method_during_an_operation_raise():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_keys_from_a_key_method_during_an_operation_raise(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.upsert("held", 0)
 
     class Key:
@@ -99,9 +117,9 @@ def test_keys_from_a_key_method_during_an_operation_raise():
     assert kc.items() == [("held", 0)]
 
 
-def test_240000_keys_list_in_under_a_second():
-    rt = Runtime()
-    kc = KeyedCollection(rt)
+def test_240000_keys_list_in_under_a_second(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
     kc.reconcile({i: i for i in range(240_000)})
     start = time.perf_counter()
     keys = kc.keys()

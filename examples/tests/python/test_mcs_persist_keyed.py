@@ -1,8 +1,30 @@
+import importlib
 import pickle
 
-import incr
+import incr.persist
+import incr_concurrent.persist
 import pytest
-from incr.persist import MemoryBackend, Store
+
+PACKAGES = [
+    pytest.param(incr.persist, id="local"),
+    pytest.param(incr_concurrent.persist, id="shared"),
+]
+
+
+@pytest.fixture(params=PACKAGES)
+def persist(request):
+    return request.param
+
+
+@pytest.fixture
+def with_overlay(persist):
+    if persist is not incr.persist:
+        pytest.skip("rt.overlay() raises on Shared")
+
+
+@pytest.fixture
+def pkg(persist):
+    return importlib.import_module(persist.__name__.rpartition(".")[0])
 
 
 class PickleCodec:
@@ -74,8 +96,8 @@ def rows_of(rt, collection):
     return rt.get(collection.reduce(sorted))
 
 
-def open_store(backend, build_id=1):
-    return Store.open(backend, build_id=build_id)
+def open_store(persist, backend, build_id=1):
+    return persist.Store.open(backend, build_id=build_id)
 
 
 def declare(store, name="rows"):
@@ -83,11 +105,11 @@ def declare(store, name="rows"):
     return store.keyed_collection(name, codec, codec)
 
 
-def test_batch_applies_every_operation_as_one_append():
-    inner = MemoryBackend()
+def test_batch_applies_every_operation_as_one_append(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
     codec = PickleCodec()
-    store = open_store(backend)
+    store = open_store(persist, backend)
     count = store.input("count", 0, codec)
     rows = store.collection("rows", codec)
     backend.appends.clear()
@@ -103,16 +125,16 @@ def test_batch_applies_every_operation_as_one_append():
     assert rows_of(store.runtime, rows) == ["b", "c"]
     store.close()
 
-    again = open_store(inner)
+    again = open_store(persist, inner)
     assert again.runtime.get(again.input("count", 0, codec)) == 7
     assert rows_of(again.runtime, again.collection("rows", codec)) == ["b", "c"]
 
 
-def test_a_batch_that_raises_applies_nothing():
-    inner = MemoryBackend()
+def test_a_batch_that_raises_applies_nothing(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
     codec = PickleCodec()
-    store = open_store(backend)
+    store = open_store(persist, backend)
     count = store.input("count", 0, codec)
     rows = store.collection("rows", codec)
     kc = declare(store, "pairs")
@@ -131,9 +153,9 @@ def test_a_batch_that_raises_applies_nothing():
     assert store.runtime.get(count) == 1
 
 
-def test_an_empty_batch_writes_nothing():
-    backend = RecordingBackend(MemoryBackend())
-    store = open_store(backend)
+def test_an_empty_batch_writes_nothing(persist):
+    backend = RecordingBackend(persist.MemoryBackend())
+    store = open_store(persist, backend)
     store.input("count", 0, PickleCodec())
     backend.appends.clear()
     with store.batch():
@@ -141,8 +163,8 @@ def test_an_empty_batch_writes_nothing():
     assert backend.appends == []
 
 
-def test_batch_operations_outside_the_with_block_raise():
-    store = open_store(MemoryBackend())
+def test_batch_operations_outside_the_with_block_raise(persist):
+    store = open_store(persist, persist.MemoryBackend())
     count = store.input("count", 0, PickleCodec())
     batch = store.batch()
     with pytest.raises(RuntimeError, match="batch"):
@@ -154,19 +176,19 @@ def test_batch_operations_outside_the_with_block_raise():
     assert store.runtime.get(count) == 2
 
 
-def test_batch_rejects_a_node_the_store_does_not_persist():
-    store = open_store(MemoryBackend())
+def test_batch_rejects_a_node_the_store_does_not_persist(persist):
+    store = open_store(persist, persist.MemoryBackend())
     plain = store.runtime.create_input(1)
     with pytest.raises(ValueError, match="not a persisted input"):
         with store.batch() as b:
             b.set(plain, 2)
 
 
-def test_two_inputs_and_a_progress_input_land_in_one_append():
-    inner = MemoryBackend()
+def test_two_inputs_and_a_progress_input_land_in_one_append(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
     codec = PickleCodec()
-    store = open_store(backend)
+    store = open_store(persist, backend)
     a = store.input("a", 0, codec)
     second = store.input("b", 0, codec)
     progress = store.input("progress", 0, codec)
@@ -178,18 +200,16 @@ def test_two_inputs_and_a_progress_input_land_in_one_append():
     assert backend.appends == [3]
     store.close()
 
-    again = open_store(inner)
-    values = [
-        again.runtime.get(again.input(k, 0, codec)) for k in ("a", "b", "progress")
-    ]
+    again = open_store(persist, inner)
+    values = [again.runtime.get(again.input(k, 0, codec)) for k in ("a", "b", "progress")]
     assert values == [1, 2, 99]
 
 
-def test_a_failing_append_in_a_batch_leaves_all_three_unwritten():
-    inner = MemoryBackend()
+def test_a_failing_append_in_a_batch_leaves_all_three_unwritten(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
     codec = PickleCodec()
-    store = open_store(backend)
+    store = open_store(persist, backend)
     a = store.input("a", 0, codec)
     progress = store.input("progress", 0, codec)
     backend.failing = {"append"}
@@ -201,16 +221,16 @@ def test_a_failing_append_in_a_batch_leaves_all_three_unwritten():
     backend.failing = set()
     store.close()
 
-    again = open_store(inner)
+    again = open_store(persist, inner)
     assert again.runtime.get(again.input("a", 0, codec)) == 0
     assert again.runtime.get(again.input("progress", 0, codec)) == 0
 
 
-def test_a_failing_sync_mid_batch_poisons_and_the_log_holds_all_or_none():
-    inner = MemoryBackend()
+def test_a_failing_sync_mid_batch_poisons_and_the_log_holds_all_or_none(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
     codec = PickleCodec()
-    store = open_store(backend)
+    store = open_store(persist, backend)
     a = store.input("a", 0, codec)
     progress = store.input("progress", 0, codec)
     kc = declare(store)
@@ -221,10 +241,10 @@ def test_a_failing_sync_mid_batch_poisons_and_the_log_holds_all_or_none():
             b.set(progress, 99)
             b.upsert(kc, "k", 5)
     backend.failing = set()
-    with pytest.raises(incr.persist.PersistError, match="poisoned"):
+    with pytest.raises(persist.PersistError, match="poisoned"):
         store.set(a, 2)
 
-    again = open_store(inner)
+    again = open_store(persist, inner)
     seen = (
         again.runtime.get(again.input("a", 0, codec)),
         again.runtime.get(again.input("progress", 0, codec)),
@@ -233,16 +253,16 @@ def test_a_failing_sync_mid_batch_poisons_and_the_log_holds_all_or_none():
     assert seen in {(0, 0, None), (1, 99, 5)}
 
 
-def test_batch_inside_an_overlay_raises():
-    store = open_store(MemoryBackend())
+def test_batch_inside_an_overlay_raises(with_overlay, persist):
+    store = open_store(persist, persist.MemoryBackend())
     store.input("count", 0, PickleCodec())
     with store.runtime.overlay():
         with pytest.raises(RuntimeError, match="overlay"):
             store.batch()
 
 
-def test_keyed_collection_reads_through_the_graph_and_the_index():
-    store = open_store(MemoryBackend())
+def test_keyed_collection_reads_through_the_graph_and_the_index(persist):
+    store = open_store(persist, persist.MemoryBackend())
     kc = declare(store)
     store.upsert(kc, "a", 1)
     store.upsert(kc, "b", 2)
@@ -262,15 +282,15 @@ def test_keyed_collection_reads_through_the_graph_and_the_index():
     assert rows_of(store.runtime, kc.collection) == [1, 2]
 
 
-def test_keyed_collection_restores_on_reopen_with_a_working_index():
-    backend = MemoryBackend()
-    store = open_store(backend)
+def test_keyed_collection_restores_on_reopen_with_a_working_index(persist):
+    backend = persist.MemoryBackend()
+    store = open_store(persist, backend)
     kc = declare(store)
     store.upsert(kc, Key("a"), 1)
     store.upsert(kc, Key("b"), 2)
     store.close()
 
-    again = open_store(backend)
+    again = open_store(persist, backend)
     kc2 = declare(again)
     assert len(kc2) == 2
     assert kc2.get(Key("a")) == 1
@@ -281,20 +301,20 @@ def test_keyed_collection_restores_on_reopen_with_a_working_index():
     again.checkpoint()
     again.close()
 
-    third = open_store(backend)
+    third = open_store(persist, backend)
     kc3 = declare(third)
     assert kc3.get(Key("a")) == 11
     third.upsert(kc3, Key("a"), 12)
     assert rows_of(third.runtime, kc3.collection) == [2, 12]
 
 
-def test_restoring_the_index_runs_key_hash_in_the_declaration():
-    backend = MemoryBackend()
-    store = open_store(backend)
+def test_restoring_the_index_runs_key_hash_in_the_declaration(persist):
+    backend = persist.MemoryBackend()
+    store = open_store(persist, backend)
     kc = declare(store)
     store.upsert(kc, Key("a"), 1)
     store.close()
-    again = open_store(backend)
+    again = open_store(persist, backend)
     Key.log.clear()
     kc2 = declare(again)
     assert ("hash", "a") in Key.log
@@ -303,20 +323,20 @@ def test_restoring_the_index_runs_key_hash_in_the_declaration():
     assert ("eq", "a") in Key.log
 
 
-def test_not_ready_rows_persist_in_a_keyed_collection():
-    backend = MemoryBackend()
-    store = open_store(backend)
+def test_not_ready_rows_persist_in_a_keyed_collection(pkg, persist):
+    backend = persist.MemoryBackend()
+    store = open_store(persist, backend)
     kc = declare(store)
-    store.upsert(kc, "k", incr.Unavailable("withheld", row=("id", 3)))
+    store.upsert(kc, "k", pkg.Unavailable("withheld", row=("id", 3)))
     store.close()
-    again = open_store(backend)
+    again = open_store(persist, backend)
     row = declare(again).get("k")
-    assert isinstance(row, incr.Unavailable)
+    assert isinstance(row, pkg.Unavailable)
     assert row.reason == "withheld"
 
 
-def test_direct_writes_to_a_persisted_keyed_collection_raise():
-    store = open_store(MemoryBackend())
+def test_direct_writes_to_a_persisted_keyed_collection_raise(persist):
+    store = open_store(persist, persist.MemoryBackend())
     kc = declare(store)
     store.upsert(kc, "a", 1)
     for call in (
@@ -331,9 +351,9 @@ def test_direct_writes_to_a_persisted_keyed_collection_raise():
     assert rows_of(store.runtime, kc.collection) == [1]
 
 
-def test_store_keyed_calls_reject_a_keyed_collection_of_another_store():
-    store = open_store(MemoryBackend())
-    other = incr.KeyedCollection(store.runtime)
+def test_store_keyed_calls_reject_a_keyed_collection_of_another_store(pkg, persist):
+    store = open_store(persist, persist.MemoryBackend())
+    other = pkg.KeyedCollection(store.runtime)
     with pytest.raises(ValueError, match="not a persisted keyed collection"):
         store.upsert(other, "a", 1)
     with pytest.raises(ValueError, match="not a persisted keyed collection"):
@@ -341,10 +361,10 @@ def test_store_keyed_calls_reject_a_keyed_collection_of_another_store():
             b.upsert(other, "a", 1)
 
 
-def test_keyed_ops_in_a_batch_compose_on_one_key():
-    inner = MemoryBackend()
+def test_keyed_ops_in_a_batch_compose_on_one_key(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
-    store = open_store(backend)
+    store = open_store(persist, backend)
     kc = declare(store)
     store.upsert(kc, "k", 0)
     backend.appends.clear()
@@ -370,15 +390,15 @@ def test_keyed_ops_in_a_batch_compose_on_one_key():
         b.upsert(kc, "m", 6)
     store.close()
 
-    again = open_store(inner)
+    again = open_store(persist, inner)
     kc2 = declare(again)
     assert len(kc2) == 2
     assert kc2.get("m") == 6
     assert rows_of(again.runtime, kc2.collection) == [4, 6]
 
 
-def test_a_batch_remove_of_an_absent_key_raises_and_sees_staged_keys():
-    store = open_store(MemoryBackend())
+def test_a_batch_remove_of_an_absent_key_raises_and_sees_staged_keys(persist):
+    store = open_store(persist, persist.MemoryBackend())
     kc = declare(store)
     with pytest.raises(KeyError):
         with store.batch() as b:
@@ -392,8 +412,8 @@ def test_a_batch_remove_of_an_absent_key_raises_and_sees_staged_keys():
     assert rows_of(store.runtime, kc.collection) == []
 
 
-def test_a_batch_reconcile_composes_with_other_keyed_ops():
-    store = open_store(MemoryBackend())
+def test_a_batch_reconcile_composes_with_other_keyed_ops(persist):
+    store = open_store(persist, persist.MemoryBackend())
     kc = declare(store)
     store.reconcile(kc, {"a": 1, "b": 2})
     with store.batch() as b:
@@ -405,10 +425,10 @@ def test_a_batch_reconcile_composes_with_other_keyed_ops():
     assert rows_of(store.runtime, kc.collection) == [4, 10, 30]
 
 
-def test_a_failing_batch_leaves_the_index_unchanged():
-    inner = MemoryBackend()
+def test_a_failing_batch_leaves_the_index_unchanged(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
-    store = open_store(backend)
+    store = open_store(persist, backend)
     kc = declare(store)
     store.upsert(kc, "a", 1)
     backend.failing = {"append"}
@@ -424,10 +444,10 @@ def test_a_failing_batch_leaves_the_index_unchanged():
     assert rows_of(store.runtime, kc.collection) == [5]
 
 
-def test_keyed_ops_in_one_batch_across_two_collections_and_a_plain_input():
-    inner = MemoryBackend()
+def test_keyed_ops_in_one_batch_across_two_collections_and_a_plain_input(persist):
+    inner = persist.MemoryBackend()
     backend = RecordingBackend(inner)
-    store = open_store(backend)
+    store = open_store(persist, backend)
     first = declare(store, "first")
     second = declare(store, "second")
     progress = store.input("progress", 0, PickleCodec())
@@ -441,16 +461,16 @@ def test_keyed_ops_in_one_batch_across_two_collections_and_a_plain_input():
     assert (first.get("k"), second.get("k")) == (3, 2)
     store.close()
 
-    again = open_store(inner)
+    again = open_store(persist, inner)
     assert declare(again, "first").get("k") == 3
     assert declare(again, "second").get("k") == 2
     assert again.runtime.get(again.input("progress", 0, PickleCodec())) == 4
 
 
-def test_a_keyed_collection_reopens_with_one_pair_after_an_overtaken_upsert():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_a_keyed_collection_reopens_with_one_pair_after_an_overtaken_upsert(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     kc_leader = declare(leader)
     kc_standby = declare(standby)
     leader.upsert(kc_leader, "k", 1)
@@ -459,26 +479,26 @@ def test_a_keyed_collection_reopens_with_one_pair_after_an_overtaken_upsert():
     standby.close()
     leader.close()
 
-    again = open_store(backend)
+    again = open_store(persist, backend)
     kc = declare(again)
     assert (len(kc), kc.get("k")) == (1, 2)
     assert rows_of(again.runtime, kc.collection) == [2]
 
 
-def test_refresh_returns_the_position_applied_through():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_refresh_returns_the_position_applied_through(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     count = leader.input("count", 0, PickleCodec())
     leader.set(count, 3)
     assert standby.refresh() == 2
     assert standby.refresh() == 2
 
 
-def test_refresh_makes_the_leaders_rows_visible_and_upsert_replaces_them():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_refresh_makes_the_leaders_rows_visible_and_upsert_replaces_them(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     kc_leader = declare(leader)
     kc_standby = declare(standby)
     leader.upsert(kc_leader, "a", 1)
@@ -501,10 +521,10 @@ def test_refresh_makes_the_leaders_rows_visible_and_upsert_replaces_them():
     assert rows_of(leader.runtime, kc_leader.collection) == [9]
 
 
-def test_refresh_applies_a_leader_batch_to_the_index_with_key_code_in_refresh():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_refresh_applies_a_leader_batch_to_the_index_with_key_code_in_refresh(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     kc_leader = declare(leader)
     kc_standby = declare(standby)
     with leader.batch() as b:
@@ -519,10 +539,10 @@ def test_refresh_applies_a_leader_batch_to_the_index_with_key_code_in_refresh():
     assert len(kc_standby) == 2
 
 
-def test_a_standby_that_refreshes_across_a_leader_compaction_then_upserts():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_a_standby_that_refreshes_across_a_leader_compaction_then_upserts(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     kc_leader = declare(leader)
     kc_standby = declare(standby)
     leader.reconcile(kc_leader, {"a": 1, "b": 2, "c": 3})
@@ -542,10 +562,10 @@ def test_a_standby_that_refreshes_across_a_leader_compaction_then_upserts():
     assert rows_of(standby.runtime, kc_standby.collection) == [3, 5, 11]
 
 
-def test_a_standby_behind_a_compaction_that_forgot_the_key_rebuilds_its_index():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_a_standby_behind_a_compaction_that_forgot_the_key_rebuilds_its_index(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     kc_leader = declare(leader)
     kc_standby = declare(standby)
     leader.upsert(kc_leader, "a", 1)
@@ -561,10 +581,10 @@ def test_a_standby_behind_a_compaction_that_forgot_the_key_rebuilds_its_index():
     assert len(kc_standby) == 1
 
 
-def test_a_write_that_catches_up_leaves_the_index_matching_the_collection():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_a_write_that_catches_up_leaves_the_index_matching_the_collection(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     kc_leader = declare(leader)
     kc_standby = declare(standby)
     leader.upsert(kc_leader, "a", 1)
@@ -575,10 +595,10 @@ def test_a_write_that_catches_up_leaves_the_index_matching_the_collection():
     assert rows_of(standby.runtime, kc_standby.collection) == [1, 2]
 
 
-def test_refresh_without_a_keyed_collection_applies_plain_nodes():
-    backend = MemoryBackend()
-    leader = open_store(backend)
-    standby = open_store(backend)
+def test_refresh_without_a_keyed_collection_applies_plain_nodes(persist):
+    backend = persist.MemoryBackend()
+    leader = open_store(persist, backend)
+    standby = open_store(persist, backend)
     count_leader = leader.input("count", 0, PickleCodec())
     count_standby = standby.input("count", 0, PickleCodec())
     leader.set(count_leader, 4)
@@ -586,32 +606,32 @@ def test_refresh_without_a_keyed_collection_applies_plain_nodes():
     assert standby.runtime.get(count_standby) == 4
 
 
-def assert_one_pair_for_k_after_restart(store, inner, kc, last):
+def assert_one_pair_for_k_after_restart(persist, store, inner, kc, last):
     assert kc.get("k") == last
     assert len(kc) == 1
     assert rows_of(store.runtime, kc.collection) == [last]
     store.close()
-    again = open_store(inner)
+    again = open_store(persist, inner)
     reopened = declare(again)
     assert len(reopened) == 1
     assert reopened.get("k") == last
     assert rows_of(again.runtime, reopened.collection) == [last]
 
 
-def test_a_direct_write_inside_an_open_batch_leaves_one_pair_for_the_key():
-    inner = MemoryBackend()
-    store = open_store(inner)
+def test_a_direct_write_inside_an_open_batch_leaves_one_pair_for_the_key(persist):
+    inner = persist.MemoryBackend()
+    store = open_store(persist, inner)
     kc = declare(store)
     store.upsert(kc, "k", 0)
     with store.batch() as b:
         b.upsert(kc, "k", 1)
         store.upsert(kc, "k", 2)
-    assert_one_pair_for_k_after_restart(store, inner, kc, 1)
+    assert_one_pair_for_k_after_restart(persist, store, inner, kc, 1)
 
 
-def test_two_open_batches_on_one_key_leave_one_pair():
-    inner = MemoryBackend()
-    store = open_store(inner)
+def test_two_open_batches_on_one_key_leave_one_pair(persist):
+    inner = persist.MemoryBackend()
+    store = open_store(persist, inner)
     kc = declare(store)
     store.upsert(kc, "k", 0)
     first = store.batch()
@@ -619,4 +639,4 @@ def test_two_open_batches_on_one_key_leave_one_pair():
     with first as a, second as b:
         a.upsert(kc, "k", 1)
         b.upsert(kc, "k", 2)
-    assert_one_pair_for_k_after_restart(store, inner, kc, 1)
+    assert_one_pair_for_k_after_restart(persist, store, inner, kc, 1)

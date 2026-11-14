@@ -161,3 +161,95 @@ def test_a_memo_table_declared_while_the_memo_opens_raises(watchdog):
     opener.join(10)
     declarer.join(10)
     assert "open_memo" in str(outcome.get("error"))
+
+
+def wait_for(condition, timeout=20):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.01)
+
+
+def test_the_checkpoint_thread_runs_a_due_memo_checkpoint():
+    log, memo_backend = MemoryBackend(), MemoryMemo()
+    calls = []
+
+    def square(ctx, k):
+        calls.append(k)
+        return k * k
+
+    def open_graph():
+        store = Store.open(log, build_id=1)
+        table = store.memo_table("sq", 1, PickleCodec(), PickleCodec(), square)
+        memo = store.open_memo(memo_backend, checkpoint_after_entries=3)
+        return store, table, memo
+
+    store, table, memo = open_graph()
+    for k in range(3):
+        assert store.runtime.get(memo.get_or_insert(table, k)) == k * k
+    wait_for(lambda: memo.stats()["entries"] == 3)
+    assert memo.stats()["unsaved_entries"] == 0
+    store.close()
+
+    calls.clear()
+    store, table, memo = open_graph()
+    assert [store.runtime.get(memo.get_or_insert(table, k)) for k in range(3)] == [0, 1, 4]
+    assert calls == []
+    store.close()
+
+
+def test_an_on_write_batch_is_visible_to_another_thread_before_it_lands():
+    store = Store.open(MemoryBackend(), build_id=1)
+    price = store.input("price", 0, PickleCodec())
+    position = store.stats()["position"]
+    with store.batch(apply="on_write") as b:
+        b.set(price, 5)
+        assert in_thread(lambda: store.runtime.get(price)) == 5
+        assert store.stats()["position"] == position
+    assert store.stats()["position"] == position + 1
+    assert "other threads" in Store.batch.__doc__
+
+
+def test_threads_writing_keys_batches_and_reading_memo_entries_finish(watchdog):
+    store = Store.open(MemoryBackend(), build_id=1, auto_checkpoint_records=7)
+    codec = PickleCodec()
+    shifts = store.keyed_collection("shifts", codec, codec)
+    hours = store.memo_table(
+        "hours", 1, codec, codec, lambda ctx, k: (ctx.get_key(shifts, k) or 0) * 2
+    )
+    memo = store.open_memo(MemoryMemo(), checkpoint_after_entries=5)
+    keys = [f"k{i}" for i in range(4)]
+    errors = []
+
+    def write(key):
+        try:
+            for value in range(1, 16):
+                if value % 3:
+                    store.upsert(shifts, key, value)
+                else:
+                    with store.batch() as b:
+                        b.upsert(shifts, key, value)
+                store.runtime.get(memo.get_or_insert(hours, key))
+        except Exception as error:
+            errors.append(error)
+
+    def read():
+        try:
+            for _ in range(30):
+                for key in keys:
+                    store.runtime.get(memo.get_or_insert(hours, key))
+                store.stats()
+                memo.stats()
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=write, args=(key,)) for key in keys]
+    threads += [threading.Thread(target=read) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert [store.runtime.get(memo.get_or_insert(hours, key)) for key in keys] == [30] * 4
+    store.close()

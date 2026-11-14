@@ -366,7 +366,8 @@ macro_rules! persist_classes {
             /// nothing, and reads inside it see the values from before it.
             ///
             /// `apply="on_write"` applies each write at once, so reads inside the
-            /// block see it, and appends the run on leaving the block with the
+            /// block see it (on a Shared runtime other threads read it too, before
+            /// the run lands), and appends the run on leaving the block with the
             /// backend's `append_at`, right after the position the store had
             /// applied; a backend without `append_at` refuses it with
             /// `PersistError`. Entering catches up with the log and runs a due
@@ -398,7 +399,9 @@ macro_rules! persist_classes {
             /// and `ctx.memo(table, key)` reads another entry as a dependency.
             /// `key_codec` and `codec` encode the keys and the values under the
             /// contracts of `store.input`, and `func` must be a pure function of
-            /// its key and what it reads through `ctx`. Bump `version` when it
+            /// its key and what it reads through `ctx`; on a Shared runtime it runs
+            /// on whichever thread computes the entry, so it must be thread-safe,
+            /// as the codecs must. Bump `version` when it
             /// changes meaning: entries are kept only while the name and version
             /// match. Declare every table before `store.open_memo`.
             fn memo_table(
