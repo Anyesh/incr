@@ -4,9 +4,9 @@ use std::ops::Deref;
 use std::sync::{Arc, PoisonError};
 
 use incr_core::persist_hooks::changed_at_erased;
-use incr_core::{Cells, Incr, IncrCollection};
+use incr_core::{Cells, Incr, IncrCollection, KeyedCollection, Pair, Value};
 
-use super::{Input, KeyRef, PersistValue, PersistedCollection, Store};
+use super::{Input, KeyRef, PersistValue, PersistedCollection, PersistedKeyed, Store};
 use crate::{Backend, Error, Kind, Result};
 
 /// A window in which the caller changes the runtime directly, around the
@@ -87,6 +87,23 @@ impl<C: Cells, B: Backend> UnloggedScope<'_, C, B> {
     ) -> Result<IncrCollection<T, C>> {
         let state = self.store.state()?;
         collection.unlogged_in(&state)
+    }
+
+    /// The keyed collection behind `keyed`, writable: changes made through
+    /// it never reach the log or the store's fingerprints, so the caller
+    /// must undo them before closing, for instance by applying the inverses
+    /// of a journal newest first.
+    pub fn keyed<K, V, P>(
+        &self,
+        keyed: &PersistedKeyed<K, V, C, P>,
+    ) -> Result<KeyedCollection<K, V, C, P, u128>>
+    where
+        K: Value + Hash + Eq,
+        V: Value + Hash + Eq,
+        P: Pair<K, V> + PersistValue,
+    {
+        let state = self.store.state()?;
+        keyed.unlogged_in(&state)
     }
 
     /// The runtime node behind `input`, to set around the log; see

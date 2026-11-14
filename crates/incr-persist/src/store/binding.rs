@@ -2,7 +2,7 @@ use std::any::Any;
 
 use incr_core::persist_hooks::{changed_at, set_returning_displaced};
 use incr_core::value_slot::Compared;
-use incr_core::{with_value_code, Cells, ErasedIncr, Incr, Runtime, Value};
+use incr_core::{with_value_code, Cells, DeleteError, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -22,8 +22,14 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// is the node this binding mirrors.
     fn is_handle(&self, handle: &dyn Any) -> bool;
 
-    /// The runtime node mirroring the key, which undeclaring deletes.
+    /// The runtime node mirroring the key.
     fn node(&self) -> ErasedIncr;
+
+    /// Deletes every runtime node the binding created, as one set or not
+    /// at all, as [`Runtime::try_delete_nodes`] does.
+    fn delete_nodes(&self, rt: &Runtime<C>) -> std::result::Result<(), DeleteError> {
+        rt.try_delete_node(self.node())
+    }
 
     /// The elements to hand back to the key's logged state when the
     /// binding goes, for a binding that holds them itself (see

@@ -103,6 +103,12 @@ pub enum Error {
     #[error("handle was not issued by this store")]
     UnknownHandle,
 
+    /// A keyed write found other writers changing the keys it wrote
+    /// through every repair round, so some of those keys may still hold
+    /// another row, or more than one pair. Refresh and retry.
+    #[error("keyed collection {key:?} kept changing under other writers: refresh and retry")]
+    KeyedContention { key: String },
+
     /// `BuildId::CurrentExe` could not read the running executable.
     #[error("cannot fingerprint the running executable for the memo build id")]
     BuildIdUnavailable(#[source] std::io::Error),

@@ -18,6 +18,7 @@ use dep_index::{fp_of, DepFp, DepIndex};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
 pub use collection::PersistedCollection;
+pub use keyed::{PendingWrite, PersistedKeyed};
 pub use scope::UnloggedScope;
 
 mod binding;
@@ -26,6 +27,10 @@ pub(crate) mod dep_index;
 #[cfg(test)]
 #[path = "dep_index_tests.rs"]
 mod dep_index_tests;
+mod keyed;
+#[cfg(test)]
+#[path = "keyed_tests.rs"]
+mod keyed_tests;
 mod logged;
 mod scope;
 #[cfg(test)]
@@ -578,10 +583,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// [`Store::delete`] of a key the log does not know, changes nothing
     /// otherwise.
     ///
-    /// The node (a collection's version node, the only node it creates) goes
-    /// through the runtime's strict
-    /// [`try_delete_node`](incr_core::Runtime::try_delete_node), so queries
-    /// and operators over it must be deleted first. While any remain this
+    /// The nodes the key created (an input's node, a collection's version
+    /// node, a keyed collection's pair and row version nodes) go as one
+    /// set through the runtime's strict
+    /// [`try_delete_nodes`](incr_core::Runtime::try_delete_nodes), so
+    /// queries and operators over any of them must be deleted first. While any remain this
     /// fails with [`Error::HasDependents`] and changes nothing; under
     /// `Shared`, a query computing over the key concurrently either counts
     /// as a dependent or finds the node deleted. An input whose node was
@@ -606,7 +612,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 hook();
             }
         });
-        match self.runtime.try_delete_node(binding.node()) {
+        match binding.delete_nodes(&self.runtime) {
             Ok(()) | Err(DeleteError::NotAlive) => {}
             Err(DeleteError::HasDependents) => return Err(Error::HasDependents { key }),
         }
@@ -696,7 +702,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// they would not be after a restart.
     pub fn restored_keys(&self, prefix: &str) -> Result<Vec<String>> {
         let mut state = self.state()?;
-        self.reconcile(&mut state)?;
+        self.reconcile_snapshot(&mut state)?;
         Ok(state
             .logged
             .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
@@ -873,7 +879,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     ) -> Result<Declared> {
         // A compaction at or below `applied` may have forgotten the key,
         // which a restart would then declare afresh.
-        self.reconcile(state)?;
+        self.reconcile_snapshot(state)?;
         // A loop because a concurrent compaction may fold away a Declare
         // whose key still held its default, forgetting the key again.
         let mut caught_up = false;
@@ -1006,7 +1012,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// record by record instead of reporting it.
     fn catch_up(&self, state: &mut State<C>, own: Option<RangeInclusive<Position>>) -> Result<()> {
         state.refuse_in_scope()?;
-        self.reconcile(state)?;
+        self.reconcile_snapshot(state)?;
         let start = state.applied;
         let mut read = Vec::new();
         loop {
@@ -1036,7 +1042,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             }
         }
         if state.applied != start {
-            self.reconcile(state)?;
+            self.reconcile_snapshot(state)?;
         }
         Ok(())
     }
@@ -1076,7 +1082,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// `applied`, and the changes are reported to subscribers at `applied`
     /// as [`Origin::Snapshot`] records. A snapshot beyond `applied` is left
     /// to `catch_up`, which crosses it.
-    fn reconcile(&self, state: &mut State<C>) -> Result<()> {
+    fn reconcile_snapshot(&self, state: &mut State<C>) -> Result<()> {
         state.refuse_in_scope()?;
         loop {
             let Some(id) = self

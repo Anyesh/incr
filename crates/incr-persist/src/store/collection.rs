@@ -83,7 +83,7 @@ impl<T: PersistValue + Hash + Eq, C: Cells> PersistedCollection<T, C> {
         store.write_with(|state| self.replace_record(state, old, &new))
     }
 
-    fn insert_record(&self, state: &State<C>, value: &T) -> Result<Record> {
+    pub(super) fn insert_record(&self, state: &State<C>, value: &T) -> Result<Record> {
         let key = self.key_in(state)?;
         Ok(Record::Insert {
             element: encode(&key, value)?,
@@ -91,7 +91,7 @@ impl<T: PersistValue + Hash + Eq, C: Cells> PersistedCollection<T, C> {
         })
     }
 
-    fn delete_record(&self, state: &State<C>, value: &T) -> Result<Record> {
+    pub(super) fn delete_record(&self, state: &State<C>, value: &T) -> Result<Record> {
         let key = self.key_in(state)?;
         Ok(Record::Remove {
             element: encode(&key, value)?,
@@ -99,7 +99,12 @@ impl<T: PersistValue + Hash + Eq, C: Cells> PersistedCollection<T, C> {
         })
     }
 
-    fn replace_record(&self, state: &State<C>, old: Option<&T>, new: &T) -> Result<Record> {
+    pub(super) fn replace_record(
+        &self,
+        state: &State<C>,
+        old: Option<&T>,
+        new: &T,
+    ) -> Result<Record> {
         let key = self.key_in(state)?;
         Ok(Record::Replace {
             old: old.map(|old| encode(&key, old)).transpose()?,
@@ -260,7 +265,7 @@ pub(super) fn fp_of_elements<T: Serialize>(key: &str, values: &[T]) -> Result<u1
 
 /// What a single mutation changes in a collection's fingerprint, from the
 /// representatives the core reports for it.
-struct FpDelta<'a> {
+pub(super) struct FpDelta<'a> {
     key: &'a str,
     delta: u128,
     failed: bool,
@@ -281,7 +286,7 @@ impl<T: Serialize> RepSink<T> for FpDelta<'_> {
 }
 
 impl<'a> FpDelta<'a> {
-    fn new(key: &'a str) -> Self {
+    pub(super) fn new(key: &'a str) -> Self {
         FpDelta {
             key,
             delta: 0,
@@ -289,7 +294,7 @@ impl<'a> FpDelta<'a> {
         }
     }
 
-    fn apply_to(&self, map: &mut DepMap, key: &str) {
+    pub(super) fn apply_to(&self, map: &mut DepMap, key: &str) {
         match map.entry(key).map(|entry| entry.fp) {
             _ if self.failed => map.untrust(key),
             Some(DepFp::Known(fp)) => map.set_fp(key, fp.wrapping_add(self.delta)),
