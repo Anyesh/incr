@@ -1,6 +1,6 @@
 //! Between a live dep and its stored form, under a `DepIndex` hold.
 
-use incr_core::persist_hooks::changed_at_erased;
+use incr_core::persist_hooks::{changed_at_erased, Deferred};
 use incr_core::{Cells, ErasedIncr, Runtime};
 
 use super::StoredDep;
@@ -30,6 +30,7 @@ pub(crate) fn map_live<C: Cells>(
     rt: &Runtime<C>,
     memo: u64,
     dep: ErasedIncr,
+    bag: &mut Deferred<C>,
 ) -> LiveDep {
     if let Some(key) = map.key_of(dep) {
         let entry = map.entry(key).expect("a handle's key is registered");
@@ -65,7 +66,7 @@ pub(crate) fn map_live<C: Cells>(
         };
     }
     for (collection, rows) in map.all_rows() {
-        if let Some(row) = rows_of::<C>(rows).live_row(dep) {
+        if let Some(row) = rows_of::<C>(rows).live_row(dep, bag) {
             return match (row, trusted(map, collection)) {
                 (Ok(Some((key_bytes, fp))), true) => LiveDep::Stored(StoredDep::Row {
                     collection: collection.to_owned(),
@@ -89,12 +90,14 @@ fn trusted(map: &DepMap, collection: &str) -> bool {
 
 /// A stored store-key or external dep's live node and whether its
 /// fingerprint still matches; `None` when nothing live vouches for it.
-/// `None` for a query dep, which the restore walk maps.
+/// `None` for a query dep, which the restore walk maps. A row dep's
+/// decoded key goes to `bag`.
 pub(crate) fn map_stored<C: Cells>(
     map: &DepMap,
     rt: &Runtime<C>,
     memo: u64,
     dep: &StoredDep,
+    bag: &mut Deferred<C>,
 ) -> Option<(ErasedIncr, bool)> {
     match dep {
         StoredDep::Input { key, fp } => {
@@ -126,7 +129,7 @@ pub(crate) fn map_stored<C: Cells>(
             if !trusted(map, collection) {
                 return None;
             }
-            rows_of::<C>(map.rows(collection)?).stored_row(key_bytes, *fp)
+            rows_of::<C>(map.rows(collection)?).stored_row(key_bytes, *fp, bag)
         }
         StoredDep::Query { .. } => None,
     }

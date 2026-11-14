@@ -113,7 +113,7 @@ impl DepIndex {
 
     #[cfg(test)]
     pub(crate) fn is_held(&self) -> bool {
-        self.map.try_read().is_err()
+        self.map.try_write().is_err()
     }
 }
 

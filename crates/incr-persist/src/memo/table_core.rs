@@ -298,7 +298,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
             let deps = seen
                 .deps
                 .iter()
-                .map(|&d| map_live(map, rt, memo, d))
+                .map(|&d| map_live(map, rt, memo, d, bag))
                 .collect();
             out.push(Snap {
                 table: self.index,
