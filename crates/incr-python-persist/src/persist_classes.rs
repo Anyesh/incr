@@ -558,7 +558,7 @@ macro_rules! persist_classes {
             ) -> PyResult<PyValue> {
                 let store = self.store.bind(py).try_borrow()?;
                 let core = store.core()?;
-                store.memo.value_of(core, rt, &self.name, &self.handle, key)
+                store.memo.value_of(core, py, rt, &self.name, &self.handle, key)
             }
         }
 

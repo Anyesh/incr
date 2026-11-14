@@ -410,7 +410,7 @@ impl PyRuntimeRef {
         key: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
-        let val = engine_in_query(rt, || table.value_of(py, rt, PyValue(key)))??;
+        let val = table.value_of(py, rt, PyValue(key))?;
         ready::read::<Signal>(py, val.0, missing)
     }
 

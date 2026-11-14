@@ -185,33 +185,6 @@ impl<B: PyBinding> MemoCore<B> {
         }
         *self.builder() = Some(builder);
     }
-
-    /// `key`'s value in the table `handle` names, restored from the memo or
-    /// computed, read as a dependency of whatever query is running on `rt`,
-    /// which must be this store's runtime. Runs inside a query, so it
-    /// takes no engine entry.
-    pub fn value_of(
-        &self,
-        core: &StoreCore<B>,
-        rt: &Runtime<B::C>,
-        name: &str,
-        handle: &TableHandle,
-        key: PyValue,
-    ) -> PyResult<PyValue> {
-        let memo = self.memo()?;
-        if !std::ptr::eq(core.runtime(), rt) {
-            return Err(PyValueError::new_err(format!(
-                "memo table '{name}' belongs to the runtime of its store, not this one"
-            )));
-        }
-        let table = handle.get();
-        let value = core.registry().scoped(|| {
-            let node = memo.get_or_insert(table, key);
-            rt.get(node)
-        });
-        drop(core.registry().take_failure());
-        Ok(value)
-    }
 }
 
 impl<B: PyBinding> MemoCore<B>
@@ -220,6 +193,37 @@ where
     B::Task<OpenMemo<B>>: Send,
     for<'a> B::Task<&'a OpenMemo<B>>: Send,
 {
+    /// `key`'s value in the table `handle` names, restored from the memo or
+    /// computed, read as a dependency of whatever query is running on `rt`,
+    /// which must be this store's runtime. Runs inside a query, entering
+    /// the engine through the binding so a Shared call releases the GIL.
+    pub fn value_of(
+        &self,
+        core: &StoreCore<B>,
+        py: Python<'_>,
+        rt: &Runtime<B::C>,
+        name: &str,
+        handle: &TableHandle,
+        key: PyValue,
+    ) -> PyResult<PyValue> {
+        let memo = carry::<B, _>(self.memo()?);
+        if !std::ptr::eq(core.runtime(), rt) {
+            return Err(PyValueError::new_err(format!(
+                "memo table '{name}' belongs to the runtime of its store, not this one"
+            )));
+        }
+        let table = handle.get();
+        let registry = core.registry();
+        let value = B::write(py, core.store(), move |store, _| {
+            registry.scoped(|| {
+                let node = memo.into_inner().get_or_insert(table, key);
+                store.runtime().get(node)
+            })
+        })?;
+        drop(core.registry().take_failure());
+        Ok(value)
+    }
+
     /// Opens the memo over the Python memo `backend`, loading its current
     /// generation. On failure the builder is made again with `make`, so
     /// a later open can succeed.
