@@ -327,11 +327,11 @@ def test_the_local_scan_rejects_a_violation(body, problem):
 
 
 # incr-python-persist reaches the engine through calls on the store, the
-# runtime, the memo, a carried handle or the staged writes, and through
-# calls that pass the store to a persisted handle.
+# runtime, the memo, a carried handle, the staged writes or an unlogged
+# scope, and through calls that pass the store to a persisted handle.
 SHARED_CALL = re.compile(
     r"\bstore\.(\w+)\(|\.(\w+)\(\s*&?store\b|\brt\.(\w+)\(|\bmemo\.(\w+)\("
-    r"|\.into_inner\(\)\s*\.(\w+)\(|\bwrite\.(\w+)\("
+    r"|\.into_inner\(\)\s*\.(\w+)\(|\bwrite\.(\w+)\(|\bscope\s*\.(\w+)\("
 )
 # Accessors that take no engine entry, and the `OnceLock` holding the memo.
 SHARED_ALLOWED = {"runtime", "get", "set", "into_inner", "take_encode_mismatches"}

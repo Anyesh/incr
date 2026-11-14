@@ -566,7 +566,7 @@ impl PyCollection {
             return Ok(Cow::Borrowed(&self.inner));
         }
         self.state(py)
-            .journal_with(|overlay| overlay.writable_collection(self.inner.version_node().slot()))
+            .journal_with(|overlay| overlay.writable_collection(py, self.inner.version_node().slot()))
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(
                     "collection is persisted: write it with store.insert, store.delete, store.replace or store.extend",
@@ -1054,7 +1054,7 @@ impl PyKeyedCollection {
     fn unlogged(&self, py: Python<'_>, persisted: &PyPersistedKeyed) -> PyResult<PersistedCore> {
         self.check_alive()?;
         self.state(py)
-            .journal_with(|overlay| overlay.writable_keyed(persisted))
+            .journal_with(|overlay| overlay.writable_keyed(py, persisted))
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(
                     "keyed collection is persisted: write it with store.upsert, store.remove, store.reconcile or a store.batch",
@@ -1491,7 +1491,7 @@ impl PyRuntime {
     ) -> PyResult<()> {
         if first && persisted {
             self.state
-                .journal_with(|overlay| overlay.touch(node.inner))
+                .journal_with(|overlay| Python::attach(|py| overlay.touch(py, node.inner)))
                 .transpose()?;
         }
         let old = if first {

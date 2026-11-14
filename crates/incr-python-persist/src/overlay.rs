@@ -7,12 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use incr_core::{Change, ErasedIncr, Incr, IncrCollection, KeyedCollection, PairOp, Runtime};
+use incr_persist::Input;
 use incr_python_protocol::{PyKey, PyValue};
 use pyo3::prelude::*;
 
 use crate::binding::PyBinding;
-use crate::scope::{OverlayScope, UnloggedKeyed};
-use crate::store::Keyed;
+use crate::scope::{OverlayScope, Scope, UnloggedKeyed};
+use crate::store::{Collection, Keyed};
 
 /// A plain keyed collection of a `C` runtime.
 pub type PlainKeyed<C> = KeyedCollection<PyKey, PyValue, C, PyValue, ()>;
@@ -98,24 +99,43 @@ impl<B: PyBinding> Overlay<B> {
     }
 
     /// Announces the first change of the persisted input `node`.
-    pub fn touch(&mut self, node: Incr<PyValue>) -> PyResult<()> {
-        self.persist.as_mut().ok_or_else(no_scope)?.touch(node)
+    pub fn touch(&mut self, py: Python<'_>, node: Incr<PyValue>) -> PyResult<()>
+    where
+        for<'a> B::Task<(&'a mut Scope<B>, Input<PyValue>)>: Send,
+    {
+        self.persist.as_mut().ok_or_else(no_scope)?.touch(py, node)
     }
 
     /// The writable runtime collection behind the persisted collection
     /// whose version node has slot `version_slot`.
     pub fn writable_collection(
         &mut self,
+        py: Python<'_>,
         version_slot: u32,
-    ) -> PyResult<IncrCollection<PyValue, B::C>> {
+    ) -> PyResult<IncrCollection<PyValue, B::C>>
+    where
+        for<'a> B::Task<(&'a Scope<B>, Collection<B>)>: Send,
+        B::Task<IncrCollection<PyValue, B::C>>: Send,
+    {
         self.persist
             .as_mut()
             .ok_or_else(no_scope)?
-            .collection(version_slot)
+            .collection(py, version_slot)
     }
 
-    pub fn writable_keyed(&mut self, persisted: &Keyed<B>) -> PyResult<UnloggedKeyed<B>> {
-        self.persist.as_ref().ok_or_else(no_scope)?.keyed(persisted)
+    pub fn writable_keyed(
+        &mut self,
+        py: Python<'_>,
+        persisted: &Keyed<B>,
+    ) -> PyResult<UnloggedKeyed<B>>
+    where
+        for<'a> B::Task<(&'a Scope<B>, &'a Keyed<B>)>: Send,
+        B::Task<UnloggedKeyed<B>>: Send,
+    {
+        self.persist
+            .as_ref()
+            .ok_or_else(no_scope)?
+            .keyed(py, persisted)
     }
 
     pub fn created(&mut self, node: ErasedIncr) {

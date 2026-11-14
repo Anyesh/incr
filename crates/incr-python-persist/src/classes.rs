@@ -13,7 +13,7 @@ use pyo3::PyClass;
 use crate::binding::PyBinding;
 use crate::memo::MemoFn;
 use crate::overlay::Overlay;
-use crate::scope::OverlayScope;
+use crate::scope::{OverlayScope, Scope};
 use crate::state::RtState;
 use crate::store::{Keyed, StoreCore};
 
@@ -174,7 +174,10 @@ pub fn key_counts(counts: incr_core::KeyCounts) -> KeyCounts {
 pub fn enter_overlay<B: PyBinding, R: FullStoreRuntime<B>>(
     py: Python<'_>,
     runtime: &R,
-) -> PyResult<()> {
+) -> PyResult<()>
+where
+    B::Task<Scope<B>>: Send,
+{
     if runtime.state().overlay_active() {
         return Err(PyRuntimeError::new_err(
             "an overlay is already active on this runtime",
@@ -208,7 +211,10 @@ pub fn enter_overlay<B: PyBinding, R: FullStoreRuntime<B>>(
 pub fn exit_overlay<B: PyBinding, R: FullStoreRuntime<B>>(
     py: Python<'_>,
     runtime: &Bound<'_, R>,
-) -> PyResult<()> {
+) -> PyResult<()>
+where
+    B::Task<Scope<B>>: Send,
+{
     let failure = {
         let runtime = runtime.borrow();
         let Some(mut overlay) = runtime.state().end_overlay() else {
