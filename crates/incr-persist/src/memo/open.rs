@@ -265,7 +265,9 @@ impl AutoCheckpoint {
             // A panic in a key's or value's code fails this checkpoint, not
             // the thread, so later intervals still run.
             match catch_unwind(AssertUnwindSafe(|| core.checkpoint(store.runtime()))) {
-                Ok(Ok(_) | Err(Error::Busy)) => {}
+                Ok(
+                    Ok(_) | Err(Error::Busy | Error::UnloggedScopeOpen | Error::StagedBatchOpen),
+                ) => {}
                 Ok(Err(_)) | Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
             }
         });

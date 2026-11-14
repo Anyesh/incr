@@ -4261,7 +4261,7 @@ impl<C: Cells> Runtime<C> {
         GraphSummary { groups, edges }
     }
 
-    /// Bounded, breadth-first structural snapshot; see [`GraphQuery`].
+    /// Bounded, breadth-first structural snapshot; see [`crate::trace::GraphQuery`].
     /// Takes one read of the inner state for the whole walk. Roots that
     /// are dead or out of range are ignored, and repeated roots count once.
     pub fn graph_snapshot_bounded(

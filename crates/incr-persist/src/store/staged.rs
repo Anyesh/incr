@@ -263,7 +263,7 @@ impl<C: Cells, B: Backend> StagedBatch<'_, C, B> {
                 Err(e)
             }
             Err(Failure::Poison(e)) => {
-                state.poisoned = true;
+                state.poison();
                 *phase = Phase::AwaitingRetry;
                 Err(e)
             }
@@ -297,7 +297,7 @@ impl<C: Cells, B: Backend> Drop for StagedBatch<'_, C, B> {
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .poisoned = true;
+                .poison();
         }
     }
 }

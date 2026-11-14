@@ -59,6 +59,9 @@ pub(crate) struct DepIndex {
     /// to checkpoint, because the runtime holds writes the log may never
     /// receive.
     staged: AtomicBool,
+    /// Set once the store is poisoned: a memo then refuses to checkpoint,
+    /// because the runtime may hold changes the log never received.
+    poisoned: AtomicBool,
 }
 
 #[derive(Default)]
@@ -87,6 +90,14 @@ impl DepIndex {
 
     pub(super) fn set_staged(&self, open: bool) {
         self.staged.store(open, Ordering::Release);
+    }
+
+    pub(crate) fn poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_poisoned(&self) {
+        self.poisoned.store(true, Ordering::Release);
     }
 
     // Poisoning is ignored: a mapped write that panics marks the one key it

@@ -1,4 +1,4 @@
-# Miri seconds per incr-core lib test on a GitHub runner, read by scripts/miri-shard.py. Sources: CI run 40649950119 (79ee64e15) and, for the reraised fan pair, fd2e5d55a; for tests added since, local Miri seconds times 1.25 (the runner-to-recorded ratio seen on lib-11), measured on 8baf0562f.
+# Miri seconds per incr-core lib test on a GitHub runner, read by scripts/miri-shard.py. Sources: CI run 40649950119 (79ee64e15) and, for the reraised fan pair, fd2e5d55a; for tests added since, local Miri seconds times 1.25 (the runner-to-recorded ratio seen on lib-11), measured on 8baf0562f; the 39 keyed, trace, lock-order and delete-set tests added since were timed on the commit that shrinks the keyed Miri tests (31 of them as one 121 s run, recorded at 5 s each).
 0	arena::tests::local_arena_grows
 0	arena::tests::local_arena_roundtrip
 0	arena::tests::shared_arena_roundtrip
@@ -288,6 +288,35 @@
 1	hashed_multiset::tests::replace_where_old_sits_earlier_in_new_probe_run
 0	hashed_multiset::tests::replace_with_an_equal_value_at_count_one_swaps_the_stored_copy
 1	hashed_multiset::tests::replace_with_an_equal_value_at_count_two_keeps_the_stored_copy
+5	keyed::tests::apply_pairs_keeping_drops_nothing_until_the_kept_value_drops
+5	keyed::tests::local::a_held_key_object_is_kept
+5	keyed::tests::local::a_key_with_two_pairs_reads_the_smallest_rank
+5	keyed::tests::local::a_remove_then_insert_of_one_key_reports_two_changes
+5	keyed::tests::local::an_equal_row_changes_nothing_downstream
+5	keyed::tests::local::an_inverted_journal_restores_the_previous_state
+5	keyed::tests::local::changed_lists_the_keys_whose_row_differs_and_epochs_rise
+5	keyed::tests::local::journaled_writes_are_undone_by_their_inverted_journal
+5	keyed::tests::local::keys_and_items_are_snapshots_and_len_counts_keys
+5	keyed::tests::local::model_matches
+5	keyed::tests::local::reconcile_makes_the_rows_equal_the_pairs
+5	keyed::tests::local::removing_an_absent_pair_is_a_no_op
+5	keyed::tests::local::runtime_calls_from_key_or_row_eq_are_refused
+5	keyed::tests::local::settled_stats_are_read_without_the_lock
+164	keyed::tests::local::user_panics_leave_everything_unchanged
+5	keyed::tests::shared::a_held_key_object_is_kept
+5	keyed::tests::shared::a_key_with_two_pairs_reads_the_smallest_rank
+5	keyed::tests::shared::a_remove_then_insert_of_one_key_reports_two_changes
+5	keyed::tests::shared::an_equal_row_changes_nothing_downstream
+5	keyed::tests::shared::an_inverted_journal_restores_the_previous_state
+5	keyed::tests::shared::changed_lists_the_keys_whose_row_differs_and_epochs_rise
+5	keyed::tests::shared::journaled_writes_are_undone_by_their_inverted_journal
+5	keyed::tests::shared::keys_and_items_are_snapshots_and_len_counts_keys
+40	keyed::tests::shared::model_matches
+3	keyed::tests::shared::reconcile_makes_the_rows_equal_the_pairs
+5	keyed::tests::shared::removing_an_absent_pair_is_a_no_op
+5	keyed::tests::shared::runtime_calls_from_key_or_row_eq_are_refused
+5	keyed::tests::shared::settled_stats_are_read_without_the_lock
+209	keyed::tests::shared::user_panics_leave_everything_unchanged
 4	lock_order::tests::a_binding_lock_reenters_and_sits_below_the_store
 4	lock_order::tests::a_binding_lock_under_the_store_panics
 0	lock_order::tests::a_closure_may_run_under_the_store_or_a_lower_frames_lock
@@ -300,9 +329,11 @@
 0	lock_order::tests::a_released_lock_no_longer_counts
 0	lock_order::tests::locks_may_be_released_out_of_order
 0	lock_order::tests::locks_taken_in_rising_rank_are_allowed
+1	lock_order::tests::nothing_is_taken_under_the_key_index
 5	lock_order::tests::routing_may_run_under_an_aggregate_state_only
 5	lock_order::tests::routing_under_a_binding_lock_panics
 4	lock_order::tests::routing_under_the_store_panics
+1	lock_order::tests::the_key_index_is_taken_after_a_collection_log
 0	lock_order::tests::two_locks_of_one_rank_panic
 0	lock_order::tests::waiting_on_a_claim_under_a_join_state_panics
 0	lock_order::tests::waiting_on_a_claim_under_inner_panics
@@ -417,6 +448,7 @@
 7	runtime::children_tests::local_children_sweep_hold_release_sweeps_a_clean_creator
 1	runtime::children_tests::local_children_swept_child_drop_panic
 1	runtime::children_tests::local_children_verified_landing_sweeps_nothing
+5	runtime::children_tests::local_delete_nodes_as_one_set
 0	runtime::children_tests::shared_children_adopt_accepts_a_query
 0	runtime::children_tests::shared_children_adopt_refuses_an_ownership_cycle
 2	runtime::children_tests::shared_children_cascade_plain_cycle
@@ -446,6 +478,7 @@
 1	runtime::children_tests::shared_children_swept_child_drop_panic
 2	runtime::children_tests::shared_children_value_code_read_spins_through_a_rollback
 1	runtime::children_tests::shared_children_verified_landing_sweeps_nothing
+5	runtime::children_tests::shared_delete_nodes_as_one_set
 88	runtime::cycle_rule_tests::an_adoption_lands_a_recorded_dep_its_rerun_skips_as_unbounded
 93	runtime::cycle_rule_tests::clean_foreign_rereader_runs_twice
 105	runtime::cycle_rule_tests::clean_foreign_rereader_runs_twice_in_steady_state
@@ -1060,10 +1093,16 @@
 1	runtime::tests::shared_try_delete_with_dependents_keeps_the_node
 5	runtime::tests::typed_handle_checks_runtime_generation_and_type_local
 7	runtime::tests::typed_handle_checks_runtime_generation_and_type_shared
+5	runtime::trace_tests::local_bounded_snapshot_cases
+3	runtime::trace_tests::local_graph_summary_cases
+3	runtime::trace_tests::local_instrumentation_cases
 5	runtime::trace_tests::local_nested_get_traced_caught_keeps_outer_trace
 7	runtime::trace_tests::local_nested_get_traced_unwinds_outer_and_runtime_stays_usable
+5	runtime::trace_tests::shared_bounded_snapshot_cases
 7	runtime::trace_tests::shared_concurrent_get_traced_is_refused_and_keeps_owner_trace
 5	runtime::trace_tests::shared_get_traced_started_during_the_owners_hand_off_keeps_the_owner_trace
+5	runtime::trace_tests::shared_graph_summary_cases
+5	runtime::trace_tests::shared_instrumentation_cases
 7	runtime::trace_tests::shared_nested_get_traced_caught_keeps_outer_trace
 8	runtime::trace_tests::shared_nested_get_traced_unwinds_outer_and_runtime_stays_usable
 5	runtime::type_fallback_tests::local::a_recycled_slot_has_no_type_fallback

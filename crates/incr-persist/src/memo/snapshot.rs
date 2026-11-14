@@ -23,6 +23,9 @@ impl<C: MemoCells> CoreRef<C> {
         check_value_code();
         // On a Shared store a scope another thread opens after this check is
         // not covered: the snapshot below may then see unlogged changes.
+        if self.deps.poisoned() {
+            return Err(Error::Poisoned);
+        }
         if self.deps.unlogged() {
             return Err(Error::UnloggedScopeOpen);
         }

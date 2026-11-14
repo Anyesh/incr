@@ -4,8 +4,9 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use incr_persist::memo::{BuildId, MemoBuilder, MemoCells, MemoOptions, MemoryMemo};
+use incr_persist::memo::{BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoryMemo};
 use incr_persist::{
     Backend, Cells, ConditionalAppend, Error, Local, MemoryBackend, Options, Origin, PendingWrite,
     Position, ReadOutcome, Record, Shared, SnapshotId, Store,
@@ -494,6 +495,197 @@ fn a_shared_staged_batch_keeps_the_store_alive<C: Cells>() {
     assert_eq!(log_after(&log, Position(last.0 - 1)).len(), 1);
 }
 
+fn a_rolled_away_value_misses_on_restore<C: MemoCells>() {
+    let log = MemoryBackend::new();
+    let memo_backend = MemoryMemo::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let open_both = |runs: &Arc<AtomicUsize>| {
+        let store = Arc::new(open::<C, _>(log.clone()));
+        let x = store.input("x", 1_u64).unwrap();
+        let xh = x.handle();
+        let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0xb1d)));
+        let scaled = builder.table::<u32, u64>("scaled", 1);
+        let runs = Arc::clone(runs);
+        builder.define(scaled, move |ctx, k| {
+            runs.fetch_add(1, SeqCst);
+            ctx.rt().get(xh) * u64::from(*k)
+        });
+        let memo = builder.open(&store, memo_backend.clone()).unwrap();
+        (store, x, memo, scaled)
+    };
+
+    let (store, x, memo, scaled) = open_both(&runs);
+    let q3 = memo.get_or_insert(scaled, 3);
+    assert_eq!(memo.runtime().get(q3), 3);
+    memo.checkpoint().unwrap();
+    let base = store.stats().unwrap().position;
+
+    let mut staged = store.staged_batch().unwrap();
+    staged.set(x, 2).unwrap();
+    let q4 = memo.get_or_insert(scaled, 4);
+    assert_eq!(memo.runtime().get(q4), 8);
+    assert_eq!(memo.runtime().get(q3), 6);
+    drop(staged);
+    assert_poisoned("set after the batch rolled away", store.set(x, 5));
+    assert_poisoned(
+        "memo checkpoint after the batch rolled away",
+        memo.checkpoint(),
+    );
+    assert!(log_after(&log, base).is_empty(), "nothing reached the log");
+    drop((memo, store));
+
+    runs.store(0, SeqCst);
+    let (store, x, memo, scaled) = open_both(&runs);
+    assert_eq!(store.runtime().get(x.handle()), 1);
+    let q3 = memo.get_or_insert(scaled, 3);
+    let q4 = memo.get_or_insert(scaled, 4);
+    assert_eq!(memo.runtime().get(q3), 3);
+    assert_eq!(memo.runtime().get(q4), 4);
+    assert_eq!(runs.load(SeqCst), 1, "only the rolled-away entry runs");
+}
+
+fn subscribing_refuses_while_a_batch_is_staged<C: Cells>() {
+    let store = open::<C, _>(MemoryBackend::new());
+    let x = store.input("x", 0_u32).unwrap();
+    let mut staged = store.staged_batch().unwrap();
+    staged.set(x, 1).unwrap();
+    assert_refused("subscribe", store.subscribe(|_, _, _| {}));
+    staged.commit().unwrap();
+    drop(staged);
+    store.subscribe(|_, _, _| {}).unwrap();
+}
+
+fn a_memo_checkpoint_reports_poisoned_after_a_batch_is_dropped<C: MemoCells>() {
+    let store = Arc::new(open::<C, _>(MemoryBackend::new()));
+    let x = store.input("x", 1_u64).unwrap();
+    let builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0xb1d)));
+    let memo = builder.open(&store, MemoryMemo::new()).unwrap();
+    let mut staged = store.staged_batch().unwrap();
+    staged.set(x, 2).unwrap();
+    assert_refused("memo checkpoint", memo.checkpoint());
+    drop(staged);
+    assert_poisoned("memo checkpoint", memo.checkpoint());
+}
+
+type SharedMemo = (
+    Arc<Store<Shared, MemoryBackend>>,
+    Memo<Shared, MemoryBackend>,
+);
+
+fn shared_memo_store_with_auto_checkpoint() -> SharedMemo {
+    let store = Arc::new(open::<Shared, _>(MemoryBackend::new()));
+    let x = store.input("x", 1_u64).unwrap();
+    let xh = x.handle();
+    let mut builder =
+        MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0xb1d)).auto_checkpoint_secs(1));
+    let scaled = builder.table::<u32, u64>("scaled", 1);
+    builder.define(scaled, move |ctx, k| ctx.rt().get(xh) * u64::from(*k));
+    let memo = builder.open(&store, MemoryMemo::new()).unwrap();
+    let q = memo.get_or_insert(scaled, 3);
+    assert_eq!(memo.runtime().get(q), 3);
+    (store, memo)
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn the_auto_checkpoint_skips_a_staged_batch_without_counting_an_error() {
+    let (store, memo) = shared_memo_store_with_auto_checkpoint();
+    let staged = store.staged_batch().unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    let stats = memo.stats();
+    assert_eq!(stats.auto_checkpoint_errors, 0);
+    assert_eq!(stats.checkpoints, 0);
+    drop(staged);
+}
+
+#[test]
+fn the_auto_checkpoint_skips_an_unlogged_scope_without_counting_an_error() {
+    let (store, memo) = shared_memo_store_with_auto_checkpoint();
+    let scope = store.unlogged_scope().unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(memo.stats().auto_checkpoint_errors, 0);
+    scope.close().unwrap();
+    wait_until("no automatic checkpoint ran after the scope closed", || {
+        memo.stats().checkpoints > 0
+    });
+}
+
+#[test]
+fn a_reader_never_sees_a_position_ahead_of_its_values_while_batches_commit() {
+    const ROUNDS: u64 = 300;
+    let log = MemoryBackend::new();
+    let store = Arc::new(open::<Shared, _>(log.clone()));
+    let x = store.input("x", 0_u64).unwrap();
+    let y = store.input("y", 0_u64).unwrap();
+    let base = store.stats().unwrap().position;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let reader = {
+        let (store, done) = (Arc::clone(&store), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let rt = store.runtime();
+            let (mut seen, mut refused, mut last) = (0_u64, 0_u64, (0_u64, 0_u64));
+            while !done.load(SeqCst) {
+                match store.refresh() {
+                    Ok(_) => {}
+                    Err(Error::StagedBatchOpen) => refused += 1,
+                    Err(other) => panic!("refresh failed: {other:?}"),
+                }
+                match store.stats() {
+                    Ok(stats) => {
+                        seen += 1;
+                        let committed = (stats.position.0 - base.0) / 2;
+                        let (vx, vy) = (rt.get(x.handle()), rt.get(y.handle()));
+                        assert!(
+                            vx >= committed && vy >= committed,
+                            "position says {committed} batches, values are {vx} and {vy}"
+                        );
+                    }
+                    Err(Error::StagedBatchOpen) => refused += 1,
+                    Err(other) => panic!("stats failed: {other:?}"),
+                }
+                let now = (rt.get(x.handle()), rt.get(y.handle()));
+                assert!(now.0 >= last.0 && now.1 >= last.1, "a value went backwards");
+                last = now;
+            }
+            (seen, refused)
+        })
+    };
+
+    for round in 1..=ROUNDS {
+        let mut staged = store.staged_batch().unwrap();
+        staged.set(x, round).unwrap();
+        staged.set(y, round).unwrap();
+        staged.commit().unwrap();
+        drop(staged);
+    }
+    done.store(true, SeqCst);
+    let (seen, refused) = reader.join().unwrap();
+    assert!(seen + refused > 0, "the reader never ran");
+
+    let rt = store.runtime();
+    assert_eq!(
+        store.stats().unwrap().position,
+        Position(base.0 + 2 * ROUNDS)
+    );
+    assert_eq!((rt.get(x.handle()), rt.get(y.handle())), (ROUNDS, ROUNDS));
+    drop(store);
+    let reopened = open::<Shared, _>(log);
+    let (rx, ry) = (
+        reopened.input("x", 0_u64).unwrap(),
+        reopened.input("y", 0_u64).unwrap(),
+    );
+    let rt = reopened.runtime();
+    assert_eq!((rt.get(rx.handle()), rt.get(ry.handle())), (ROUNDS, ROUNDS));
+}
+
 macro_rules! both {
     ($($name:ident),* $(,)?) => {
         mod local {
@@ -520,4 +712,7 @@ both!(
     a_foreign_record_before_the_run_poisons,
     a_memo_checkpoint_refuses_while_a_batch_is_staged,
     a_shared_staged_batch_keeps_the_store_alive,
+    a_rolled_away_value_misses_on_restore,
+    subscribing_refuses_while_a_batch_is_staged,
+    a_memo_checkpoint_reports_poisoned_after_a_batch_is_dropped,
 );
