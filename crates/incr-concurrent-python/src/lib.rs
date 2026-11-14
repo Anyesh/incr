@@ -1150,7 +1150,7 @@ impl PyRuntime {
             }
             trace_dict.set_item("node_traces", node_traces)?;
 
-            Ok((val.0, trace_dict.into_any().unbind()))
+            Ok((ready::unwrapped(py, val.0), trace_dict.into_any().unbind()))
         })
     }
 
