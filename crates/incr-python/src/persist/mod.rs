@@ -6,14 +6,10 @@
 //! log. Values cross to bytes through [`codec`], one user codec per
 //! persisted key.
 
-mod backend;
 mod batch;
-mod codec;
-#[cfg(feature = "conformance")]
-mod conformance;
 mod keyed;
 mod memo;
-mod memo_backend;
+mod memory;
 mod scope;
 mod store;
 
@@ -26,65 +22,28 @@ pub(crate) use memo::PyMemoTable;
 pub(crate) use scope::OverlayScope;
 pub(crate) use store::StoreCore;
 
-pyo3::create_exception!(
-    incr.persist,
-    PersistError,
-    pyo3::exceptions::PyRuntimeError,
-    "A store or backend failure that no Python exception describes better."
-);
+incr_python_persist::persist_exceptions!(Exceptions, incr.persist);
 
-pyo3::create_exception!(
-    incr.persist,
-    Busy,
-    PersistError,
-    "Another handle holds the memo checkpoint lock or has written a newer generation: the checkpoint wrote nothing and can be retried."
-);
+pub(crate) type PyBackend = incr_python_persist::backend::PyBackend<Exceptions>;
+pub(crate) type PyMemoBackend = incr_python_persist::memo_backend::PyMemoBackend<Exceptions>;
+pub(crate) type Registry = incr_python_persist::codec::Registry<Exceptions>;
+pub(crate) use incr_python_persist::codec::{PairCodec, Slot};
 
-pyo3::create_exception!(
-    incr.persist,
-    ReadOnly,
-    PersistError,
-    "A write reached a handle opened read-only."
-);
+#[cfg(feature = "conformance")]
+mod conformance {
+    use super::Exceptions;
 
-pyo3::create_exception!(
-    incr.persist,
-    InvalidCompaction,
-    PersistError,
-    "`compact(upto, ..)` was given an `upto` below the snapshot position or beyond the tail; constructed as `InvalidCompaction(upto, snapshot_at, tail)`."
-);
+    incr_python_persist::conformance_functions!(
+        Exceptions,
+        incr.persist.conformance,
+        "incr.persist.conformance"
+    );
+}
 
 /// The Python exception for `error`: the exception a Python backend
 /// raised, as itself, or a `PersistError` carrying the whole chain.
 pub(crate) fn persist_error(py: Python<'_>, error: Error) -> PyErr {
-    if let Error::Backend(source) = &error {
-        if let Some(raised) = source.downcast_ref::<backend::PyBackendError>() {
-            return raised.err().clone_ref(py);
-        }
-    }
-    match error {
-        Error::Busy => return Busy::new_err(error.to_string()),
-        Error::ReadOnly => return ReadOnly::new_err(error.to_string()),
-        Error::KeyedContention { .. } => {
-            return pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
-        }
-        Error::InvalidCompaction {
-            upto,
-            snapshot_at,
-            tail,
-        } => {
-            return InvalidCompaction::new_err((upto.0, snapshot_at.0, tail.0));
-        }
-        _ => {}
-    }
-    let mut message = error.to_string();
-    let mut source = std::error::Error::source(&error);
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    PersistError::new_err(message)
+    incr_python_persist::persist_error::<Exceptions>(py, error)
 }
 
 /// Creates `incr.persist`, adds it to `parent` and registers it in
@@ -98,16 +57,16 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("Busy", py.get_type::<Busy>())?;
     module.add("ReadOnly", py.get_type::<ReadOnly>())?;
     module.add("InvalidCompaction", py.get_type::<InvalidCompaction>())?;
-    module.add_class::<backend::PyMemoryBackend>()?;
-    module.add_class::<memo_backend::PyMemoryMemo>()?;
-    module.add_class::<memo_backend::PyMemoryMemoGuard>()?;
+    module.add_class::<memory::PyMemoryBackend>()?;
+    module.add_class::<memory::PyMemoryMemo>()?;
+    module.add_class::<memory::PyMemoryMemoGuard>()?;
     module.add_class::<memo::PyMemo>()?;
     module.add_class::<memo::PyMemoTable>()?;
     module.add_class::<store::PyStore>()?;
     module.add_class::<batch::PyBatch>()?;
     #[cfg(feature = "conformance")]
-    conformance::register(&module)?;
-    codec::install_hook();
+    conformance::register_conformance(&module)?;
+    incr_python_persist::codec::install_hook::<Exceptions>();
     parent.add("persist", &module)?;
     py.import("sys")?
         .getattr("modules")?

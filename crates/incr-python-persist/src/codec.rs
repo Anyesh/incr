@@ -20,6 +20,7 @@
 //! whatever the codec handles.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 
@@ -37,7 +38,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyTuple};
 
-use super::PersistError;
+use crate::PersistExceptions;
 
 const PLAIN: u8 = 0;
 const PENDING: u8 = 1;
@@ -46,7 +47,7 @@ const UNAVAILABLE: u8 = 3;
 const INCOMPLETE: u8 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Slot {
+pub enum Slot {
     Key(String),
     MemoKey(String),
     MemoValue(String),
@@ -67,7 +68,7 @@ impl Slot {
         }
     }
 
-    pub(super) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         match self {
             Slot::Key(key) => format!("persisted key '{key}'"),
             Slot::MemoKey(table) => format!("keys of memo table '{table}'"),
@@ -80,15 +81,25 @@ impl Slot {
 /// the call in progress there, which incr-persist can only report as a bare
 /// serde error. The store finds it through its value scope on any thread.
 /// No Python runs under either lock.
-#[derive(Default)]
-pub(crate) struct Registry {
+pub struct Registry<E> {
     codecs: Mutex<HashMap<Slot, Py<PyAny>>>,
     failures: Mutex<HashMap<ThreadId, PyErr>>,
+    exceptions: PhantomData<fn() -> E>,
 }
 
-impl Registry {
+impl<E> Default for Registry<E> {
+    fn default() -> Self {
+        Registry {
+            codecs: Mutex::default(),
+            failures: Mutex::default(),
+            exceptions: PhantomData,
+        }
+    }
+}
+
+impl<E: PersistExceptions> Registry<E> {
     /// The value scope a store opened with these codecs carries.
-    pub(crate) fn value_scope(self: &Arc<Self>) -> ValueScope {
+    pub fn value_scope(self: &Arc<Self>) -> ValueScope {
         ValueScope::new(Arc::clone(self))
     }
 
@@ -102,7 +113,7 @@ impl Registry {
 
     /// Registers `codec` for `slot`. Returns whether it is new: a slot keeps
     /// the codec it was declared with, and a different one is an error.
-    pub(crate) fn register(&self, slot: Slot, codec: Py<PyAny>) -> PyResult<bool> {
+    pub fn register(&self, slot: Slot, codec: Py<PyAny>) -> PyResult<bool> {
         let mut codecs = self.codecs();
         match codecs.get(&slot) {
             Some(held) if held.is(&codec) => Ok(false),
@@ -117,19 +128,19 @@ impl Registry {
         }
     }
 
-    pub(crate) fn unregister(&self, slot: &Slot) {
+    pub fn unregister(&self, slot: &Slot) {
         let removed = self.codecs().remove(slot);
         drop(removed);
     }
 
-    pub(crate) fn is_registered(&self, slot: &Slot) -> bool {
+    pub fn is_registered(&self, slot: &Slot) -> bool {
         self.codecs().contains_key(slot)
     }
 
     /// Runs a store call with this registry's codecs active. A failure is
     /// raised as the exception a codec raised during it on this thread,
     /// else through `describe`.
-    pub(crate) fn run<R>(
+    pub fn run<R>(
         self: &Arc<Self>,
         py: Python<'_>,
         f: impl FnOnce() -> incr_persist::Result<R>,
@@ -139,12 +150,12 @@ impl Registry {
         let failure = self.take_failure();
         match result {
             Ok(value) => Ok(value),
-            Err(error) => Err(failure.unwrap_or_else(|| super::persist_error(py, error))),
+            Err(error) => Err(failure.unwrap_or_else(|| crate::persist_error::<E>(py, error))),
         }
     }
 
     /// Runs `f` with this registry's codecs active on this thread.
-    pub(crate) fn scoped<R>(self: &Arc<Self>, f: impl FnOnce() -> R) -> R {
+    pub fn scoped<R>(self: &Arc<Self>, f: impl FnOnce() -> R) -> R {
         let _scope = enter_value_scope(self.value_scope());
         f()
     }
@@ -152,7 +163,7 @@ impl Registry {
     /// The exception a codec raised on this thread since the last
     /// [`Self::run`] or call to this, for a decode that went through serde
     /// directly.
-    pub(crate) fn take_failure(&self) -> Option<PyErr> {
+    pub fn take_failure(&self) -> Option<PyErr> {
         self.failures().remove(&std::thread::current().id())
     }
 
@@ -166,39 +177,45 @@ impl Registry {
 
     fn codec_for(&self, py: Python<'_>) -> Result<Py<PyAny>, String> {
         let context = current_value_context().ok_or_else(|| {
-            self.stash(PersistError::new_err(
+            self.stash(PyErr::from_type(
+                E::persist_error(py),
                 "a value was encoded outside any persisted slot",
             ))
         })?;
         let slot = Slot::of(context);
         let codec = self.codecs().get(&slot).map(|codec| codec.clone_ref(py));
         codec.ok_or_else(|| {
-            self.stash(PersistError::new_err(format!(
-                "no codec is registered for {}",
-                slot.describe()
-            )))
+            self.stash(PyErr::from_type(
+                E::persist_error(py),
+                format!("no codec is registered for {}", slot.describe()),
+            ))
         })
     }
 }
 
-fn active() -> Result<Arc<Registry>, String> {
+fn active<E: PersistExceptions>() -> Result<Arc<Registry<E>>, String> {
     current_value_scope()
-        .and_then(|scope| scope.downcast::<Registry>())
+        .and_then(|scope| scope.downcast::<Registry<E>>())
         .ok_or_else(|| "a persisted value was used outside a store call".to_owned())
 }
 
-pub(crate) fn install_hook() {
-    let _ = install(Hook { encode, decode });
+/// Installs the serde hook that encodes persisted values through the
+/// codecs of the registry current on the calling thread.
+pub fn install_hook<E: PersistExceptions>() {
+    let _ = install(Hook {
+        encode: encode::<E>,
+        decode: decode::<E>,
+    });
 }
 
-fn encode(py: Python<'_>, value: &PyValue) -> Result<Vec<u8>, String> {
-    let registry = active()?;
+fn encode<E: PersistExceptions>(py: Python<'_>, value: &PyValue) -> Result<Vec<u8>, String> {
+    let registry = active::<E>()?;
     let codec = registry.codec_for(py)?;
     frame(py, &codec, value.0.bind(py)).map_err(|e| registry.stash(e))
 }
 
-fn decode(py: Python<'_>, bytes: &[u8]) -> Result<PyValue, String> {
-    let registry = active()?;
+fn decode<E: PersistExceptions>(py: Python<'_>, bytes: &[u8]) -> Result<PyValue, String> {
+    let registry = active::<E>()?;
     let codec = registry.codec_for(py)?;
     unframe(py, &codec, bytes)
         .map(PyValue)
@@ -368,13 +385,13 @@ fn unframe(py: Python<'_>, codec: &Py<PyAny>, bytes: &[u8]) -> PyResult<Py<PyAny
 /// The codec of a keyed collection's `(key, row)` pairs: each half is framed
 /// with its own user codec, so a not-ready row persists as itself.
 #[pyclass(module = "incr.persist")]
-pub(crate) struct PairCodec {
+pub struct PairCodec {
     key: Py<PyAny>,
     row: Py<PyAny>,
 }
 
 impl PairCodec {
-    pub(crate) fn new(key: Py<PyAny>, row: Py<PyAny>) -> Self {
+    pub fn new(key: Py<PyAny>, row: Py<PyAny>) -> Self {
         Self { key, row }
     }
 }

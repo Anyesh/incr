@@ -16,28 +16,30 @@
 //! `lock_checkpoint` or `write_generation` skips the checkpoint; any other
 //! exception fails it and reaches the caller as itself.
 
+use std::marker::PhantomData;
+
 use incr_persist::memo::{
     decode_header, encode_header, EncodedEntry, GenId, Generation, IndexItem, MemoBackend,
-    MemoryMemo,
 };
 use incr_persist::Result;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyString};
 
-use super::backend::{bad_return, raised};
-use super::persist_error;
+use crate::backend::{bad_return, raised};
+use crate::PersistExceptions;
 
-type ItemTuple = (u32, u64, u64, u32);
+/// A memo index item as the protocol passes it: `(table, key_hash, loc, len)`.
+pub type ItemTuple = (u32, u64, u64, u32);
 
-fn item_tuple(item: &IndexItem) -> ItemTuple {
+pub fn item_tuple(item: &IndexItem) -> ItemTuple {
     (item.table, item.key_hash, item.loc, item.len)
 }
 
-fn item_of(object: &Bound<'_, PyAny>, what: &str) -> Result<IndexItem> {
+fn item_of<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Result<IndexItem> {
     let (table, key_hash, loc, len) = object
         .extract::<ItemTuple>()
-        .map_err(|_| bad_return(what))?;
+        .map_err(|_| bad_return::<E>(what))?;
     Ok(IndexItem {
         table,
         key_hash,
@@ -46,21 +48,27 @@ fn item_of(object: &Bound<'_, PyAny>, what: &str) -> Result<IndexItem> {
     })
 }
 
-fn items_of(object: &Bound<'_, PyAny>, what: &str) -> Result<Vec<IndexItem>> {
+fn items_of<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Result<Vec<IndexItem>> {
     object
         .try_iter()
-        .map_err(|_| bad_return(what))?
-        .map(|item| item_of(&item.map_err(raised)?, what))
+        .map_err(|_| bad_return::<E>(what))?
+        .map(|item| item_of::<E>(&item.map_err(raised::<E>)?, what))
         .collect()
 }
 
-pub(crate) struct PyMemoBackend {
+/// A Python object implementing the memo backend protocol, as a
+/// `MemoBackend` whose errors use the exceptions `E`.
+pub struct PyMemoBackend<E> {
     backend: Py<PyAny>,
+    exceptions: PhantomData<fn() -> E>,
 }
 
-impl PyMemoBackend {
-    pub(crate) fn new(backend: Py<PyAny>) -> Self {
-        PyMemoBackend { backend }
+impl<E: PersistExceptions> PyMemoBackend<E> {
+    pub fn new(backend: Py<PyAny>) -> Self {
+        PyMemoBackend {
+            backend,
+            exceptions: PhantomData,
+        }
     }
 
     fn call<'py, A: pyo3::call::PyCallArgs<'py>>(
@@ -72,13 +80,13 @@ impl PyMemoBackend {
         self.backend
             .bind(py)
             .call_method1(method, args)
-            .map_err(raised)
+            .map_err(raised::<E>)
     }
 }
 
 /// The object `lock_checkpoint()` returned, released when the checkpoint
 /// drops it.
-pub(crate) struct PyMemoGuard {
+pub struct PyMemoGuard {
     guard: Py<PyAny>,
 }
 
@@ -93,7 +101,7 @@ impl Drop for PyMemoGuard {
     }
 }
 
-impl MemoBackend for PyMemoBackend {
+impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
     type Guard = PyMemoGuard;
 
     fn lock_checkpoint(&self) -> Result<PyMemoGuard> {
@@ -113,12 +121,16 @@ impl MemoBackend for PyMemoBackend {
             }
             let (id, header, items) = result
                 .extract::<(u64, Vec<u8>, Bound<'_, PyAny>)>()
-                .map_err(|_| bad_return("load"))?;
+                .map_err(|_| bad_return::<E>("load"))?;
             let id = GenId(id);
             let Ok(header) = decode_header(&header) else {
                 return Ok(Some(Generation::empty(id)));
             };
-            Ok(Some(Generation::new(id, header, items_of(&items, "load")?)))
+            Ok(Some(Generation::new(
+                id,
+                header,
+                items_of::<E>(&items, "load")?,
+            )))
         })
     }
 
@@ -134,7 +146,7 @@ impl MemoBackend for PyMemoBackend {
             }
             let frame = result
                 .downcast::<PyBytes>()
-                .map_err(|_| bad_return("read_entry"))?;
+                .map_err(|_| bad_return::<E>("read_entry"))?;
             Ok(Some(frame.as_bytes().to_vec()))
         })
     }
@@ -158,10 +170,10 @@ impl MemoBackend for PyMemoBackend {
                     base.map(|base| base.0),
                     id.0,
                     PyBytes::new(py, &encode_header(header)?),
-                    PyList::new(py, frames).map_err(raised)?,
+                    PyList::new(py, frames).map_err(raised::<E>)?,
                 ),
             )?;
-            let items = items_of(&result, "write_generation")?;
+            let items = items_of::<E>(&result, "write_generation")?;
             Ok(Generation::new(id, header.clone(), items))
         })
     }
@@ -171,105 +183,5 @@ impl MemoBackend for PyMemoBackend {
             self.call(py, intern!(py, "remove_generation"), (generation.0,))
                 .map(drop)
         })
-    }
-}
-
-/// A memo store held in process memory: the reference implementation of
-/// the memo backend protocol, for tests and development. Stores opened on
-/// the same object share its generations.
-#[pyclass(name = "MemoryMemo", module = "incr.persist")]
-pub(crate) struct PyMemoryMemo {
-    inner: MemoryMemo,
-}
-
-#[pyclass(name = "MemoryMemoGuard", module = "incr.persist")]
-pub(crate) struct PyMemoryMemoGuard {
-    guard: Option<<MemoryMemo as MemoBackend>::Guard>,
-}
-
-#[pymethods]
-impl PyMemoryMemoGuard {
-    fn release(&mut self) {
-        self.guard.take();
-    }
-}
-
-#[pymethods]
-impl PyMemoryMemo {
-    #[new]
-    fn new() -> Self {
-        PyMemoryMemo {
-            inner: MemoryMemo::new(),
-        }
-    }
-
-    fn lock_checkpoint(&self, py: Python<'_>) -> PyResult<PyMemoryMemoGuard> {
-        let guard = self
-            .inner
-            .lock_checkpoint()
-            .map_err(|e| persist_error(py, e))?;
-        Ok(PyMemoryMemoGuard { guard: Some(guard) })
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn load(&self, py: Python<'_>) -> PyResult<Option<(u64, Py<PyBytes>, Vec<ItemTuple>)>> {
-        let Some(generation) = self.inner.load().map_err(|e| persist_error(py, e))? else {
-            return Ok(None);
-        };
-        let header = encode_header(generation.header()).map_err(|e| persist_error(py, e))?;
-        Ok(Some((
-            generation.id().0,
-            PyBytes::new(py, &header).unbind(),
-            generation.items().iter().map(item_tuple).collect(),
-        )))
-    }
-
-    fn read_entry(
-        &self,
-        py: Python<'_>,
-        generation: u64,
-        item: ItemTuple,
-    ) -> PyResult<Option<Py<PyBytes>>> {
-        let item = IndexItem {
-            table: item.0,
-            key_hash: item.1,
-            loc: item.2,
-            len: item.3,
-        };
-        let frame = self
-            .inner
-            .read_entry(GenId(generation), &item)
-            .map_err(|e| persist_error(py, e))?;
-        Ok(frame.map(|frame| PyBytes::new(py, &frame).unbind()))
-    }
-
-    fn write_generation(
-        &self,
-        py: Python<'_>,
-        base: Option<u64>,
-        generation: u64,
-        header: Vec<u8>,
-        entries: Vec<(u32, u64, Vec<u8>)>,
-    ) -> PyResult<Vec<ItemTuple>> {
-        let header = decode_header(&header).map_err(|e| persist_error(py, e))?;
-        let entries = entries
-            .into_iter()
-            .map(|(table, key_hash, frame)| EncodedEntry {
-                table,
-                key_hash,
-                frame,
-            })
-            .collect::<Vec<_>>();
-        let written = self
-            .inner
-            .write_generation(base.map(GenId), GenId(generation), &header, &entries)
-            .map_err(|e| persist_error(py, e))?;
-        Ok(written.items().iter().map(item_tuple).collect())
-    }
-
-    fn remove_generation(&self, py: Python<'_>, generation: u64) -> PyResult<()> {
-        self.inner
-            .remove_generation(GenId(generation))
-            .map_err(|e| persist_error(py, e))
     }
 }

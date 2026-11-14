@@ -11,10 +11,10 @@ use incr_persist::UnloggedScope;
 use incr_python_protocol::PyValue;
 use pyo3::prelude::*;
 
-use super::backend::PyBackend;
 use super::keyed::PyPersistedKeyed;
 use super::persist_error;
 use super::store::{PyPersistedCollection, StoreCore};
+use super::PyBackend;
 use crate::{PersistedCore, PyCollection, PyNodeId};
 
 /// An open [`UnloggedScope`] with the writable handles it gave out.

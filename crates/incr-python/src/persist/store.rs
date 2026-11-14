@@ -15,11 +15,11 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 
-use super::backend::PyBackend;
 use super::batch::PyBatch;
-use super::codec::{PairCodec, Registry, Slot};
 use super::keyed::Pending;
 use super::memo::{self, PyMemo, PyMemoTable};
+use super::PyBackend;
+use super::{PairCodec, Registry, Slot};
 use crate::overlay::Born;
 use crate::{engine_write, KeyCounts, PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
 

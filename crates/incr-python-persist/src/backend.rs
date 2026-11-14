@@ -19,24 +19,23 @@
 //! raising `ReadOnly`.
 
 use std::fmt;
+use std::marker::PhantomData;
 
-use incr_persist::{
-    Backend, Error, MemoryBackend, Position, ReadOutcome, Record, Result, SnapshotId,
-};
+use incr_persist::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 use pyo3::exceptions::PyTypeError;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 
-use super::{persist_error, Busy, InvalidCompaction, ReadOnly};
+use crate::PersistExceptions;
 
 /// A Python exception a backend method raised, carried through
 /// incr-persist's `Error::Backend` so the store call raises it unchanged.
 #[derive(Debug)]
-pub(crate) struct PyBackendError(PyErr);
+pub struct PyBackendError(PyErr);
 
 impl PyBackendError {
-    pub(crate) fn err(&self) -> &PyErr {
+    pub fn err(&self) -> &PyErr {
         &self.0
     }
 }
@@ -60,21 +59,21 @@ impl std::error::Error for PyBackendError {}
 /// `InvalidCompaction` are the store's own variants, so a skipped
 /// checkpoint or a rejected write stays one, and any other exception is
 /// carried so the call raises it unchanged.
-pub(super) fn raised(err: PyErr) -> Error {
-    if let Some(known) = Python::attach(|py| well_known(py, &err)) {
+pub fn raised<E: PersistExceptions>(err: PyErr) -> Error {
+    if let Some(known) = Python::attach(|py| well_known::<E>(py, &err)) {
         return known;
     }
     Error::Backend(Box::new(PyBackendError(err)))
 }
 
-fn well_known(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    if err.is_instance_of::<Busy>(py) {
+fn well_known<E: PersistExceptions>(py: Python<'_>, err: &PyErr) -> Option<Error> {
+    if err.is_instance(py, &E::busy(py)) {
         return Some(Error::Busy);
     }
-    if err.is_instance_of::<ReadOnly>(py) {
+    if err.is_instance(py, &E::read_only(py)) {
         return Some(Error::ReadOnly);
     }
-    if err.is_instance_of::<InvalidCompaction>(py) {
+    if err.is_instance(py, &E::invalid_compaction(py)) {
         let (upto, snapshot_at, tail) = err
             .value(py)
             .getattr("args")
@@ -89,19 +88,25 @@ fn well_known(py: Python<'_>, err: &PyErr) -> Option<Error> {
     None
 }
 
-pub(super) fn bad_return(what: &str) -> Error {
-    raised(PyTypeError::new_err(format!(
+pub fn bad_return<E: PersistExceptions>(what: &str) -> Error {
+    raised::<E>(PyTypeError::new_err(format!(
         "backend {what} returned a value of the wrong shape"
     )))
 }
 
-pub(crate) struct PyBackend {
+/// A Python object implementing the backend protocol, as a `Backend`
+/// whose errors use the exceptions `E`.
+pub struct PyBackend<E> {
     backend: Py<PyAny>,
+    exceptions: PhantomData<fn() -> E>,
 }
 
-impl PyBackend {
-    pub(crate) fn new(backend: Py<PyAny>) -> Self {
-        PyBackend { backend }
+impl<E: PersistExceptions> PyBackend<E> {
+    pub fn new(backend: Py<PyAny>) -> Self {
+        PyBackend {
+            backend,
+            exceptions: PhantomData,
+        }
     }
 
     fn call<'py, A: pyo3::call::PyCallArgs<'py>>(
@@ -113,45 +118,48 @@ impl PyBackend {
         self.backend
             .bind(py)
             .call_method1(method, args)
-            .map_err(raised)
+            .map_err(raised::<E>)
     }
 }
 
-fn encoded<'py>(py: Python<'py>, records: &[Record]) -> Result<Bound<'py, PyList>> {
+fn encoded<'py, E: PersistExceptions>(
+    py: Python<'py>,
+    records: &[Record],
+) -> Result<Bound<'py, PyList>> {
     let items = records
         .iter()
         .map(|record| Ok(PyBytes::new(py, &record.encode()?)))
         .collect::<Result<Vec<_>>>()?;
-    PyList::new(py, items).map_err(raised)
+    PyList::new(py, items).map_err(raised::<E>)
 }
 
-fn decoded(object: &Bound<'_, PyAny>) -> Result<Record> {
+fn decoded<E: PersistExceptions>(object: &Bound<'_, PyAny>) -> Result<Record> {
     let bytes = object
         .downcast::<PyBytes>()
-        .map_err(|_| bad_return("record"))?;
+        .map_err(|_| bad_return::<E>("record"))?;
     Record::decode(bytes.as_bytes())
 }
 
-fn decoded_all(object: &Bound<'_, PyAny>) -> Result<Vec<Record>> {
+fn decoded_all<E: PersistExceptions>(object: &Bound<'_, PyAny>) -> Result<Vec<Record>> {
     object
         .try_iter()
-        .map_err(raised)?
-        .map(|item| decoded(&item.map_err(raised)?))
+        .map_err(raised::<E>)?
+        .map(|item| decoded::<E>(&item.map_err(raised::<E>)?))
         .collect()
 }
 
-fn position(object: &Bound<'_, PyAny>, what: &str) -> Result<Position> {
+fn position<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Result<Position> {
     object
         .extract::<u64>()
         .map(Position)
-        .map_err(|_| bad_return(what))
+        .map_err(|_| bad_return::<E>(what))
 }
 
-impl Backend for PyBackend {
+impl<E: PersistExceptions> Backend for PyBackend<E> {
     fn append(&self, records: &[Record]) -> Result<Position> {
         Python::attach(|py| {
-            let list = encoded(py, records)?;
-            position(&self.call(py, intern!(py, "append"), (list,))?, "append")
+            let list = encoded::<E>(py, records)?;
+            position::<E>(&self.call(py, intern!(py, "append"), (list,))?, "append")
         })
     }
 
@@ -163,21 +171,21 @@ impl Backend for PyBackend {
         Python::attach(|py| {
             let result = self.call(py, intern!(py, "read_from"), (after.0,))?;
             if let Ok(tuple) = result.downcast::<PyTuple>() {
-                if let Some(snapshot_at) = compacted(tuple)? {
+                if let Some(snapshot_at) = compacted::<E>(tuple)? {
                     return Ok(ReadOutcome::Compacted { snapshot_at });
                 }
             }
             let mut found = Vec::new();
-            for item in result.try_iter().map_err(raised)? {
-                let pair = item.map_err(raised)?;
+            for item in result.try_iter().map_err(raised::<E>)? {
+                let pair = item.map_err(raised::<E>)?;
                 let pair = pair
                     .downcast::<PyTuple>()
-                    .map_err(|_| bad_return("read_from"))?;
+                    .map_err(|_| bad_return::<E>("read_from"))?;
                 if pair.len() != 2 {
-                    return Err(bad_return("read_from"));
+                    return Err(bad_return::<E>("read_from"));
                 }
-                let at = position(&pair.get_item(0).map_err(raised)?, "read_from")?;
-                found.push((at, decoded(&pair.get_item(1).map_err(raised)?)?));
+                let at = position::<E>(&pair.get_item(0).map_err(raised::<E>)?, "read_from")?;
+                found.push((at, decoded::<E>(&pair.get_item(1).map_err(raised::<E>)?)?));
             }
             out.extend(found);
             Ok(ReadOutcome::Records)
@@ -192,12 +200,15 @@ impl Backend for PyBackend {
             }
             let pair = result
                 .downcast::<PyTuple>()
-                .map_err(|_| bad_return("load_snapshot"))?;
+                .map_err(|_| bad_return::<E>("load_snapshot"))?;
             if pair.len() != 2 {
-                return Err(bad_return("load_snapshot"));
+                return Err(bad_return::<E>("load_snapshot"));
             }
-            let at = position(&pair.get_item(0).map_err(raised)?, "load_snapshot")?;
-            Ok(Some((at, decoded_all(&pair.get_item(1).map_err(raised)?)?)))
+            let at = position::<E>(&pair.get_item(0).map_err(raised::<E>)?, "load_snapshot")?;
+            Ok(Some((
+                at,
+                decoded_all::<E>(&pair.get_item(1).map_err(raised::<E>)?)?,
+            )))
         })
     }
 
@@ -209,7 +220,7 @@ impl Backend for PyBackend {
             }
             let (at, generation) = result
                 .extract::<(u64, u64)>()
-                .map_err(|_| bad_return("snapshot_id"))?;
+                .map_err(|_| bad_return::<E>("snapshot_id"))?;
             Ok(Some(SnapshotId {
                 position: Position(at),
                 generation,
@@ -219,7 +230,7 @@ impl Backend for PyBackend {
 
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()> {
         Python::attach(|py| {
-            let list = encoded(py, &folded)?;
+            let list = encoded::<E>(py, &folded)?;
             self.call(py, intern!(py, "compact"), (upto.0, list))
                 .map(drop)
         })
@@ -235,120 +246,15 @@ impl Backend for PyBackend {
     }
 }
 
-fn compacted(tuple: &Bound<'_, PyTuple>) -> Result<Option<Position>> {
+fn compacted<E: PersistExceptions>(tuple: &Bound<'_, PyTuple>) -> Result<Option<Position>> {
     if tuple.len() != 2 {
         return Ok(None);
     }
-    let first = tuple.get_item(0).map_err(raised)?;
+    let first = tuple.get_item(0).map_err(raised::<E>)?;
     match first.downcast::<PyString>() {
         Ok(tag) if tag.to_str().is_ok_and(|tag| tag == "compacted") => {
-            position(&tuple.get_item(1).map_err(raised)?, "read_from").map(Some)
+            position::<E>(&tuple.get_item(1).map_err(raised::<E>)?, "read_from").map(Some)
         }
         _ => Ok(None),
-    }
-}
-
-/// A log held in process memory: the reference implementation of the
-/// backend protocol, for tests and development. Stores opened on the same
-/// object share its log; `read_only()` gives a handle that cannot write.
-#[pyclass(name = "MemoryBackend", module = "incr.persist")]
-pub(crate) struct PyMemoryBackend {
-    inner: MemoryBackend,
-}
-
-#[pymethods]
-impl PyMemoryBackend {
-    #[new]
-    fn new() -> Self {
-        PyMemoryBackend {
-            inner: MemoryBackend::new(),
-        }
-    }
-
-    fn read_only(&self) -> Self {
-        PyMemoryBackend {
-            inner: self.inner.read_only(),
-        }
-    }
-
-    fn append(&self, py: Python<'_>, records: Vec<Vec<u8>>) -> PyResult<u64> {
-        let records = records
-            .iter()
-            .map(|bytes| Record::decode(bytes))
-            .collect::<Result<Vec<_>>>()
-            .map_err(|e| persist_error(py, e))?;
-        self.inner
-            .append(&records)
-            .map(|at| at.0)
-            .map_err(|e| persist_error(py, e))
-    }
-
-    fn sync(&self, py: Python<'_>, upto: u64) -> PyResult<()> {
-        self.inner
-            .sync(Position(upto))
-            .map_err(|e| persist_error(py, e))
-    }
-
-    fn read_from(&self, py: Python<'_>, after: u64) -> PyResult<Py<PyAny>> {
-        let mut found = Vec::new();
-        let outcome = self
-            .inner
-            .read_from(Position(after), &mut found)
-            .map_err(|e| persist_error(py, e))?;
-        if let ReadOutcome::Compacted { snapshot_at } = outcome {
-            return Ok(("compacted", snapshot_at.0)
-                .into_pyobject(py)?
-                .into_any()
-                .unbind());
-        }
-        let items = found
-            .iter()
-            .map(|(at, record)| {
-                let bytes = record.encode().map_err(|e| persist_error(py, e))?;
-                Ok((at.0, PyBytes::new(py, &bytes)))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyList::new(py, items)?.into_any().unbind())
-    }
-
-    fn load_snapshot(&self, py: Python<'_>) -> PyResult<Option<(u64, Vec<Py<PyBytes>>)>> {
-        let Some((at, records)) = self
-            .inner
-            .load_snapshot()
-            .map_err(|e| persist_error(py, e))?
-        else {
-            return Ok(None);
-        };
-        let records = records
-            .iter()
-            .map(|record| {
-                let bytes = record.encode().map_err(|e| persist_error(py, e))?;
-                Ok(PyBytes::new(py, &bytes).unbind())
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(Some((at.0, records)))
-    }
-
-    fn snapshot_id(&self, py: Python<'_>) -> PyResult<Option<(u64, u64)>> {
-        Ok(self
-            .inner
-            .snapshot_id()
-            .map_err(|e| persist_error(py, e))?
-            .map(|id| (id.position.0, id.generation)))
-    }
-
-    fn compact(&self, py: Python<'_>, upto: u64, folded: Vec<Vec<u8>>) -> PyResult<()> {
-        let folded = folded
-            .iter()
-            .map(|bytes| Record::decode(bytes))
-            .collect::<Result<Vec<_>>>()
-            .map_err(|e| persist_error(py, e))?;
-        self.inner
-            .compact(Position(upto), folded)
-            .map_err(|e| persist_error(py, e))
-    }
-
-    fn writable(&self) -> bool {
-        self.inner.writable()
     }
 }

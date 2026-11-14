@@ -17,11 +17,11 @@ use incr_python_protocol::{in_runtime, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
-use super::backend::PyBackend;
-use super::codec::Slot;
-use super::memo_backend::PyMemoBackend;
 use super::persist_error;
 use super::store::{PyStore, StoreCore};
+use super::PyBackend;
+use super::PyMemoBackend;
+use super::Slot;
 use crate::state::{PyCallable, RtState};
 use crate::{engine_read, engine_write, ready, InvalidateRef, PyNodeId, PyRuntimeRef};
 

@@ -1,0 +1,20 @@
+[package]
+name = "incr-python-persist"
+version.workspace = true
+edition = "2021"
+rust-version = "1.89"
+description = "The persistence layer shared by incr's Python bindings"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+doc = false
+
+[features]
+conformance = ["incr-persist/backend-tests"]
+
+[dependencies]
+incr-core.workspace = true
+incr-persist = { path = "../incr-persist" }
+incr-python-protocol = { path = "../incr-python-protocol", features = ["persist"] }
+pyo3 = "0.26"
