@@ -899,6 +899,10 @@ impl PyCollection {
 /// an operation on the collection raises `RuntimeError`, which the
 /// operation raises, changing nothing.
 ///
+/// A key read with `ctx.get_key` has a version input node. When a write
+/// leaves a key with no row and no query reading it, its node is deleted,
+/// so memory follows the keys held or read, not every key ever read.
+///
 /// `label` names the collection's group in `Runtime.graph_summary`: it
 /// labels the pair and row collections' version nodes, and the group
 /// reports the key count as `"keys"`.

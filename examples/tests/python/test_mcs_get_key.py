@@ -276,6 +276,26 @@ def test_a_persisted_reader_first_run_in_an_overlay_still_tracks_its_key_after_e
     assert reader.runs == runs + 1
 
 
+def key_inputs(rt):
+    groups = {g["label"]: g for g in rt.graph_summary()["groups"]}
+    return groups["k"]["nodes"] - 2
+
+
+def test_a_removed_keys_version_input_is_reclaimed_on_local_and_kept_on_shared(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt, label="k/rows")
+    kc.reconcile({n: n for n in range(20)})
+    readers = [rt.create_query(lambda ctx, n=n: ctx.get_key(kc, n)) for n in range(20)]
+    for reader in readers:
+        rt.get(reader)
+    assert key_inputs(rt) == 20
+    for reader in readers:
+        rt.delete_node(reader)
+    for n in range(20):
+        kc.remove(n)
+    assert key_inputs(rt) == (0 if pkg is incr else 20)
+
+
 def test_published_240k_keys_one_upsert_reruns_one_reader(pkg, capsys):
     keys = 240_000
     rt = pkg.Runtime()

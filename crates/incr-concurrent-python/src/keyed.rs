@@ -40,6 +40,12 @@ enum KeyedKind {
 /// calls into incr during an operation on the collection raises
 /// `RuntimeError`, which the operation raises, changing nothing.
 ///
+/// A key read with `ctx.get_key` has a version input node, which a Shared
+/// collection keeps for its whole life, also after the key is removed and
+/// no query reads it. Memory therefore grows with the number of distinct
+/// keys ever read, not only the keys held; `incr.Runtime` deletes a
+/// removed key's node once nothing reads it.
+///
 /// `label` labels the pair and row collections' version nodes, and the
 /// version input each `ctx.get_key` creates as `<label>/<str(key)>`.
 #[pyclass(name = "KeyedCollection", module = "incr_concurrent", frozen)]
