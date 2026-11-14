@@ -282,3 +282,71 @@ def test_a_call_holding_the_memo_when_the_store_closes_does_not_deadlock(watchdo
     memo_backend.release.set()
     reader.join(10)
     assert not reader.is_alive()
+
+
+def test_memo_calls_from_python_threads_while_the_checkpoint_thread_runs_finish(watchdog):
+    store = Store.open(MemoryBackend(), build_id=1)
+    codec = PickleCodec()
+    table = store.memo_table("sq", 1, codec, codec, lambda ctx, k: k * k)
+    memo = store.open_memo(MemoryMemo(), checkpoint_after_entries=2)
+    rt = store.runtime
+    computing = threading.Event()
+    errors = []
+
+    def compute(base):
+        try:
+            for k in range(base, base + 400):
+                assert rt.get(memo.get_or_insert(table, k)) == k * k
+        except Exception as error:
+            errors.append(error)
+
+    def poll():
+        try:
+            while not computing.is_set():
+                memo.checkpoint_if_due()
+                memo.stats()
+        except Exception as error:
+            errors.append(error)
+
+    pollers = [threading.Thread(target=poll) for _ in range(2)]
+    computers = [threading.Thread(target=compute, args=(i * 1000,)) for i in range(3)]
+    for thread in pollers + computers:
+        thread.start()
+    for thread in computers:
+        thread.join(30)
+    computing.set()
+    for thread in pollers:
+        thread.join(30)
+    assert not any(thread.is_alive() for thread in pollers + computers)
+    assert errors == []
+    store.close()
+
+
+class UserError(Exception):
+    pass
+
+
+def test_abandoning_an_on_write_batch_raises_the_blocks_exception_not_a_stored_routing_failure(
+    watchdog,
+):
+    store = Store.open(MemoryBackend(), build_id=1)
+    codec = PickleCodec()
+    rows = store.collection("rows", codec)
+
+    def key(row):
+        if row == "bad":
+            raise UserError("no key")
+        return row
+
+    rt = store.runtime
+    store.insert(rows, "ok")
+    count = rows.group_by(key).get_group("ok").count()
+    assert rt.get(count) == 1
+    with pytest.raises(UserError, match="the block"):
+        with store.batch(apply="on_write") as b:
+            b.insert(rows, "bad")
+            raise UserError("the block")
+    with pytest.raises(RuntimeError, match="routing failed"):
+        rt.node_count()
+    with pytest.raises(PersistError):
+        store.insert(rows, "ok")

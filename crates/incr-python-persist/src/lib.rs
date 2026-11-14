@@ -34,6 +34,7 @@ pub use incr_python_protocol;
 pub use pyo3;
 
 use incr_persist::Error;
+use incr_python_protocol::PyKey;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
@@ -68,6 +69,20 @@ pub fn persist_error<E: PersistExceptions>(py: Python<'_>, error: Error) -> PyEr
         Error::TailMoved { .. } => return PyErr::from_type(E::tail_moved(py), error.to_string()),
         Error::KeyedContention { .. } => {
             return pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+        }
+        Error::UnstableRow {
+            ref key,
+            ref row_key,
+        } => {
+            let row_key = row_key
+                .downcast_ref::<PyKey>()
+                .and_then(|row_key| row_key.0.bind(py).repr().ok())
+                .map_or_else(|| "a key".to_owned(), |repr| repr.to_string());
+            return pyo3::exceptions::PyValueError::new_err(format!(
+                "keyed collection '{key}', key {row_key}: the held row does not equal its decoded \
+                 copy and its codec encodes it differently from the logged bytes, so a replay \
+                 would not find it; nothing was written"
+            ));
         }
         Error::InvalidCompaction {
             upto,

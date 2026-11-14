@@ -92,14 +92,18 @@ impl Exceptions for Exc {
 /// because the engine may wait on a claim whose holder needs the GIL to
 /// finish: the GIL is lock level -1, never held while waiting on an incr
 /// lock. A `group_by` routing failure an earlier call on this thread
-/// stored is raised first, before the call consumes anything.
+/// stored is raised first, before the call consumes anything; `f` is then
+/// dropped with the GIL released, since it may own a value whose drop
+/// takes a store lock.
 fn engine_call<R: Ungil>(
     py: Python<'_>,
     rt: &Runtime,
-    f: impl FnOnce() -> R + Ungil,
+    f: impl FnOnce() -> R + Ungil + Send,
 ) -> PyResult<R> {
     if let Some(failure) = rt.take_routing_failure() {
-        return Err(routing_error(py, failure));
+        let err = routing_error(py, failure);
+        py.detach(move || drop(f));
+        return Err(err);
     }
     pyerr_boundary::<Exc, _>(|| in_runtime(rt, || py.detach(f)))
 }

@@ -642,3 +642,49 @@ def test_two_open_batches_on_one_key_leave_one_pair(persist):
         a.upsert(kc, "k", 1)
         b.upsert(kc, "k", 2)
     assert_one_pair_for_k_after_restart(persist, store, inner, kc, 1)
+
+
+class AlternatingCodec:
+    """Encodes every call to different bytes, which decode to the same row."""
+
+    def __init__(self):
+        self.encodings = 0
+
+    def encode(self, obj):
+        self.encodings += 1
+        return pickle.dumps((obj, self.encodings), protocol=4)
+
+    def decode(self, data):
+        return pickle.loads(data)[0]
+
+
+def test_a_write_removing_a_row_a_replay_could_not_match_is_refused(persist):
+    backend = persist.MemoryBackend()
+    store = open_store(persist, backend)
+    kc = store.keyed_collection("rows", PickleCodec(), AlternatingCodec())
+    nan = float("nan")
+    store.upsert(kc, "a", nan)
+    store.upsert(kc, "b", 2)
+    logged = backend.read_from(0)
+
+    with pytest.raises(ValueError, match=r"keyed collection 'rows', key 'a'.*replay"):
+        store.upsert(kc, "a", 1)
+    with pytest.raises(ValueError, match=r"key 'a'"):
+        store.remove(kc, "a")
+    with pytest.raises(ValueError, match=r"key 'a'"):
+        store.reconcile(kc, {"b": 2})
+    with pytest.raises(ValueError, match=r"key 'a'"):
+        with store.batch() as b:
+            b.upsert(kc, "a", 3)
+    assert backend.read_from(0) == logged
+    assert len(kc) == 2
+
+    store.upsert(kc, "b", 3)
+    store.upsert(kc, "c", 4)
+    assert kc.get("b") == 3
+    assert len(kc) == 3
+    store.close()
+
+    again = open_store(persist, backend)
+    kc2 = again.keyed_collection("rows", PickleCodec(), AlternatingCodec())
+    assert sorted(kc2.keys()) == ["a", "b", "c"]
