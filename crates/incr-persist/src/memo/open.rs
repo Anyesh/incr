@@ -266,19 +266,30 @@ impl AutoCheckpoint {
             unreachable!("incr-persist: automatic checkpoints are Shared-only");
         };
         let wake = Arc::clone(&core.wake);
-        let thread = thread::spawn(move || loop {
-            core.wake.arm();
-            if core.wake.wait(every) {
-                return;
-            }
-            if core.dirty.unsaved() == 0 {
-                continue;
-            }
-            // A panic in a key's or value's code fails this checkpoint, not
-            // the thread, so later intervals still run.
-            match catch_unwind(AssertUnwindSafe(|| core.checkpoint(store.runtime()))) {
-                Ok(Ok(_) | Err(Error::Busy)) => {}
-                Ok(Err(_)) | Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
+        let thread = thread::spawn(move || {
+            let mut failed = false;
+            loop {
+                core.wake.arm();
+                // Computes that reached the trigger while the thread was
+                // unarmed did not wake it. After a failure the next compute
+                // wakes it instead, so a lasting error does not spin.
+                if !failed && core.checkpoint_due() {
+                    core.wake.due_once();
+                }
+                if core.wake.wait(every) {
+                    return;
+                }
+                if core.dirty.unsaved() == 0 {
+                    continue;
+                }
+                // A panic in a key's or value's code fails this checkpoint,
+                // not the thread, so later intervals still run.
+                let done = catch_unwind(AssertUnwindSafe(|| core.checkpoint(store.runtime())));
+                failed = !matches!(done, Ok(Ok(_)));
+                match done {
+                    Ok(Ok(_) | Err(Error::Busy)) => {}
+                    Ok(Err(_)) | Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
+                }
             }
         });
         AutoCheckpoint { wake, thread }

@@ -246,7 +246,7 @@ impl Wake {
     }
 
     /// [`Self::due`] once per [`Self::arm`].
-    fn due_once(&self) {
+    pub(crate) fn due_once(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
             self.due();
         }
