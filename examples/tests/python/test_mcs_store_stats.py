@@ -109,10 +109,10 @@ def test_auto_checkpoint_records_must_be_positive(Store):
         Store.open(DictBackend(DictLogState()), build_id=1, auto_checkpoint_records=0)
 
 
-def test_inside_an_on_write_batch_the_trigger_fires_before_the_append():
+def test_inside_an_on_write_batch_the_trigger_fires_before_the_append(Store):
     state = DictLogState()
     backend = RecordingBackend(state)
-    store = incr.persist.Store.open(backend, build_id=1, auto_checkpoint_records=3)
+    store = Store.open(backend, build_id=1, auto_checkpoint_records=3)
     node = store.input("x", 0, PickleCodec())
     store.set(node, 1)
     store.set(node, 2)
@@ -137,5 +137,5 @@ def test_inside_an_on_write_batch_the_trigger_fires_before_the_append():
     assert store.stats()["records_since_checkpoint"] == 1
     store.close()
 
-    again = incr.persist.Store.open(DictBackend(state), build_id=1, auto_checkpoint_records=3)
+    again = Store.open(DictBackend(state), build_id=1, auto_checkpoint_records=3)
     assert again.runtime.get(again.input("x", 0, PickleCodec())) == 8
