@@ -293,6 +293,13 @@ where
         self.keyed.get_key(rt, key)
     }
 
+    /// The keys held, as [`KeyedCollection::get_keys`] reads them: inside a
+    /// query, a dependency on the key set. A memo entry reading it is
+    /// unsaveable.
+    pub fn get_keys(&self, rt: &Runtime<C>) -> Vec<K> {
+        self.keyed.get_keys(rt)
+    }
+
     /// `key`'s version input, if a read with [`Self::get_key`] or a memo
     /// restore created one.
     pub fn version_input(&self, key: &K) -> Option<Incr<u64>> {
@@ -1220,6 +1227,7 @@ where
     fn delete_nodes(&self, rt: &Runtime<C>) -> std::result::Result<(), DeleteError> {
         let mut nodes = vec![self.node(), self.keyed.rows().version_node().erase()];
         nodes.extend(self.keyed.version_inputs());
+        nodes.extend(self.keyed.membership_input().map(Incr::erase));
         rt.try_delete_nodes(&nodes)
     }
 
