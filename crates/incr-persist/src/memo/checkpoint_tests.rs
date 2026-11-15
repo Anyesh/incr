@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 
 use super::*;
 use crate::memo::{decode_entry, encode_entry, fingerprint, MemoryMemo, StoredDep, TableDesc};
@@ -336,23 +337,24 @@ fn eviction_takes_the_oldest_first_with_transitive_dependents() {
     let mut e = entry(0, 5, 0, vec![]);
     e.last_used = 4;
     let entries = [a, b, c, d, e];
-    let sizes = [10, 10, 10, 10, 10];
-    assert_eq!(evict(&entries, &sizes, 50), [false; 5]);
-    assert_eq!(
-        evict(&entries, &sizes, 49),
-        [true, true, true, false, false]
-    );
-    assert_eq!(
-        evict(&entries, &sizes, 20),
-        [true, true, true, false, false]
-    );
-    assert_eq!(evict(&entries, &sizes, 19), [true, true, true, true, false]);
-    assert_eq!(evict(&entries, &sizes, 0), [true; 5]);
+    let nodes: Vec<Node> = entries.iter().map(|e| Node::of(e, 10)).collect();
+    let dependents = node_edges(&nodes);
+    let evict = |skip: &[bool], max, target| evict(&nodes, &dependents, skip, max, target);
+    let none = [false; 5];
+    assert_eq!(evict(&none, 50, 50), [false; 5]);
+    assert_eq!(evict(&none, 49, 49), [true, true, true, false, false]);
+    assert_eq!(evict(&none, 20, 20), [true, true, true, false, false]);
+    assert_eq!(evict(&none, 19, 19), [true, true, true, true, false]);
+    assert_eq!(evict(&none, 0, 0), [true; 5]);
+    assert_eq!(evict(&none, 49, 19), [true, true, true, true, false]);
+    assert_eq!(evict(&none, 50, 0), [false; 5]);
+    let d_gone = [false, false, false, true, false];
+    assert_eq!(evict(&d_gone, 39, 39), [true, true, true, false, false]);
 }
 
 #[test]
-fn eviction_through_the_driver_keeps_the_newest_within_budget() {
-    let memo = MemoryMemo::new();
+fn eviction_without_deltas_keeps_the_newest_within_max_bytes() {
+    let memo = MemoryMemo::without_deltas();
     let tables = vec![desc("a", 1)];
     write_checkpoint(&memo, input(tables.clone(), vec![entry(0, 1, 10, vec![])])).unwrap();
     let newer = entry(0, 2, 20, vec![]);
@@ -393,6 +395,12 @@ fn an_entry_too_large_for_a_frame_is_dropped_with_its_dependents() {
         }
     };
     let done = write_with(&memo, input(tables, fresh), too_large).unwrap();
+    assert_eq!(done.mode, Mode::TwoPass { remap: false });
+    assert_eq!(
+        done.fates,
+        [Fate::Written, Fate::Oversized, Fate::Oversized]
+    );
+    assert_eq!(done.stats.fresh_written, 1);
     assert_eq!(done.stats.merged, 1);
     assert_eq!(done.stats.oversized, 3);
     assert_eq!(done.stats.evicted, 0);
@@ -443,6 +451,14 @@ fn wide(table: u32, n: u32, value: u8) -> Entry {
         value: vec![value; 16],
         deps: Vec::new(),
         last_used: 0,
+    }
+}
+
+fn on_wide(table: u32, n: u32) -> StoredDep {
+    StoredDep::Query {
+        table,
+        key: n.to_le_bytes().to_vec(),
+        fp: 0,
     }
 }
 
@@ -580,7 +596,7 @@ fn a_delta_over_a_quarter_of_the_base_compacts() {
 }
 
 #[test]
-fn a_delta_that_would_exceed_max_bytes_compacts_and_evicts() {
+fn a_delta_that_would_exceed_max_bytes_compacts_and_evicts_to_nine_tenths() {
     let memo = MemoryMemo::new();
     let tables = vec![desc("a", 1)];
     let base = write_checkpoint(&memo, wide_input(tables.clone(), 0..400, 1)).unwrap();
@@ -588,13 +604,306 @@ fn a_delta_that_would_exceed_max_bytes_compacts_and_evicts() {
     let mut next = wide_input(tables.clone(), 0..10, 2);
     next.max_bytes = max_bytes;
     assert!(write_checkpoint(&memo, next).unwrap().stats.delta);
-    let mut over = wide_input(tables, 1000..1010, 3);
+    let mut over = wide_input(tables.clone(), 1000..1010, 3);
     over.max_bytes = max_bytes;
     let done = write_checkpoint(&memo, over).unwrap();
     assert!(!done.stats.delta);
     assert!(done.stats.compacted);
-    assert_eq!(done.stats.evicted, 10);
-    assert_eq!(visible(&memo).len(), 400);
+    assert_eq!(done.mode, Mode::TwoPass { remap: false });
+    assert!(done.generation.entry_bytes() <= max_bytes - max_bytes / 10);
+    let all = visible(&memo);
+    assert_eq!(done.stats.evicted, 410 - all.len());
+    assert_eq!(all.iter().filter(|e| e.last_used > 1).count(), 20);
+
+    for round in 0..4 {
+        let mut small = wide_input(tables.clone(), 2000 + round..2001 + round, 4);
+        small.max_bytes = max_bytes;
+        let done = write_checkpoint(&memo, small).unwrap();
+        assert!(done.stats.delta, "round {round}");
+        assert_eq!(done.stats.evicted, 0);
+    }
+}
+
+/// A table name, key, value, `last_used` and deps with tables by name.
+type Named = (String, Vec<u8>, Vec<u8>, u64, Vec<String>);
+
+/// Every entry `memo`'s chain shows, with tables and query-dep tables by
+/// name, so stores whose catalogs number tables differently compare.
+fn named(memo: &MemoryMemo) -> Vec<Named> {
+    let chain = memo.load_chain(&[]).unwrap().unwrap();
+    let names: Vec<String> = chain
+        .tip()
+        .header()
+        .tables
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    let mut out: Vec<_> = visible(memo)
+        .into_iter()
+        .map(|e| {
+            let deps = e
+                .deps
+                .into_iter()
+                .map(|dep| match dep {
+                    StoredDep::Query { table, key, fp } => {
+                        format!("{}:{key:?}:{fp}", names[table as usize])
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            (
+                names[e.table as usize].clone(),
+                e.key,
+                e.value,
+                e.last_used,
+                deps,
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// What `rounds` leave visible when every fresh entry is kept and none is
+/// evicted: each key's latest write, at its round's seq, in `named` form.
+fn oracle(rounds: &[CheckpointInput]) -> Vec<Named> {
+    let mut latest = HashMap::new();
+    for (at, round) in rounds.iter().enumerate() {
+        let name = |table: u32| round.tables[table as usize].name.clone();
+        for entry in &round.fresh {
+            let deps = entry
+                .deps
+                .iter()
+                .map(|dep| match dep {
+                    StoredDep::Query { table, key, fp } => {
+                        format!("{}:{key:?}:{fp}", name(*table))
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            let value = (entry.value.clone(), at as u64 + 1, deps);
+            latest.insert((name(entry.table), entry.key.clone()), value);
+        }
+    }
+    let mut out: Vec<Named> = latest
+        .into_iter()
+        .map(|((table, key), (value, seq, deps))| (table, key, value, seq, deps))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Writes `rounds` to a store with deltas and to one without, checking
+/// after each that both show what [`oracle`] expects, and returns each
+/// round's mode on the store with deltas.
+fn against_full(rounds: Vec<CheckpointInput>) -> Vec<Mode> {
+    let chained = MemoryMemo::new();
+    let full = MemoryMemo::without_deltas();
+    let mut modes = Vec::new();
+    for at in 0..rounds.len() {
+        let round = rounds[at].clone();
+        modes.push(write_checkpoint(&chained, round.clone()).unwrap().mode);
+        write_checkpoint(&full, round).unwrap();
+        let expected = oracle(&rounds[..=at]);
+        assert_eq!(named(&chained), expected, "round {at}");
+        assert_eq!(named(&full), expected, "round {at}");
+    }
+    modes
+}
+
+#[test]
+fn a_compaction_without_eviction_or_remap_retags_and_matches_a_full_write() {
+    let tables = vec![desc("a", 1)];
+    let mut rounds = vec![wide_input(tables.clone(), 0..400, 1)];
+    for round in 1..=9 {
+        let mut next = wide_input(tables.clone(), round..round + 3, round as u8 + 1);
+        next.fresh
+            .push(entry(0, 7, round as u8, vec![on_wide(0, round)]));
+        rounds.push(next);
+    }
+    let modes = against_full(rounds);
+    assert_eq!(modes[0], Mode::Copy { remap: false });
+    assert!(modes[1..9].iter().all(|&p| p == Mode::Delta));
+    assert_eq!(modes[9], Mode::Copy { remap: false });
+}
+
+#[test]
+fn a_compaction_over_a_reordered_catalog_remaps_and_matches_a_full_write() {
+    let (a, b, c) = (desc("a", 1), desc("b", 1), desc("c", 1));
+    let mut first = wide_input(vec![a.clone(), b.clone()], 0..300, 1);
+    first.fresh.extend((0..100).map(|n| wide(1, n, 1)));
+    first.fresh.push(entry(1, 9, 9, vec![on_wide(0, 3)]));
+    let delta = wide_input(vec![b.clone(), a.clone()], 0..1, 2);
+    let mut grown = wide_input(vec![c, b, a], 0..2, 3);
+    grown.fresh.push(wide(2, 5, 3));
+    let modes = against_full(vec![first, delta, grown]);
+    assert_eq!(modes[1], Mode::Delta);
+    assert_eq!(modes[2], Mode::Copy { remap: true });
+}
+
+#[test]
+fn eviction_on_a_reordered_catalog_remaps_in_the_second_pass() {
+    let (a, b) = (desc("a", 1), desc("b", 1));
+    let memo = MemoryMemo::new();
+    let base = write_checkpoint(&memo, wide_input(vec![a.clone()], 0..400, 1)).unwrap();
+    let mut next = wide_input(vec![b, a], 0..200, 2);
+    next.max_bytes = base.generation.entry_bytes();
+    for entry in &mut next.fresh {
+        entry.table = 1;
+    }
+    next.fresh.extend((0..100).map(|n| wide(0, n, 2)));
+    let done = write_checkpoint(&memo, next).unwrap();
+    assert_eq!(done.mode, Mode::TwoPass { remap: true });
+    let max_bytes = base.generation.entry_bytes();
+    assert!(done.generation.entry_bytes() <= max_bytes - max_bytes / 10);
+    let all = visible(&memo);
+    assert_eq!(all.iter().filter(|e| e.last_used == 2).count(), 300);
+    assert_eq!(done.stats.evicted, 500 - all.len());
+}
+
+/// A [`MemoryMemo`] that records, during a streamed write, how many
+/// frames it had handed out beyond the entries the write had pulled.
+#[derive(Default)]
+struct Streaming {
+    memo: MemoryMemo,
+    writing: AtomicBool,
+    read: AtomicUsize,
+    ahead: AtomicUsize,
+}
+
+impl Streaming {
+    fn count(&self, frames: usize) {
+        if self.writing.load(SeqCst) {
+            self.read.fetch_add(frames, SeqCst);
+        }
+    }
+}
+
+impl MemoBackend for Streaming {
+    type Guard = <MemoryMemo as MemoBackend>::Guard;
+
+    fn lock_checkpoint(&self) -> Result<Self::Guard> {
+        self.memo.lock_checkpoint()
+    }
+
+    fn load(&self) -> Result<Option<Generation>> {
+        self.memo.load()
+    }
+
+    fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
+        self.count(1);
+        self.memo.read_entry(generation, item)
+    }
+
+    fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
+        self.count(items.len());
+        self.memo.read_entries(generation, items)
+    }
+
+    fn write_generation(
+        &self,
+        _: Option<GenId>,
+        _: GenId,
+        _: &GenHeader,
+        _: &[EncodedEntry],
+    ) -> Result<Generation> {
+        panic!("a checkpoint writes full generations streamed");
+    }
+
+    fn write_generation_streamed(
+        &self,
+        base: Option<GenId>,
+        id: GenId,
+        header: &GenHeader,
+        entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
+    ) -> Result<Generation> {
+        self.read.store(0, SeqCst);
+        self.writing.store(true, SeqCst);
+        let mut pulled = Vec::new();
+        for entry in entries {
+            pulled.push(entry?);
+            let ahead = self.read.load(SeqCst).saturating_sub(pulled.len());
+            self.ahead.fetch_max(ahead, SeqCst);
+        }
+        self.writing.store(false, SeqCst);
+        self.memo.write_generation(base, id, header, &pulled)
+    }
+
+    fn supports_delta(&self) -> bool {
+        true
+    }
+
+    fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
+        self.memo.load_chain(known)
+    }
+
+    fn write_delta(
+        &self,
+        tip: GenId,
+        id: GenId,
+        header: &DeltaHeader,
+        entries: &[EncodedEntry],
+        tombstones: &[Tombstone],
+    ) -> Result<Generation> {
+        self.memo.write_delta(tip, id, header, entries, tombstones)
+    }
+
+    fn remove_generation(&self, generation: GenId) -> Result<()> {
+        self.memo.remove_generation(generation)
+    }
+}
+
+#[test]
+fn a_compaction_reads_the_chain_in_batches_as_the_write_pulls() {
+    let tables = vec![desc("a", 1)];
+    for evicting in [false, true] {
+        let memo = Streaming::default();
+        let base = write_checkpoint(&memo, wide_input(tables.clone(), 0..4000, 1)).unwrap();
+        if !evicting {
+            for round in 0..8 {
+                write_checkpoint(&memo, wide_input(tables.clone(), round..round + 1, 2)).unwrap();
+            }
+        }
+        let fresh = 4000..4020;
+        let mut over = wide_input(tables.clone(), fresh.clone(), 3);
+        if evicting {
+            over.max_bytes = base.generation.entry_bytes();
+        }
+        let done = write_checkpoint(&memo, over).unwrap();
+        assert!(!done.stats.delta);
+        assert_eq!(done.stats.compacted, !evicting);
+        assert_eq!(
+            done.mode,
+            if evicting {
+                Mode::TwoPass { remap: false }
+            } else {
+                Mode::Copy { remap: false }
+            }
+        );
+        assert!(
+            memo.ahead.load(SeqCst) <= STREAM_BATCH + fresh.len(),
+            "{} frames read ahead of the write",
+            memo.ahead.load(SeqCst)
+        );
+    }
+}
+
+#[test]
+fn a_streamed_compaction_reading_through_the_same_memory_memo_finishes() {
+    let memo = Arc::new(MemoryMemo::new());
+    let tables = vec![desc("a", 1)];
+    write_checkpoint(&*memo, wide_input(tables.clone(), 0..400, 1)).unwrap();
+    let (sent, done) = std::sync::mpsc::channel();
+    let writer = Arc::clone(&memo);
+    std::thread::spawn(move || {
+        let result = write_checkpoint(&*writer, wide_input(tables, 0..200, 2));
+        sent.send(result.map(|done| done.mode)).unwrap();
+    });
+    let mode = done
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the compaction finished")
+        .unwrap();
+    assert_eq!(mode, Mode::Copy { remap: false });
 }
 
 #[test]

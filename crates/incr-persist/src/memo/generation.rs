@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use super::layers::Live;
 use super::{DeltaHeader, GenHeader, IndexItem};
 use crate::{Error, Result};
 
@@ -29,6 +30,12 @@ pub struct Generation {
     slots: Vec<u32>,
     /// `64 - log2(slots.len())`, for [`home`].
     shift: u32,
+    /// The items that are not tombstones, and their summed lengths.
+    entries: u64,
+    entry_bytes: u64,
+    /// For a delta, what its chain up to and including it shows, once
+    /// computed: its older layers are fixed by its base and parent ids.
+    shown: OnceLock<Live>,
 }
 
 /// The first slot probed for `(table, key_hash)`: the top bits of the hash,
@@ -80,6 +87,12 @@ impl Generation {
             }
             slots[at] = u32::try_from(start + 1).expect("a generation holds under u32::MAX items");
         }
+        let (entries, entry_bytes) = items
+            .iter()
+            .filter(|item| !item.is_tombstone())
+            .fold((0, 0), |(n, bytes), item| {
+                (n + 1, bytes + u64::from(item.len))
+            });
         Generation {
             id,
             frame_tag,
@@ -88,6 +101,9 @@ impl Generation {
             items,
             slots,
             shift,
+            entries,
+            entry_bytes,
+            shown: OnceLock::new(),
         }
     }
 
@@ -179,7 +195,20 @@ impl Generation {
     /// The summed length of every entry frame, which `max_bytes` bounds.
     /// Tombstones add nothing.
     pub fn entry_bytes(&self) -> u64 {
-        self.items.iter().map(|item| u64::from(item.len)).sum()
+        self.entry_bytes
+    }
+
+    /// The items that are not tombstones.
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.entries
+    }
+
+    pub(crate) fn shown(&self) -> Option<Live> {
+        self.shown.get().copied()
+    }
+
+    pub(crate) fn set_shown(&self, live: Live) {
+        let _ = self.shown.set(live);
     }
 }
 

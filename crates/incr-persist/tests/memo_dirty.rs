@@ -338,7 +338,8 @@ fn evicted_entries_are_dirtied_again_and_a_reopen_recomputes_them<C: MemoCells>(
         w.memo.checkpoint().unwrap();
         w.memo.stats().bytes / u64::from(N)
     };
-    let budget = options().max_bytes(per_entry * 5);
+    // Eviction goes down to 0.9 of max_bytes, which this keeps at five entries.
+    let budget = options().max_bytes((per_entry * 50).div_ceil(9));
     let backends = Backends::new();
     let evicted = {
         let w = Leaves::<C>::open(&backends, budget.clone());
