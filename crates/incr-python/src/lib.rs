@@ -402,14 +402,37 @@ impl PyRuntimeRef {
     /// exist: the query reruns when a write inserts or removes a key, not
     /// when it only changes a row. Raises `ValueError` for a keyed
     /// collection of another runtime.
+    ///
+    /// `keys(parts, p)` reads one partition of a `kc.key_partitions(fn)`
+    /// result instead: the keys `fn` maps to `p`, rerunning the query only
+    /// when a write inserts or removes a key of that partition.
+    #[pyo3(signature = (source, *partition))]
     fn keys<'py>(
         &self,
         py: Python<'py>,
-        kc: PyRef<'_, PyKeyedCollection>,
+        source: &Bound<'py, PyAny>,
+        partition: &Bound<'py, pyo3::types::PyTuple>,
     ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
         let rt = self.rt()?;
-        let (source, _) = kc.key_source(py, rt)?;
-        let keys = engine_in_query(rt, || source.get_keys(rt))?;
+        let keys = match partition.len() {
+            0 => {
+                let kc: PyRef<'_, PyKeyedCollection> = source.extract()?;
+                let (source, _) = kc.key_source(py, rt)?;
+                engine_in_query(rt, || source.get_keys(rt))?
+            }
+            1 => {
+                let parts: PyRef<'_, PyKeyPartitions> = source.extract()?;
+                let kc = parts.owner.bind(py).borrow();
+                let (source, _) = kc.key_source(py, rt)?;
+                let q = PyKey(partition.get_item(0)?.unbind());
+                engine_in_query(rt, || source.get_partition(rt, &parts.parts, &q))?
+            }
+            n => {
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "keys() takes a keyed collection, or key partitions and one partition, not {n} partitions"
+                )))
+            }
+        };
         pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
     }
 
@@ -945,6 +968,14 @@ struct PyKeyedCollection {
     label: Option<String>,
 }
 
+/// The result of `KeyedCollection.key_partitions`: read one partition with
+/// `ctx.keys(parts, p)`.
+#[pyclass(name = "KeyPartitions", unsendable)]
+struct PyKeyPartitions {
+    parts: incr_core::KeyPartitions<PyKey>,
+    owner: Py<PyKeyedCollection>,
+}
+
 /// A keyed collection whose pairs are `(key, row)` tuples, read by rank `R`.
 type PyKeyedCore<R> = incr_core::KeyedCollection<PyKey, PyValue, Local, PyPair, R>;
 
@@ -1195,6 +1226,24 @@ impl PyKeyedCollection {
             let (source, _) = self.key_source(py, rt)?;
             Ok(source.forget_key(rt, &key))
         })?
+    }
+
+    /// Partition the keys by `fn(key)`, which must return the same
+    /// hashable value for a key every time. `fn` runs on the keys held now
+    /// and on each key a write inserts or removes, never on a row update;
+    /// an exception it raises refuses the write and leaves the collection
+    /// unchanged. Read a partition with `ctx.keys(parts, p)`.
+    fn key_partitions(slf: &Bound<'_, Self>, f: Py<PyAny>) -> PyResult<PyKeyPartitions> {
+        let py = slf.py();
+        let this = slf.borrow();
+        let parts = this.engine_write(py, |rt| {
+            let (source, _) = this.key_source(py, rt)?;
+            Ok::<_, PyErr>(source.key_partitions(rt, f))
+        })??;
+        Ok(PyKeyPartitions {
+            parts,
+            owner: slf.clone().unbind(),
+        })
     }
 
     /// How many version inputs this collection holds: one per key a query
@@ -2156,6 +2205,7 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<persist::PyOverlay>()?;
     m.add_class::<PyCollection>()?;
     m.add_class::<PyKeyedCollection>()?;
+    m.add_class::<PyKeyPartitions>()?;
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
     persist::register(m)?;

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, Runtime};
-use incr_python_protocol::{PyKey, PyPair, PyValue};
+use incr_python_protocol::{call_stashing, PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::PyClass;
@@ -124,6 +124,43 @@ impl<B: PyBinding> KeyedSource<'_, B> {
         match self {
             KeyedSource::Plain(keyed) => keyed.get_keys(rt),
             KeyedSource::Persisted(persisted) => persisted.get_keys(rt),
+        }
+    }
+
+    /// Registers `f` as a partitioning of the keys, as
+    /// [`incr_core::KeyedCollection::key_partitions`] does: `f` is called
+    /// with each key a write inserts or removes and with the keys held
+    /// now, and must return the same hashable partition for a key every
+    /// time. An exception it raises refuses the write. The caller runs it
+    /// inside its package's engine boundary.
+    pub fn key_partitions(
+        &self,
+        _rt: &Runtime<B::C>,
+        f: Py<PyAny>,
+    ) -> incr_core::KeyPartitions<PyKey> {
+        let f = move |key: &PyKey| {
+            Python::attach(|py| PyKey(call_stashing(py, &f, (key.0.clone_ref(py),))))
+        };
+        match self {
+            KeyedSource::Plain(keyed) => keyed.key_partitions(f),
+            KeyedSource::Persisted(persisted) => persisted.key_partitions(f),
+        }
+    }
+
+    /// The keys of partition `q`, as
+    /// [`incr_core::KeyedCollection::get_partition`] reads them: inside a
+    /// compute of `rt`, a dependency on that partition alone. Runs the
+    /// partition's `__hash__` and `__eq__`: the caller runs it inside its
+    /// package's engine boundary.
+    pub fn get_partition(
+        &self,
+        rt: &Runtime<B::C>,
+        parts: &incr_core::KeyPartitions<PyKey>,
+        q: &PyKey,
+    ) -> Vec<PyKey> {
+        match self {
+            KeyedSource::Plain(keyed) => keyed.get_partition(rt, parts, q),
+            KeyedSource::Persisted(persisted) => persisted.get_partition(rt, parts, q),
         }
     }
 

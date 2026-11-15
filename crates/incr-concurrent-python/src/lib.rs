@@ -59,7 +59,7 @@ use incr_python_protocol::{
     try_read, Exceptions, PyFixpoint, PyKey, PyValue, StaleNodeError,
 };
 
-use keyed::PyKeyedCollection;
+use keyed::{PyKeyPartitions, PyKeyedCollection};
 use persist::{SharedBinding, Signal};
 
 pyo3::create_exception!(
@@ -339,12 +339,32 @@ impl PyRuntimeRef {
     /// exist: the query reruns when a write inserts or removes a key, not
     /// when it only changes a row. Raises `ValueError` for a keyed
     /// collection of another runtime.
+    ///
+    /// `keys(parts, p)` reads one partition of a `kc.key_partitions(fn)`
+    /// result instead: the keys `fn` maps to `p`, rerunning the query only
+    /// when a write inserts or removes a key of that partition.
+    #[pyo3(signature = (source, *partition))]
     fn keys<'py>(
         &self,
         py: Python<'py>,
-        kc: PyRef<'_, PyKeyedCollection>,
+        source: &Bound<'py, PyAny>,
+        partition: &Bound<'py, pyo3::types::PyTuple>,
     ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
-        key_list(py, self.rt()?, &kc)
+        let rt = self.rt()?;
+        match partition.len() {
+            0 => {
+                let kc: PyRef<'_, PyKeyedCollection> = source.extract()?;
+                key_list(py, rt, &kc)
+            }
+            1 => {
+                let parts: PyRef<'_, PyKeyPartitions> = source.extract()?;
+                let q = PyKey(partition.get_item(0)?.unbind());
+                partition_list(py, rt, &parts, q)
+            }
+            n => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "keys() takes a keyed collection, or key partitions and one partition, not {n} partitions"
+            ))),
+        }
     }
 
     /// `(row, status)` for `kc`'s `key` as `get_status` gives them, read
@@ -424,6 +444,17 @@ fn key_list<'py>(
 ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
     let (source, _) = kc.key_source(rt)?;
     let keys = engine_call(py, rt, || source.get_keys(rt))?;
+    pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
+}
+
+fn partition_list<'py>(
+    py: Python<'py>,
+    rt: &Runtime,
+    parts: &PyKeyPartitions,
+    q: PyKey,
+) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+    let (source, _) = parts.owner.get().key_source(rt)?;
+    let keys = engine_call(py, rt, || source.get_partition(rt, &parts.parts, &q))?;
     pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
 }
 
@@ -1292,6 +1323,7 @@ fn incr_concurrent(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
     m.add_class::<PyKeyedCollection>()?;
+    m.add_class::<PyKeyPartitions>()?;
     m.add(
         "_NotReadySignal",
         m.py().get_type::<persist::_NotReadySignal>(),
