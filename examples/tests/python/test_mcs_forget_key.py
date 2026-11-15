@@ -161,3 +161,15 @@ def test_a_restored_entry_not_yet_run_survives_forget_key(persist, key):
     graph.store.upsert(graph.shifts, key, (7,))
     assert rt.get(node) == 7
     assert graph.calls == [key]
+
+
+def test_forget_key_from_inside_a_query_raises_and_leaves_the_input(pkg):
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
+    node = reader(rt, kc, "z")
+    rt.get(node)
+    rt.delete_node(node)
+    q = rt.create_query(lambda ctx: kc.forget_key("z"))
+    with pytest.raises(RuntimeError, match="inside a compute"):
+        rt.get(q)
+    assert kc.version_input_count() == 1

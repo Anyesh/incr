@@ -1388,9 +1388,15 @@ where
     /// on it and the key holds no row, for a key a write never changed
     /// after its readers went away. Returns whether it freed the input;
     /// under `Shared` it frees nothing and returns false, since a reader
-    /// may still hold the handle.
+    /// may still hold the handle. Panics inside a compute of any runtime,
+    /// like every write.
     pub fn forget_key(&self, rt: &Runtime<C>, key: &K) -> bool {
         refuse_value_code();
+        assert!(
+            !rt.frame_active(),
+            "incr-core: KeyedCollection::forget_key called from inside a compute; a run the \
+             engine discards would delete an input its own read created",
+        );
         if !C::SINGLE_THREADED || !self.versions.any() {
             return false;
         }

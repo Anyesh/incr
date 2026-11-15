@@ -1201,6 +1201,23 @@ fn forget_key_of_an_unread_or_orphaned_key<C: Cells>() {
     assert_eq!(rt.get(again), Some(5));
 }
 
+fn forget_key_inside_a_compute_is_refused<C: Cells>() {
+    let rt = Arc::new(Runtime::<C>::new());
+    let kc = Plain::<C>::new(&rt);
+    let (reader, _) = key_reader(&rt, &kc, 3);
+    rt.get(reader);
+    rt.try_delete_node(reader).unwrap();
+    let captured = Captured(kc.clone());
+    let q = rt.create_query(move |rt| {
+        catch_unwind(AssertUnwindSafe(|| captured.get().forget_key(rt, &3)))
+            .map_err(panic_text)
+            .err()
+    });
+    let text = rt.get(q).expect("forget_key panics");
+    assert!(text.contains("inside a compute"), "{text}");
+    assert_eq!(kc.version_input_count(), 1);
+}
+
 fn a_keyed_write_inside_a_compute_is_refused<C: Cells>() {
     let rt = Arc::new(Runtime::<C>::new());
     let kc = Plain::<C>::new(&rt);
@@ -1270,6 +1287,7 @@ for_both!(
     a_removed_key_without_readers_is_reclaimed_on_local_only,
     forget_key_frees_the_input_of_a_never_written_key,
     forget_key_of_an_unread_or_orphaned_key,
+    forget_key_inside_a_compute_is_refused,
     a_keyed_write_inside_a_compute_is_refused,
     one_upsert_among_many_keys_reruns_one_reader,
 );
