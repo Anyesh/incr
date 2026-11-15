@@ -3052,6 +3052,116 @@ fn seed_56cd8c2_keeps_the_failed_set() {
     });
 }
 
+/// F-2T: 0xc1c333d3e3432839's two-thread case, shrunk.
+fn seed_c1c333d3_case() -> Case {
+    let q = |expr, replay, bare, strategy| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy,
+    };
+    let read = |n, try_| Box::new(Expr::Read(n, try_));
+    let zero = || q(Expr::Const(0), true, false, Strat::None);
+    let mut specs: Vec<Spec> = (0..27).map(|_| zero()).collect();
+    specs[8] = q(Expr::Read(9, false), true, false, Strat::None);
+    specs[9] = q(Expr::Read(10, false), true, true, Strat::Fallback(1));
+    specs[10] = q(
+        Expr::Add(read(11, true), read(17, false)),
+        true,
+        false,
+        Strat::None,
+    );
+    specs[11] = q(Expr::Read(16, false), true, false, Strat::None);
+    specs[14] = q(Expr::Read(15, false), true, false, Strat::None);
+    specs[15] = q(Expr::Read(9, true), false, false, Strat::None);
+    specs[16] = q(
+        Expr::If(read(23, false), read(17, false), Box::new(Expr::Const(0))),
+        true,
+        true,
+        Strat::None,
+    );
+    specs[17] = q(Expr::Read(9, false), true, false, Strat::None);
+    specs[23] = q(Expr::Read(26, false), false, false, Strat::None);
+    specs[24] = Spec::Input(1);
+    specs[25] = Spec::Input(4);
+    specs[26] = Spec::Input(3);
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 24,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(14), Op::Set(26, 2), Op::TryGet(16), Op::Get(8)],
+    }
+}
+
+/// F-2T, 0xc1c333d3e3432839 shrunk, at no budget. Op 0 lands the group
+/// {9, 10, 17}; op 1 sets 26 so 16 reads 17 and the cycle grows through 11
+/// and 16. In the overlap, op 3 (`Get(8)`) reads 9, whose walk expands the
+/// group at 9 with its record then and its external 11, and waits on 16
+/// under op 2's (`TryGet(16)`) claim. Op 2's episode at 17 replaces the
+/// group's record and leaves 16 Dirty. Woken, op 3's walk expands 16 again
+/// and, through it, the replaced record at 17, a second time, so it runs 17
+/// before 11: the cycle is entered at 17, 9's fallback settles it, and op 3
+/// returns `Value(1)` where every order enters it at 11 and op 3 panics
+/// with the cycle. Op 3's walk holds before its visit of 16 until op 2's
+/// thread has claimed 16, which then holds until that walk waits on it.
+#[test]
+#[ignore = "F-2T: a walk woken on a non-root entry expands a replaced group record at a second member"]
+fn seed_c1c333d3_two_threads_match_an_order() {
+    let case = seed_c1c333d3_case();
+    let phases = [
+        Phase::Read([Some(0), None]),
+        Phase::Mutate(1, 0),
+        Phase::Read([Some(2), Some(3)]),
+    ];
+    let serial = Serial::new(&case, &phases);
+    quiet(|| {
+        for _ in 0..8 {
+            let (waits, held) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let rig = |live: &Live<Shared>| {
+                let (waits, held, world) = (waits.clone(), held.clone(), live.world.clone());
+                let until = |flag: &AtomicBool| {
+                    let begun = std::time::Instant::now();
+                    while !flag.load(SeqCst) && begun.elapsed() < std::time::Duration::from_secs(10)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                };
+                let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                    let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                        return;
+                    };
+                    if TWO_PHASE.with(std::cell::Cell::get) != 2 {
+                        return;
+                    }
+                    let n16 = NodeId(world.handle(0, 16).erased().slot());
+                    if t == 1 && p == ParkPoint::BeforeVisit(n16) && !waits.load(SeqCst) {
+                        until(&held);
+                    } else if t == 1 && p == ParkPoint::WalkWaits(n16) {
+                        waits.store(true, SeqCst);
+                    } else if t == 0
+                        && p == ParkPoint::BeforeReservationCheck(n16)
+                        && !held.swap(true, SeqCst)
+                    {
+                        until(&waits);
+                    }
+                });
+                assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+            };
+            serial.differential("F-2T 0xc1c333d3e3432839 shrunk", None, 0, &rig);
+            assert!(
+                waits.load(SeqCst),
+                "op 3's walk never waited on 16 under op 2's claim"
+            );
+        }
+    });
+}
+
 /// 0x36b61, shrunk. At budget 3, `Get(17)` reaches 6, which reads 5 and
 /// is doomed below 7; its discard keeps 5's claim for 6's retry. 20 then
 /// runs at 6's position and is discarded too, and that discard released
