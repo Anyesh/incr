@@ -23,6 +23,11 @@ STATS = {
     "evicted_last_checkpoint",
     "auto_checkpoint_errors",
     "last_auto_checkpoint_error",
+    "chain_depth",
+    "chain_bytes",
+    "delta_checkpoints",
+    "compactions",
+    "last_bytes_appended",
 }
 
 

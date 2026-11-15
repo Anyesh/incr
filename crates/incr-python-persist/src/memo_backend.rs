@@ -46,6 +46,13 @@
 //!   `load_chain() -> [(generation, header, items)] | None` returns every
 //!   layer, base first; a layer's header is the bytes its writer was
 //!   given (the base's, or the delta header a `write_delta` received).
+//!   A `load_chain(known)` that takes one argument is passed a frozenset of
+//!   the generation ids this handle already holds, and may send
+//!   `(generation, None, None)` for each of them instead of loading the
+//!   layer again; the list still names every layer of the chain, in order.
+//!   A placeholder for an id outside `known` fails the checkpoint with a
+//!   `TypeError`. Whether `load_chain` takes the argument is decided once,
+//!   when the store opens the backend.
 //!   `write_delta(tip, generation, header, entries, tombstones) -> items`
 //!   stores the delta's `entries` as `write_generation` does, and hides
 //!   each `(table, key_hash)` of `tombstones` from the layers below: a
@@ -72,10 +79,10 @@ use incr_persist::memo::{
     EncodedEntry, GenId, Generation, IndexItem, MemoBackend, Tombstone,
 };
 use incr_persist::{Error, Result};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyString};
+use pyo3::types::{PyBytes, PyFrozenSet, PyList, PyString};
 
 use crate::backend::{bad_return, raised};
 use crate::PersistExceptions;
@@ -115,6 +122,7 @@ fn items_of<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Resu
 pub struct PyMemoBackend<E> {
     backend: Py<PyAny>,
     chains: bool,
+    takes_known: bool,
     streams: bool,
     batches: bool,
     exceptions: PhantomData<fn() -> E>,
@@ -128,11 +136,13 @@ impl<E: PersistExceptions> PyMemoBackend<E> {
             let object = backend.bind(py);
             let chains = object.hasattr(intern!(py, "load_chain"))?
                 && object.hasattr(intern!(py, "write_delta"))?;
+            let takes_known = chains && takes_one_argument(py, object, "load_chain")?;
             let streams = object.hasattr(intern!(py, "write_generation_streamed"))?;
             let batches = object.hasattr(intern!(py, "read_entries"))?;
             Ok(PyMemoBackend {
                 backend,
                 chains,
+                takes_known,
                 streams,
                 batches,
                 exceptions: PhantomData,
@@ -150,6 +160,25 @@ impl<E: PersistExceptions> PyMemoBackend<E> {
             .bind(py)
             .call_method1(method, args)
             .map_err(raised::<E>)
+    }
+}
+
+/// Whether `object.method` accepts one positional argument. A callable
+/// with no readable signature is taken to accept none.
+fn takes_one_argument(py: Python<'_>, object: &Bound<'_, PyAny>, method: &str) -> PyResult<bool> {
+    let signature = match py
+        .import(intern!(py, "inspect"))?
+        .call_method1(intern!(py, "signature"), (object.getattr(method)?,))
+    {
+        Ok(signature) => signature,
+        Err(error) if error.is_instance_of::<PyValueError>(py) => return Ok(false),
+        Err(error) if error.is_instance_of::<PyTypeError>(py) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match signature.call_method1(intern!(py, "bind"), (py.None(),)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.is_instance_of::<PyTypeError>(py) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -334,7 +363,13 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
             return Ok(self.load()?.map(Chain::from));
         }
         Python::attach(|py| {
-            let result = self.call(py, intern!(py, "load_chain"), ())?;
+            let result = if self.takes_known {
+                let ids = PyFrozenSet::new(py, known.iter().map(|layer| layer.id().0))
+                    .map_err(raised::<E>)?;
+                self.call(py, intern!(py, "load_chain"), (ids,))?
+            } else {
+                self.call(py, intern!(py, "load_chain"), ())?
+            };
             if result.is_none() {
                 return Ok(None);
             }
@@ -344,6 +379,20 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                 .map_err(|_| bad_return::<E>("load_chain"))?
             {
                 let layer = layer.map_err(raised::<E>)?;
+                if self.takes_known {
+                    let placeholder = layer
+                        .extract::<(u64, Bound<'_, PyAny>, Bound<'_, PyAny>)>()
+                        .ok()
+                        .filter(|(_, header, items)| header.is_none() && items.is_none());
+                    if let Some((id, _, _)) = placeholder {
+                        let held = known
+                            .iter()
+                            .find(|held| held.id() == GenId(id))
+                            .ok_or_else(|| bad_return::<E>("load_chain"))?;
+                        layers.push(Arc::clone(held));
+                        continue;
+                    }
+                }
                 let (id, header, items) = layer
                     .extract::<(u64, Vec<u8>, Bound<'_, PyAny>)>()
                     .map_err(|_| bad_return::<E>("load_chain"))?;

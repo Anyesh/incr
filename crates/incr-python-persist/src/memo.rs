@@ -3,7 +3,6 @@
 //! as the slots `MemoKey(name)` and `MemoValue(name)`; the package makes
 //! the closure the engine runs for its function.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use incr_core::{Cells, Incr, Runtime};
@@ -14,6 +13,7 @@ use incr_persist::{Error, MemoPart};
 use incr_python_protocol::{PyKey, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::backend::PyBackend;
 use crate::binding::{carry, Carry, PyBinding};
@@ -184,9 +184,14 @@ impl OpenOptions {
     }
 }
 
-/// `stats` as the dict `memo.checkpoint()` returns.
-fn checkpoint_counts(stats: &CheckpointStats) -> HashMap<&'static str, usize> {
-    HashMap::from([
+/// `stats` as the dict `memo.checkpoint()` returns; `times` holds the
+/// wall time of each step in nanoseconds.
+pub fn checkpoint_dict<'py>(
+    py: Python<'py>,
+    stats: &CheckpointStats,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    for (name, count) in [
         ("written", stats.written),
         ("unkept", stats.unkept),
         ("merged", stats.merged),
@@ -194,7 +199,22 @@ fn checkpoint_counts(stats: &CheckpointStats) -> HashMap<&'static str, usize> {
         ("evicted", stats.evicted),
         ("oversized", stats.oversized),
         ("unchanged", usize::from(stats.unchanged)),
-    ])
+        ("fresh_written", stats.fresh_written),
+        ("tombstones", stats.tombstones),
+        ("chain_depth", stats.chain_depth),
+    ] {
+        dict.set_item(name, count)?;
+    }
+    dict.set_item("bytes_appended", stats.bytes_appended)?;
+    dict.set_item("delta", stats.delta)?;
+    dict.set_item("compacted", stats.compacted)?;
+    let times = PyDict::new(py);
+    let nanos = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    times.set_item("snapshot_ns", nanos(stats.times.snapshot))?;
+    times.set_item("merge_ns", nanos(stats.times.merge))?;
+    times.set_item("write_ns", nanos(stats.times.write))?;
+    dict.set_item("times", times)?;
+    Ok(dict)
 }
 
 /// What `memo.stats()` returns.
@@ -210,7 +230,7 @@ pub struct PyMemoStats {
 
 impl PyMemoStats {
     /// The counts `memo.stats()` returns beside `last_auto_checkpoint_error`.
-    pub fn counts(&self) -> [(&'static str, u64); 6] {
+    pub fn counts(&self) -> [(&'static str, u64); 11] {
         let stats = &self.stats;
         [
             ("entries", stats.entries),
@@ -219,6 +239,11 @@ impl PyMemoStats {
             ("unsaveable", stats.unsaveable),
             ("evicted_last_checkpoint", stats.evicted_last_checkpoint),
             ("auto_checkpoint_errors", self.auto_checkpoint_errors),
+            ("chain_depth", stats.chain_depth),
+            ("chain_bytes", stats.chain_bytes),
+            ("delta_checkpoints", stats.delta_checkpoints),
+            ("compactions", stats.compactions),
+            ("last_bytes_appended", stats.last_bytes_appended),
         ]
     }
 }
@@ -480,11 +505,7 @@ where
     /// Writes every live entry whose dependencies are persisted as the next
     /// generation and returns its counts. Raises `ValueError` naming the
     /// tables whose entries did not round-trip through their codec.
-    pub fn checkpoint(
-        &self,
-        core: &StoreCore<B>,
-        py: Python<'_>,
-    ) -> PyResult<HashMap<&'static str, usize>> {
+    pub fn checkpoint(&self, core: &StoreCore<B>, py: Python<'_>) -> PyResult<CheckpointStats> {
         let done = self.run_checkpoint(core, py, |memo| memo.checkpoint().map(Some))?;
         Ok(done.unwrap_or_default())
     }
@@ -495,7 +516,7 @@ where
         &self,
         core: &StoreCore<B>,
         py: Python<'_>,
-    ) -> PyResult<Option<HashMap<&'static str, usize>>> {
+    ) -> PyResult<Option<CheckpointStats>> {
         self.run_checkpoint(core, py, OpenMemo::<B>::checkpoint_if_due)
     }
 
@@ -560,7 +581,7 @@ where
         core: &StoreCore<B>,
         py: Python<'_>,
         checkpoint: impl FnOnce(&OpenMemo<B>) -> Result<Option<CheckpointStats>, Error> + Send,
-    ) -> PyResult<Option<HashMap<&'static str, usize>>> {
+    ) -> PyResult<Option<CheckpointStats>> {
         let memo = self.memo()?;
         drop(core.registry().take_failure());
         let registry = core.registry();
@@ -599,6 +620,6 @@ where
             err.set_cause(py, cause);
             return Err(err);
         }
-        Ok(stats.as_ref().map(checkpoint_counts))
+        Ok(stats)
     }
 }
