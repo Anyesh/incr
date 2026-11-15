@@ -387,6 +387,24 @@ def test_checkpoint_compacts_and_a_reopen_sees_the_same_state(persist):
     assert rows_of(again.runtime, again.collection("rows", codec)) == [0, 1, 2, 3, 4]
 
 
+def test_a_set_equal_to_the_default_survives_a_checkpoint_and_a_reopen(persist):
+    backend = persist.MemoryBackend()
+    codec = PickleCodec()
+    store = persist.Store.open(backend, build_id=1)
+    same = store.input("same", 3, codec)
+    store.set(same, 3)
+    other = store.input("other", 3, codec)
+    store.set(other, 7)
+    store.input("never", 3, codec)
+    store.checkpoint()
+    store.close()
+
+    again = persist.Store.open(backend, build_id=1)
+    assert again.runtime.get(again.input("same", 9, codec)) == 3
+    assert again.runtime.get(again.input("other", 9, codec)) == 7
+    assert again.runtime.get(again.input("never", 9, codec)) == 9
+
+
 def test_memory_backend_protocol(persist):
     source = persist.MemoryBackend()
     store = persist.Store.open(source, build_id=1)

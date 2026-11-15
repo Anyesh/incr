@@ -181,7 +181,9 @@ fn snapshot_fold_and_compaction_run_in_the_slots_context() {
     store.set(x, P::new(7)).unwrap();
     take_seen();
     store.checkpoint().unwrap();
-    assert_all_key("checkpoint input", "x");
+    for (label, op, ctx) in take_seen() {
+        assert_eq!(ctx, key("x"), "checkpoint input: {label} {op:?}");
+    }
 
     let log = MemoryBackend::new();
     let store = open_store(&log);

@@ -97,18 +97,12 @@ impl LoggedKey {
             .or(self.declared.as_ref().map(|d| d.default.as_slice()))
     }
 
-    /// Whether the key holds nothing beyond its logged default, compared
-    /// by bytes, so that compaction may forget it. A key without a
-    /// `Declare` has no default and never qualifies.
+    /// Whether the key holds nothing beyond its logged default, so that
+    /// compaction may forget it: a `Declare` and no value or element. A set
+    /// value is kept even when it equals the default, since a reopen may
+    /// declare another default. A key without a `Declare` never qualifies.
     pub fn at_default(&self) -> bool {
-        let Some(declared) = &self.declared else {
-            return false;
-        };
-        self.elements.is_empty()
-            && self
-                .value
-                .as_ref()
-                .is_none_or(|value| *value == declared.default)
+        self.declared.is_some() && self.elements.is_empty() && self.value.is_none()
     }
 
     /// The records a snapshot keeps for this key: its `Declare`, its latest
@@ -625,7 +619,10 @@ mod tests {
         fold(&mut keys, set(1));
         assert!(!keys["k"].at_default(), "no Declare, so no default");
         fold(&mut keys, declare);
-        assert!(keys["k"].at_default());
+        assert!(
+            !keys["k"].at_default(),
+            "a set equal to the default is kept"
+        );
         fold(&mut keys, set(2));
         assert!(!keys["k"].at_default());
         fold(&mut keys, Record::Delete { key: "k".into() });

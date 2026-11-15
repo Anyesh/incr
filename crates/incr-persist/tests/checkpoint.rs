@@ -128,6 +128,13 @@ fn checkpoint_folds_each_key_per_the_folding_rules() {
             ]),
         ),
         (
+            "back".to_owned(),
+            group(&[
+                declare("back", Kind::Input, enc(&5u32)),
+                set("back", enc(&5u32)),
+            ]),
+        ),
+        (
             "tags".to_owned(),
             group(&[
                 declare("tags", Kind::Collection, vec![]),
@@ -165,7 +172,7 @@ fn checkpoint_folds_each_key_per_the_folding_rules() {
     let store = open::<Local, _>(log);
     let rt = store.runtime();
     assert_eq!(rt.get(store.input("price", 9.0f64).unwrap().handle()), 2.5);
-    assert_eq!(rt.get(store.input("back", 9u32).unwrap().handle()), 9);
+    assert_eq!(rt.get(store.input("back", 9u32).unwrap().handle()), 5);
     assert_eq!(rt.get(store.input("idle", 9u32).unwrap().handle()), 9);
     let tags = store.collection::<String>("tags").unwrap();
     assert_eq!(tags.handle().values(rt), ["a", "a"]);
@@ -366,7 +373,8 @@ fn a_store_at_the_compacted_position_adopts_a_fresh_declare_of_a_key_forgotten_t
     let a = open::<Local, _>(log.clone());
     let k = a.input("k", 1u32).unwrap();
     let s = a.input("s", 1u32).unwrap();
-    a.set(s, 1).unwrap();
+    a.set(s, 2).unwrap();
+    a.delete(s).unwrap();
     let b = open::<Local, _>(log.clone());
     b.input("u", 1u32).unwrap();
     let applied = a.refresh().unwrap();
@@ -491,26 +499,44 @@ fn a_file_reader_that_reads_through_a_compaction_learns_what_it_forgot() {
     assert_eq!(restart.runtime().get(restarted.handle()), 6);
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Loose(u32, u32);
+
+impl PartialEq for Loose {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Loose {}
+
+impl std::hash::Hash for Loose {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
 /// A snapshot replaced at the same position may forget more than the one it
-/// replaced: a store that declared a key compares its value with the default
-/// by decoded value, one that did not by bytes, and `-0.0` equals `0.0` only
-/// by value. A store that accounted for the first snapshot must still learn
+/// replaced: a store that declared a collection folds its elements by
+/// decoded value, one that did not by bytes, and a `Loose` equals another
+/// with the same id only by value. A store that accounted for the first snapshot must still learn
 /// what the second forgot.
 #[test]
 fn a_snapshot_replaced_at_the_same_position_is_taken_into_account_too() {
     let log = MemoryBackend::new();
     let declarer = open::<Local, _>(log.clone());
-    let z = declarer.input("z", 0.0f64).unwrap();
-    declarer.set(z, -0.0).unwrap();
+    let z = declarer.collection::<Loose>("z").unwrap();
+    z.insert(&declarer, Loose(1, 0)).unwrap();
+    z.delete(&declarer, &Loose(1, 9)).unwrap();
     let other = open::<Local, _>(log.clone());
     let at = other.checkpoint().unwrap();
     let (_, snapshot) = snapshot_by_key(&log);
-    assert!(snapshot.contains_key("z"), "bytes differ from the default");
+    assert!(snapshot.contains_key("z"), "bytes differ from the removal");
     assert_eq!(other.restored_keys("").unwrap(), ["z"]);
 
     assert_eq!(declarer.checkpoint().unwrap(), at);
     let (_, snapshot) = snapshot_by_key(&log);
-    assert!(!snapshot.contains_key("z"), "equal to the default by value");
+    assert!(!snapshot.contains_key("z"), "empty by value");
     assert!(other.restored_keys("").unwrap().is_empty());
     assert!(open::<Local, _>(log).restored_keys("").unwrap().is_empty());
 }
@@ -805,4 +831,27 @@ fn a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records_local
 #[test]
 fn a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records_shared() {
     a_due_checkpoint_runs_when_a_staged_batch_opens_not_between_its_records::<Shared>();
+}
+
+#[test]
+fn a_set_equal_to_the_default_survives_a_checkpoint_and_a_reopen_with_another_default() {
+    let log = MemoryBackend::new();
+    let store = open::<Local, _>(log.clone());
+    let same = store.input("same", 3u32).unwrap();
+    store.set(same, 3).unwrap();
+    let other = store.input("other", 3u32).unwrap();
+    store.set(other, 7).unwrap();
+    store.input("never", 3u32).unwrap();
+    store.checkpoint().unwrap();
+    drop(store);
+
+    let store = open::<Local, _>(log);
+    let rt = store.runtime();
+    assert_eq!(rt.get(store.input("same", 9u32).unwrap().handle()), 3);
+    assert_eq!(rt.get(store.input("other", 9u32).unwrap().handle()), 7);
+    assert_eq!(
+        rt.get(store.input("never", 9u32).unwrap().handle()),
+        9,
+        "a key declared and never set is still forgotten"
+    );
 }
