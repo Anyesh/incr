@@ -640,7 +640,9 @@ trait Stage<C: Cells> {
     fn stale(&self) -> bool;
 
     /// The records that make the staged changes: per key, a `Remove` of
-    /// each pair it held, then an `Insert` of its new pair. Values decoded
+    /// each pair it held, then an `Insert` of its new pair; a key that
+    /// held one pair and takes a new one gets one `Replace`, so replaying
+    /// it is one write. Values decoded
     /// along the way are kept in the stage, to drop with it after the store
     /// lock is released.
     fn records(&mut self, state: &State<C>) -> Result<Vec<Record>>;

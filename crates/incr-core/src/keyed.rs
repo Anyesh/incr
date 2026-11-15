@@ -1502,7 +1502,8 @@ where
             None => self.membership_input_or_create(rt),
         };
         rt.get(handle);
-        self.keys()
+        let table = self.index.table.read();
+        value_code::run(|| table.buckets().map(|(_, b)| b.first().key()).collect())
     }
 
     /// The membership input, if a read created one.
