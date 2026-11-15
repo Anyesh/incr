@@ -22,6 +22,12 @@ pub enum NodeKindInfo {
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
     pub id: NodeId,
+    /// The generation of the node at `id`'s slot: a slot that was deleted
+    /// and reused reports the new occupant's, so `(id, generation)` names
+    /// one node for good.
+    pub generation: u32,
+    /// The node's state when the walk read it.
+    pub state: crate::state::NodeState,
     pub kind: NodeKindInfo,
     pub label: Option<String>,
     pub dependencies: Vec<NodeId>,

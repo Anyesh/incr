@@ -3123,6 +3123,18 @@ impl<C: Cells> Runtime<C> {
         self.alive(handle).then_some(handle)
     }
 
+    /// The handle of the live node at `id`'s slot if the slot is at
+    /// `generation`: `None` for a dead slot, a slot this runtime never
+    /// allocated, or one deleted and reused since `generation` was read.
+    pub fn erased_handle_at(&self, id: NodeId, generation: u32) -> Option<ErasedIncr> {
+        self.dep_stack.unrecorded_lookup();
+        if id.0 >= self.nodes.len() {
+            return None;
+        }
+        let handle = ErasedIncr::new(id.0, generation, self.runtime_id);
+        self.alive(handle).then_some(handle)
+    }
+
     /// The deletion path behind every public delete. Never panics on a
     /// dependent or on a node that is already gone; it reports them. An
     /// owned node counts as a dependent: callers delete owned nodes first.
@@ -4163,7 +4175,8 @@ impl<C: Cells> Runtime<C> {
     fn live_node_info(&self, inner: &Inner<C>, slot: u32) -> Option<crate::trace::NodeInfo> {
         use crate::trace::{NodeInfo, NodeKindInfo};
         let node = self.nodes.get(slot);
-        if state::load::<C>(node.state_cell()) == NodeState::Dead {
+        let state = state::load::<C>(node.state_cell());
+        if state == NodeState::Dead {
             return None;
         }
         let kind = if inner
@@ -4184,6 +4197,8 @@ impl<C: Cells> Runtime<C> {
             .unwrap_or_default();
         Some(NodeInfo {
             id: NodeId(slot),
+            generation: node.generation(),
+            state,
             kind,
             label: inner.labels.get(&slot).cloned(),
             dependencies,
@@ -8977,6 +8992,43 @@ mod tests {
         let current = rt.erased_handle(NodeId(q.slot()));
         assert_eq!(current, Some(recycled.erase()));
         assert_ne!(current, Some(q.erase()), "the deleted generation");
+    }
+
+    fn erased_handle_at_names_a_slot_only_at_its_generation<C: Cells>() {
+        let rt = Runtime::<C>::new();
+        let a = rt.create_input(1_i64);
+        let q = rt.create_query(move |rt: &Runtime<C>| rt.get(a) + 1);
+        let at = |h: ErasedIncr| rt.erased_handle_at(NodeId(h.slot()), h.generation());
+        assert_eq!(at(a.erase()), Some(a.erase()));
+        assert_eq!(at(q.erase()), Some(q.erase()));
+        assert_eq!(
+            rt.erased_handle_at(NodeId::SENTINEL, 0),
+            None,
+            "out of range"
+        );
+        assert_eq!(
+            rt.erased_handle_at(NodeId(q.slot()), q.erase().generation() + 1),
+            None,
+            "a generation the slot never had"
+        );
+
+        rt.delete_node(q);
+        assert_eq!(at(q.erase()), None, "a dead slot");
+
+        let recycled = rt.create_input(3_i64);
+        assert_eq!(recycled.slot(), q.slot());
+        assert_eq!(at(q.erase()), None, "the deleted generation");
+        assert_eq!(at(recycled.erase()), Some(recycled.erase()));
+    }
+
+    #[test]
+    fn erased_handle_at_names_a_slot_only_at_its_generation_local() {
+        erased_handle_at_names_a_slot_only_at_its_generation::<Local>();
+    }
+
+    #[test]
+    fn erased_handle_at_names_a_slot_only_at_its_generation_shared() {
+        erased_handle_at_names_a_slot_only_at_its_generation::<Shared>();
     }
 
     #[test]

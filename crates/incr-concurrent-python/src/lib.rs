@@ -46,6 +46,8 @@ use engine::{
 use incr_python_persist::incr_core::StateStats;
 use incr_python_persist::ready;
 use incr_python_persist::state::RtState;
+use incr_python_protocol::by_id::{resolve, snapshot_values};
+use incr_python_protocol::inspect::trace_header;
 use incr_python_protocol::notready::{
     PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
@@ -54,7 +56,7 @@ use incr_python_protocol::snapshot::{
 };
 use incr_python_protocol::{
     call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, routing_error,
-    try_read, Exceptions, PyFixpoint, PyKey, PyValue,
+    try_read, Exceptions, PyFixpoint, PyKey, PyValue, StaleNodeError,
 };
 
 use keyed::PyKeyedCollection;
@@ -106,6 +108,24 @@ fn engine_call<R: Ungil>(
         return Err(err);
     }
     pyerr_boundary::<Exc, _>(|| in_runtime(rt, || py.detach(f)))
+}
+
+fn hold_gil(f: &mut dyn FnMut()) {
+    Python::attach(|_| f());
+}
+
+fn traced_to_py(
+    py: Python<'_>,
+    value: Py<PyAny>,
+    trace: &PropagationTrace,
+) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+    let trace_dict = trace_header(py, trace)?;
+    let node_traces = pyo3::types::PyList::empty(py);
+    for nt in &trace.node_traces {
+        node_traces.append(incr_python_protocol::inspect::trace_entry(py, nt)?)?;
+    }
+    trace_dict.set_item("node_traces", node_traces)?;
+    Ok((value, trace_dict.into_any().unbind()))
 }
 
 /// The closure the engine runs for a Python query: `py_func` called with
@@ -1140,22 +1160,34 @@ impl PyRuntime {
     fn get_traced(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let (val, trace): (PyValue, PropagationTrace) =
             engine_call(py, &self.inner, || self.inner.get_traced(node.inner))?;
-        Python::attach(|py| {
-            let trace_dict = pyo3::types::PyDict::new(py);
-            trace_dict.set_item("target", trace.target.0)?;
-            trace_dict.set_item("total_nodes", trace.total_nodes)?;
-            trace_dict.set_item("nodes_recomputed", trace.nodes_recomputed)?;
-            trace_dict.set_item("nodes_cutoff", trace.nodes_cutoff)?;
-            trace_dict.set_item("elapsed_ns", trace.elapsed_ns)?;
+        Python::attach(|py| traced_to_py(py, ready::unwrapped(py, val.0), &trace))
+    }
 
-            let node_traces = pyo3::types::PyList::empty(py);
-            for nt in &trace.node_traces {
-                node_traces.append(incr_python_protocol::inspect::trace_entry(py, nt)?)?;
-            }
-            trace_dict.set_item("node_traces", node_traces)?;
+    /// `get` for the node a `graph_snapshot` entry names by its `"id"` and
+    /// `"generation"`. Raises `StaleNodeError` if no live node has both:
+    /// the node was deleted, its slot was reused, or the id is out of
+    /// range. A cycle that leaves the node without a value gives `None`; a
+    /// compute that raises re-raises here.
+    fn get_by_id(&self, py: Python<'_>, id: u32, generation: u32) -> PyResult<Option<Py<PyAny>>> {
+        let value = engine_call(py, &self.inner, || {
+            resolve(&self.inner, id, generation).map(|node| node.try_value(&self.inner))
+        })??;
+        Ok(value.map(|value| ready::unwrapped(py, value)))
+    }
 
-            Ok((ready::unwrapped(py, val.0), trace_dict.into_any().unbind()))
-        })
+    /// `get_traced` for the node a `graph_snapshot` entry names by its
+    /// `"id"` and `"generation"`; raises `StaleNodeError` like
+    /// `get_by_id`. A cycle raises `CycleError`, as `get_traced` does.
+    fn get_traced_by_id(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        generation: u32,
+    ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        let (val, trace) = engine_call(py, &self.inner, || {
+            resolve(&self.inner, id, generation).map(|node| node.get_traced(&self.inner))
+        })??;
+        Python::attach(|py| traced_to_py(py, ready::unwrapped(py, val), &trace))
     }
 
     /// The graph as a list of `{"id", "kind", "label", "dependencies",
@@ -1167,8 +1199,15 @@ impl PyRuntime {
     /// `"dependencies"` (default), `"dependents"` or `"both"`; `depth`
     /// counts edges from a root; `label_prefix` filters the returned nodes
     /// while the walk still passes through the others; `limit` caps them.
-    /// Each returned node keeps its full dependency and dependent lists.
-    #[pyo3(signature = (roots=None, *, direction=None, depth=None, label_prefix=None, limit=None))]
+    /// Each returned node keeps its full dependency and dependent lists,
+    /// and carries `"generation"`, which with `"id"` names the node for
+    /// `get_by_id` and `get_traced_by_id`. With `values=True` each
+    /// returned node also has `"status"` (`"new"`, `"dirty"`,
+    /// `"computing"`, `"clean"`, `"failed"` or `"cyclic"`) and, if it is
+    /// Clean and holds a value Python can read, `"value"` as stored;
+    /// nothing recomputes, and `limit` bounds the values read.
+    #[pyo3(signature = (roots=None, *, direction=None, depth=None, label_prefix=None, limit=None, values=false))]
+    #[allow(clippy::too_many_arguments)]
     fn graph_snapshot(
         &self,
         py: Python<'_>,
@@ -1177,6 +1216,7 @@ impl PyRuntime {
         depth: Option<u32>,
         label_prefix: Option<String>,
         limit: Option<usize>,
+        values: bool,
     ) -> PyResult<Py<PyAny>> {
         let request = SnapshotRequest::parse(roots, direction, depth, label_prefix, limit, |o| {
             if let Ok(node) = o.extract::<PyRef<'_, PyNodeId>>() {
@@ -1191,14 +1231,21 @@ impl PyRuntime {
         })?;
         match request {
             None => {
-                let infos = engine_call(py, &self.inner, || self.inner.graph_snapshot())?;
-                full_snapshot_to_py(py, &infos)
+                let (infos, values) = engine_call(py, &self.inner, || {
+                    let infos = self.inner.graph_snapshot();
+                    let values = values.then(|| snapshot_values(&self.inner, &infos, hold_gil));
+                    (infos, values)
+                })?;
+                full_snapshot_to_py(py, &infos, values)
             }
             Some(request) => {
-                let snap = engine_call(py, &self.inner, || {
-                    self.inner.graph_snapshot_bounded(&request.query())
+                let (snap, values) = engine_call(py, &self.inner, || {
+                    let snap = self.inner.graph_snapshot_bounded(&request.query());
+                    let values =
+                        values.then(|| snapshot_values(&self.inner, &snap.nodes, hold_gil));
+                    (snap, values)
                 })?;
-                bounded_snapshot_to_py(py, &snap)
+                bounded_snapshot_to_py(py, &snap, values)
             }
         }
     }
@@ -1211,6 +1258,7 @@ impl PyRuntime {
 #[pymodule]
 fn incr_concurrent(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CycleError", m.py().get_type::<CycleError>())?;
+    m.add("StaleNodeError", m.py().get_type::<StaleNodeError>())?;
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyNodeId>()?;
     m.add_class::<PyObserverId>()?;

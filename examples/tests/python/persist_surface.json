@@ -440,6 +440,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /, node)"
    },
+   "get_by_id": {
+    "doc": "`get` for the node a `graph_snapshot` entry names by its `\"id\"` and\n`\"generation\"`. Raises `StaleNodeError` if no live node has both:\nthe node was deleted, its slot was reused, or the id is out of\nrange. A cycle that leaves the node without a value gives `None`; a\ncompute that raises re-raises here.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, id, generation)"
+   },
    "get_key": {
     "doc": "The row `kc` holds for `key`, or `None`, as stored. Outside a query\nit creates nothing; `ctx.get_key` is the read that depends on the\nkey. Raises `ValueError` for a keyed collection of another runtime.",
     "kind": "method_descriptor",
@@ -450,15 +455,20 @@
     "kind": "method_descriptor",
     "signature": "(self, /, node)"
    },
+   "get_traced_by_id": {
+    "doc": "`get_traced` for the node a `graph_snapshot` entry names by its\n`\"id\"` and `\"generation\"`; raises `StaleNodeError` like\n`get_by_id`. A cycle raises `CycleError`, as `get_traced` does.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, id, generation)"
+   },
    "get_with_status": {
     "doc": "`(value, status)`: the value `get` returns, and `None`, the\n`NotReady` value, or the `Incomplete` value.",
     "kind": "method_descriptor",
     "signature": "(self, /, node)"
    },
    "graph_snapshot": {
-    "doc": "The graph as a list of `{\"id\", \"kind\", \"label\", \"dependencies\",\n\"dependents\"}` dicts. With any argument given, a breadth-first walk\nfrom `roots` (node handles, collections, or `(keyed collection, key)`\nper-key reads, each that key's version input, skipped when no query\nhas read the key) returns\n`{\"nodes\": [...], \"truncated\": bool}` instead: `direction` is\n`\"dependencies\"` (default), `\"dependents\"` or `\"both\"`; `depth`\ncounts edges from a root; `label_prefix` filters the returned nodes\nwhile the walk still passes through the others; `limit` caps them.\nEach returned node keeps its full dependency and dependent lists.",
+    "doc": "The graph as a list of `{\"id\", \"kind\", \"label\", \"dependencies\",\n\"dependents\"}` dicts. With any argument given, a breadth-first walk\nfrom `roots` (node handles, collections, or `(keyed collection, key)`\nper-key reads, each that key's version input, skipped when no query\nhas read the key) returns\n`{\"nodes\": [...], \"truncated\": bool}` instead: `direction` is\n`\"dependencies\"` (default), `\"dependents\"` or `\"both\"`; `depth`\ncounts edges from a root; `label_prefix` filters the returned nodes\nwhile the walk still passes through the others; `limit` caps them.\nEach returned node keeps its full dependency and dependent lists,\nand carries `\"generation\"`, which with `\"id\"` names the node for\n`get_by_id` and `get_traced_by_id`. With `values=True` each\nreturned node also has `\"status\"` (`\"new\"`, `\"dirty\"`,\n`\"computing\"`, `\"clean\"`, `\"failed\"` or `\"cyclic\"`) and, if it is\nClean and holds a value Python can read, `\"value\"` as stored;\nnothing recomputes, and `limit` bounds the values read.",
     "kind": "method_descriptor",
-    "signature": "(self, /, roots=None, *, direction=None, depth=None, label_prefix=None, limit=None)"
+    "signature": "(self, /, roots=None, *, direction=None, depth=None, label_prefix=None, limit=None, values=False)"
    },
    "graph_summary": {
     "doc": "`{\"groups\": [{\"label\", \"kind\", \"nodes\"}], \"edges\": [{\"from\", \"to\",\n\"count\"}]}` over the live graph, grouped by the label up to its\nfirst `/` (`None` for unlabelled nodes); `kind` is \"input\",\n\"compute\" or \"mixed\". An edge inside one group has `from == to`.\nA group a labelled `KeyedCollection` names also has `\"keys\"`, the\ncollection's key count (summed over such collections). Walks every\nnode under the engine's read lock, so the cost is linear in the\nnode count.",

@@ -5,7 +5,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use incr_core::{BoundedSnapshot, Direction, GraphQuery, NodeId, NodeInfo, NodeKindInfo};
+use incr_core::{
+    BoundedSnapshot, Direction, GraphQuery, NodeId, NodeInfo, NodeKindInfo, NodeState,
+};
 
 /// What a `graph_snapshot` root resolves to: a node, or nothing to walk
 /// from, as for a per-key read whose key no query has read.
@@ -103,9 +105,30 @@ impl SnapshotRequest {
     }
 }
 
-fn info_dict<'py>(py: Python<'py>, info: &NodeInfo) -> PyResult<Bound<'py, PyDict>> {
+/// `NodeInfo::state` as `graph_snapshot(values=True)` reports it.
+fn status(state: NodeState) -> &'static str {
+    match state {
+        NodeState::New => "new",
+        NodeState::Dirty => "dirty",
+        NodeState::Computing | NodeState::ComputingDirty => "computing",
+        NodeState::Clean => "clean",
+        NodeState::Failed => "failed",
+        NodeState::Cyclic => "cyclic",
+        _ => "other",
+    }
+}
+
+/// The values `graph_snapshot(values=True)` adds, one per node in order.
+pub type SnapshotValues = Vec<Option<Py<PyAny>>>;
+
+fn info_dict<'py>(
+    py: Python<'py>,
+    info: &NodeInfo,
+    value: Option<&Option<Py<PyAny>>>,
+) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("id", info.id.0)?;
+    d.set_item("generation", info.generation)?;
     d.set_item(
         "kind",
         match info.kind {
@@ -118,26 +141,45 @@ fn info_dict<'py>(py: Python<'py>, info: &NodeInfo) -> PyResult<Bound<'py, PyDic
     let depts: Vec<u32> = info.dependents.iter().map(|n| n.0).collect();
     d.set_item("dependencies", deps)?;
     d.set_item("dependents", depts)?;
+    if let Some(value) = value {
+        d.set_item("status", status(info.state))?;
+        if let Some(value) = value {
+            d.set_item("value", value)?;
+        }
+    }
     Ok(d)
 }
 
-fn info_list<'py>(py: Python<'py>, infos: &[NodeInfo]) -> PyResult<Bound<'py, PyList>> {
+fn info_list<'py>(
+    py: Python<'py>,
+    infos: &[NodeInfo],
+    values: Option<SnapshotValues>,
+) -> PyResult<Bound<'py, PyList>> {
     let list = PyList::empty(py);
-    for info in infos {
-        list.append(info_dict(py, info)?)?;
+    for (index, info) in infos.iter().enumerate() {
+        let value = values.as_ref().map(|values| &values[index]);
+        list.append(info_dict(py, info, value)?)?;
     }
     Ok(list)
 }
 
 /// The full snapshot as a list of node dicts.
-pub fn full_snapshot_to_py(py: Python<'_>, infos: &[NodeInfo]) -> PyResult<Py<PyAny>> {
-    Ok(info_list(py, infos)?.into_any().unbind())
+pub fn full_snapshot_to_py(
+    py: Python<'_>,
+    infos: &[NodeInfo],
+    values: Option<SnapshotValues>,
+) -> PyResult<Py<PyAny>> {
+    Ok(info_list(py, infos, values)?.into_any().unbind())
 }
 
 /// A bounded snapshot as `{"nodes": [node dicts], "truncated": bool}`.
-pub fn bounded_snapshot_to_py(py: Python<'_>, snap: &BoundedSnapshot) -> PyResult<Py<PyAny>> {
+pub fn bounded_snapshot_to_py(
+    py: Python<'_>,
+    snap: &BoundedSnapshot,
+    values: Option<SnapshotValues>,
+) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
-    d.set_item("nodes", info_list(py, &snap.nodes)?)?;
+    d.set_item("nodes", info_list(py, &snap.nodes, values)?)?;
     d.set_item("truncated", snap.truncated)?;
     Ok(d.into_any().unbind())
 }

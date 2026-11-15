@@ -7,7 +7,22 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 pub use incr_core::label_group;
-use incr_core::{ComputeCounts, GraphSummary, GroupKind, NodeTrace, TraceAction};
+use incr_core::{ComputeCounts, GraphSummary, GroupKind, NodeTrace, PropagationTrace, TraceAction};
+
+/// A trace's `target`, counts and `elapsed_ns`, for the caller to add its
+/// `node_traces` to.
+pub fn trace_header<'py>(
+    py: Python<'py>,
+    trace: &PropagationTrace,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("target", trace.target.0)?;
+    d.set_item("total_nodes", trace.total_nodes)?;
+    d.set_item("nodes_recomputed", trace.nodes_recomputed)?;
+    d.set_item("nodes_cutoff", trace.nodes_cutoff)?;
+    d.set_item("elapsed_ns", trace.elapsed_ns)?;
+    Ok(d)
+}
 
 /// A trace entry's `id`, `action`, `dependencies` and `elapsed_ns`.
 pub fn trace_entry<'py>(py: Python<'py>, entry: &NodeTrace) -> PyResult<Bound<'py, PyDict>> {
