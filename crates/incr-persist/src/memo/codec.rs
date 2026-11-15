@@ -9,12 +9,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::{EncodedEntry, GenId};
 use crate::{Error, Result};
 
 /// The leading bytes of a header frame's body.
 pub const MAGIC: [u8; 8] = *b"incrmemo";
 /// The format version this build writes and reads, stored after [`MAGIC`].
 pub const FORMAT: u8 = 3;
+/// The format version of a [`DeltaHeader`] frame.
+pub const DELTA_FORMAT: u8 = 4;
 /// The bytes before a frame's body.
 pub const FRAME_HEADER_LEN: usize = 8;
 
@@ -59,6 +62,28 @@ impl GenHeader {
             .iter()
             .position(|table| table == desc)
             .map(|index| index as u32)
+    }
+}
+
+/// What a delta generation holds besides its entries and tombstones: the
+/// header its entries are numbered by, which carries the base's merged
+/// catalog, and the generations it builds on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaHeader {
+    pub header: GenHeader,
+    /// The full generation at the bottom of the chain.
+    pub base: GenId,
+    /// The layer this delta was written on: `base` or an earlier delta.
+    pub parent: GenId,
+}
+
+impl DeltaHeader {
+    /// The xxh3-64 of this delta header's postcard bytes, which every entry
+    /// frame of the delta carries. It differs from `header.frame_tag()`, so
+    /// a delta frame never decodes as one of a full generation.
+    pub fn frame_tag(&self) -> u64 {
+        let bytes = postcard::to_stdvec(self).expect("a DeltaHeader always encodes");
+        xxhash_rust::xxh3::xxh3_64(&bytes)
     }
 }
 
@@ -109,8 +134,27 @@ pub struct IndexItem {
     /// A location only the backend that wrote the frame interprets, such
     /// as a file offset or a row id.
     pub loc: u64,
-    /// The frame's length in bytes.
+    /// The frame's length in bytes, 0 for a tombstone.
     pub len: u32,
+}
+
+impl IndexItem {
+    /// An item of a delta that hides every older entry of `table` whose
+    /// key hashes to `key_hash`. It has no frame.
+    pub fn tombstone(table: u32, key_hash: u64) -> Self {
+        IndexItem {
+            table,
+            key_hash,
+            loc: 0,
+            len: 0,
+        }
+    }
+
+    /// Whether this item is a tombstone; every real frame is at least
+    /// [`FRAME_HEADER_LEN`] bytes long.
+    pub fn is_tombstone(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// The xxh3-128 every memo fingerprint uses.
@@ -154,9 +198,46 @@ pub fn decode_entry(frame: &[u8], tag: u64) -> Result<Entry> {
     }
 }
 
+/// Copies an entry frame of the generation tagged `old` as a frame of the
+/// one tagged `new`, decoding only its table and key: the crc and the old
+/// tag are checked, the tag bytes swapped and the crc recomputed, so the
+/// value bytes come through unchanged.
+pub fn retag_frame(frame: &[u8], old: u64, new: u64) -> Result<EncodedEntry> {
+    let body = body(frame)?;
+    let entry = match body.split_first_chunk() {
+        Some((found, entry)) if u64::from_le_bytes(*found) == old => entry,
+        _ => {
+            return Err(Error::Corrupt(
+                "memo entry frame belongs to another generation",
+            ))
+        }
+    };
+    let ((table, key), _): ((u32, &[u8]), _) =
+        postcard::take_from_bytes(entry).map_err(Error::Decode)?;
+    let mut out = frame.to_vec();
+    let tag_at = FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8;
+    out[tag_at].copy_from_slice(&new.to_le_bytes());
+    let word = u32::from_le_bytes(frame[..4].try_into().expect("4 bytes"));
+    let crc = crc(word, &out[FRAME_HEADER_LEN..]);
+    out[4..8].copy_from_slice(&crc.to_le_bytes());
+    Ok(EncodedEntry {
+        table,
+        key_hash: key_hash(key),
+        frame: out,
+    })
+}
+
 pub fn encode_header(header: &GenHeader) -> Result<Vec<u8>> {
+    header_frame(FORMAT, header)
+}
+
+pub fn encode_delta_header(header: &DeltaHeader) -> Result<Vec<u8>> {
+    header_frame(DELTA_FORMAT, header)
+}
+
+fn header_frame(format: u8, header: &impl Serialize) -> Result<Vec<u8>> {
     let mut body = MAGIC.to_vec();
-    body.push(FORMAT);
+    body.push(format);
     body.extend(postcard::to_stdvec(header).map_err(Error::Encode)?);
     frame_bytes(&body)
 }
@@ -164,16 +245,38 @@ pub fn encode_header(header: &GenHeader) -> Result<Vec<u8>> {
 /// Decodes a header from exactly one frame, failing with
 /// [`Error::UnsupportedFormat`] on another format version.
 pub fn decode_header(frame: &[u8]) -> Result<GenHeader> {
+    match header_body(frame)? {
+        (FORMAT, header) => decode_body(header),
+        (found, _) => Err(Error::UnsupportedFormat {
+            found,
+            supported: FORMAT,
+        }),
+    }
+}
+
+/// Decodes a delta header from exactly one frame. A full generation's
+/// header is [`Error::Corrupt`]; any other format version is
+/// [`Error::UnsupportedFormat`].
+pub fn decode_delta_header(frame: &[u8]) -> Result<DeltaHeader> {
+    match header_body(frame)? {
+        (DELTA_FORMAT, header) => decode_body(header),
+        (FORMAT, _) => Err(Error::Corrupt(
+            "memo delta header is a full generation's header",
+        )),
+        (found, _) => Err(Error::UnsupportedFormat {
+            found,
+            supported: DELTA_FORMAT,
+        }),
+    }
+}
+
+fn header_body(frame: &[u8]) -> Result<(u8, &[u8])> {
     let body = body(frame)?;
     let Some(rest) = body.strip_prefix(&MAGIC) else {
         return Err(Error::Corrupt("memo header has the wrong magic"));
     };
     match rest.split_first() {
-        Some((&FORMAT, header)) => decode_body(header),
-        Some((&found, _)) => Err(Error::UnsupportedFormat {
-            found,
-            supported: FORMAT,
-        }),
+        Some((&format, header)) => Ok((format, header)),
         None => Err(Error::Corrupt("memo header has no format version")),
     }
 }

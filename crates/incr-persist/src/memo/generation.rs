@@ -1,8 +1,13 @@
-use super::{GenHeader, IndexItem};
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use super::{DeltaHeader, GenHeader, IndexItem};
+use crate::{Error, Result};
 
 /// Names one generation of a memo store. Each checkpoint writes the next
 /// id after the generation it replaces; the first is `GenId(1)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GenId(pub u64);
 
 /// A generation's header and the index of its entry frames, as a backend
@@ -12,8 +17,10 @@ pub struct GenId(pub u64);
 pub struct Generation {
     id: GenId,
     header: GenHeader,
-    /// `header.frame_tag()`.
+    /// `header.frame_tag()`, or the [`DeltaHeader::frame_tag`] of a delta.
     frame_tag: u64,
+    /// A delta's `(base, parent)`.
+    delta: Option<(GenId, GenId)>,
     /// Sorted by `(table, key_hash, loc)`, so equal keys form one run.
     items: Vec<IndexItem>,
     /// Open addressing over the runs of `items`: a slot is 0 or one plus
@@ -38,7 +45,26 @@ fn same_key(item: &IndexItem, table: u32, key_hash: u64) -> bool {
 
 impl Generation {
     /// Panics if `items` holds `u32::MAX` items or more.
-    pub fn new(id: GenId, header: GenHeader, mut items: Vec<IndexItem>) -> Self {
+    pub fn new(id: GenId, header: GenHeader, items: Vec<IndexItem>) -> Self {
+        let frame_tag = header.frame_tag();
+        Generation::build(id, header, frame_tag, None, items)
+    }
+
+    /// A delta generation, whose frames carry `delta`'s own frame tag and
+    /// whose items may be tombstones. Panics like [`new`](Self::new).
+    pub fn new_delta(id: GenId, delta: DeltaHeader, items: Vec<IndexItem>) -> Self {
+        let frame_tag = delta.frame_tag();
+        let link = Some((delta.base, delta.parent));
+        Generation::build(id, delta.header, frame_tag, link, items)
+    }
+
+    fn build(
+        id: GenId,
+        header: GenHeader,
+        frame_tag: u64,
+        delta: Option<(GenId, GenId)>,
+        mut items: Vec<IndexItem>,
+    ) -> Self {
         items.sort_unstable_by_key(|item| (item.table, item.key_hash, item.loc));
         let len = (items.len() * 2).next_power_of_two().max(2);
         let shift = 64 - len.trailing_zeros();
@@ -56,7 +82,8 @@ impl Generation {
         }
         Generation {
             id,
-            frame_tag: header.frame_tag(),
+            frame_tag,
+            delta,
             header,
             items,
             slots,
@@ -77,6 +104,27 @@ impl Generation {
         Generation::new(id, header, Vec::new())
     }
 
+    /// What a backend's `load_chain` returns for a delta layer whose header
+    /// or index is unreadable: a delta that holds nothing, so probes fall
+    /// through to older layers. Its build fingerprint is 0 and its catalog
+    /// empty.
+    pub fn empty_delta(id: GenId, base: GenId, parent: GenId) -> Self {
+        let header = GenHeader {
+            build: 0,
+            seq: 0,
+            tables: Vec::new(),
+        };
+        Generation::new_delta(
+            id,
+            DeltaHeader {
+                header,
+                base,
+                parent,
+            },
+            Vec::new(),
+        )
+    }
+
     pub fn id(&self) -> GenId {
         self.id
     }
@@ -85,9 +133,21 @@ impl Generation {
         &self.header
     }
 
-    /// The [`GenHeader::frame_tag`] its entry frames are decoded with.
+    /// The tag its entry frames are decoded with: the header's
+    /// [`GenHeader::frame_tag`], or for a delta its
+    /// [`DeltaHeader::frame_tag`].
     pub fn frame_tag(&self) -> u64 {
         self.frame_tag
+    }
+
+    /// The full generation a delta builds on, `None` for a full one.
+    pub fn base(&self) -> Option<GenId> {
+        self.delta.map(|(base, _)| base)
+    }
+
+    /// The layer a delta was written on, `None` for a full generation.
+    pub fn parent(&self) -> Option<GenId> {
+        self.delta.map(|(_, parent)| parent)
     }
 
     /// Every item, sorted by `(table, key_hash, loc)`.
@@ -117,8 +177,78 @@ impl Generation {
     }
 
     /// The summed length of every entry frame, which `max_bytes` bounds.
+    /// Tombstones add nothing.
     pub fn entry_bytes(&self) -> u64 {
         self.items.iter().map(|item| u64::from(item.len)).sum()
+    }
+}
+
+/// The layers a store's current state is read through, oldest first: a
+/// full generation, then zero or more deltas, each written on the one
+/// before it. An entry is found by probing the layers newest first, and a
+/// tombstone there is a miss.
+#[derive(Clone, Debug)]
+pub struct Chain {
+    layers: Vec<Arc<Generation>>,
+}
+
+impl Chain {
+    /// Fails with [`Error::Corrupt`] unless `layers` is a full generation
+    /// followed by deltas whose base is that generation and whose parent is
+    /// the layer before each.
+    pub fn new(layers: Vec<Arc<Generation>>) -> Result<Self> {
+        let Some((base, deltas)) = layers.split_first() else {
+            return Err(Error::Corrupt("a memo chain has no layers"));
+        };
+        if base.base().is_some() {
+            return Err(Error::Corrupt("a memo chain starts with a delta"));
+        }
+        let mut parent = base.id();
+        for delta in deltas {
+            if delta.base() != Some(base.id()) || delta.parent() != Some(parent) {
+                return Err(Error::Corrupt("a memo delta is not on the layer before it"));
+            }
+            parent = delta.id();
+        }
+        Ok(Chain { layers })
+    }
+
+    /// Oldest first.
+    pub fn layers(&self) -> &[Arc<Generation>] {
+        &self.layers
+    }
+
+    pub fn into_layers(self) -> Vec<Arc<Generation>> {
+        self.layers
+    }
+
+    /// The full generation at the bottom.
+    pub fn base(&self) -> &Arc<Generation> {
+        &self.layers[0]
+    }
+
+    /// The newest layer, which a write must name to replace or extend the
+    /// chain.
+    pub fn tip(&self) -> &Arc<Generation> {
+        self.layers.last().expect("a chain has a layer")
+    }
+
+    /// The number of deltas.
+    pub fn depth(&self) -> usize {
+        self.layers.len() - 1
+    }
+}
+
+impl From<Generation> for Chain {
+    /// A chain of one full generation. Panics if `generation` is a delta.
+    fn from(generation: Generation) -> Self {
+        assert!(
+            generation.base().is_none(),
+            "a chain starts with a full generation"
+        );
+        Chain {
+            layers: vec![Arc::new(generation)],
+        }
     }
 }
 

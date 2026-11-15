@@ -1,4 +1,4 @@
-use incr_persist::memo::{conformance::MemoHarness, MemoryMemo};
+use incr_persist::memo::{conformance::MemoHarness, MemoBackend, MemoryMemo};
 
 struct MemoryHarness;
 
@@ -20,3 +20,8 @@ impl MemoHarness for MemoryHarness {
 }
 
 incr_persist::memo_backend_conformance!(MemoryHarness);
+
+#[test]
+fn memory_memo_opts_in_to_deltas() {
+    assert!(MemoryMemo::new().supports_delta());
+}

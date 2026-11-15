@@ -102,6 +102,34 @@ fn an_entry_whose_query_dep_is_not_kept_is_dropped_with_its_dependents() {
 }
 
 #[test]
+fn a_full_checkpoint_reports_its_fresh_entries_and_appended_bytes() {
+    let memo = MemoryMemo::new();
+    let tables = vec![desc("a", 1)];
+    write_checkpoint(
+        &memo,
+        input(
+            tables.clone(),
+            (1..=4).map(|k| entry(0, k, k, vec![])).collect(),
+        ),
+    )
+    .unwrap();
+    let fresh = vec![
+        entry(0, 1, 50, vec![]),
+        entry(0, 7, 70, vec![on(0, 1)]),
+        entry(0, 8, 80, vec![on(0, 9)]),
+    ];
+    let done = write_checkpoint(&memo, input(tables, fresh)).unwrap();
+    let stats = &done.stats;
+    assert_eq!((stats.written, stats.merged, stats.unkept), (5, 3, 1));
+    assert_eq!(stats.fresh_written, 2);
+    assert_eq!(stats.bytes_appended, done.generation.entry_bytes());
+    assert!(stats.bytes_appended > 0);
+    assert!(!stats.delta);
+    assert!(!stats.compacted);
+    assert_eq!((stats.tombstones, stats.chain_depth), (0, 0));
+}
+
+#[test]
 fn merge_carries_unrewritten_entries_with_their_last_used() {
     let memo = MemoryMemo::new();
     let tables = vec![desc("a", 1)];

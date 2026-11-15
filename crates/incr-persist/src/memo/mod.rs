@@ -34,14 +34,14 @@ mod table_core;
 /// store's value scope; between batches other threads take its lock.
 pub(crate) const VALUE_BATCH: usize = 256;
 
-pub use backend::{EncodedEntry, MemoBackend};
+pub use backend::{EncodedEntry, MemoBackend, Tombstone};
 pub use checkpoint::{
     write_checkpoint, CheckpointInput, CheckpointStats, CheckpointTimes, Checkpointed,
     DEFAULT_MAX_BYTES,
 };
 pub use codec::*;
 pub use file::{FileMemo, FileMemoGuard};
-pub use generation::{GenId, Generation};
+pub use generation::{Chain, GenId, Generation};
 pub use handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
 pub(crate) use memo_core::Wake;
 pub use memo_core::{MemoCells, MemoStats};
