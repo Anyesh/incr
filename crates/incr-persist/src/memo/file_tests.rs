@@ -600,7 +600,7 @@ fn the_open_file_cache_stays_small_across_many_generations() {
 
 #[test]
 fn a_stale_delta_sharing_the_current_generations_id_does_not_remove_it() {
-    let (dir, memo, _delta) = memo_with_delta();
+    let (dir, _memo, _delta) = memo_with_delta();
     let (other_dir, other) = store();
     other
         .write_generation(None, GenId(2), &header(2), &entries(0..4))
