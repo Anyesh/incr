@@ -844,6 +844,8 @@ where
 struct VersionMap<K> {
     by_hash: HashMap<u64, Vec<(K, Incr<u64>)>, FxBuildHasher>,
     by_handle: HashMap<ErasedIncr, K, FxBuildHasher>,
+    /// The membership input, which no key maps to.
+    membership: Option<Incr<u64>>,
 }
 
 impl<K: Eq> VersionMap<K> {
@@ -899,6 +901,9 @@ struct KeyVersions<K: 'static, C: Cells> {
     /// How many inputs `map` holds, so a write to a collection no query
     /// reads by key takes no lock.
     live: C::U64,
+    /// 1 once `map` holds the membership input, so a write that inserts or
+    /// removes a key in a collection no query lists takes no lock.
+    listed: C::U64,
 }
 
 impl<K: 'static, C: Cells> KeyVersions<K, C> {
@@ -909,11 +914,17 @@ impl<K: 'static, C: Cells> KeyVersions<K, C> {
                 VersionMap {
                     by_hash: HashMap::default(),
                     by_handle: HashMap::default(),
+                    membership: None,
                 },
             ),
             changes: C::new_u64(1),
             live: C::new_u64(0),
+            listed: C::new_u64(0),
         }
+    }
+
+    fn any_listed(&self) -> bool {
+        C::u64_load_acquire(&self.listed) != 0
     }
 
     fn any(&self) -> bool {
@@ -1281,7 +1292,8 @@ where
             drop(table);
             drop(log);
             let hashes = mem::take(&mut stage.changed_hashes);
-            let queued = self.bump(rt, &hashes);
+            let membership = stage.counts.inserted + stage.counts.removed != 0;
+            let queued = self.bump(rt, &hashes, membership);
             let outcome = stage.outcome(epoch);
             match keep.as_deref_mut() {
                 Some(keep) => {
@@ -1307,18 +1319,28 @@ where
         }
     }
 
-    /// Sets the version input of every key with one of `hashes` to a fresh
-    /// value without routing: whether a set queued a router, which the
-    /// caller routes once the write's other sets are done. Runs no user
-    /// code.
-    fn bump(&self, rt: &Runtime<C>, hashes: &[u64]) -> bool {
-        if hashes.is_empty() || !self.versions.any() {
+    /// Sets the version input of every key with one of `hashes`, and the
+    /// membership input when `membership`, to a fresh value without
+    /// routing: whether a set queued a router, which the caller routes once
+    /// the write's other sets are done. Runs no user code.
+    fn bump(&self, rt: &Runtime<C>, hashes: &[u64], membership: bool) -> bool {
+        let keyed = !hashes.is_empty() && self.versions.any();
+        let listed = membership && self.versions.any_listed();
+        if !keyed && !listed {
             return false;
         }
         let value = C::u64_fetch_add(&self.versions.changes, 1);
         let handles: Vec<Incr<u64>> = {
             let map = self.versions.map.read();
-            map.by_hashes(hashes).map(|(_, _, handle)| handle).collect()
+            let mut handles: Vec<Incr<u64>> = if keyed {
+                map.by_hashes(hashes).map(|(_, _, handle)| handle).collect()
+            } else {
+                Vec::new()
+            };
+            if listed {
+                handles.extend(map.membership);
+            }
+            handles
         };
         let mut queued = false;
         for handle in handles {
@@ -1455,6 +1477,54 @@ where
                 .find_key(self.index.hasher.hash_one(key), key)
                 .map(|s| table.bucket(s).read().0.row())
         })
+    }
+
+    /// The keys held. Inside a compute of `rt` the read depends on the
+    /// membership input, created at 0 on the first such read, so the query
+    /// reruns when a write inserts or removes a key and not when it only
+    /// changes a row. Outside one it reads as [`Self::keys`] and creates
+    /// nothing; in a run the engine discards, with no input yet, likewise.
+    pub fn get_keys(&self, rt: &Runtime<C>) -> Vec<K> {
+        refuse_value_code();
+        if !records_reads(rt) {
+            return self.keys();
+        }
+        let handle = match self.membership_input() {
+            Some(handle) => handle,
+            None if rt.frame_doomed() => return self.keys(),
+            None => self.membership_input_or_create(rt),
+        };
+        rt.get(handle);
+        self.keys()
+    }
+
+    /// The membership input, if a read created one.
+    pub fn membership_input(&self) -> Option<Incr<u64>> {
+        if !self.versions.any_listed() {
+            return None;
+        }
+        self.versions.map.read().membership
+    }
+
+    /// Whether a read created the membership input.
+    pub fn has_membership_input(&self) -> bool {
+        self.versions.any_listed()
+    }
+
+    /// The membership input, created at 0 if no read created one yet.
+    /// Takes the version lock, like [`Self::version_input_or_create`].
+    pub fn membership_input_or_create(&self, rt: &Runtime<C>) -> Incr<u64> {
+        if let Some(handle) = self.membership_input() {
+            return handle;
+        }
+        let mut map = self.versions.map.write();
+        if let Some(handle) = map.membership {
+            return handle;
+        }
+        let handle = rt.create_input_unchecked(0_u64);
+        map.membership = Some(handle);
+        C::u64_store_release(&self.versions.listed, 1);
+        handle
     }
 
     /// `key`'s version input, if a read created one.

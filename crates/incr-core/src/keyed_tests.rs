@@ -1275,6 +1275,97 @@ fn one_upsert_among_many_keys_reruns_one_reader<C: Cells>() {
     assert_eq!(rt.get(readers[2]), Some(7));
 }
 
+/// A query listing the keys through `get_keys`, and how often it ran.
+fn keys_reader<C: Cells>(rt: &Runtime<C>, kc: &Plain<C>) -> (Incr<Vec<u8>>, Runs) {
+    let runs: Runs = Arc::default();
+    let counted = Arc::clone(&runs);
+    let kc = Captured(kc.clone());
+    let q = rt.create_query(move |rt| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut keys = kc.get().get_keys(rt);
+        keys.sort_unstable();
+        keys
+    });
+    (q, runs)
+}
+
+fn a_keys_reader_reruns_on_insert_and_remove_only<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let (q, runs) = keys_reader(&rt, &kc);
+    assert_eq!(rt.get(q), vec![1]);
+    assert_eq!(runs_of(&runs), 1);
+
+    kc.upsert(&rt, 1, 11);
+    assert_eq!(rt.get(q), vec![1]);
+    assert_eq!(runs_of(&runs), 1, "a row update");
+
+    kc.upsert(&rt, 2, 20);
+    assert_eq!(rt.get(q), vec![1, 2]);
+    assert_eq!(runs_of(&runs), 2, "an insert");
+
+    kc.remove(&rt, &2);
+    assert_eq!(rt.get(q), vec![1]);
+    assert_eq!(runs_of(&runs), 3, "a remove");
+
+    kc.remove(&rt, &9);
+    assert_eq!(rt.get(q), vec![1]);
+    assert_eq!(runs_of(&runs), 3, "a remove of an absent key");
+
+    kc.reconcile(&rt, [(1, 12), (3, 30)]);
+    assert_eq!(rt.get(q), vec![1, 3]);
+    assert_eq!(runs_of(&runs), 4, "a reconcile that inserts and removes");
+
+    kc.reconcile(&rt, [(1, 13), (3, 31)]);
+    assert_eq!(rt.get(q), vec![1, 3]);
+    assert_eq!(runs_of(&runs), 4, "a reconcile that only updates rows");
+}
+
+fn replayed_pairs_move_the_membership_only_when_a_key_appears_or_goes<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let (q, runs) = keys_reader(&rt, &kc);
+    assert_eq!(rt.get(q), vec![1]);
+    kc.apply_pairs_with(&rt, [PairOp::Insert((1, 9), 0)], &mut (), None);
+    assert_eq!(rt.get(q), vec![1]);
+    assert_eq!(runs_of(&runs), 1, "a higher-ranked pair of a held key");
+    kc.apply_pairs_with(&rt, [PairOp::Insert((2, 5), 0)], &mut (), None);
+    assert_eq!(rt.get(q), vec![1, 2]);
+    assert_eq!(runs_of(&runs), 2);
+}
+
+fn get_keys_outside_a_query_creates_nothing<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    assert_eq!(kc.get_keys(&rt), vec![1]);
+    assert!(!kc.has_membership_input());
+    let (q, _) = keys_reader(&rt, &kc);
+    rt.get(q);
+    assert!(kc.has_membership_input());
+    assert_eq!(kc.version_input_count(), 0, "it is not a key's input");
+}
+
+fn keys_readers_and_key_readers_do_not_wake_each_other<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let (by_key, key_runs) = key_reader(&rt, &kc, 1);
+    let (listing, list_runs) = keys_reader(&rt, &kc);
+    rt.get(by_key);
+    rt.get(listing);
+    kc.upsert(&rt, 2, 20);
+    rt.get(by_key);
+    rt.get(listing);
+    assert_eq!((runs_of(&key_runs), runs_of(&list_runs)), (1, 2));
+    kc.upsert(&rt, 1, 11);
+    rt.get(by_key);
+    rt.get(listing);
+    assert_eq!((runs_of(&key_runs), runs_of(&list_runs)), (2, 2));
+}
+
 for_both!(
     @rows
     a_key_reader_reruns_only_when_its_row_changes,
@@ -1290,4 +1381,8 @@ for_both!(
     forget_key_inside_a_compute_is_refused,
     a_keyed_write_inside_a_compute_is_refused,
     one_upsert_among_many_keys_reruns_one_reader,
+    a_keys_reader_reruns_on_insert_and_remove_only,
+    replayed_pairs_move_the_membership_only_when_a_key_appears_or_goes,
+    get_keys_outside_a_query_creates_nothing,
+    keys_readers_and_key_readers_do_not_wake_each_other,
 );
