@@ -61,6 +61,18 @@ pub struct MemoStats {
     pub auto_checkpoint_errors: u64,
     /// Generations a checkpoint replaced but could not remove.
     pub stale_generations: u64,
+    /// Deltas in the current chain.
+    pub chain_depth: u64,
+    /// The summed entry frame lengths of the current chain's deltas.
+    pub chain_bytes: u64,
+    /// Checkpoints that wrote a delta, a part of `checkpoints`.
+    pub delta_checkpoints: u64,
+    /// Checkpoints whose full write replaced a chain holding deltas.
+    pub compactions: u64,
+    /// [`CheckpointStats::bytes_appended`](super::CheckpointStats::bytes_appended)
+    /// of the last checkpoint that succeeded, 0 when it found nothing
+    /// fresh.
+    pub last_bytes_appended: u64,
 }
 
 /// [`MemoBackend`] with its guard type erased.

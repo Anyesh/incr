@@ -44,6 +44,7 @@ both!(
     evicted_entries_are_dirtied_again_and_a_reopen_recomputes_them,
     a_failed_checkpoint_leaves_its_entries_unsaved,
     a_checkpoint_with_nothing_fresh_writes_nothing,
+    full_checkpoints_report_no_chain_and_their_appended_bytes,
     a_cutoff_recompute_keeps_the_bytes_its_clean_dependents_name,
     a_clean_dep_the_base_lost_is_written_again,
 );
@@ -405,6 +406,48 @@ fn a_checkpoint_with_nothing_fresh_writes_nothing<C: MemoCells>() {
         (1, 1, 1)
     );
     assert_eq!(generation_id(&backends), id);
+}
+
+fn full_checkpoints_report_no_chain_and_their_appended_bytes<C: MemoCells>() {
+    let backends = Backends::new();
+    let w = Leaves::<C>::open(&backends, options());
+    for k in 0..3 {
+        w.read(k);
+    }
+    let done = w.memo.checkpoint().unwrap();
+    assert_eq!(done.fresh_written, 3);
+    let generation = incr_persist::memo::MemoBackend::load(&backends.memo)
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.bytes_appended, generation.entry_bytes());
+    let stats = w.memo.stats();
+    assert_eq!(stats.last_bytes_appended, done.bytes_appended);
+    assert_eq!(
+        (
+            stats.chain_depth,
+            stats.chain_bytes,
+            stats.delta_checkpoints,
+            stats.compactions
+        ),
+        (0, 0, 0, 0)
+    );
+
+    w.store.set(w.x, 7).unwrap();
+    w.read(0);
+    let done = w.memo.checkpoint().unwrap();
+    assert_eq!((done.fresh_written, done.written), (1, 3));
+    assert_eq!(w.memo.stats().last_bytes_appended, done.bytes_appended);
+    assert!(w.memo.checkpoint().unwrap().unchanged);
+    let stats = w.memo.stats();
+    assert_eq!(stats.last_bytes_appended, 0);
+    assert_eq!(
+        (
+            stats.checkpoints,
+            stats.delta_checkpoints,
+            stats.compactions
+        ),
+        (2, 0, 0)
+    );
 }
 
 /// `parent(k) = child(k).v + y`, `child(k) = k * (x % 2)` with a value

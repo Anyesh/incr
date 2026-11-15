@@ -196,6 +196,7 @@ impl<C: MemoCells> CoreRef<C> {
             }
             state.stats.unsaveable = found.unsaveable;
             state.stats.evicted_last_checkpoint = 0;
+            state.stats.last_bytes_appended = 0;
             let mut stats = CheckpointStats {
                 unchanged: true,
                 ..CheckpointStats::default()
@@ -218,6 +219,9 @@ impl<C: MemoCells> CoreRef<C> {
         done.stats.times.snapshot = snapshot;
         self.swap_index(IndexGen::new(done.generation, self.build, &self.catalog));
         state.stats.checkpoints += 1;
+        state.stats.delta_checkpoints += u64::from(done.stats.delta);
+        state.stats.compactions += u64::from(done.stats.compacted);
+        state.stats.last_bytes_appended = done.stats.bytes_appended;
         let mut unsaveable = found.unsaveable;
         let mut saved = Vec::new();
         {

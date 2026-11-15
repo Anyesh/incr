@@ -47,6 +47,19 @@ pub struct CheckpointStats {
     /// No entry was fresh, so `Memo::checkpoint` wrote nothing: the
     /// current generation stays and every count is zero.
     pub unchanged: bool,
+    /// The checkpoint wrote a delta on the current chain instead of a full
+    /// generation.
+    pub delta: bool,
+    /// Fresh entries written, a part of `written`.
+    pub fresh_written: usize,
+    /// Tombstones the delta wrote; 0 for a full generation.
+    pub tombstones: usize,
+    /// The summed length of the entry frames written.
+    pub bytes_appended: u64,
+    /// Deltas in the chain after the checkpoint; 0 after a full write.
+    pub chain_depth: usize,
+    /// A full write replaced a chain that held deltas.
+    pub compacted: bool,
     pub times: CheckpointTimes,
 }
 
@@ -213,6 +226,8 @@ fn write_with<B: MemoBackend + ?Sized>(
         }
     }
     stats.written = kept.len();
+    stats.fresh_written = fates.iter().filter(|&&f| f == Fate::Written).count();
+    stats.bytes_appended = kept.iter().map(|e| e.frame.len() as u64).sum();
     let base_id = base.as_ref().map(Generation::id);
     let generation = backend.write_generation(base_id, id, &header, &kept)?;
     stats.times.write = merged_at.elapsed();
