@@ -116,6 +116,17 @@ impl<B: PyBinding> KeyedSource<'_, B> {
         }
     }
 
+    /// The keys held as [`incr_core::KeyedCollection::get_keys`] reads
+    /// them: inside a compute of `rt`, a dependency on which keys exist.
+    /// Runs the keys' `__hash__` and `__eq__`: the caller runs it inside
+    /// its package's engine boundary.
+    pub fn get_keys(&self, rt: &Runtime<B::C>) -> Vec<PyKey> {
+        match self {
+            KeyedSource::Plain(keyed) => keyed.get_keys(rt),
+            KeyedSource::Persisted(persisted) => persisted.get_keys(rt),
+        }
+    }
+
     /// [`incr_core::KeyedCollection::forget_key`]. Runs the key's
     /// `__hash__` and `__eq__`: the caller runs it inside its package's
     /// engine boundary.

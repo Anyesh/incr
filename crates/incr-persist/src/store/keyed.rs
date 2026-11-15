@@ -856,11 +856,26 @@ where
                 Next::Row(pair) => Some(pair),
                 Next::Gone => None,
             };
+            let first = out.len();
             for (pair, rank) in &staged.held {
                 out.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
             }
             if let Some(pair) = next {
-                out.push(insert_record(&key, pair)?);
+                let insert = insert_record(&key, pair)?;
+                match (&out[first..], insert) {
+                    (
+                        [Record::Remove { element: old, .. }],
+                        Record::Insert { element: new, .. },
+                    ) => {
+                        let replace = Record::Replace {
+                            key: key.clone(),
+                            old: Some(old.clone()),
+                            new,
+                        };
+                        out[first] = replace;
+                    }
+                    (_, insert) => out.push(insert),
+                }
             }
         }
         Ok(out)

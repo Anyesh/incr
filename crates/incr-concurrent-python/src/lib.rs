@@ -335,6 +335,18 @@ impl PyRuntimeRef {
         ready::read::<Signal>(py, row, missing)
     }
 
+    /// A new list of the keys `kc` holds, with a dependency on which keys
+    /// exist: the query reruns when a write inserts or removes a key, not
+    /// when it only changes a row. Raises `ValueError` for a keyed
+    /// collection of another runtime.
+    fn keys<'py>(
+        &self,
+        py: Python<'py>,
+        kc: PyRef<'_, PyKeyedCollection>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        key_list(py, self.rt()?, &kc)
+    }
+
     /// `(row, status)` for `kc`'s `key` as `get_status` gives them, read
     /// with the dependency of `get_key`; `(None, None)` for an absent key.
     fn get_key_status(
@@ -403,6 +415,16 @@ fn key_row(
     let key = PyKey(key);
     let row = engine_call(py, rt, || source.get_key(rt, &key, label))?;
     Ok(row.map(|row| row.0))
+}
+
+fn key_list<'py>(
+    py: Python<'py>,
+    rt: &Runtime,
+    kc: &PyKeyedCollection,
+) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+    let (source, _) = kc.key_source(rt)?;
+    let keys = engine_call(py, rt, || source.get_keys(rt))?;
+    pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
 }
 
 /// A map from keys to nodes of one runtime. Key `__eq__` and `__hash__`
