@@ -421,11 +421,9 @@ where
         drop(declared);
         let builder = self.builder_from_decls(py, options.memo_options(core), &make);
         let builder = carry::<B, _>(builder);
+        let adapter = PyMemoBackend::<B::Exceptions>::new(backend)?;
         let opened = core.write(py, move |store, _| {
-            builder
-                .into_inner()
-                .open(store, PyMemoBackend::<B::Exceptions>::new(backend))
-                .map(carry::<B, _>)
+            builder.into_inner().open(store, adapter).map(carry::<B, _>)
         });
         match opened {
             Ok(memo) => self

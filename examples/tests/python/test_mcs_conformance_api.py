@@ -6,13 +6,26 @@ import incr_concurrent.persist
 import pytest
 from test_mcs_persist_conformance import (
     DictBackend,
+    DictDeltaMemoFactory,
     DictLogFactory,
     DictMemoFactory,
+    DictMemo,
     EpochMismatch,
     PickleCodec,
     SqliteLog,
     SqliteLogFactory,
 )
+
+DELTA_CASES = {
+    "streamed_write_reads_the_base_through_the_same_handle",
+    "delta_chain_roundtrips",
+    "tombstone_hides_a_base_entry",
+    "chain_of_deltas_resolves_newest_first",
+    "delta_frames_reject_a_bad_tag",
+    "stale_delta_is_not_returned",
+    "compaction_drops_the_chain",
+    "read_entries_matches_read_entry",
+}
 
 PACKAGES = [
     pytest.param(incr.persist, id="local"),
@@ -96,6 +109,7 @@ def test_the_built_in_memory_backends_pass(persist, conformance):
 def test_python_backends_pass(persist, conformance):
     conformance.run_log_backend(DictLogFactory(persist))
     conformance.run_memo_backend(DictMemoFactory(persist))
+    conformance.run_memo_backend(DictDeltaMemoFactory(persist))
 
 
 def test_a_backend_that_reorders_records_fails_naming_the_case(persist, conformance):
@@ -167,7 +181,7 @@ def test_cases_lists_each_kind(persist, conformance):
         "racing_append_at_one_position_lands_exactly_one",
         "append_at_right_after_compacting_to_the_tail_lands",
     } <= set(conformance.cases("log"))
-    assert conformance.cases("memo")
+    assert DELTA_CASES <= set(conformance.cases("memo"))
     with pytest.raises(ValueError):
         conformance.cases("elsewhere")
 
@@ -236,3 +250,61 @@ def test_a_backend_whose_append_at_raises_another_error_on_a_moved_tail_fails(
     with pytest.raises(conformance.ConformanceFailure) as failure:
         conformance.run_log_backend(Mislabelled(persist))
     assert failure.value.case == "append_at_a_stale_position_writes_nothing"
+
+
+def test_memory_memo_speaks_the_delta_protocol(persist):
+    memo = persist.MemoryMemo()
+    for method in (
+        "load_chain",
+        "write_delta",
+        "write_generation_streamed",
+        "read_entries",
+    ):
+        assert callable(getattr(memo, method)), method
+
+
+def test_a_python_delta_backend_gets_every_delta_call(persist, conformance):
+    factory = DictDeltaMemoFactory(persist)
+    stores = []
+    new_store = factory.new_store
+
+    def tracked():
+        stores.append(new_store())
+        return stores[-1]
+
+    factory.new_store = tracked
+    conformance.run_memo_backend(factory)
+    calls = {call for store in stores for call in store.calls}
+    assert {
+        "load_chain",
+        "write_delta",
+        "write_generation_streamed",
+        "read_entries",
+    } <= calls
+
+
+def test_a_five_method_backend_is_never_given_a_delta(persist, conformance):
+    assert not any(
+        hasattr(DictMemo, name)
+        for name in ("load_chain", "write_delta", "write_generation_streamed")
+    )
+    conformance.run_memo_backend(DictMemoFactory(persist))
+
+
+def test_a_streamed_write_that_leaves_frames_unpulled_fails_its_case(
+    persist, conformance
+):
+    class Skips(DictDeltaMemoFactory):
+        def open(self, store):
+            memo = super().open(store)
+            write = memo.write_generation
+
+            def streamed(base, generation, header, frames):
+                return write(base, generation, header, [])
+
+            memo.write_generation_streamed = streamed
+            return memo
+
+    with pytest.raises(conformance.ConformanceFailure) as failure:
+        conformance.run_memo_backend(Skips(persist))
+    assert failure.value.case == "streamed_write_reads_the_base_through_the_same_handle"
