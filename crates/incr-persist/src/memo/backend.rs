@@ -1,5 +1,9 @@
-use super::{encode_entry, key_hash, Entry, GenHeader, GenId, Generation, IndexItem};
-use crate::Result;
+use std::sync::Arc;
+
+use super::{
+    encode_entry, key_hash, Chain, DeltaHeader, Entry, GenHeader, GenId, Generation, IndexItem,
+};
+use crate::{Error, Result};
 
 /// An entry frame ready to be written, with the index fields a backend
 /// stores beside it.
@@ -23,11 +27,30 @@ impl EncodedEntry {
     }
 }
 
+/// An entry of the generations below a delta that the delta hides: every
+/// one of `table` whose key hashes to `key_hash`. A delta stores it as an
+/// [`IndexItem::tombstone`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Tombstone {
+    pub table: u32,
+    pub key_hash: u64,
+}
+
 /// Storage for the generations of one memo store.
 ///
 /// A store holds a sequence of immutable generations and names one of them
 /// current. Several handles, in this process or others, may share a store;
 /// every method takes `&self` and implementations serialize internally.
+///
+/// A backend whose [`supports_delta`](Self::supports_delta) is `true` also
+/// keeps chains: a full generation, its base, followed by deltas written
+/// with [`write_delta`](Self::write_delta), each on the one before it (see
+/// [`Chain`]). The current generation is then the chain's tip, the newest
+/// layer: [`write_generation`](Self::write_generation) and `write_delta`
+/// take it as their base, and a full write replaces the whole chain.
+/// [`load`](Self::load) returns the chain's base, which is what a reader
+/// that knows nothing of deltas sees. A backend that does not opt in never
+/// holds a delta, so its current generation is its only one.
 /// [`write_checkpoint`](super::write_checkpoint) calls, in order:
 /// [`lock_checkpoint`](Self::lock_checkpoint), [`load`](Self::load),
 /// [`read_entry`](Self::read_entry) on the loaded generation, and
@@ -51,13 +74,15 @@ pub trait MemoBackend: Send + Sync {
     /// concurrent writers on its own may return a guard that excludes
     /// nothing; its base check then makes the losing writer `Busy`.
     ///
-    /// Once taken, it removes every generation but the current one: what
-    /// an interrupted write left, and old generations whose removal failed
-    /// or never ran. Handles whose index names one of them then miss.
+    /// Once taken, it removes every generation not in the current chain:
+    /// what an interrupted write left, and old generations whose removal
+    /// failed or never ran. Handles whose index names one of them then
+    /// miss.
     fn lock_checkpoint(&self) -> Result<Self::Guard>;
 
     /// Loads the current generation's header and index, without entry
-    /// values, or `None` when no generation was ever written.
+    /// values, or `None` when no generation was ever written. Once a chain
+    /// holds deltas, this is the chain's base.
     ///
     /// When the current generation's header or index is damaged it returns
     /// [`Generation::empty`] with the current id, so restores miss and the
@@ -76,9 +101,10 @@ pub trait MemoBackend: Send + Sync {
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>>;
 
     /// Durably writes generation `id` with `header` and `entries`, and makes
-    /// it current, if the current generation is still `base` (`None`: no
-    /// generation was ever written). Otherwise it writes nothing visible
-    /// and fails with [`Error::Busy`](crate::Error::Busy).
+    /// it current, if the current generation, the chain's tip, is still
+    /// `base` (`None`: no generation was ever written). Otherwise it writes
+    /// nothing visible and fails with [`Error::Busy`](crate::Error::Busy).
+    /// The new generation replaces the whole chain `base` ends.
     ///
     /// - `id` is greater than every id this store has used.
     /// - Atomic: a crash at any point leaves `load` returning either `base`
@@ -88,7 +114,7 @@ pub trait MemoBackend: Send + Sync {
     /// - The returned [`Generation`] equals what `load` returns next: the
     ///   same id and header, and one item per entry, in any order, whose
     ///   `len` is its frame's length and whose `loc` `read_entry` resolves.
-    /// - `base` stays readable until it is removed.
+    /// - `base` and every layer below it stay readable until removed.
     fn write_generation(
         &self,
         base: Option<GenId>,
@@ -97,8 +123,91 @@ pub trait MemoBackend: Send + Sync {
         entries: &[EncodedEntry],
     ) -> Result<Generation>;
 
-    /// Deletes a generation that is no longer current. Removing one that is
-    /// already gone succeeds. Handles still reading it get `None` from
+    /// [`write_generation`](Self::write_generation) with the entries
+    /// pulled one at a time, so a backend can write each frame as it comes
+    /// instead of holding them all. Same contract; an `Err` from `entries`
+    /// fails the write with that error and writes nothing visible.
+    ///
+    /// The iterator may call [`read_entry`](Self::read_entry) and
+    /// [`read_entries`](Self::read_entries) on this same handle while the
+    /// write is in progress, as a compaction reading the old chain does, so
+    /// an implementation must not hold a lock across a pull that those
+    /// reads also take. The default collects every entry, then calls
+    /// `write_generation`.
+    fn write_generation_streamed(
+        &self,
+        base: Option<GenId>,
+        id: GenId,
+        header: &GenHeader,
+        entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
+    ) -> Result<Generation> {
+        let entries = entries.collect::<Result<Vec<_>>>()?;
+        self.write_generation(base, id, header, &entries)
+    }
+
+    /// [`read_entry`](Self::read_entry) for each of `items` of
+    /// `generation`, in order, none of them a tombstone. A backend whose
+    /// reads cost a round trip each can batch them. The default reads them
+    /// one by one.
+    fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
+        items
+            .iter()
+            .map(|item| self.read_entry(generation, item))
+            .collect()
+    }
+
+    /// Whether this backend keeps delta chains: `true` promises that
+    /// [`load_chain`](Self::load_chain) returns every layer,
+    /// [`write_delta`](Self::write_delta) writes them, and
+    /// [`lock_checkpoint`](Self::lock_checkpoint) keeps the current
+    /// chain. The default is `false`, and a checkpoint then writes only
+    /// full generations, as on a backend from before deltas.
+    fn supports_delta(&self) -> bool {
+        false
+    }
+
+    /// Loads the current chain, oldest layer first: the base, then each
+    /// delta on the one before it up to the tip, or `None` when no
+    /// generation was ever written. Each layer is what `write_delta` or
+    /// `write_generation` returned for it. A delta whose base is no longer
+    /// current, or that is not on the chain's tip, is never part of it.
+    ///
+    /// `known` holds layers this handle loaded earlier. Generations are
+    /// immutable, so a backend may return a known layer's `Arc` for the
+    /// same id instead of reloading its index. Damage is handled as in
+    /// `load`. The default wraps `load` in a chain of one generation.
+    fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
+        let _ = known;
+        Ok(self.load()?.map(Chain::from))
+    }
+
+    /// Durably writes delta `id` with `header`, `entries` and
+    /// `tombstones`, and makes it the chain's new tip, if the current tip
+    /// is still `tip`. Otherwise it writes nothing visible and fails with
+    /// [`Error::Busy`](crate::Error::Busy). `header.parent` is `tip` and
+    /// `header.base` is the chain's base; the entries' frames carry
+    /// [`DeltaHeader::frame_tag`].
+    ///
+    /// Atomic and durable as `write_generation`, with `id` greater than
+    /// every id used. The returned [`Generation`] is a
+    /// [`Generation::new_delta`] equal to the layer `load_chain` returns
+    /// next: one item per entry as in `write_generation`, plus one
+    /// [`IndexItem::tombstone`] per tombstone. The default fails with
+    /// [`Error::Unsupported`].
+    fn write_delta(
+        &self,
+        tip: GenId,
+        id: GenId,
+        header: &DeltaHeader,
+        entries: &[EncodedEntry],
+        tombstones: &[Tombstone],
+    ) -> Result<Generation> {
+        let _ = (tip, id, header, entries, tombstones);
+        Err(Error::Unsupported("memo delta"))
+    }
+
+    /// Deletes a generation that is no longer in the current chain.
+    /// Removing one that is already gone succeeds. Handles still reading it get `None` from
     /// `read_entry`.
     fn remove_generation(&self, generation: GenId) -> Result<()>;
 }

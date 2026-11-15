@@ -34,7 +34,7 @@ mod table_core;
 /// store's value scope; between batches other threads take its lock.
 pub(crate) const VALUE_BATCH: usize = 256;
 
-pub use backend::{EncodedEntry, MemoBackend};
+pub use backend::{EncodedEntry, MemoBackend, Tombstone};
 pub use checkpoint::{
     write_checkpoint, CheckpointInput, CheckpointStats, CheckpointTimes, Checkpointed,
     DEFAULT_MAX_BYTES,

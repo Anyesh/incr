@@ -30,6 +30,11 @@ pub enum Error {
     )]
     UnsupportedFormat { found: u8, supported: u8 },
 
+    /// The backend does not implement an optional operation, named here,
+    /// such as a memo delta write.
+    #[error("this backend does not support {0}")]
+    Unsupported(&'static str),
+
     /// A record failed to serialize.
     #[error("failed to encode record")]
     Encode(#[source] postcard::Error),
