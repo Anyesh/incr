@@ -901,10 +901,20 @@
     "kind": "method_descriptor",
     "signature": "(self, /)"
    },
+   "load_chain": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
    "lock_checkpoint": {
     "doc": null,
     "kind": "method_descriptor",
     "signature": "(self, /)"
+   },
+   "read_entries": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, generation, items)"
    },
    "read_entry": {
     "doc": null,
@@ -916,10 +926,20 @@
     "kind": "method_descriptor",
     "signature": "(self, /, generation)"
    },
+   "write_delta": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, tip, generation, header, entries, tombstones)"
+   },
    "write_generation": {
     "doc": null,
     "kind": "method_descriptor",
     "signature": "(self, /, base, generation, header, entries)"
+   },
+   "write_generation_streamed": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, base, generation, header, frames)"
    }
   },
   "signature": "()"
