@@ -86,7 +86,8 @@ impl Live {
 
     /// What `layers` (oldest first, a full generation first) show, by key
     /// hash: each delta's runs replace the newest older run for the same
-    /// table and hash. Linear in the deltas times depth.
+    /// table and hash. Each delta's totals are kept on it once computed,
+    /// so only deltas new to this process cost their items times depth.
     pub(crate) fn of_chain(layers: &[Arc<Generation>]) -> Live {
         let Some((base, deltas)) = layers.split_first() else {
             return Live::default();
@@ -96,7 +97,14 @@ impl Live {
             bytes: base.entry_bytes(),
         };
         for (at, delta) in deltas.iter().enumerate() {
-            live = live.with_layer(&layers[..=at], delta.items());
+            live = match delta.shown() {
+                Some(shown) => shown,
+                None => {
+                    let shown = live.with_layer(&layers[..=at], delta.items());
+                    delta.set_shown(shown);
+                    shown
+                }
+            };
         }
         live
     }

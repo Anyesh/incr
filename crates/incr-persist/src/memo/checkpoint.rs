@@ -345,6 +345,7 @@ fn write_delta<B: MemoBackend + ?Sized>(
     stats.bytes_appended = bytes;
     let generation =
         backend.write_delta(chain.tip().id(), next.id, &header, &written, &tombstones)?;
+    generation.set_shown(live);
     stats.times.write = merged_at.elapsed();
     let generation = Arc::new(generation);
     let mut layers = chain.layers().to_vec();

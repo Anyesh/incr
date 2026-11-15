@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use super::layers::Live;
 use super::{DeltaHeader, GenHeader, IndexItem};
 use crate::{Error, Result};
 
@@ -32,6 +33,9 @@ pub struct Generation {
     /// The items that are not tombstones, and their summed lengths.
     entries: u64,
     entry_bytes: u64,
+    /// For a delta, what its chain up to and including it shows, once
+    /// computed: its older layers are fixed by its base and parent ids.
+    shown: OnceLock<Live>,
 }
 
 /// The first slot probed for `(table, key_hash)`: the top bits of the hash,
@@ -99,6 +103,7 @@ impl Generation {
             shift,
             entries,
             entry_bytes,
+            shown: OnceLock::new(),
         }
     }
 
@@ -196,6 +201,14 @@ impl Generation {
     /// The items that are not tombstones.
     pub(crate) fn entry_count(&self) -> u64 {
         self.entries
+    }
+
+    pub(crate) fn shown(&self) -> Option<Live> {
+        self.shown.get().copied()
+    }
+
+    pub(crate) fn set_shown(&self, live: Live) {
+        let _ = self.shown.set(live);
     }
 }
 
