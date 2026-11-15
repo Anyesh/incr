@@ -55,6 +55,7 @@ MUTATING = {
     "reconcile",
     "reconcile_journaled",
     "apply_pairs_with",
+    "forget_key",
 }
 ENTRIES = {
     "engine_read": "engine_read",
