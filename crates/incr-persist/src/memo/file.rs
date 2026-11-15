@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufWriter, Write};
@@ -6,8 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::{
-    decode_header, decode_index, encode_header, encode_index, EncodedEntry, GenHeader, GenId,
-    Generation, IndexItem, MemoBackend, FRAME_HEADER_LEN,
+    decode_delta_header, decode_header, decode_index, encode_delta_header, encode_header,
+    encode_index, Chain, DeltaHeader, EncodedEntry, GenHeader, GenId, Generation, IndexItem,
+    MemoBackend, Tombstone, FRAME_HEADER_LEN,
 };
 use crate::file::{sync_dir, write_synced};
 use crate::flock::Flock;
@@ -17,10 +19,15 @@ const CURRENT: &str = "MEMO_CURRENT";
 const LOCK: &str = "MEMO_LOCK";
 const PUBLISH: &str = "MEMO_PUBLISH";
 const GEN_PREFIX: &str = "MEMO_GEN.";
+const DELTA_PREFIX: &str = "MEMO_DELTA.";
+const CHAIN: &str = "MEMO_CHAIN";
+const CHAIN_VERSION: u8 = 1;
+const CACHE_LIMIT: usize = 16;
 // Not a `.tmp` suffix: a FileBackend log sharing the directory removes
 // `*.tmp` files when it opens or compacts.
 const TMP_PREFIX: &str = "MEMO_TMP.";
 const CURRENT_TMP: &str = "MEMO_TMP.current";
+const CHAIN_TMP: &str = "MEMO_TMP.chain";
 const CURRENT_LEN: usize = 12;
 const FOOTER_LEN: usize = 20;
 
@@ -53,8 +60,20 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `write_generation` made without it can lose its temp file and fail
 /// with an I/O error.
 ///
-/// A handle keeps the last generation file it read from open. On Unix it
-/// therefore keeps reading a generation another process removed after this
+/// A backend that keeps delta chains writes each delta as `MEMO_DELTA.{id}`,
+/// laid out like a generation file but with a delta header, and lists the
+/// chain in `MEMO_CHAIN`: a version byte, the base id, the count and ids of
+/// the deltas oldest first, and a crc32. `MEMO_CURRENT` keeps naming the
+/// chain's base, so [`load`](MemoBackend::load) returns the base, which is
+/// all a reader from before deltas sees. A delta is published by renaming
+/// its file and then `MEMO_CHAIN`, under `MEMO_PUBLISH`; a delta file the
+/// manifest does not list is a leftover, and a manifest whose base is not
+/// `MEMO_CURRENT` is ignored. Both are removed by the next
+/// [`lock_checkpoint`](MemoBackend::lock_checkpoint). A manifest of
+/// another version is an error.
+///
+/// A handle keeps the generation files it read last open, at most a
+/// handful. On Unix it therefore keeps reading a generation another process removed after this
 /// handle opened it, which returns the frames that generation was written
 /// with. If the file is rewritten in place instead, its frames carry
 /// another generation's [`frame_tag`](super::GenHeader::frame_tag) and fail
@@ -62,7 +81,7 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct FileMemo {
     dir: PathBuf,
-    open: Mutex<Option<(GenId, Arc<File>)>>,
+    open: Mutex<BTreeMap<GenId, Arc<File>>>,
 }
 
 /// The checkpoint lock of a [`FileMemo`], released on drop.
@@ -79,7 +98,7 @@ impl FileMemo {
         fs::create_dir_all(&dir)?;
         Ok(FileMemo {
             dir,
-            open: Mutex::new(None),
+            open: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -87,9 +106,13 @@ impl FileMemo {
         self.dir.join(format!("{GEN_PREFIX}{}", id.0))
     }
 
+    fn delta_path(&self, id: GenId) -> PathBuf {
+        self.dir.join(format!("{DELTA_PREFIX}{}", id.0))
+    }
+
     // Holds only plain data replaced in one assignment, so a panic while it
     // is held leaves nothing half-written.
-    fn cache(&self) -> MutexGuard<'_, Option<(GenId, Arc<File>)>> {
+    fn cache(&self) -> MutexGuard<'_, BTreeMap<GenId, Arc<File>>> {
         self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -123,12 +146,45 @@ impl FileMemo {
         Ok(Flock(file))
     }
 
-    /// Removes temp files and every generation file but the current one.
-    /// Runs under `MEMO_LOCK` and `MEMO_PUBLISH`, so no checkpoint of any
-    /// handle is writing.
+    /// The manifest's `(base, deltas)`, `None` when there is none or it is
+    /// damaged, and an error when it is of another version.
+    fn read_chain(&self) -> Result<Option<(GenId, Vec<GenId>)>> {
+        match fs::read(self.dir.join(CHAIN)) {
+            Ok(bytes) => parse_chain(&bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The deltas of the chain on `base`, oldest first. A manifest of
+    /// another base is a stale one and lists nothing.
+    fn chain_ids(&self, base: GenId) -> Result<Vec<GenId>> {
+        Ok(match self.read_chain()? {
+            Some((chain_base, ids)) if chain_base == base => ids,
+            _ => Vec::new(),
+        })
+    }
+
+    /// The current chain's base and deltas.
+    fn chain_state(&self) -> Result<Option<(GenId, Vec<GenId>)>> {
+        let Some(base) = self.current()? else {
+            return Ok(None);
+        };
+        Ok(Some((base, self.chain_ids(base)?)))
+    }
+
+    /// Removes temp files, every generation file but the current one, and
+    /// every delta file and manifest that is not part of the current
+    /// chain. Runs under `MEMO_LOCK` and `MEMO_PUBLISH`, so no checkpoint
+    /// of any handle is writing.
     fn remove_leftovers(&self) -> Result<()> {
         let _publish = self.lock_publish()?;
-        let current = self.current()?;
+        let state = self.chain_state()?;
+        let current = state.as_ref().map(|(base, _)| *base);
+        let deltas = state.map(|(_, deltas)| deltas).unwrap_or_default();
+        if deltas.is_empty() {
+            remove_if_present(&self.dir.join(CHAIN))?;
+        }
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -138,22 +194,30 @@ impl FileMemo {
                 if Some(id) != current {
                     self.remove_generation(id)?;
                 }
+            } else if let Some(id) = delta_of(&name).map(GenId) {
+                if !deltas.contains(&id) {
+                    self.remove_generation(id)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// The open file of generation `id`, or `None` when its file is gone or
-    /// is not generation `id`.
+    /// The open file of generation or delta `id`, or `None` when its file
+    /// is gone or is not `id`.
     fn generation_file(&self, id: GenId) -> Result<Option<Arc<File>>> {
-        if let Some((open_id, file)) = self.cache().as_ref() {
-            if *open_id == id {
-                return Ok(Some(Arc::clone(file)));
-            }
+        if let Some(file) = self.cache().get(&id) {
+            return Ok(Some(Arc::clone(file)));
         }
         let file = match File::open(self.gen_path(id)) {
             Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match File::open(self.delta_path(id)) {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                }
+            }
             Err(e) => return Err(e.into()),
         };
         let len = file.metadata()?.len();
@@ -161,13 +225,42 @@ impl FileMemo {
             return Ok(None);
         }
         let file = Arc::new(file);
-        *self.cache() = Some((id, Arc::clone(&file)));
+        let mut cache = self.cache();
+        cache.insert(id, Arc::clone(&file));
+        while cache.len() > CACHE_LIMIT {
+            let Some(oldest) = cache.keys().copied().find(|&cached| cached != id) else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
         Ok(Some(file))
     }
 
-    fn publish(&self, base: Option<GenId>, id: GenId, tmp: &Path) -> Result<()> {
+    fn read_layer(&self, id: GenId, link: Option<(GenId, GenId)>) -> Result<Option<Generation>> {
+        let Some(file) = self.generation_file(id)? else {
+            return Ok(None);
+        };
+        read_generation(&file, id, link)
+    }
+
+    fn tip(&self) -> Result<Option<GenId>> {
+        Ok(self
+            .chain_state()?
+            .map(|(base, deltas)| deltas.last().copied().unwrap_or(base)))
+    }
+
+    fn tmp_path(&self, id: GenId) -> PathBuf {
+        self.dir.join(format!(
+            "{TMP_PREFIX}{}.{}.{}",
+            id.0,
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn publish(&self, tip: Option<GenId>, id: GenId, tmp: &Path) -> Result<()> {
         let _publish = self.lock_publish()?;
-        if self.current()? != base {
+        if self.tip()? != tip {
             return Err(Error::Busy);
         }
         fs::rename(tmp, self.gen_path(id))?;
@@ -176,6 +269,42 @@ impl FileMemo {
         write_synced(&current_tmp, &current_bytes(id))?;
         fs::rename(&current_tmp, self.dir.join(CURRENT))?;
         sync_dir(&self.dir)
+    }
+
+    fn publish_delta(&self, base: GenId, tip: GenId, id: GenId, tmp: &Path) -> Result<()> {
+        let _publish = self.lock_publish()?;
+        let Some((current, mut deltas)) = self.chain_state()? else {
+            return Err(Error::Busy);
+        };
+        if current != base || deltas.last().copied().unwrap_or(base) != tip {
+            return Err(Error::Busy);
+        }
+        fs::rename(tmp, self.delta_path(id))?;
+        sync_dir(&self.dir)?;
+        deltas.push(id);
+        let chain_tmp = self.dir.join(CHAIN_TMP);
+        write_synced(&chain_tmp, &chain_bytes(base, &deltas))?;
+        fs::rename(&chain_tmp, self.dir.join(CHAIN))?;
+        sync_dir(&self.dir)
+    }
+
+    fn write_layer(
+        &self,
+        id: GenId,
+        header: Vec<u8>,
+        entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
+        tombstones: &[Tombstone],
+        publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Vec<IndexItem>> {
+        let tmp = self.tmp_path(id);
+        let written = write_layer_file(&tmp, id, &header, entries, tombstones)
+            .and_then(|items| publish(&tmp).map(|()| items));
+        if written.is_err() {
+            // A temp file that cannot be removed now is removed by the
+            // next lock_checkpoint; the write's own error matters more.
+            let _ = remove_if_present(&tmp);
+        }
+        written
     }
 }
 
@@ -211,7 +340,7 @@ impl MemoBackend for FileMemo {
             }
         };
         Ok(Some(
-            read_generation(&file, id)?.unwrap_or_else(|| Generation::empty(id)),
+            read_generation(&file, id, None)?.unwrap_or_else(|| Generation::empty(id)),
         ))
     }
 
@@ -219,10 +348,7 @@ impl MemoBackend for FileMemo {
         let Some(file) = self.generation_file(generation)? else {
             return Ok(None);
         };
-        let mut frame = vec![0; item.len as usize];
-        let read = read_full_at(&file, &mut frame, item.loc)?;
-        frame.truncate(read);
-        Ok(Some(frame))
+        read_item(&file, item).map(Some)
     }
 
     fn write_generation(
@@ -232,33 +358,91 @@ impl MemoBackend for FileMemo {
         header: &GenHeader,
         entries: &[EncodedEntry],
     ) -> Result<Generation> {
-        let tmp = self.dir.join(format!(
-            "{TMP_PREFIX}{}.{}.{}",
-            id.0,
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = write_generation_file(&tmp, id, header, entries)
-            .and_then(|items| self.publish(base, id, &tmp).map(|()| items));
-        match written {
-            Ok(items) => Ok(Generation::new(id, header.clone(), items)),
-            Err(e) => {
-                // A temp file that cannot be removed now is removed by the
-                // next lock_checkpoint; the write's own error matters more.
-                let _ = remove_if_present(&tmp);
-                Err(e)
+        self.write_generation_streamed(base, id, header, &mut entries.iter().cloned().map(Ok))
+    }
+
+    /// Writes each frame to the temp file as it is pulled and holds no
+    /// lock while pulling, so the iterator may read through this handle.
+    fn write_generation_streamed(
+        &self,
+        base: Option<GenId>,
+        id: GenId,
+        header: &GenHeader,
+        entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
+    ) -> Result<Generation> {
+        let items = self.write_layer(id, encode_header(header)?, entries, &[], |tmp| {
+            self.publish(base, id, tmp)
+        })?;
+        Ok(Generation::new(id, header.clone(), items))
+    }
+
+    fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
+        let Some(file) = self.generation_file(generation)? else {
+            return Ok(vec![None; items.len()]);
+        };
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_unstable_by_key(|&at| items[at].loc);
+        let mut frames = vec![None; items.len()];
+        for at in order {
+            frames[at] = Some(read_item(&file, &items[at])?);
+        }
+        Ok(frames)
+    }
+
+    fn supports_delta(&self) -> bool {
+        true
+    }
+
+    fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
+        'retry: loop {
+            let Some((base, deltas)) = self.chain_state()? else {
+                return Ok(None);
+            };
+            let mut layers = Vec::with_capacity(deltas.len() + 1);
+            let mut parent = base;
+            for (at, id) in std::iter::once(base).chain(deltas).enumerate() {
+                let link = (at > 0).then_some((base, parent));
+                parent = id;
+                if let Some(layer) = known.iter().find(|layer| layer.id() == id) {
+                    layers.push(Arc::clone(layer));
+                    continue;
+                }
+                let layer = match self.read_layer(id, link)? {
+                    Some(layer) => layer,
+                    None if self.current()? != Some(base) => continue 'retry,
+                    None => match link {
+                        Some((base, parent)) => Generation::empty_delta(id, base, parent),
+                        None => Generation::empty(id),
+                    },
+                };
+                layers.push(Arc::new(layer));
             }
+            return Chain::new(layers).map(Some);
         }
     }
 
+    fn write_delta(
+        &self,
+        tip: GenId,
+        id: GenId,
+        header: &DeltaHeader,
+        entries: &[EncodedEntry],
+        tombstones: &[Tombstone],
+    ) -> Result<Generation> {
+        let items = self.write_layer(
+            id,
+            encode_delta_header(header)?,
+            &mut entries.iter().cloned().map(Ok),
+            tombstones,
+            |tmp| self.publish_delta(header.base, tip, id, tmp),
+        )?;
+        Ok(Generation::new_delta(id, header.clone(), items))
+    }
+
     fn remove_generation(&self, generation: GenId) -> Result<()> {
-        {
-            let mut cache = self.cache();
-            if cache.as_ref().is_some_and(|(id, _)| *id == generation) {
-                *cache = None;
-            }
-        }
-        remove_if_present(&self.gen_path(generation))
+        self.cache().remove(&generation);
+        remove_if_present(&self.gen_path(generation))?;
+        remove_if_present(&self.delta_path(generation))
     }
 }
 
@@ -282,6 +466,55 @@ fn generation_of(name: &OsStr) -> Option<u64> {
     name.to_str()?.strip_prefix(GEN_PREFIX)?.parse().ok()
 }
 
+fn delta_of(name: &OsStr) -> Option<u64> {
+    name.to_str()?.strip_prefix(DELTA_PREFIX)?.parse().ok()
+}
+
+fn chain_bytes(base: GenId, deltas: &[GenId]) -> Vec<u8> {
+    let mut bytes = vec![CHAIN_VERSION];
+    bytes.extend(base.0.to_le_bytes());
+    bytes.extend((deltas.len() as u32).to_le_bytes());
+    for id in deltas {
+        bytes.extend(id.0.to_le_bytes());
+    }
+    let crc = crc32fast::hash(&bytes);
+    bytes.extend(crc.to_le_bytes());
+    bytes
+}
+
+/// A manifest's `(base, deltas)`: `None` when damaged, an error when of
+/// another version.
+fn parse_chain(bytes: &[u8]) -> Result<Option<(GenId, Vec<GenId>)>> {
+    let Some((&version, rest)) = bytes.split_first() else {
+        return Ok(None);
+    };
+    if version != CHAIN_VERSION {
+        return Err(Error::UnsupportedFormat {
+            found: version,
+            supported: CHAIN_VERSION,
+        });
+    }
+    let Some((body, crc)) = bytes.split_last_chunk::<4>() else {
+        return Ok(None);
+    };
+    if crc32fast::hash(body) != u32::from_le_bytes(*crc) || rest.len() < 12 + 4 {
+        return Ok(None);
+    }
+    let base = GenId(u64::from_le_bytes(rest[..8].try_into().expect("8 bytes")));
+    let count = u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes")) as usize;
+    let ids = &rest[12..rest.len() - 4];
+    if ids.len() != count * 8 {
+        return Ok(None);
+    }
+    let deltas = ids
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|id| GenId(u64::from_le_bytes(*id)))
+        .collect();
+    Ok(Some((base, deltas)))
+}
+
 fn current_bytes(id: GenId) -> [u8; CURRENT_LEN] {
     let mut bytes = [0; CURRENT_LEN];
     bytes[..8].copy_from_slice(&id.0.to_le_bytes());
@@ -296,20 +529,22 @@ fn parse_current(bytes: &[u8]) -> Option<GenId> {
     (current_bytes(id) == bytes).then_some(id)
 }
 
-/// Streams the generation file to `path`, fsyncs it and returns its index.
-fn write_generation_file(
+/// Streams a generation or delta file to `path`, fsyncs it and returns
+/// its index. `header` is the encoded header frame.
+fn write_layer_file(
     path: &Path,
     id: GenId,
-    header: &GenHeader,
-    entries: &[EncodedEntry],
+    header: &[u8],
+    entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
+    tombstones: &[Tombstone],
 ) -> Result<Vec<IndexItem>> {
     let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let mut out = BufWriter::new(file);
-    let header = encode_header(header)?;
-    out.write_all(&header)?;
+    out.write_all(header)?;
     let mut at = header.len() as u64;
-    let mut items = Vec::with_capacity(entries.len());
+    let mut items = Vec::new();
     for entry in entries {
+        let entry = entry?;
         let len = u32::try_from(entry.frame.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -325,10 +560,23 @@ fn write_generation_file(
         out.write_all(&entry.frame)?;
         at += u64::from(len);
     }
+    items.extend(
+        tombstones
+            .iter()
+            .map(|t| IndexItem::tombstone(t.table, t.key_hash)),
+    );
     out.write_all(&encode_index(&items)?)?;
     out.write_all(&footer_bytes(at, id))?;
     out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     Ok(items)
+}
+
+/// The frame `item` locates, as stored: short when the file is.
+fn read_item(file: &File, item: &IndexItem) -> Result<Vec<u8>> {
+    let mut frame = vec![0; item.len as usize];
+    let read = read_full_at(file, &mut frame, item.loc)?;
+    frame.truncate(read);
+    Ok(frame)
 }
 
 struct Footer {
@@ -386,8 +634,13 @@ fn undamaged<T>(decoded: Result<T>) -> Result<Option<T>> {
 
 /// Reads generation `id`'s header and index from `file`, or `None` when
 /// either is damaged, the footer names another generation, or an item
-/// points outside the entry frames.
-fn read_generation(file: &File, id: GenId) -> Result<Option<Generation>> {
+/// points outside the entry frames. `link` is `(base, parent)` for a delta,
+/// which is damaged too when its header names other layers.
+fn read_generation(
+    file: &File,
+    id: GenId,
+    link: Option<(GenId, GenId)>,
+) -> Result<Option<Generation>> {
     let len = file.metadata()?.len();
     let Some(footer) = read_footer(file, len)? else {
         return Ok(None);
@@ -399,8 +652,17 @@ fn read_generation(file: &File, id: GenId) -> Result<Option<Generation>> {
         return Ok(None);
     };
     let entries_at = frame.len() as u64;
-    let Some(header) = undamaged(decode_header(&frame))? else {
-        return Ok(None);
+    let (header, delta) = match link {
+        None => match undamaged(decode_header(&frame))? {
+            Some(header) => (header, None),
+            None => return Ok(None),
+        },
+        Some((base, parent)) => match undamaged(decode_delta_header(&frame))? {
+            Some(delta) if delta.base == base && delta.parent == parent => {
+                (delta.header.clone(), Some(delta))
+            }
+            _ => return Ok(None),
+        },
     };
     let index_end = len - FOOTER_LEN as u64;
     let Some(frame) = read_frame(file, footer.index_at, index_end)? else {
@@ -413,13 +675,19 @@ fn read_generation(file: &File, id: GenId) -> Result<Option<Generation>> {
         return Ok(None);
     };
     let in_bounds = items.iter().all(|item| {
+        if delta.is_some() && item.is_tombstone() {
+            return item.loc == 0;
+        }
         item.loc >= entries_at
             && item
                 .loc
                 .checked_add(u64::from(item.len))
                 .is_some_and(|end| end <= footer.index_at)
     });
-    Ok(in_bounds.then(|| Generation::new(id, header, items)))
+    Ok(in_bounds.then(|| match delta {
+        Some(delta) => Generation::new_delta(id, delta, items),
+        None => Generation::new(id, header, items),
+    }))
 }
 
 /// Reads into `buf` from `offset` until it is full or the file ends, and

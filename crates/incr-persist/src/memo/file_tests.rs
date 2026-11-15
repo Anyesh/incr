@@ -2,7 +2,8 @@ use std::cell::RefCell;
 
 use super::*;
 use crate::memo::{
-    decode_entry, write_checkpoint, CheckpointInput, Entry, StoredDep, TableDesc, DEFAULT_MAX_BYTES,
+    decode_entry, write_checkpoint, CheckpointInput, DeltaHeader, Entry, StoredDep, TableDesc,
+    Tombstone, DEFAULT_MAX_BYTES,
 };
 
 thread_local! {
@@ -371,4 +372,228 @@ fn a_duplicated_lock_descriptor_does_not_outlive_the_guard() {
     drop(guard);
     assert!(memo.lock_checkpoint().is_ok());
     drop(copy);
+}
+
+fn delta_header(base: u64, parent: u64, seq: u64) -> DeltaHeader {
+    DeltaHeader {
+        header: header(seq),
+        base: GenId(base),
+        parent: GenId(parent),
+    }
+}
+
+fn delta_entries(keys: std::ops::Range<u8>, header: &DeltaHeader) -> Vec<EncodedEntry> {
+    let tag = header.frame_tag();
+    keys.map(|key| EncodedEntry::new(&entry(key), tag).unwrap())
+        .collect()
+}
+
+fn chain_of(memo: &FileMemo) -> Vec<GenId> {
+    memo.load_chain(&[])
+        .unwrap()
+        .unwrap()
+        .layers()
+        .iter()
+        .map(|layer| layer.id())
+        .collect()
+}
+
+fn memo_with_delta() -> (tempfile::TempDir, FileMemo, Generation) {
+    let (dir, memo) = store();
+    memo.write_generation(None, GenId(1), &header(1), &entries(0..3))
+        .unwrap();
+    let delta_header = delta_header(1, 1, 2);
+    let delta = memo
+        .write_delta(
+            GenId(1),
+            GenId(2),
+            &delta_header,
+            &delta_entries(5..7, &delta_header),
+            &[Tombstone {
+                table: 0,
+                key_hash: 7,
+            }],
+        )
+        .unwrap();
+    (dir, memo, delta)
+}
+
+#[test]
+fn a_file_memo_keeps_delta_chains() {
+    let (_dir, memo) = store();
+    assert!(memo.supports_delta());
+}
+
+#[test]
+fn a_delta_is_a_separate_file_listed_by_the_chain_manifest() {
+    let (dir, _memo, delta) = memo_with_delta();
+    assert_eq!(
+        names(dir.path()),
+        [CHAIN, CURRENT, "MEMO_DELTA.2", "MEMO_GEN.1", PUBLISH]
+    );
+    let chain = FileMemo::open(dir.path())
+        .unwrap()
+        .load_chain(&[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(chain.depth(), 1);
+    assert_whole(chain.tip(), &delta);
+    assert_eq!(chain.tip().parent(), Some(GenId(1)));
+}
+
+#[test]
+fn load_returns_the_base_of_a_chain() {
+    let (dir, _memo, _delta) = memo_with_delta();
+    let base = reload(dir.path()).unwrap();
+    assert_eq!(base.id(), GenId(1));
+    assert!(base.base().is_none());
+    assert_eq!(base.items().len(), 3);
+}
+
+#[test]
+fn a_crash_before_the_chain_rename_restores_the_previous_state() {
+    let (dir, memo) = store();
+    memo.write_generation(None, GenId(1), &header(1), &entries(0..3))
+        .unwrap();
+    let (other_dir, other) = store();
+    other
+        .write_generation(None, GenId(1), &header(1), &entries(0..3))
+        .unwrap();
+    let delta_header = delta_header(1, 1, 2);
+    other
+        .write_delta(
+            GenId(1),
+            GenId(2),
+            &delta_header,
+            &delta_entries(5..7, &delta_header),
+            &[],
+        )
+        .unwrap();
+    fs::copy(
+        other_dir.path().join("MEMO_DELTA.2"),
+        dir.path().join("MEMO_DELTA.2"),
+    )
+    .unwrap();
+    fs::write(dir.path().join(CHAIN_TMP), b"torn").unwrap();
+
+    assert_eq!(chain_of(&FileMemo::open(dir.path()).unwrap()), [GenId(1)]);
+    let guard = memo.lock_checkpoint().unwrap();
+    assert_eq!(names(dir.path()), [CURRENT, "MEMO_GEN.1", LOCK, PUBLISH]);
+    drop(guard);
+}
+
+#[test]
+fn an_unknown_chain_version_is_a_loud_error() {
+    let (dir, memo, _delta) = memo_with_delta();
+    let path = dir.path().join(CHAIN);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] = 99;
+    fs::write(&path, bytes).unwrap();
+    let result = memo.load_chain(&[]);
+    assert!(
+        matches!(result, Err(Error::UnsupportedFormat { found: 99, .. })),
+        "got {result:?}"
+    );
+    assert!(memo.lock_checkpoint().is_err());
+}
+
+#[test]
+fn a_chain_whose_base_is_not_current_is_ignored() {
+    let (dir, memo, _delta) = memo_with_delta();
+    let chain_bytes = fs::read(dir.path().join(CHAIN)).unwrap();
+    memo.write_generation(Some(GenId(2)), GenId(3), &header(3), &entries(0..1))
+        .unwrap();
+    fs::write(dir.path().join(CHAIN), chain_bytes).unwrap();
+    let fresh = FileMemo::open(dir.path()).unwrap();
+    assert_eq!(chain_of(&fresh), [GenId(3)]);
+    drop(fresh.lock_checkpoint().unwrap());
+    assert_eq!(names(dir.path()), [CURRENT, "MEMO_GEN.3", LOCK, PUBLISH]);
+}
+
+#[test]
+fn a_full_write_from_a_chain_tip_drops_the_chain_and_a_lock_removes_its_files() {
+    let (dir, memo, _delta) = memo_with_delta();
+    memo.write_generation(Some(GenId(2)), GenId(3), &header(3), &entries(0..2))
+        .unwrap();
+    assert_eq!(chain_of(&memo), [GenId(3)]);
+    drop(memo.lock_checkpoint().unwrap());
+    assert_eq!(names(dir.path()), [CURRENT, "MEMO_GEN.3", LOCK, PUBLISH]);
+}
+
+#[test]
+fn a_damaged_delta_loads_as_an_empty_delta() {
+    let (dir, _memo, _delta) = memo_with_delta();
+    let path = dir.path().join("MEMO_DELTA.2");
+    let len = fs::metadata(&path).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(len - 3)
+        .unwrap();
+    let chain = FileMemo::open(dir.path())
+        .unwrap()
+        .load_chain(&[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(chain.depth(), 1);
+    assert!(chain.tip().items().is_empty());
+    assert_eq!(chain.tip().parent(), Some(GenId(1)));
+}
+
+#[test]
+fn a_streamed_write_goes_to_disk_as_entries_are_pulled() {
+    let (dir, memo) = store();
+    let tag = header(1).frame_tag();
+    let big = |key: u8| {
+        let mut e = entry(key);
+        e.value = vec![key; 40_000];
+        EncodedEntry::new(&e, tag).unwrap()
+    };
+    let mut pulled = 0;
+    let mut pulls = std::iter::from_fn(|| {
+        pulled += 1;
+        if pulled == 4 {
+            let tmp_len: u64 = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
+                .map(|e| e.metadata().unwrap().len())
+                .sum();
+            assert!(tmp_len >= 80_000, "only {tmp_len} bytes written so far");
+        }
+        (pulled <= 4).then(|| Ok(big(pulled as u8)))
+    });
+    let written = memo
+        .write_generation_streamed(None, GenId(1), &header(1), &mut pulls)
+        .unwrap();
+    assert_eq!(written.items().len(), 4);
+}
+
+#[test]
+fn read_entries_returns_each_frame_in_order() {
+    let (_dir, memo) = store();
+    let generation = memo
+        .write_generation(None, GenId(1), &header(1), &entries(0..6))
+        .unwrap();
+    let mut items = generation.items().to_vec();
+    items.reverse();
+    let batched = memo.read_entries(GenId(1), &items).unwrap();
+    for (item, frame) in items.iter().zip(&batched) {
+        assert_eq!(frame, &memo.read_entry(GenId(1), item).unwrap());
+    }
+}
+
+#[test]
+fn the_open_file_cache_stays_small_across_many_generations() {
+    let (_dir, memo) = store();
+    let mut base = None;
+    for id in 1..=40 {
+        let generation = memo
+            .write_generation(base, GenId(id), &header(id), &entries(0..1))
+            .unwrap();
+        memo.read_entry(GenId(id), &generation.items()[0]).unwrap();
+        base = Some(GenId(id));
+    }
+    assert!(memo.cache().len() <= CACHE_LIMIT);
 }
