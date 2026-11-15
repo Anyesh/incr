@@ -13,11 +13,12 @@
 //! `write_generation(base, generation, header, entries) -> items` for
 //! `entries` of `(table, key_hash, frame)`, and
 //! `remove_generation(generation)`. Raising `incr.persist.Busy` from
-//! `lock_checkpoint` or `write_generation` skips the checkpoint; any other
-//! exception fails it and reaches the caller as itself.
+//! `lock_checkpoint`, `write_generation`, `write_generation_streamed` or
+//! `write_delta` skips the checkpoint; any other exception fails it and
+//! reaches the caller as itself.
 //!
-//! Three optional methods, each looked up once when the store opens the
-//! backend, add what a large store needs. A backend without them behaves
+//! Four optional methods, looked up once when the store opens the backend,
+//! add what a large store needs. A backend without them behaves
 //! exactly as one written for the five methods above.
 //!
 //! - `read_entries(generation, items) -> [bytes | None]` reads the frames
@@ -49,8 +50,16 @@
 //!   the returned items and `load_chain` list like any other. An unreadable
 //!   delta layer may be returned with a header incr cannot decode: it is
 //!   then treated as holding nothing.
+//!
+//! incr decides which write a checkpoint makes: `write_delta` appends only
+//! what changed since the tip, while `write_generation_streamed` (or
+//! `write_generation` for a backend without it) rewrites everything, as a
+//! compaction or a first checkpoint does. `load_chain` (or `load`) opens
+//! the store, and `read_entries` (or `read_entry`) serves restores and the
+//! frames a rewrite carries over from older layers.
 
 use std::marker::PhantomData;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, ThreadId};
@@ -260,8 +269,10 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
             );
             let frames = lent.end(py);
             let frames = frames.get();
-            if let Some(error) = frames.failure() {
-                return Err(error);
+            match frames.failure() {
+                Some(Failure::Error(error)) => return Err(error),
+                Some(Failure::Panic(payload)) => panic::resume_unwind(payload),
+                None => {}
             }
             let items = items_of::<E>(&result?, "write_generation_streamed")?;
             if !frames.exhausted() {
@@ -347,6 +358,9 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                 };
                 layers.push(Arc::new(generation));
             }
+            if layers.is_empty() {
+                return Err(bad_return::<E>("load_chain"));
+            }
             Chain::new(layers).map(Some)
         })
     }
@@ -405,12 +419,19 @@ unsafe impl Send for Source {}
 
 /// The lazy `frames` iterator a streamed write hands its backend: it pulls
 /// the engine's own iterator, and is invalid once the call returns.
-#[pyclass(name = "MemoFrames", module = "incr.persist", frozen)]
+#[pyclass(name = "MemoFrames", module = "incr_python_persist", frozen)]
 pub struct Frames {
     source: Mutex<Option<Source>>,
     thread: ThreadId,
     exhausted: AtomicBool,
-    failure: Mutex<Option<Error>>,
+    failure: Mutex<Option<Failure>>,
+}
+
+/// What stopped a pull: an error the engine's iterator returned, or a
+/// panic inside it, resumed once the backend's call has returned.
+enum Failure {
+    Error(Error),
+    Panic(Box<dyn std::any::Any + Send>),
 }
 
 impl Frames {
@@ -418,7 +439,7 @@ impl Frames {
         self.exhausted.load(Ordering::Acquire)
     }
 
-    fn failure(&self) -> Option<Error> {
+    fn failure(&self) -> Option<Failure> {
         self.failure
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -450,10 +471,22 @@ impl Frames {
                 "memo frames are only valid during the write_generation_streamed call",
             ));
         };
+        if self.exhausted() {
+            return Ok(None);
+        }
         // SAFETY: `Lent` keeps the pointee alive and clears this slot
         // before the call that lent it returns, and the lock excludes a
         // second pull.
-        let next = unsafe { (**pulls).next() };
+        let next = panic::catch_unwind(AssertUnwindSafe(|| unsafe { (**pulls).next() }));
+        let next = match next {
+            Ok(next) => next,
+            Err(payload) => {
+                *source = None;
+                *self.failure.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Failure::Panic(payload));
+                return Err(PyRuntimeError::new_err("memo frame source panicked"));
+            }
+        };
         match next {
             None => {
                 self.exhausted.store(true, Ordering::Release);
@@ -466,7 +499,8 @@ impl Frames {
             ))),
             Some(Err(error)) => {
                 let message = format!("memo frame source failed: {error}");
-                *self.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                *self.failure.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Failure::Error(error));
                 Err(PyRuntimeError::new_err(message))
             }
         }

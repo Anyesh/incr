@@ -1,6 +1,8 @@
 """The conformance API of each package's `persist` module: `persist` is the
 package's module, and a backend raises that module's exceptions."""
 
+import threading
+
 import incr.persist
 import incr_concurrent.persist
 import pytest
@@ -308,3 +310,75 @@ def test_a_streamed_write_that_leaves_frames_unpulled_fails_its_case(
     with pytest.raises(conformance.ConformanceFailure) as failure:
         conformance.run_memo_backend(Skips(persist))
     assert failure.value.case == "streamed_write_reads_the_base_through_the_same_handle"
+
+
+class Recording(DictDeltaMemoFactory):
+    """A delta backend whose streamed write runs `during(frames)` before it
+    stores `list(frames)`, and keeps every `frames` for the test. With
+    `give_up`, a failed pull makes it raise `ValueError` instead."""
+
+    def __init__(self, persist, during=None, give_up=False):
+        super().__init__(persist)
+        self.during = during
+        self.give_up = give_up
+        self.kept = []
+
+    def open(self, store):
+        memo = super().open(store)
+        write = memo.write_generation
+
+        def streamed(base, generation, header, frames):
+            self.kept.append(frames)
+            if self.during:
+                self.during(frames)
+            try:
+                entries = list(frames)
+            except RuntimeError:
+                if self.give_up:
+                    raise ValueError("gave up on the frames") from None
+                raise
+            return write(base, generation, header, entries)
+
+        memo.write_generation_streamed = streamed
+        return memo
+
+
+def test_frames_are_invalid_once_the_streamed_call_returns(persist, conformance):
+    refused = []
+    factory = Recording(persist)
+
+    def pull_earlier_calls_frames(frames):
+        for earlier in factory.kept[:-1]:
+            try:
+                next(earlier)
+            except RuntimeError as error:
+                refused.append(str(error))
+
+    factory.during = pull_earlier_calls_frames
+    conformance.run_memo_backend(factory)
+    assert any("only valid during" in message for message in refused)
+
+
+def test_frames_refuse_a_pull_from_another_thread(persist, conformance):
+    refused = []
+
+    def pull_elsewhere(frames):
+        def pull():
+            try:
+                next(frames)
+            except RuntimeError as error:
+                refused.append(str(error))
+
+        worker = threading.Thread(target=pull)
+        worker.start()
+        worker.join()
+
+    conformance.run_memo_backend(Recording(persist, during=pull_elsewhere))
+    assert refused
+    assert all("thread" in message for message in refused)
+
+
+def test_a_failed_pull_is_the_error_even_if_the_backend_raises_another(
+    persist, conformance
+):
+    conformance.run_memo_backend(Recording(persist, give_up=True))

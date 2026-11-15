@@ -417,11 +417,11 @@ where
         if self.is_open() {
             return Err(PyRuntimeError::new_err("the memo is already open"));
         }
+        let adapter = PyMemoBackend::<B::Exceptions>::new(backend)?;
         let declared = self.builder().take();
         drop(declared);
         let builder = self.builder_from_decls(py, options.memo_options(core), &make);
         let builder = carry::<B, _>(builder);
-        let adapter = PyMemoBackend::<B::Exceptions>::new(backend)?;
         let opened = core.write(py, move |store, _| {
             builder.into_inner().open(store, adapter).map(carry::<B, _>)
         });
