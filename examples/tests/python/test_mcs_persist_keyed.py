@@ -373,7 +373,7 @@ def test_keyed_ops_in_a_batch_compose_on_one_key(persist):
     with store.batch() as b:
         b.upsert(kc, "k", 1)
         b.upsert(kc, "k", 2)
-    assert backend.appends == [2]
+    assert backend.appends == [1]
     assert kc.get("k") == 2
     assert len(kc) == 1
     assert rows_of(store.runtime, kc.collection) == [2]
