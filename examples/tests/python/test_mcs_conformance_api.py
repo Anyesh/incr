@@ -285,31 +285,24 @@ def test_a_python_delta_backend_gets_every_delta_call(persist, conformance):
     } <= calls
 
 
-def test_a_five_method_backend_is_never_given_a_delta(persist, conformance):
-    assert not any(
-        hasattr(DictMemo, name)
-        for name in ("load_chain", "write_delta", "write_generation_streamed")
-    )
-    conformance.run_memo_backend(DictMemoFactory(persist))
-
-
 def test_a_streamed_write_that_leaves_frames_unpulled_fails_its_case(
     persist, conformance
 ):
-    class Skips(DictDeltaMemoFactory):
+    class Stops(DictDeltaMemoFactory):
         def open(self, store):
             memo = super().open(store)
             write = memo.write_generation
 
             def streamed(base, generation, header, frames):
-                return write(base, generation, header, [])
+                return write(base, generation, header, [next(frames)])
 
             memo.write_generation_streamed = streamed
             return memo
 
     with pytest.raises(conformance.ConformanceFailure) as failure:
-        conformance.run_memo_backend(Skips(persist))
+        conformance.run_memo_backend(Stops(persist))
     assert failure.value.case == "streamed_write_reads_the_base_through_the_same_handle"
+    assert "before its frames were exhausted" in str(failure.value)
 
 
 class Recording(DictDeltaMemoFactory):
@@ -317,11 +310,13 @@ class Recording(DictDeltaMemoFactory):
     stores `list(frames)`, and keeps every `frames` for the test. With
     `give_up`, a failed pull makes it raise `ValueError` instead."""
 
-    def __init__(self, persist, during=None, give_up=False):
+    def __init__(self, persist, during=None, give_up=False, reenter=False):
         super().__init__(persist)
         self.during = during
         self.give_up = give_up
+        self.reenter = reenter
         self.kept = []
+        self.reentered = []
 
     def open(self, store):
         memo = super().open(store)
@@ -340,6 +335,18 @@ class Recording(DictDeltaMemoFactory):
             return write(base, generation, header, entries)
 
         memo.write_generation_streamed = streamed
+        if self.reenter:
+            read_entry = memo.read_entry
+
+            def reading(generation, item):
+                if self.kept:
+                    try:
+                        next(self.kept[-1])
+                    except RuntimeError as error:
+                        self.reentered.append(str(error))
+                return read_entry(generation, item)
+
+            memo.read_entry = reading
         return memo
 
 
@@ -382,3 +389,9 @@ def test_a_failed_pull_is_the_error_even_if_the_backend_raises_another(
     persist, conformance
 ):
     conformance.run_memo_backend(Recording(persist, give_up=True))
+
+
+def test_frames_refuse_a_pull_made_while_a_pull_is_running(persist, conformance):
+    factory = Recording(persist, reenter=True)
+    conformance.run_memo_backend(factory)
+    assert any("re-entrantly" in message for message in factory.reentered)

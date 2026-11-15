@@ -32,6 +32,9 @@
 //!   exhausting it (reading until `StopIteration`) fails the checkpoint.
 //!   Pulling may read this backend through `read_entry` and `read_entries`,
 //!   so do not hold a lock of those across a pull.
+//!   A pull that raises means the write must be abandoned with nothing
+//!   stored; incr then reports the pull's own failure, whatever the call
+//!   returns or raises.
 //! - Delta chains, enabled when the backend has both `load_chain` and
 //!   `write_delta`. A chain is a full generation, its base, followed by
 //!   deltas, each written on the one before it; the newest layer is the
