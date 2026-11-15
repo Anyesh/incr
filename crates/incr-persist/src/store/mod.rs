@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
 use incr_core::{
-    check_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value,
+    in_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1031,7 +1031,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
             !self.runtime.frame_active(),
             "incr-persist: Store methods must not be called from inside a query's compute",
         );
-        check_value_code();
+        if in_value_code() {
+            return Err(Error::Reentrant);
+        }
         let routing = self.runtime.hold_routing();
         // A panic while the mutex was held may have left the runtime and
         // the folded log out of step, which is the poisoned condition too.

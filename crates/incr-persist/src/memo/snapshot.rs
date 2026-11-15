@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use incr_core::persist_hooks::{changed_at_erased, Deferred};
-use incr_core::{check_value_code, ErasedIncr, Runtime};
+use incr_core::{in_value_code, ErasedIncr, Runtime};
 
 use super::checkpoint::Fate;
 use super::dirty::Record;
@@ -74,7 +74,9 @@ impl<C: MemoCells> CoreRef<C> {
             !rt.frame_active(),
             "incr-persist: Memo::checkpoint called from inside a query's compute"
         );
-        check_value_code();
+        if in_value_code() {
+            return Err(Error::Reentrant);
+        }
         // On a Shared store a scope another thread opens after this check is
         // not covered: the snapshot below may then see unlogged changes.
         if self.deps.poisoned() {

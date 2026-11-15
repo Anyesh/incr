@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use incr_core::{check_value_code, Incr, Runtime, Shared};
+use incr_core::{check_value_code, in_value_code, Incr, Runtime, Shared};
 
 use super::handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
 use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats, Wake};
@@ -219,7 +219,9 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
     /// trigger is set. For after a write or a read-only rebuild, so the
     /// stall lands where the caller chooses.
     pub fn checkpoint_if_due(&self) -> Result<Option<CheckpointStats>> {
-        check_value_code();
+        if in_value_code() {
+            return Err(Error::Reentrant);
+        }
         if !self.core.checkpoint_due() {
             return Ok(None);
         }

@@ -102,7 +102,9 @@ const _: () = assert!(crate::bits::disjoint(&[
     SPECULATING_BIT,
 ]));
 
-pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
+/// The message of the contract panic, after the `incr-core: ` prefix.
+#[doc(hidden)]
+pub const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
 #[cfg(not(loom))]
 thread_local! {
@@ -220,6 +222,14 @@ pub fn with_value_code<R>(f: impl FnOnce() -> R) -> R {
 #[inline(always)]
 pub fn check_value_code() {
     check();
+}
+
+/// Whether this thread is inside value code, for the crates that return
+/// an error instead of the contract panic where their signature allows.
+#[doc(hidden)]
+#[inline(always)]
+pub fn in_value_code() -> bool {
+    thread_word() & COUNTER_MASK != 0
 }
 
 /// The contract panic of a checked path reached from value code.
