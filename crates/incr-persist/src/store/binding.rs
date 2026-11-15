@@ -112,8 +112,8 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     ) -> Result<Option<(u128, u64)>>;
 
     /// The records a snapshot keeps for this key, given its logged state.
-    /// Empty when the key holds only its logged default, compared by
-    /// decoded value, which is how compaction forgets it.
+    /// Empty when the key holds nothing beyond its logged default, which is
+    /// how compaction forgets it.
     fn fold(
         &self,
         rt: &Runtime<C>,
@@ -336,30 +336,11 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         &self,
         _rt: &Runtime<C>,
         logged: Option<&LoggedKey>,
-        bag: &AfterLock,
+        _bag: &AfterLock,
     ) -> Result<Vec<Record>> {
-        let Some(logged) = logged else {
-            return Ok(Vec::new());
-        };
-        let at_default = match (&logged.declared, &logged.value) {
-            (Some(_), _) if !logged.elements.is_empty() => false,
-            (Some(_), None) => true,
-            (Some(declared), Some(value)) => {
-                let value = decode::<T>(&self.key, value)?;
-                let default = decode::<T>(&self.key, &declared.default);
-                let equal = default
-                    .as_ref()
-                    .is_ok_and(|default| with_value_code(|| value == *default));
-                bag.push(value);
-                bag.push(default?);
-                equal
-            }
-            (None, _) => false,
-        };
-        Ok(if at_default {
-            Vec::new()
-        } else {
-            logged.records(&self.key)
+        Ok(match logged {
+            Some(logged) if !logged.at_default() => logged.records(&self.key),
+            _ => Vec::new(),
         })
     }
 

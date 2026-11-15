@@ -832,12 +832,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
     ///
     /// Each key folds to its first `Declare`, then its latest `Set`, then
     /// one `Insert` per element occurrence; records before a `Delete` are
-    /// gone. A key holding only its logged default (an input at its default
-    /// value, an empty collection) folds to nothing, `Declare` included, so
+    /// gone. A key holding only its logged default (an input never
+    /// set or deleted back, an empty collection) folds to nothing, `Declare` included, so
     /// it disappears from [`Store::restored_keys`] and the next declaration
     /// appends a fresh first-wins `Declare`, possibly with another default.
-    /// Declared keys compare by decoded value; keys this store has not
-    /// declared compare by bytes.
+    /// A set value is kept even when it equals the default, so a reopen that
+    /// declares another default still reads it; only an input declared and
+    /// never set, or reset by [`Store::delete`], is forgotten.
     ///
     /// In debug builds it first fails with [`Error::Bypassed`] if any
     /// declared input was written through the runtime directly.
