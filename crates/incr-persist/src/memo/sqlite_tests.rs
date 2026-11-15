@@ -404,7 +404,7 @@ fn a_database_of_another_kind_is_rejected() {
     drop(SqliteMemo::open(&other).unwrap());
     Connection::open(&other)
         .unwrap()
-        .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .pragma_update(None, "user_version", DELTA_SCHEMA_VERSION + 1)
         .unwrap();
     assert!(matches!(SqliteMemo::open(&other), Err(Error::Backend(_))));
 }
@@ -468,4 +468,199 @@ fn concurrent_first_opens_create_one_schema() {
             });
         }
     });
+}
+
+fn user_version(conn: &Connection) -> i64 {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap()
+}
+
+fn has_parent_column(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('memo_generation') WHERE name = 'parent'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap()
+        > 0
+}
+
+fn delta_header(base: u64, parent: u64, id: u64) -> DeltaHeader {
+    DeltaHeader {
+        header: header(id),
+        base: GenId(base),
+        parent: GenId(parent),
+    }
+}
+
+fn delta_entry(key: u8, delta: &DeltaHeader) -> EncodedEntry {
+    EncodedEntry::new(&entry(key), delta.frame_tag()).unwrap()
+}
+
+fn write_delta_on(
+    memo: &SqliteMemo,
+    base: u64,
+    tip: u64,
+    id: u64,
+    keys: &[u8],
+    tombstones: &[Tombstone],
+) -> Generation {
+    let delta = delta_header(base, tip, id);
+    let entries: Vec<_> = keys.iter().map(|&key| delta_entry(key, &delta)).collect();
+    memo.write_delta(GenId(tip), GenId(id), &delta, &entries, tombstones)
+        .unwrap()
+}
+
+#[test]
+fn a_version_1_database_reads_and_takes_its_first_delta_in_place() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(3))
+        .unwrap();
+    assert_eq!(user_version(&raw(&db)), 1);
+    assert!(!has_parent_column(&raw(&db)));
+
+    let reopened = SqliteMemo::open(&db.path).unwrap();
+    let chain = reopened.load_chain(&[]).unwrap().unwrap();
+    assert_eq!(chain.depth(), 0);
+    assert_eq!(chain.base().items().len(), 3);
+    assert_eq!(reopened.load().unwrap().unwrap().id(), GenId(1));
+
+    write_delta_on(&reopened, 1, 1, 2, &[7], &[]);
+    let chain = reopened.load_chain(&[]).unwrap().unwrap();
+    assert_eq!(chain.depth(), 1);
+    assert_eq!(chain.base().items().len(), 3);
+}
+
+#[test]
+fn the_version_becomes_2_on_the_first_delta_only() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    assert!(memo.supports_delta());
+    memo.write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    memo.write_generation_streamed(
+        Some(GenId(1)),
+        GenId(2),
+        &header(2),
+        &mut encoded(2).into_iter().map(Ok),
+    )
+    .unwrap();
+    assert_eq!(user_version(&raw(&db)), 1);
+    assert!(!has_parent_column(&raw(&db)));
+
+    write_delta_on(&memo, 2, 2, 3, &[9], &[]);
+    assert_eq!(user_version(&raw(&db)), 2);
+    assert!(has_parent_column(&raw(&db)));
+    write_delta_on(&memo, 2, 3, 4, &[10], &[]);
+    assert_eq!(user_version(&raw(&db)), 2);
+
+    memo.write_generation(Some(GenId(4)), GenId(5), &header(5), &encoded(1))
+        .unwrap();
+    assert_eq!(user_version(&raw(&db)), 2);
+    assert_eq!(memo.load_chain(&[]).unwrap().unwrap().depth(), 0);
+}
+
+#[test]
+fn a_reader_that_wants_version_1_refuses_a_database_with_deltas() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    write_delta_on(&memo, 1, 1, 2, &[9], &[]);
+    let mut conn = raw(&db);
+    let Err(Error::Backend(err)) = create_schema_for(&mut conn, &[1]) else {
+        panic!("a version 1 reader opened a database with deltas");
+    };
+    assert!(err.to_string().contains("user_version 2"), "got {err}");
+    assert!(create_schema_for(&mut conn, &[1, 2]).is_ok());
+}
+
+#[test]
+fn a_handle_opened_before_the_first_delta_reads_the_chain_another_handle_wrote() {
+    let db = db();
+    let early = SqliteMemo::open(&db.path).unwrap();
+    early
+        .write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    let late = SqliteMemo::open(&db.path).unwrap();
+    write_delta_on(&late, 1, 1, 2, &[9], &[]);
+    assert_eq!(early.load_chain(&[]).unwrap().unwrap().depth(), 1);
+    write_delta_on(&early, 1, 2, 3, &[10], &[]);
+    assert_eq!(late.load_chain(&[]).unwrap().unwrap().depth(), 2);
+}
+
+#[test]
+fn tombstones_are_empty_frame_rows_and_load_as_tombstone_items() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    let tombstone = Tombstone {
+        table: 0,
+        key_hash: 0xabcd,
+    };
+    let written = write_delta_on(&memo, 1, 1, 2, &[5], &[tombstone]);
+    let rows: i64 = raw(&db)
+        .query_row(
+            "SELECT count(*) FROM memo_entry WHERE generation = 2 AND len = 0 AND length(frame) = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    let expected = IndexItem::tombstone(0, 0xabcd);
+    assert!(written.items().contains(&expected));
+    let loaded = memo.load_chain(&[]).unwrap().unwrap();
+    assert!(loaded.tip().items().contains(&expected));
+    assert_eq!(loaded.tip().items(), written.items());
+}
+
+#[test]
+fn a_damaged_delta_loads_empty_and_a_known_layer_is_not_reloaded() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    let base = memo
+        .write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    write_delta_on(&memo, 1, 1, 2, &[5], &[]);
+    raw(&db)
+        .execute("UPDATE memo_generation SET header = x'00' WHERE id = 2", [])
+        .unwrap();
+    let chain = memo.load_chain(&[]).unwrap().unwrap();
+    assert_eq!(chain.depth(), 1);
+    assert!(chain.tip().items().is_empty());
+    assert_eq!(chain.tip().parent(), Some(GenId(1)));
+
+    raw(&db)
+        .execute("DELETE FROM memo_entry WHERE generation = 1", [])
+        .unwrap();
+    let known = [std::sync::Arc::new(base)];
+    let chain = memo.load_chain(&known).unwrap().unwrap();
+    assert_eq!(chain.base().items().len(), 2);
+}
+
+#[test]
+fn a_streamed_full_write_from_the_tip_replaces_the_chain() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    write_delta_on(&memo, 1, 1, 2, &[5], &[]);
+    write_delta_on(&memo, 1, 2, 3, &[6], &[]);
+    memo.write_generation_streamed(
+        Some(GenId(3)),
+        GenId(4),
+        &header(4),
+        &mut encoded(1).into_iter().map(Ok),
+    )
+    .unwrap();
+    assert_eq!(memo.load_chain(&[]).unwrap().unwrap().depth(), 0);
+    let removing_old = memo.remove_generation(GenId(2));
+    assert!(removing_old.is_ok());
+    drop(memo.lock_checkpoint().unwrap());
+    let ids: i64 = raw(&db)
+        .query_row("SELECT count(*) FROM memo_generation", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(ids, 1);
 }
