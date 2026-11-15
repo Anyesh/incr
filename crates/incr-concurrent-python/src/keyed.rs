@@ -228,6 +228,23 @@ impl PyKeyedCollection {
         Ok(())
     }
 
+    /// Free `key`'s version input as the Local package does; a Shared
+    /// runtime never frees one, so this returns False.
+    fn forget_key(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<bool> {
+        let rt = self.runtime();
+        let (source, _) = self.key_source(rt)?;
+        let key = PyKey(key);
+        engine_call(py, rt, || source.forget_key(rt, &key))
+    }
+
+    /// How many version inputs this collection holds: one per key a query
+    /// read through `ctx.get_key`, since none is ever freed.
+    fn version_input_count(&self, py: Python<'_>) -> PyResult<usize> {
+        let rt = self.runtime();
+        let (source, _) = self.key_source(rt)?;
+        engine_call(py, rt, || source.version_input_count())
+    }
+
     /// Make the held rows equal `rows`, a mapping or an iterable of
     /// `(key, row)` pairs (a later pair for a key wins), in one atomic
     /// change. Returns how many keys were `(inserted, replaced, removed)`.

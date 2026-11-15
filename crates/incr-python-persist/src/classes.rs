@@ -116,6 +116,24 @@ impl<B: PyBinding> KeyedSource<'_, B> {
         }
     }
 
+    /// [`incr_core::KeyedCollection::forget_key`]. Runs the key's
+    /// `__hash__` and `__eq__`: the caller runs it inside its package's
+    /// engine boundary.
+    pub fn forget_key(&self, rt: &Runtime<B::C>, key: &PyKey) -> bool {
+        match self {
+            KeyedSource::Plain(keyed) => keyed.forget_key(rt, key),
+            KeyedSource::Persisted(persisted) => persisted.forget_key(rt, key),
+        }
+    }
+
+    /// How many version inputs the collection holds.
+    pub fn version_input_count(&self) -> usize {
+        match self {
+            KeyedSource::Plain(keyed) => keyed.version_input_count(),
+            KeyedSource::Persisted(persisted) => persisted.version_input_count(),
+        }
+    }
+
     /// `key`'s version input, if a read created one. Runs the key's
     /// `__hash__` and `__eq__`: the caller runs it inside its package's
     /// engine boundary.

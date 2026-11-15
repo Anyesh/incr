@@ -1148,6 +1148,33 @@ impl PyKeyedCollection {
         Ok(())
     }
 
+    /// Free `key`'s version input if no query depends on it and the key
+    /// holds no row, for a key whose readers were deleted without a write
+    /// to it. Returns whether it freed the input; always False for a
+    /// Shared runtime. Raises `RuntimeError` inside an overlay.
+    fn forget_key(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<bool> {
+        self.check_alive()?;
+        let state = self.state(py);
+        if state.overlay_active() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "forget_key cannot run inside an overlay",
+            ));
+        }
+        let key = PyKey(key);
+        self.engine_write(py, |rt| {
+            let (source, _) = self.key_source(py, rt)?;
+            Ok(source.forget_key(rt, &key))
+        })?
+    }
+
+    /// How many version inputs this collection holds: one per key a query
+    /// read through `ctx.get_key` that no write or `forget_key` freed.
+    fn version_input_count(&self, py: Python<'_>) -> PyResult<usize> {
+        let runtime = self.rt.bind(py).borrow();
+        let (source, _) = self.key_source(py, runtime.rt()?)?;
+        self.read_core(py, || source.version_input_count())
+    }
+
     /// The row held for `key`, or `None`. Registers no dependency: inside a
     /// query, read a key with `ctx.get_key(kc, key)` so the query reruns
     /// when that key's row changes.
