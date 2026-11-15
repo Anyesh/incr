@@ -1376,3 +1376,13 @@
 2	keyed::tests::rows_shared::forget_key_of_an_unread_or_orphaned_key
 2	keyed::tests::rows_local::forget_key_inside_a_compute_is_refused
 2	keyed::tests::rows_shared::forget_key_inside_a_compute_is_refused
+19	keyed::tests::rows_local::a_keys_reader_reruns_on_insert_and_remove_only
+14	keyed::tests::rows_local::a_pair_swap_in_one_write_keeps_the_membership
+17	keyed::tests::rows_local::get_keys_outside_a_query_creates_nothing
+15	keyed::tests::rows_local::keys_readers_and_key_readers_do_not_wake_each_other
+10	keyed::tests::rows_local::replayed_pairs_move_the_membership_only_when_a_key_appears_or_goes
+12	keyed::tests::rows_shared::a_keys_reader_reruns_on_insert_and_remove_only
+9	keyed::tests::rows_shared::a_pair_swap_in_one_write_keeps_the_membership
+5	keyed::tests::rows_shared::get_keys_outside_a_query_creates_nothing
+8	keyed::tests::rows_shared::keys_readers_and_key_readers_do_not_wake_each_other
+15	keyed::tests::rows_shared::replayed_pairs_move_the_membership_only_when_a_key_appears_or_goes

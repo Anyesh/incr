@@ -101,6 +101,14 @@ fn rem(k: u32, v: &str) -> Record {
     }
 }
 
+fn rep(k: u32, old: &str, new: &str) -> Record {
+    Record::Replace {
+        key: s("k"),
+        old: Some(enc(k, old)),
+        new: enc(k, new),
+    }
+}
+
 fn records(backend: &impl Backend) -> Vec<Record> {
     let mut out = Vec::new();
     assert_eq!(
@@ -158,8 +166,7 @@ fn records_match_the_reference_encoding<C: Cells>() {
         records(&log)[start..],
         [
             ins(1, "a"),
-            rem(1, "a"),
-            ins(1, "b"),
+            rep(1, "a", "b"),
             rem(1, "b"),
             Record::Set {
                 key: s("x"),
@@ -1232,10 +1239,7 @@ fn an_overtaken_identity_compared_write_repairs_to_one_pair<C: Cells>() {
     let before = records(&log).len();
     b.write_pending(pending).unwrap();
 
-    assert_eq!(
-        records(&log)[before..],
-        [rem(1, "x"), ins(1, "b"), rem(1, "a")]
-    );
+    assert_eq!(records(&log)[before..], [rep(1, "x", "b"), rem(1, "a")]);
     assert_eq!(ident_rows(&b, &kb), [pair(1, "b")]);
     drop((ka, kb, a, b));
     let c = open::<C, _>(log.clone());

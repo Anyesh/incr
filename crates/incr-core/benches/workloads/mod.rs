@@ -3,7 +3,9 @@
 //! same.
 
 use criterion::{BatchSize, Bencher};
-use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, QueryOpts, Replay, Runtime, Shared};
+use incr_core::{
+    Cells, ErasedIncr, Incr, IncrCollection, KeyedCollection, QueryOpts, Replay, Runtime, Shared,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::hint::black_box;
@@ -563,6 +565,46 @@ impl<C: Cells> Workload for ValueSlotRead<C> {
     fn setup(&self) {}
     fn run(&self, (): ()) -> i64 {
         black_box(incr_core::ValueSlot::read(&self.slot))
+    }
+}
+
+/// A keyed collection of 1000 rows that no query reads: each iteration
+/// replaces one row, inserts a key and removes it, so the count is the
+/// keyed write path's cost with no version or membership reader.
+pub struct KeyedWrite<C: Cells> {
+    rt: Runtime<C>,
+    keyed: KeyedCollection<u64, u64, C>,
+    row: Cell<u64>,
+}
+
+impl<C: Cells> KeyedWrite<C> {
+    pub fn new() -> Self {
+        let rt: Runtime<C> = Runtime::new();
+        let keyed = KeyedCollection::new(&rt);
+        for k in 0..1000 {
+            keyed.upsert(&rt, k, k);
+        }
+        Self {
+            rt,
+            keyed,
+            row: Cell::new(1000),
+        }
+    }
+}
+
+impl<C: Cells> Workload for KeyedWrite<C> {
+    type Input = ();
+    type Output<'a>
+        = ()
+    where
+        Self: 'a;
+    fn setup(&self) {}
+    fn run(&self, (): ()) {
+        let row = self.row.get() + 1;
+        self.row.set(row);
+        self.keyed.upsert(&self.rt, 7, row);
+        self.keyed.upsert(&self.rt, 5000, row);
+        self.keyed.remove(&self.rt, &5000);
     }
 }
 

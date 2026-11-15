@@ -293,6 +293,13 @@ where
         self.keyed.get_key(rt, key)
     }
 
+    /// The keys held, as [`KeyedCollection::get_keys`] reads them: inside a
+    /// query, a dependency on the key set. A memo entry reading it is
+    /// unsaveable.
+    pub fn get_keys(&self, rt: &Runtime<C>) -> Vec<K> {
+        self.keyed.get_keys(rt)
+    }
+
     /// `key`'s version input, if a read with [`Self::get_key`] or a memo
     /// restore created one.
     pub fn version_input(&self, key: &K) -> Option<Incr<u64>> {
@@ -633,7 +640,9 @@ trait Stage<C: Cells> {
     fn stale(&self) -> bool;
 
     /// The records that make the staged changes: per key, a `Remove` of
-    /// each pair it held, then an `Insert` of its new pair. Values decoded
+    /// each pair it held, then an `Insert` of its new pair; a key that
+    /// held one pair and takes a new one gets one `Replace`, so replaying
+    /// it is one write. Values decoded
     /// along the way are kept in the stage, to drop with it after the store
     /// lock is released.
     fn records(&mut self, state: &State<C>) -> Result<Vec<Record>>;
@@ -849,11 +858,26 @@ where
                 Next::Row(pair) => Some(pair),
                 Next::Gone => None,
             };
+            let first = out.len();
             for (pair, rank) in &staged.held {
                 out.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);
             }
             if let Some(pair) = next {
-                out.push(insert_record(&key, pair)?);
+                let insert = insert_record(&key, pair)?;
+                match (&out[first..], insert) {
+                    (
+                        [Record::Remove { element: old, .. }],
+                        Record::Insert { element: new, .. },
+                    ) => {
+                        let replace = Record::Replace {
+                            key: key.clone(),
+                            old: Some(old.clone()),
+                            new,
+                        };
+                        out[first] = replace;
+                    }
+                    (_, insert) => out.push(insert),
+                }
             }
         }
         Ok(out)
@@ -1220,6 +1244,7 @@ where
     fn delete_nodes(&self, rt: &Runtime<C>) -> std::result::Result<(), DeleteError> {
         let mut nodes = vec![self.node(), self.keyed.rows().version_node().erase()];
         nodes.extend(self.keyed.version_inputs());
+        nodes.extend(self.keyed.membership_input().map(Incr::erase));
         rt.try_delete_nodes(&nodes)
     }
 
