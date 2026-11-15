@@ -9,7 +9,8 @@
 macro_rules! memory_classes {
     ($exc:ty, $module:literal) => {
         use $crate::incr_persist::memo::{
-            decode_header, encode_header, EncodedEntry, GenId, IndexItem, MemoBackend, MemoryMemo,
+            decode_delta_header, decode_header, encode_delta_header, encode_header, DeltaHeader,
+            EncodedEntry, GenId, Generation, IndexItem, MemoBackend, MemoryMemo, Tombstone,
         };
         use $crate::incr_persist::{Backend, MemoryBackend, Position, ReadOutcome, Record, Result};
         use $crate::memo_backend::{item_tuple, ItemTuple};
@@ -147,6 +148,26 @@ macro_rules! memory_classes {
             }
         }
 
+        fn layer_tuple(
+            py: Python<'_>,
+            layer: &Generation,
+        ) -> PyResult<(u64, Py<PyBytes>, Vec<ItemTuple>)> {
+            let header = match (layer.base(), layer.parent()) {
+                (Some(base), Some(parent)) => encode_delta_header(&DeltaHeader {
+                    header: layer.header().clone(),
+                    base,
+                    parent,
+                }),
+                _ => encode_header(layer.header()),
+            }
+            .map_err(|e| persist_error(py, e))?;
+            Ok((
+                layer.id().0,
+                PyBytes::new(py, &header).unbind(),
+                layer.items().iter().map(item_tuple).collect(),
+            ))
+        }
+
         /// A memo store held in process memory: the reference implementation of
         /// the memo backend protocol, for tests and development. Stores opened on
         /// the same object share its generations.
@@ -237,6 +258,117 @@ macro_rules! memory_classes {
                 let written = self
                     .inner
                     .write_generation(base.map(GenId), GenId(generation), &header, &entries)
+                    .map_err(|e| persist_error(py, e))?;
+                Ok(written.items().iter().map(item_tuple).collect())
+            }
+
+            fn read_entries(
+                &self,
+                py: Python<'_>,
+                generation: u64,
+                items: Vec<ItemTuple>,
+            ) -> PyResult<Vec<Option<Py<PyBytes>>>> {
+                let items = items
+                    .into_iter()
+                    .map(|(table, key_hash, loc, len)| IndexItem {
+                        table,
+                        key_hash,
+                        loc,
+                        len,
+                    })
+                    .collect::<Vec<_>>();
+                let frames = self
+                    .inner
+                    .read_entries(GenId(generation), &items)
+                    .map_err(|e| persist_error(py, e))?;
+                Ok(frames
+                    .into_iter()
+                    .map(|frame| frame.map(|frame| PyBytes::new(py, &frame).unbind()))
+                    .collect())
+            }
+
+            #[allow(clippy::type_complexity)]
+            fn load_chain(
+                &self,
+                py: Python<'_>,
+            ) -> PyResult<Option<Vec<(u64, Py<PyBytes>, Vec<ItemTuple>)>>> {
+                let Some(chain) = self
+                    .inner
+                    .load_chain(&[])
+                    .map_err(|e| persist_error(py, e))?
+                else {
+                    return Ok(None);
+                };
+                let layers = chain
+                    .layers()
+                    .iter()
+                    .map(|layer| layer_tuple(py, layer))
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok(Some(layers))
+            }
+
+            fn write_delta(
+                &self,
+                py: Python<'_>,
+                tip: u64,
+                generation: u64,
+                header: Vec<u8>,
+                entries: Vec<(u32, u64, Vec<u8>)>,
+                tombstones: Vec<(u32, u64)>,
+            ) -> PyResult<Vec<ItemTuple>> {
+                let header = decode_delta_header(&header).map_err(|e| persist_error(py, e))?;
+                let entries = entries
+                    .into_iter()
+                    .map(|(table, key_hash, frame)| EncodedEntry {
+                        table,
+                        key_hash,
+                        frame,
+                    })
+                    .collect::<Vec<_>>();
+                let tombstones = tombstones
+                    .into_iter()
+                    .map(|(table, key_hash)| Tombstone { table, key_hash })
+                    .collect::<Vec<_>>();
+                let written = self
+                    .inner
+                    .write_delta(
+                        GenId(tip),
+                        GenId(generation),
+                        &header,
+                        &entries,
+                        &tombstones,
+                    )
+                    .map_err(|e| persist_error(py, e))?;
+                Ok(written.items().iter().map(item_tuple).collect())
+            }
+
+            fn write_generation_streamed(
+                &self,
+                py: Python<'_>,
+                base: Option<u64>,
+                generation: u64,
+                header: Vec<u8>,
+                frames: Bound<'_, PyAny>,
+            ) -> PyResult<Vec<ItemTuple>> {
+                let header = decode_header(&header).map_err(|e| persist_error(py, e))?;
+                let mut pulls = frames.try_iter()?.map(|frame| {
+                    let (table, key_hash, frame) = frame
+                        .and_then(|frame| frame.extract::<(u32, u64, Vec<u8>)>())
+                        .map_err($crate::backend::raised::<$exc>)?;
+                    Ok(EncodedEntry {
+                        table,
+                        key_hash,
+                        frame,
+                    })
+                });
+                let written = self
+                    .inner
+                    .write_generation_streamed(
+                        base.map(GenId),
+                        GenId(generation),
+                        &header,
+                        &mut pulls,
+                    )
                     .map_err(|e| persist_error(py, e))?;
                 Ok(written.items().iter().map(item_tuple).collect())
             }

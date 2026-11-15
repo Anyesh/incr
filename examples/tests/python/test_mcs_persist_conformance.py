@@ -353,6 +353,108 @@ class DictMemo:
             self.state.generations.pop(generation, None)
 
 
+class DictDeltaState(DictMemoState):
+    def __init__(self):
+        super().__init__()
+        self.chain = []
+        self.calls = []
+
+
+class DictDeltaMemo(DictMemo):
+    """A memo backend with the delta protocol, over a dict: layers in
+    `state.chain`, base first, each `(table, key_hash, loc, len)` item a
+    tombstone when `len` is 0."""
+
+    def record(self, name):
+        with self.state.lock:
+            self.state.calls.append(name)
+
+    def lock_checkpoint(self):
+        with self.state.lock:
+            if self.state.locked:
+                raise self.persist.Busy("checkpoint lock held")
+            self.state.locked = True
+            keep = set(self.state.chain)
+            for gen in [g for g in self.state.generations if g not in keep]:
+                del self.state.generations[gen]
+        return DictMemoGuard(self.state)
+
+    def load(self):
+        with self.state.lock:
+            if not self.state.chain:
+                return None
+            base = self.state.chain[0]
+            header, items, _ = self.state.generations[base]
+            return base, header, list(items)
+
+    def load_chain(self):
+        self.record("load_chain")
+        with self.state.lock:
+            if not self.state.chain:
+                return None
+            return [
+                (
+                    gen,
+                    self.state.generations[gen][0],
+                    list(self.state.generations[gen][1]),
+                )
+                for gen in self.state.chain
+            ]
+
+    def read_entries(self, generation, items):
+        self.record("read_entries")
+        with self.state.lock:
+            found = self.state.generations.get(generation)
+            return [found[2].get(item[2]) if found else None for item in items]
+
+    def _store(self, generation, header, entries, tombstones):
+        items = [
+            (table, key_hash, loc, len(frame))
+            for loc, (table, key_hash, frame) in enumerate(entries, 1)
+        ]
+        items += [(table, key_hash, 0, 0) for table, key_hash in tombstones]
+        frames = {loc: entry[2] for loc, entry in enumerate(entries, 1)}
+        self.state.generations[generation] = (header, items, frames)
+        return list(items)
+
+    def write_generation(self, base, generation, header, entries):
+        with self.state.lock:
+            tip = self.state.chain[-1] if self.state.chain else None
+            if tip != base:
+                raise self.persist.Busy("another handle wrote a generation")
+            items = self._store(generation, header, entries, [])
+            self.state.chain = [generation]
+            return items
+
+    def write_generation_streamed(self, base, generation, header, frames):
+        self.record("write_generation_streamed")
+        assert not hasattr(frames, "__len__"), "frames must be a lazy iterator"
+        return self.write_generation(base, generation, header, list(frames))
+
+    def write_delta(self, tip, generation, header, entries, tombstones):
+        self.record("write_delta")
+        with self.state.lock:
+            if not self.state.chain or self.state.chain[-1] != tip:
+                raise self.persist.Busy("the chain's tip moved")
+            items = self._store(generation, header, entries, tombstones)
+            self.state.chain.append(generation)
+            return items
+
+
+class DictDeltaMemoFactory:
+    def __init__(self, persist=persist):
+        self.persist = persist
+
+    def new_store(self):
+        return DictDeltaState()
+
+    def open(self, store):
+        return DictDeltaMemo(store, persist=self.persist)
+
+    def exclusive_lock(self):
+        return True
+
+
 class DictMemoFactory:
     def __init__(self, persist=persist):
         self.persist = persist
@@ -495,7 +597,11 @@ class SqliteMemoFactory:
 
 
 STORE_FLAVORS = {"dict": DictLogFactory, "sqlite3": SqliteLogFactory}
-MEMO_FLAVORS = {"dict": DictMemoFactory, "sqlite3": SqliteMemoFactory}
+MEMO_FLAVORS = {
+    "dict": DictMemoFactory,
+    "dict-delta": DictDeltaMemoFactory,
+    "sqlite3": SqliteMemoFactory,
+}
 
 
 def case_params(kind):

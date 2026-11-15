@@ -99,6 +99,7 @@ impl<E: PersistExceptions> MemoHarness for MemoFactory<E> {
 
     fn open(&mut self, store: &Self::Store) -> PyMemoBackend<E> {
         PyMemoBackend::new(self.0.call("open", Some(store)))
+            .unwrap_or_else(|e| panic!("looking up the handle's delta methods raised: {e}"))
     }
 
     fn exclusive_lock(&self) -> bool {
@@ -171,6 +172,14 @@ fn memo_table<E: PersistExceptions>() -> Vec<Case> {
         older_generation_stays_readable_until_removed,
         checkpoint_lock_excludes_other_handles,
         checkpoint_lock_removes_generations_below_current,
+        streamed_write_reads_the_base_through_the_same_handle,
+        delta_chain_roundtrips,
+        tombstone_hides_a_base_entry,
+        chain_of_deltas_resolves_newest_first,
+        delta_frames_reject_a_bad_tag,
+        stale_delta_is_not_returned,
+        compaction_drops_the_chain,
+        read_entries_matches_read_entry,
     )
 }
 
