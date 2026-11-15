@@ -3798,6 +3798,34 @@ fn loom_keyed_get_key_creates_its_input_against_an_upsert() {
     });
 }
 
+/// A query lists the keys through `get_keys`, creating the membership
+/// input, while a writer inserts a key. Whichever order the creation and
+/// the writer's membership set take, the query ends on both keys: either
+/// it listed the new key, or the set reached the input it depends on.
+#[test]
+fn loom_keyed_get_keys_creates_its_input_against_an_insert() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let keyed = Arc::new(Keyed::new(&rt));
+        keyed.upsert(&rt, 1, 10);
+        let reading = Arc::clone(&keyed);
+        let reader = rt.create_query(move |rt: &Rt| {
+            let mut keys = reading.get_keys(rt);
+            keys.sort_unstable();
+            keys
+        });
+        let writer = {
+            let (rt, keyed) = (Arc::clone(&rt), Arc::clone(&keyed));
+            thread::spawn(move || keyed.upsert(&rt, 2, 20))
+        };
+        let read = rt.get(reader);
+        assert!(read == vec![1] || read == vec![1, 2], "read {read:?}");
+        writer.join().unwrap();
+        assert_eq!(rt.get(reader), vec![1, 2]);
+        assert!(keyed.has_membership_input());
+    });
+}
+
 /// Two writers replace one key's row while a query reads it through
 /// `get_key`: after both, the query reads the row the key holds.
 #[test]
