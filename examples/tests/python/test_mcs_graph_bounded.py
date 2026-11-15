@@ -82,7 +82,14 @@ def test_no_argument_call_is_unchanged(mod):
     full = rt.graph_snapshot()
     assert isinstance(full, list)
     assert [n["id"] for n in full] == [n.id for n in chain]
-    assert set(full[0]) == {"id", "kind", "label", "dependencies", "dependents"}
+    assert set(full[0]) == {
+        "id",
+        "generation",
+        "kind",
+        "label",
+        "dependencies",
+        "dependents",
+    }
     bounded = rt.graph_snapshot(roots=[chain[3]])
     assert sorted(n["id"] for n in bounded["nodes"]) == sorted(n["id"] for n in full)
     by_id = {n["id"]: n for n in full}

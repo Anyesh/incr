@@ -22,6 +22,7 @@ use incr_core::{
     Cells, Cycle, CycleStrategy, Fixpoint, Pair, QueryOpts, Replay, RoutingFailed, Runtime,
 };
 
+pub mod by_id;
 pub mod inspect;
 pub mod notready;
 #[cfg(feature = "persist")]
@@ -243,6 +244,13 @@ fn catch_into_python<E: Exceptions, R>(f: impl FnOnce() -> R) -> PyResult<R> {
     };
     Err(pyo3::exceptions::PyRuntimeError::new_err(msg))
 }
+
+pyo3::create_exception!(
+    incr,
+    StaleNodeError,
+    pyo3::exceptions::PyLookupError,
+    "A snapshot id and generation that name no live node: it was deleted, its slot was reused, or it never existed."
+);
 
 pub fn cycle_ids(cycle: &Cycle) -> Vec<u32> {
     cycle.participants().iter().map(|p| p.slot()).collect()
