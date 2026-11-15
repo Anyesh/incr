@@ -279,6 +279,9 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
         plans: Vec<Box<dyn Any + Send>>,
         gone: &mut Vec<P>,
     ) -> Vec<(usize, u64)> {
+        if self.parts.is_empty() {
+            return Vec::new();
+        }
         let mut touched = Vec::new();
         for (sink, (at, plan)) in self.parts.iter_mut().zip(plans.into_iter().enumerate()) {
             touched.extend(sink.touched(&*plan).into_iter().map(|hash| (at, hash)));
@@ -1393,7 +1396,9 @@ where
                         &mut keep.displaced,
                     );
                     keep.pairs.extend(dropped);
-                    keep.unused.extend(gone);
+                    if !gone.is_empty() {
+                        keep.unused.extend(gone);
+                    }
                     stage.spend_into(keep);
                 }
                 None => {
