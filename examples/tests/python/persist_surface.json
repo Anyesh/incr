@@ -624,6 +624,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /, node)"
    },
+   "keys": {
+    "doc": "A new list of the keys `kc` holds, with a dependency on which keys\nexist: the query reruns when a write inserts or removes a key, not\nwhen it only changes a row. Raises `ValueError` for a keyed\ncollection of another runtime.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, kc)"
+   },
    "lookup": {
     "doc": "The value of `key`'s lookup (see `Runtime.create_lookup`), read as\n`get` reads a node: `Pending` makes this query's value `Pending`.",
     "kind": "method_descriptor",
