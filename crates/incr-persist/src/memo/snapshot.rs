@@ -204,12 +204,17 @@ impl<C: MemoCells> CoreRef<C> {
             stats.times.snapshot = snapshot;
             return Ok(stats);
         }
-        let done = self.backend.checkpoint(CheckpointInput {
-            build: self.build,
-            tables: self.catalog.clone(),
-            fresh: found.entries,
-            max_bytes: self.max_bytes,
-        });
+        let known = self.index().layers.clone();
+        let done = self.backend.checkpoint(
+            CheckpointInput {
+                build: self.build,
+                tables: self.catalog.clone(),
+                fresh: found.entries,
+                max_bytes: self.max_bytes,
+            },
+            &known,
+        );
+        drop(known);
         let mut state = self.lock_memo();
         for mismatch in mismatches {
             state.record_mismatch(mismatch);
@@ -217,7 +222,7 @@ impl<C: MemoCells> CoreRef<C> {
         let mut done = done?;
         attempt.saved = true;
         done.stats.times.snapshot = snapshot;
-        self.swap_index(IndexGen::new(done.generation, self.build, &self.catalog));
+        self.swap_index(IndexGen::new(done.chain, self.build, &self.catalog));
         state.stats.checkpoints += 1;
         state.stats.delta_checkpoints += u64::from(done.stats.delta);
         state.stats.compactions += u64::from(done.stats.compacted);
@@ -260,10 +265,10 @@ impl<C: MemoCells> CoreRef<C> {
         }
         state.stats.unsaveable = unsaveable;
         state.stats.evicted_last_checkpoint = done.stats.evicted as u64;
-        // Restores hold M, so none is still reading the old generation.
+        // Restores hold M, so none is still reading the old chain.
         // The new one is current either way, so a failed removal only
         // leaves a stale generation behind.
-        if let Some(old) = done.replaced {
+        for &old in &done.superseded {
             if self.backend.remove_generation(old).is_err() {
                 state.stats.stale_generations += 1;
             }

@@ -11,7 +11,7 @@ use super::handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
 use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats, Wake};
 use super::options::MemoOptions;
 use super::table_core::{ErasedTable, TableCore};
-use super::{CheckpointStats, GenId, Generation, MemoBackend, TableDesc};
+use super::{Chain, CheckpointStats, GenId, Generation, MemoBackend, TableDesc};
 use crate::store::dep_index::DepIndex;
 use crate::value_context::{EncodeMismatch, ValueScope};
 use crate::{Backend, Error, Result, Store};
@@ -116,10 +116,10 @@ impl<C: MemoCells> MemoBuilder<C> {
             makes.push(make);
         }
         let deps = store.open_dep_index()?;
-        let generation = backend
-            .load()?
-            .unwrap_or_else(|| Generation::empty(GenId(0)));
-        let index = IndexGen::new(generation, build, &catalog);
+        let chain = backend
+            .load_chain(&[])?
+            .unwrap_or_else(|| Chain::from(Generation::empty(GenId(0))));
+        let index = IndexGen::new(chain, build, &catalog);
         let rt = store.runtime();
         let tables = makes
             .into_iter()

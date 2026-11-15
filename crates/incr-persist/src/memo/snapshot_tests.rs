@@ -36,7 +36,9 @@ fn a_checkpoint_touches_only_the_keys_of_dirty_entries_and_their_clean_deps() {
     store.set(y, 20).unwrap();
     assert_eq!(rt.get(q), 21);
     KEYS_TOUCHED.with(|n| n.set(0));
-    assert_eq!(memo.checkpoint().unwrap().written, 201);
+    let done = memo.checkpoint().unwrap();
+    assert!(done.delta);
+    assert_eq!(done.written, 1);
     assert_eq!(KEYS_TOUCHED.with(std::cell::Cell::get), 2);
 }
 

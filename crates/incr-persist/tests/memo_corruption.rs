@@ -208,15 +208,17 @@ fn reset_dir(dir: &Path, files: &[(PathBuf, Vec<u8>)]) {
     }
 }
 
-/// After damage, a checkpoint writes every live entry again and the next
-/// restart reuses them all without running anything.
+/// After damage, a checkpoint rewrites what the damage lost, as a delta
+/// over the damaged generation or as a full one, and the next restart
+/// reuses every entry without running anything.
 fn assert_recovers<C: MemoCells>(
     w: Chain<C>,
     log: &MemoryBackend,
     dir: &Path,
     runs: &Arc<AtomicUsize>,
 ) {
-    assert_eq!(w.memo.checkpoint().unwrap().written, ENTRIES as usize);
+    let written = w.memo.checkpoint().unwrap().written;
+    assert!((1..=ENTRIES as usize).contains(&written), "wrote {written}");
     drop(w);
     let w = Chain::<C>::open(log, FileMemo::open(dir).unwrap(), runs);
     let before = runs.load(SeqCst);
@@ -970,7 +972,7 @@ fn a_bypass_restored_and_checkpointed_keeps_nothing_over_it<C: MemoCells>() {
         w.check(2);
         assert_eq!(runs.load(SeqCst), before + 3, "an entry over x verified");
         let stats = w.memo.checkpoint().unwrap();
-        assert_eq!((stats.written, stats.merged), (3, 3));
+        assert_eq!((stats.fresh_written, stats.unkept), (0, 2));
     }
     let w = Chain::<C>::open(&log, backend.clone(), &runs);
     assert_eq!(w.x(), 1);
@@ -1004,7 +1006,7 @@ fn an_equal_mapped_write_does_not_launder_a_bypass<C: MemoCells>() {
         w.check(2);
         assert_eq!(runs.load(SeqCst), before + 3, "an entry over x verified");
         let stats = w.memo.checkpoint().unwrap();
-        assert_eq!((stats.written, stats.merged), (3, 3));
+        assert_eq!((stats.fresh_written, stats.unkept), (0, 2));
     }
     let w = Chain::<C>::open(&log, backend.clone(), &runs);
     assert_eq!(w.x(), 5);
@@ -1029,7 +1031,7 @@ fn a_bypass_before_open_is_not_trusted<C: MemoCells>() {
         w.check(2);
         assert_eq!(runs.load(SeqCst), before + 3, "an entry over x verified");
         let stats = w.memo.checkpoint().unwrap();
-        assert_eq!((stats.written, stats.merged), (3, 3));
+        assert_eq!((stats.fresh_written, stats.unkept), (0, 2));
     }
     let w = Chain::<C>::open(&log, backend.clone(), &runs);
     let before = runs.load(SeqCst);

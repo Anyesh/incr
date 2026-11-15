@@ -53,13 +53,15 @@ pub struct Tombstone {
 /// holds a delta, so its current generation is its only one.
 ///
 /// [`write_checkpoint`](super::write_checkpoint) calls, in order:
-/// [`lock_checkpoint`](Self::lock_checkpoint), [`load`](Self::load),
-/// [`read_entry`](Self::read_entry) on the loaded generation, and
-/// [`write_generation`](Self::write_generation) from it, then drops the
-/// guard. Its caller swaps its in-memory index to the new generation and
+/// [`lock_checkpoint`](Self::lock_checkpoint),
+/// [`load_chain`](Self::load_chain), [`read_entry`](Self::read_entry) on
+/// the chain's layers, and either [`write_delta`](Self::write_delta) or
+/// [`write_generation`](Self::write_generation) from its tip, then drops
+/// the guard. Its caller swaps its in-memory index to the new chain and
 /// only then calls [`remove_generation`](Self::remove_generation) on the
-/// old one. Restores call `read_entry` on whichever generation their index
-/// names, which may by then have been removed by another handle.
+/// layers a full write replaced. Restores call `read_entry` on whichever
+/// layer their index names, which may by then have been removed by another
+/// handle.
 ///
 /// The `memo_backend_conformance!` suite, behind the `backend-tests`
 /// feature, checks this contract.

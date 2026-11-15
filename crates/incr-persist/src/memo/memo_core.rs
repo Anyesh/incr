@@ -11,10 +11,12 @@ use incr_core::{Cells, ErasedIncr, Incr, Local, NodeTable, Runtime, Shared};
 
 use super::dirty::Dirty;
 
+use super::checkpoint::write_known;
+use super::layers::{self, Live, Probe};
 use super::table_core::{ErasedTable, KeyPart};
 use super::{
-    decode_entry, key_hash, write_checkpoint, CheckpointInput, Checkpointed, Entry, GenId,
-    Generation, IndexItem, MemoBackend, TableDesc,
+    key_hash, Chain, CheckpointInput, Checkpointed, Entry, GenId, Generation, IndexItem,
+    MemoBackend, TableDesc,
 };
 use crate::store::dep_index::{DepIndex, External};
 use crate::value_context::{EncodeMismatch, ValueScope};
@@ -78,7 +80,9 @@ pub struct MemoStats {
 /// [`MemoBackend`] with its guard type erased.
 pub(crate) trait ErasedBackend: Send + Sync {
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>>;
-    fn checkpoint(&self, input: CheckpointInput) -> Result<Checkpointed>;
+    /// `known` holds the layers this handle's index already loaded.
+    fn checkpoint(&self, input: CheckpointInput, known: &[Arc<Generation>])
+        -> Result<Checkpointed>;
     fn remove_generation(&self, generation: GenId) -> Result<()>;
 }
 
@@ -87,8 +91,12 @@ impl<M: MemoBackend> ErasedBackend for M {
         MemoBackend::read_entry(self, generation, item)
     }
 
-    fn checkpoint(&self, input: CheckpointInput) -> Result<Checkpointed> {
-        write_checkpoint(self, input)
+    fn checkpoint(
+        &self,
+        input: CheckpointInput,
+        known: &[Arc<Generation>],
+    ) -> Result<Checkpointed> {
+        write_known(self, input, known)
     }
 
     fn remove_generation(&self, generation: GenId) -> Result<()> {
@@ -96,21 +104,27 @@ impl<M: MemoBackend> ErasedBackend for M {
     }
 }
 
-/// The current generation as the live catalog sees it.
+/// The current chain as the live catalog sees it. Every layer of a chain
+/// shares its base's catalog, so one table mapping serves them all.
 pub(crate) struct IndexGen {
-    pub(crate) generation: Generation,
-    /// Per live table, its index in the generation's catalog: `None` for a
-    /// table the generation doesn't hold under the same descriptor, and for
-    /// every table when the build differs.
+    /// Oldest first.
+    pub(crate) layers: Vec<Arc<Generation>>,
+    /// Per live table, its index in the base's catalog: `None` for a table
+    /// the base doesn't hold under the same descriptor, and for every table
+    /// when the build differs.
     to_gen: Vec<Option<u32>>,
     to_live: HashMap<u32, u32>,
-    /// The generation's [`Generation::entry_bytes`].
-    pub(crate) bytes: u64,
+    /// What the chain shows its readers; `bytes` is the size `max_bytes`
+    /// bounds.
+    pub(crate) live: Live,
+    /// The summed entry frame lengths of the deltas.
+    pub(crate) chain_bytes: u64,
 }
 
 impl IndexGen {
-    pub(crate) fn new(generation: Generation, build: u128, catalog: &[TableDesc]) -> Self {
-        let header = generation.header();
+    pub(crate) fn new(chain: Chain, build: u128, catalog: &[TableDesc]) -> Self {
+        let layers = chain.into_layers();
+        let header = layers[0].header();
         let to_gen: Vec<Option<u32>> = catalog
             .iter()
             .map(|desc| {
@@ -125,26 +139,31 @@ impl IndexGen {
             .filter_map(|(live, gen)| Some((((*gen)?), live as u32)))
             .collect();
         IndexGen {
-            bytes: generation.entry_bytes(),
-            generation,
+            live: Live::of_chain(&layers),
+            chain_bytes: layers[1..].iter().map(|layer| layer.entry_bytes()).sum(),
+            layers,
             to_gen,
             to_live,
         }
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.layers.len() - 1
     }
 
     pub(crate) fn live_table(&self, gen_table: u32) -> Option<u32> {
         self.to_live.get(&gen_table).copied()
     }
 
-    /// Whether the generation may hold an entry for `key` of live `table`.
+    /// Whether the chain may hold an entry for `key` of live `table`.
     pub(crate) fn holds(&self, table: u32, key: &[u8]) -> bool {
         self.to_gen[table as usize]
-            .is_some_and(|gen| !self.generation.find(gen, key_hash(key)).is_empty())
+            .is_some_and(|gen| layers::may_hold(&self.layers, gen, key_hash(key)))
     }
 
     /// The stored entry for `key` of live `table`: `Ok(None)` if there is
-    /// none or its generation has been removed, `Err(())` for a frame that
-    /// fails to decode.
+    /// none or a layer it needs has been removed, `Err(())` for a frame
+    /// that fails to decode or to read.
     pub(crate) fn read(
         &self,
         backend: &dyn ErasedBackend,
@@ -154,22 +173,12 @@ impl IndexGen {
         let Some(gen) = self.to_gen[table as usize] else {
             return Ok(None);
         };
-        let mut corrupt = false;
-        for item in self.generation.find(gen, key_hash(key)) {
-            match backend.read_entry(self.generation.id(), item) {
-                Ok(Some(frame)) => match decode_entry(&frame, self.generation.frame_tag()) {
-                    Ok(entry) if entry.table == gen && entry.key == key => return Ok(Some(entry)),
-                    Ok(_) => {}
-                    Err(_) => corrupt = true,
-                },
-                Ok(None) => return Ok(None),
-                Err(_) => corrupt = true,
-            }
-        }
-        if corrupt {
-            Err(())
-        } else {
-            Ok(None)
+        match layers::probe(&self.layers, gen, key, |id, item| {
+            backend.read_entry(id, item)
+        }) {
+            Ok(Probe::Found(entry)) => Ok(Some(entry)),
+            Ok(Probe::Missing | Probe::Gone) => Ok(None),
+            Ok(Probe::Corrupt) | Err(_) => Err(()),
         }
     }
 }
@@ -440,8 +449,10 @@ impl<C: MemoCells> MemoCore<C> {
     pub(crate) fn stats(&self) -> MemoStats {
         let mut stats = self.lock_memo().stats.clone();
         let index = self.index();
-        stats.entries = index.generation.items().len() as u64;
-        stats.bytes = index.bytes;
+        stats.entries = index.live.entries;
+        stats.bytes = index.live.bytes;
+        stats.chain_depth = index.depth() as u64;
+        stats.chain_bytes = index.chain_bytes;
         stats.unsaved_entries = self.dirty.unsaved();
         stats
     }

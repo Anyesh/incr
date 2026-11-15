@@ -145,9 +145,9 @@ fn the_default_read_entries_reads_each_item() {
 }
 
 #[test]
-fn full_checkpoints_match_a_delta_capable_backend() {
+fn full_checkpoints_match_a_memory_store_without_deltas() {
     let plain = PlainMemo::default();
-    let memory = MemoryMemo::new();
+    let memory = MemoryMemo::without_deltas();
     for keys in [0..6, 3..9, 9..10] {
         let a = write_checkpoint(&plain, input(keys.clone())).unwrap();
         let b = write_checkpoint(&memory, input(keys)).unwrap();
@@ -156,7 +156,8 @@ fn full_checkpoints_match_a_delta_capable_backend() {
             ..stats.clone()
         };
         assert_eq!(untimed(&a.stats), untimed(&b.stats));
-        assert_eq!(a.replaced, b.replaced);
+        assert!(!a.stats.delta);
+        assert_eq!(a.superseded, b.superseded);
         assert_eq!(a.generation.header(), b.generation.header());
         assert_eq!(a.generation.items(), b.generation.items());
         for item in a.generation.items() {
@@ -165,7 +166,7 @@ fn full_checkpoints_match_a_delta_capable_backend() {
                 memory.read_entry(b.generation.id(), item).unwrap()
             );
         }
-        if let Some(old) = a.replaced {
+        for &old in &a.superseded {
             plain.remove_generation(old).unwrap();
             memory.remove_generation(old).unwrap();
         }

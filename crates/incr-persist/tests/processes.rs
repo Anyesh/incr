@@ -531,7 +531,7 @@ fn memo_checkpoint_loop() {
     loop {
         round += 1;
         let done = write_checkpoint(&memo, memo_input(0..round * 50)).unwrap();
-        if let Some(old) = done.replaced {
+        for &old in &done.superseded {
             memo.remove_generation(old).unwrap();
         }
         say(&format!("wrote {round}"));
@@ -571,6 +571,7 @@ fn a_memo_checkpoint_killed_midway_leaves_a_whole_generation() {
         }
         let next = write_checkpoint(&memo, memo_input(0..7)).unwrap();
         assert_eq!(next.stats.corrupt, 0);
-        assert_eq!(memo.load().unwrap().unwrap().id(), next.generation.id());
+        let chain = memo.load_chain(&[]).unwrap().unwrap();
+        assert_eq!(chain.tip().id(), next.generation.id());
     }
 }

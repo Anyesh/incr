@@ -302,7 +302,7 @@ fn checkpoints_merge_across_handles_and_reopen() {
             },
         )
         .unwrap();
-        if let Some(old) = done.replaced {
+        for &old in &done.superseded {
             memo.remove_generation(old).unwrap();
         }
         done.generation
