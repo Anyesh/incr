@@ -1047,6 +1047,8 @@
 0	runtime::tests::delete_node_with_foreign_handle_panics
 0	runtime::tests::delete_query_then_input_unhooks_edges
 0	runtime::tests::deleted_slot_recycles_across_value_types
+1	runtime::tests::erased_handle_at_names_a_slot_only_at_its_generation_local
+1	runtime::tests::erased_handle_at_names_a_slot_only_at_its_generation_shared
 4	runtime::tests::erased_handle_names_the_live_occupant_of_a_slot_local
 5	runtime::tests::erased_handle_names_the_live_occupant_of_a_slot_shared
 0	runtime::tests::get_with_foreign_handle_panics
@@ -1101,6 +1103,7 @@
 3	runtime::trace_tests::local_instrumentation_cases
 5	runtime::trace_tests::local_nested_get_traced_caught_keeps_outer_trace
 7	runtime::trace_tests::local_nested_get_traced_unwinds_outer_and_runtime_stays_usable
+1	runtime::trace_tests::local_snapshot_reports_each_node_generation_and_state
 5	runtime::trace_tests::shared_bounded_snapshot_cases
 7	runtime::trace_tests::shared_concurrent_get_traced_is_refused_and_keeps_owner_trace
 5	runtime::trace_tests::shared_get_traced_started_during_the_owners_hand_off_keeps_the_owner_trace
@@ -1108,6 +1111,7 @@
 5	runtime::trace_tests::shared_instrumentation_cases
 7	runtime::trace_tests::shared_nested_get_traced_caught_keeps_outer_trace
 8	runtime::trace_tests::shared_nested_get_traced_unwinds_outer_and_runtime_stays_usable
+1	runtime::trace_tests::shared_snapshot_reports_each_node_generation_and_state
 5	runtime::type_fallback_tests::local::a_recycled_slot_has_no_type_fallback
 4	runtime::type_fallback_tests::local::a_second_type_fallback_panics
 5	runtime::type_fallback_tests::local::none_ignores_the_type_fallback

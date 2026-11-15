@@ -9,6 +9,7 @@ use std::thread;
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::node::NodeId;
+use crate::state::NodeState;
 use crate::trace::{Direction, GraphQuery, TraceAction};
 
 const NESTED: &str = "incr-core: get_traced called while another get_traced is in progress";
@@ -593,4 +594,41 @@ fn shared_instrumentation_cases() {
     trace_entries_carry_dependencies_and_own_time::<Shared>();
     verified_entries_have_no_time::<Shared>();
     compute_stats_count_by_label::<Shared>();
+}
+
+fn snapshot_reports_each_node_generation_and_state<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let a = rt.create_input(1_i64);
+    let q = rt.create_query(move |r: &Runtime<C>| r.get(a) + 1);
+    let state_of = |slot: u32| {
+        rt.graph_snapshot()
+            .into_iter()
+            .find(|n| n.id == NodeId(slot))
+            .map(|n| (n.generation, n.state))
+    };
+    assert_eq!(state_of(q.slot()), Some((0, NodeState::New)));
+    rt.get(q);
+    assert_eq!(state_of(q.slot()), Some((0, NodeState::Clean)));
+    rt.set(a, 2);
+    assert_eq!(state_of(q.slot()), Some((0, NodeState::Dirty)));
+
+    rt.delete_node(q);
+    let recycled = rt.create_input(3_i64);
+    assert_eq!(recycled.slot(), q.slot());
+    let (generation, _) = state_of(q.slot()).unwrap();
+    assert_ne!(generation, 0, "a recycled slot reports its new generation");
+
+    let roots = [NodeId(recycled.slot())];
+    let bounded = rt.graph_snapshot_bounded(&query(&roots, Direction::Dependencies));
+    assert_eq!(bounded.nodes[0].generation, generation);
+}
+
+#[test]
+fn local_snapshot_reports_each_node_generation_and_state() {
+    snapshot_reports_each_node_generation_and_state::<Local>();
+}
+
+#[test]
+fn shared_snapshot_reports_each_node_generation_and_state() {
+    snapshot_reports_each_node_generation_and_state::<Shared>();
 }
