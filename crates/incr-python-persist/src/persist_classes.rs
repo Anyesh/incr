@@ -12,14 +12,13 @@
 #[macro_export]
 macro_rules! persist_classes {
     (binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
-        use std::collections::HashMap;
         use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
         use $crate::binding::PyBinding;
         use $crate::classes::{key_counts, keyed_of, reconcile_pairs, FullStoreRuntime, KeyCounts, StoreRuntime};
         use $crate::incr_core::Runtime;
         use $crate::keyed::Pending;
-        use $crate::memo::{MemoCore, TableHandle};
+        use $crate::memo::{checkpoint_dict, MemoCore, TableHandle};
         use $crate::pyo3::exceptions::{PyRuntimeError, PyValueError};
         use $crate::pyo3::prelude::*;
         use $crate::pyo3::types::PyDict;
@@ -691,8 +690,15 @@ macro_rules! persist_classes {
             }
 
             /// Writes every live entry whose dependencies are persisted to the
-            /// backend as the next generation, and returns how many it `written`,
-            /// `merged` from the previous generation, `evicted` and so on. Raises
+            /// backend, as a delta on the current chain or as a new full
+            /// generation, and returns a dict: the counts `written`, `unkept`,
+            /// `merged`, `corrupt`, `evicted`, `oversized` and `unchanged`; `delta`
+            /// (a delta was written), `fresh_written` (entries computed since the
+            /// last checkpoint that it wrote), `tombstones`, `bytes_appended`,
+            /// `chain_depth` (deltas on the chain afterwards) and `compacted` (a
+            /// full write replaced a chain holding deltas); and `times`, the
+            /// nanoseconds of the `snapshot`, `merge` and `write` steps as
+            /// `snapshot_ns`, `merge_ns` and `write_ns`. Raises
             /// `Busy` when another handle is checkpointing. Raises `ValueError`
             /// naming the table when an entry's key or value did not round-trip
             /// through its codec: the generation was still written, without that
@@ -701,26 +707,35 @@ macro_rules! persist_classes {
             /// open. That refusal is best effort: a batch or scope another thread
             /// opens after the check is seen by the snapshot, and the content
             /// fingerprints stored with each entry keep a restore correct.
-            fn checkpoint(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, usize>> {
+            fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
                 let store = self.store.bind(py).borrow();
                 let core = store.core_outside_overlay(py)?;
-                store.memo()?.checkpoint(&core, py)
+                let stats = store.memo()?.checkpoint(&core, py)?;
+                checkpoint_dict(py, &stats)
             }
 
             /// Runs `checkpoint()` when `checkpoint_after_entries` entries are
             /// unsaved and returns its counts; `None` when none is due, and
             /// always when `open_memo` set no trigger. For after a read-only
             /// rebuild, since reads never checkpoint.
-            fn checkpoint_if_due(&self, py: Python<'_>) -> PyResult<Option<HashMap<&'static str, usize>>> {
+            fn checkpoint_if_due<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
                 let store = self.store.bind(py).borrow();
                 let core = store.core_outside_overlay(py)?;
-                store.memo()?.checkpoint_if_due(&core, py)
+                store
+                    .memo()?
+                    .checkpoint_if_due(&core, py)?
+                    .map(|stats| checkpoint_dict(py, &stats))
+                    .transpose()
             }
 
             /// `entries` and `bytes` of the current generation, `unsaved_entries`
             /// computed since the last checkpoint and not saved,
             /// `unsaveable` entries the last checkpoint could not save,
-            /// `evicted_last_checkpoint`, `auto_checkpoint_errors` (triggered
+            /// `evicted_last_checkpoint`, `chain_depth` and `chain_bytes` (the
+            /// deltas on the current chain and their frame bytes),
+            /// `delta_checkpoints` and `compactions` since the memo opened,
+            /// `last_bytes_appended` (what the last checkpoint wrote),
+            /// `auto_checkpoint_errors` (triggered
             /// checkpoints that failed) and `last_auto_checkpoint_error` (the
             /// latest such failure a write ran, as text, or `None`), read without
             /// touching the backend.

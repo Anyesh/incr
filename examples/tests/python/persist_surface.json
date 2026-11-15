@@ -791,7 +791,7 @@
   "doc": "An open memo: `memo.get_or_insert(table, key)` gives an entry's node, and\n`memo.checkpoint()` writes the live entries to the backend.",
   "members": {
    "checkpoint": {
-    "doc": "Writes every live entry whose dependencies are persisted to the\nbackend as the next generation, and returns how many it `written`,\n`merged` from the previous generation, `evicted` and so on. Raises\n`Busy` when another handle is checkpointing. Raises `ValueError`\nnaming the table when an entry's key or value did not round-trip\nthrough its codec: the generation was still written, without that\nentry, which is recomputed on the next run. Raises `PersistError`,\nwriting nothing, while an `apply=\"on_write\"` batch or an overlay is\nopen. That refusal is best effort: a batch or scope another thread\nopens after the check is seen by the snapshot, and the content\nfingerprints stored with each entry keep a restore correct.",
+    "doc": "Writes every live entry whose dependencies are persisted to the\nbackend, as a delta on the current chain or as a new full\ngeneration, and returns a dict: the counts `written`, `unkept`,\n`merged`, `corrupt`, `evicted`, `oversized` and `unchanged`; `delta`\n(a delta was written), `fresh_written` (entries computed since the\nlast checkpoint that it wrote), `tombstones`, `bytes_appended`,\n`chain_depth` (deltas on the chain afterwards) and `compacted` (a\nfull write replaced a chain holding deltas); and `times`, the\nnanoseconds of the `snapshot`, `merge` and `write` steps as\n`snapshot_ns`, `merge_ns` and `write_ns`. Raises\n`Busy` when another handle is checkpointing. Raises `ValueError`\nnaming the table when an entry's key or value did not round-trip\nthrough its codec: the generation was still written, without that\nentry, which is recomputed on the next run. Raises `PersistError`,\nwriting nothing, while an `apply=\"on_write\"` batch or an overlay is\nopen. That refusal is best effort: a batch or scope another thread\nopens after the check is seen by the snapshot, and the content\nfingerprints stored with each entry keep a restore correct.",
     "kind": "method_descriptor",
     "signature": "(self, /)"
    },
@@ -806,7 +806,7 @@
     "signature": "(self, /, table, key)"
    },
    "stats": {
-    "doc": "`entries` and `bytes` of the current generation, `unsaved_entries`\ncomputed since the last checkpoint and not saved,\n`unsaveable` entries the last checkpoint could not save,\n`evicted_last_checkpoint`, `auto_checkpoint_errors` (triggered\ncheckpoints that failed) and `last_auto_checkpoint_error` (the\nlatest such failure a write ran, as text, or `None`), read without\ntouching the backend.",
+    "doc": "`entries` and `bytes` of the current generation, `unsaved_entries`\ncomputed since the last checkpoint and not saved,\n`unsaveable` entries the last checkpoint could not save,\n`evicted_last_checkpoint`, `chain_depth` and `chain_bytes` (the\ndeltas on the current chain and their frame bytes),\n`delta_checkpoints` and `compactions` since the memo opened,\n`last_bytes_appended` (what the last checkpoint wrote),\n`auto_checkpoint_errors` (triggered\ncheckpoints that failed) and `last_auto_checkpoint_error` (the\nlatest such failure a write ran, as text, or `None`), read without\ntouching the backend.",
     "kind": "method_descriptor",
     "signature": "(self, /)"
    }
@@ -909,7 +909,7 @@
    "load_chain": {
     "doc": null,
     "kind": "method_descriptor",
-    "signature": "(self, /)"
+    "signature": "(self, /, known=None)"
    },
    "lock_checkpoint": {
     "doc": null,
