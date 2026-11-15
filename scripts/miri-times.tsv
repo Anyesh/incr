@@ -1370,3 +1370,5 @@
 2	keyed::tests::rows_local::forget_key_of_an_unread_or_orphaned_key
 2	keyed::tests::rows_shared::forget_key_frees_the_input_of_a_never_written_key
 2	keyed::tests::rows_shared::forget_key_of_an_unread_or_orphaned_key
+2	keyed::tests::rows_local::forget_key_inside_a_compute_is_refused
+2	keyed::tests::rows_shared::forget_key_inside_a_compute_is_refused
