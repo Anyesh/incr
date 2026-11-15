@@ -110,7 +110,9 @@ pub use trace::{
 };
 pub use value::Value;
 #[doc(hidden)]
-pub use value_code::{check_value_code, with_value_code};
+pub use value_code::{
+    check_value_code, in_value_code, is_contract_panic_message, with_value_code, CONTRACT_MESSAGE,
+};
 pub use value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
 
 #[cfg(test)]

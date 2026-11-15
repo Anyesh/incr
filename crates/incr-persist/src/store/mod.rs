@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
 use incr_core::{
-    check_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value,
+    in_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1021,8 +1021,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// the holder may be waiting on a claim the calling compute or value
     /// code's caller holds, and value code may be running on the thread
     /// that holds the mutex. Re-entry is checked first, so a `Drop` the
-    /// engine runs as value code under the mutex gets the error, not the
-    /// value-code panic.
+    /// engine runs as value code under the mutex gets the error too, and a
+    /// call from value code returns [`Error::Reentrant`] instead of
+    /// panicking.
     fn state(&self) -> Result<Locked<'_, C>> {
         if self.holder.is_current() {
             return Err(Error::Reentrant);
@@ -1031,7 +1032,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
             !self.runtime.frame_active(),
             "incr-persist: Store methods must not be called from inside a query's compute",
         );
-        check_value_code();
+        if in_value_code() {
+            return Err(Error::Reentrant);
+        }
         let routing = self.runtime.hold_routing();
         // A panic while the mutex was held may have left the runtime and
         // the folded log out of step, which is the poisoned condition too.

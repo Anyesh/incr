@@ -1257,6 +1257,7 @@ impl PyRuntime {
 
 #[pymodule]
 fn incr_concurrent(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    incr_python_protocol::install_panic_hook();
     m.add("CycleError", m.py().get_type::<CycleError>())?;
     m.add("StaleNodeError", m.py().get_type::<StaleNodeError>())?;
     m.add_class::<PyRuntime>()?;

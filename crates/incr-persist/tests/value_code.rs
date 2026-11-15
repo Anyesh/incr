@@ -153,19 +153,12 @@ fn shared_hash_that_reads_a_node() {
     insert_whose_element_reads_a_node::<Shared>(Op::Hash);
 }
 
-/// Value code that calls the store panics before the store mutex is
-/// requested, so the store is not poisoned.
+/// Value code that calls the store gets `Error::Reentrant` before the
+/// store mutex is requested, so the store is not poisoned.
 fn store_call_from_value_code<C: Cells>() {
     let store = Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap();
-    let err = catch_unwind(AssertUnwindSafe(|| {
-        with_value_code(|| store.restored_keys(""))
-    }))
-    .expect_err("the store call was allowed");
-    let message = panic_message(err);
-    assert!(
-        message.contains(CONTRACT_MESSAGE),
-        "expected the contract panic, got: {message}"
-    );
+    let result = with_value_code(|| store.restored_keys(""));
+    assert!(matches!(result, Err(Error::Reentrant)), "got {result:?}");
     assert!(store.restored_keys("").unwrap().is_empty());
 }
 
@@ -275,20 +268,6 @@ fn shared_insert_whose_element_hash_declares_an_input() {
     .assert_clean();
 }
 
-fn assert_contract_panic(what: &str, op: impl FnOnce()) {
-    let err =
-        catch_unwind(AssertUnwindSafe(op)).expect_err(&format!("{what}: the call was allowed"));
-    let message = panic_message(err);
-    assert!(
-        message.contains(CONTRACT_MESSAGE),
-        "{what}: expected the contract panic, got: {message}"
-    );
-    assert!(
-        HOOK.with(|h| h.borrow().is_none()),
-        "{what}: the hook never ran"
-    );
-}
-
 /// A Clean read whose `Clone` sets the input it reads through the store
 /// is refused before the store mutex is taken, so the input stays Clean
 /// on its old value and the store is not poisoned.
@@ -296,13 +275,16 @@ fn clone_of_a_clean_read_that_sets_its_input<C: Cells>() {
     let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
     let x = store.input("x", Hooked(1)).unwrap();
     let hooked = Rc::clone(&store);
+    let refused = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&refused);
     arm(Op::Clone, move || {
-        let _ = hooked.set(x, Hooked(2));
-    });
-    assert_contract_panic("Store::set from Clone", || {
-        store.runtime().get(x.handle());
+        let result = hooked.set(x, Hooked(2));
+        seen.borrow_mut()
+            .push(matches!(result, Err(Error::Reentrant)));
     });
     let rt = store.runtime();
+    assert_eq!(rt.get(x.handle()), Hooked(1));
+    assert_eq!(*refused.borrow(), [true], "Store::set from Clone");
     assert!(rt.is_alive(x.handle()));
     assert_eq!(inspect(rt, x.handle()).map(|i| i.value), Some(Hooked(1)));
     store.set(x, Hooked(3)).unwrap();
@@ -323,22 +305,25 @@ fn memo_options() -> MemoOptions {
     MemoOptions::new(BuildId::Fixed(0x0dea_d10c))
 }
 
-/// A Clean read whose `Clone` opens a memo over the store is refused at
-/// the store mutex, and the store opens one normally afterwards.
+/// A Clean read whose `Clone` opens a memo over the store gets
+/// `Error::Reentrant`, and the store opens one normally afterwards.
 fn clone_of_a_clean_read_that_opens_a_memo<C: MemoCells>() {
     let store = Arc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
     let x = store.input("x", Hooked(1)).unwrap();
     let hooked = Arc::clone(&store);
+    let refused = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&refused);
     arm(Op::Clone, move || {
         let mut builder = MemoBuilder::<C>::new(memo_options());
         let t = builder.table::<u32, u32>("t", 1);
         builder.define(t, |_, &k| k);
-        let _ = builder.open(&hooked, MemoryMemo::new());
-    });
-    assert_contract_panic("MemoBuilder::open from Clone", || {
-        store.runtime().get(x.handle());
+        let result = builder.open(&hooked, MemoryMemo::new());
+        seen.borrow_mut()
+            .push(matches!(result, Err(Error::Reentrant)));
     });
     let rt = store.runtime();
+    assert_eq!(rt.get(x.handle()), Hooked(1));
+    assert_eq!(*refused.borrow(), [true], "MemoBuilder::open from Clone");
     assert_eq!(inspect(rt, x.handle()).map(|i| i.value), Some(Hooked(1)));
     let mut builder = MemoBuilder::<C>::new(memo_options());
     let t = builder.table::<u32, u32>("t", 1);

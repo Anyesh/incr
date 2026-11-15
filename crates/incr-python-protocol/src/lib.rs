@@ -16,7 +16,7 @@ use pyo3::types::PyTuple;
 use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, Once, PoisonError};
 
 use incr_core::{
     Cells, Cycle, CycleStrategy, Fixpoint, Pair, QueryOpts, Replay, RoutingFailed, Runtime,
@@ -151,6 +151,37 @@ impl Drop for RestoreActive {
     fn drop(&mut self) {
         ACTIVE_RT.with(|a| a.set(self.0));
     }
+}
+
+/// Installs, once, a panic hook that stays silent for the value-code
+/// contract panics while a `pyerr_boundary` is active on the thread, since
+/// the boundary turns it into a `RuntimeError` carrying the same message.
+/// Every other panic reaches the hook that was installed before.
+pub fn install_panic_hook() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !(in_boundary() && is_contract_panic(info.payload())) {
+                previous(info);
+            }
+        }));
+    });
+}
+
+fn in_boundary() -> bool {
+    BOUNDARY_DEPTH.try_with(|d| d.get() > 0).unwrap_or(false)
+}
+
+fn is_contract_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = match payload.downcast_ref::<String>() {
+        Some(message) => message.as_str(),
+        None => match payload.downcast_ref::<&str>() {
+            Some(message) => message,
+            None => return false,
+        },
+    };
+    incr_core::is_contract_panic_message(message)
 }
 
 /// Marks a `pyerr_boundary` in progress; the outermost one drops every

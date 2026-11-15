@@ -65,7 +65,9 @@ pub enum Error {
 
     /// A store method was called on a thread that is already inside a call
     /// of the same store, such as from the `Drop` of a value the engine
-    /// dropped under the store's lock, or from a subscriber. Nothing was
+    /// dropped under the store's lock, or from a subscriber, or from value
+    /// code (`Hash`, `Eq`, `Clone`, `Serialize` of a value) before the
+    /// store's lock. Nothing was
     /// done. The outer call is unaffected, unless the refused call consumed
     /// a [`StagedBatch`](crate::StagedBatch) or an
     /// [`UnloggedScope`](crate::UnloggedScope) that then drops unfinished,

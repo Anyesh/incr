@@ -21,7 +21,7 @@ use incr_core::{CycleStrategy, Fixpoint, Incr, QueryOpts};
 use incr_persist::memo::{
     BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoValue, MemoryMemo,
 };
-use incr_persist::{Local, MemoryBackend, Options, Shared, Store};
+use incr_persist::{Error, Local, MemoryBackend, Options, Shared, Store};
 use serde::{Deserialize, Serialize};
 
 const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
@@ -67,7 +67,7 @@ macro_rules! in_child {
 }
 
 in_child!(
-    insert_whose_element_hash_checkpoints: assert_panicked_with(super::CONTRACT_MESSAGE),
+    insert_whose_element_hash_checkpoints: assert_clean,
     insert_whose_element_hash_sets_an_external: assert_panicked_with(super::CONTRACT_MESSAGE),
     insert_whose_element_hash_restores_an_entry: assert_panicked_with(super::CONTRACT_MESSAGE),
     a_declare_catches_up_a_foreign_insert_under_a_memo: assert_clean,
@@ -580,8 +580,8 @@ fn a_compute_calling_restored_keys_while_a_subscriber_waits_on_it() {
 /// `store.batch`. Reads never wait on a set's claim, but the subscriber's
 /// own `set` waits on it. The setting thread has no frame, so only the
 /// value-code check in `Store::state()` stops it before it requests S:
-/// its `set` panics with the contract message before writing, and the
-/// subscriber's read and `set` complete.
+/// its `batch` returns `Error::Reentrant`, the `set` goes on and writes,
+/// and the subscriber's read and `set` complete.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_set_whose_partial_eq_batches_while_a_subscriber_sets_it() {
@@ -615,27 +615,23 @@ fn a_set_whose_partial_eq_batches_while_a_subscriber_sets_it() {
                             Arc::clone(&comparing),
                             Arc::clone(&waiting),
                         );
+                        let refused = Arc::new(AtomicBool::new(false));
+                        let flag = Arc::clone(&refused);
                         arm(move || {
                             entered.store(true, SeqCst);
                             wait_for(&waited);
                             thread::sleep(SETTLE);
-                            let _ = batching.batch(|_| {});
+                            let result = batching.batch(|_| {});
+                            flag.store(matches!(result, Err(Error::Reentrant)), SeqCst);
                         });
-                        catch_unwind(AssertUnwindSafe(|| {
-                            store.runtime().set(x, Compared(u32::MAX))
-                        }))
+                        store.runtime().set(x, Compared(round));
+                        refused.load(SeqCst)
                     });
                     wait_for(&comparing);
                     store.set(tick, round + 1).unwrap();
-                    let message = panic_message(
-                        setter
-                            .join()
-                            .unwrap()
-                            .expect_err("the PartialEq's store call was allowed"),
-                    );
                     assert!(
-                        message.contains(CONTRACT_MESSAGE),
-                        "expected the contract panic, got: {message}"
+                        setter.join().unwrap(),
+                        "the PartialEq's store call was allowed"
                     );
                 });
                 assert_eq!(seen.lock().unwrap().pop(), Some(round));
@@ -676,11 +672,11 @@ fn insert_whose_element_hash_calls<C: MemoCells>(
 }
 
 /// Checkpoint's snapshot would request a `DepIndex` read hold on the lock
-/// its own thread holds for writing; the value-code check refuses it
-/// before lock 1.
+/// its own thread holds for writing; the value-code check returns
+/// `Error::Reentrant` before lock 1.
 fn insert_whose_element_hash_checkpoints<C: MemoCells>() {
     insert_whose_element_hash_calls::<C>(|memo, _| {
-        let _ = memo.checkpoint();
+        assert!(matches!(memo.checkpoint(), Err(Error::Reentrant)));
     });
 }
 
