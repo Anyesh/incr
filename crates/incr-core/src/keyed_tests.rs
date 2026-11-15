@@ -1148,6 +1148,59 @@ fn a_removed_key_without_readers_is_reclaimed_on_local_only<C: Cells>() {
     assert_eq!(rt.get(kept), None);
 }
 
+fn forget_key_frees_the_input_of_a_never_written_key<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    assert_eq!(kc.version_input_count(), 0);
+    let (reader, _) = key_reader(&rt, &kc, 9);
+    assert_eq!(rt.get(reader), None);
+    assert_eq!(kc.version_input_count(), 1);
+    let handle = kc.version_input(&9).unwrap();
+
+    assert!(!kc.forget_key(&rt, &9), "a live reader keeps the input");
+    assert_eq!(kc.version_input_count(), 1);
+
+    kc.upsert(&rt, 9, 90);
+    assert_eq!(rt.get(reader), Some(90), "the kept input still invalidates");
+
+    rt.try_delete_node(reader).unwrap();
+    if C::SINGLE_THREADED {
+        kc.upsert(&rt, 9, 91);
+        assert_eq!(kc.version_input_count(), 1, "a held key keeps its input");
+        assert!(!kc.forget_key(&rt, &9));
+        kc.remove(&rt, &9);
+        assert_eq!(kc.version_input_count(), 0);
+    } else {
+        assert!(!kc.forget_key(&rt, &9));
+        assert_eq!(kc.version_input_count(), 1);
+        assert_eq!(kc.version_input(&9), Some(handle));
+    }
+}
+
+fn forget_key_of_an_unread_or_orphaned_key<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    assert!(!kc.forget_key(&rt, &1), "no input");
+    let (reader, _) = key_reader(&rt, &kc, 1);
+    rt.get(reader);
+    rt.try_delete_node(reader).unwrap();
+    let handle = kc.version_input(&1).unwrap();
+    assert_eq!(kc.forget_key(&rt, &1), C::SINGLE_THREADED);
+    if C::SINGLE_THREADED {
+        assert_eq!(kc.version_input_count(), 0);
+        assert_eq!(kc.version_input(&1), None);
+        assert!(!rt.is_alive(handle));
+        assert_eq!(kc.key_of_version(handle.erase()), None);
+        assert!(!kc.forget_key(&rt, &1), "already freed");
+    } else {
+        assert_eq!(kc.version_input_count(), 1);
+    }
+    let (again, _) = key_reader(&rt, &kc, 1);
+    assert_eq!(rt.get(again), None);
+    kc.upsert(&rt, 1, 5);
+    assert_eq!(rt.get(again), Some(5));
+}
+
 fn a_keyed_write_inside_a_compute_is_refused<C: Cells>() {
     let rt = Arc::new(Runtime::<C>::new());
     let kc = Plain::<C>::new(&rt);
@@ -1215,6 +1268,8 @@ for_both!(
     version_inputs_map_back_to_their_keys,
     batched_key_and_rank_reads_run_in_one_stretch,
     a_removed_key_without_readers_is_reclaimed_on_local_only,
+    forget_key_frees_the_input_of_a_never_written_key,
+    forget_key_of_an_unread_or_orphaned_key,
     a_keyed_write_inside_a_compute_is_refused,
     one_upsert_among_many_keys_reruns_one_reader,
 );
