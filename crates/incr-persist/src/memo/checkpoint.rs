@@ -1,12 +1,11 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::layers::{self, Live, Probe};
 use super::{
-    decode_entry, fingerprint, key_hash, Chain, DeltaHeader, EncodedEntry, Entry, GenHeader, GenId,
-    Generation, IndexItem, MemoBackend, StoredDep, TableDesc, Tombstone,
+    decode_entry, fingerprint, key_hash, retag_frame, Chain, DeltaHeader, EncodedEntry, Entry,
+    GenHeader, GenId, Generation, IndexItem, MemoBackend, StoredDep, TableDesc, Tombstone,
 };
 use crate::{Error, Result};
 
@@ -110,6 +109,8 @@ pub struct Checkpointed {
     /// The `(table, key)` of every base entry eviction dropped, tables in
     /// the input catalog's numbering extended by carried-over tables.
     pub(crate) evicted_base: Vec<(u32, Vec<u8>)>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) mode: Mode,
 }
 
 /// Runs a checkpoint's write step against `backend`: takes the checkpoint
@@ -248,7 +249,13 @@ fn write_delta<B: MemoBackend + ?Sized>(
         chain_depth: chain.depth() + 1,
         ..CheckpointStats::default()
     };
-    let held = held_in_chain(backend, chain, &input.fresh, &to_base)?;
+    let held = held_in_chain(
+        backend,
+        chain.layers(),
+        &input.fresh,
+        |table| to_base.get(table as usize).copied(),
+        |_| true,
+    )?;
     let unkept = unkept(&input.fresh, &held);
     drop(held);
     let mut fates = vec![Fate::Written; input.fresh.len()];
@@ -309,6 +316,7 @@ fn write_delta<B: MemoBackend + ?Sized>(
             stats,
             fates,
             evicted_base: Vec::new(),
+            mode: Mode::Delta,
         }));
     }
     let bytes: u64 = written.iter().map(|e| e.frame.len() as u64).sum();
@@ -348,6 +356,7 @@ fn write_delta<B: MemoBackend + ?Sized>(
         stats,
         fates,
         evicted_base: Vec::new(),
+        mode: Mode::Delta,
     }))
 }
 
@@ -363,38 +372,66 @@ fn renumber(entry: &mut Entry, to_base: &[u32]) {
 }
 
 /// The fps of the stored entries the fresh entries' query deps name, read
-/// through `chain` newest first; deps are keyed in the live catalog.
+/// through `layers` newest first. Deps are keyed in the live catalog;
+/// `to_chain` maps a live table to the chain's, and only entries `keep`
+/// accepts count.
 fn held_in_chain<'a, B: MemoBackend + ?Sized>(
     backend: &B,
-    chain: &Chain,
+    layers: &[Arc<Generation>],
     fresh: &'a [Entry],
-    to_base: &[u32],
+    to_chain: impl Fn(u32) -> Option<u32>,
+    keep: impl Fn(&Entry) -> bool,
 ) -> Result<Held<'a>> {
     let mut fps = HashMap::new();
+    let mut missing = HashSet::new();
     for entry in fresh {
         for (dep, _) in query_deps(entry) {
-            if fps.contains_key(&dep) {
+            if fps.contains_key(&dep) || missing.contains(&dep) {
                 continue;
             }
-            let Some(&table) = to_base.get(dep.0 as usize) else {
+            let Some(table) = to_chain(dep.0) else {
                 continue;
             };
-            let probe = layers::probe(chain.layers(), table, dep.1, |id, item| {
+            let probe = layers::probe(layers, table, dep.1, |id, item| {
                 backend.read_entry(id, item)
             })?;
-            if let Probe::Found(stored) = probe {
-                fps.insert(dep, fingerprint(&stored.value));
+            match probe {
+                Probe::Found(stored) if keep(&stored) => {
+                    fps.insert(dep, fingerprint(&stored.value));
+                }
+                _ => {
+                    missing.insert(dep);
+                }
             }
         }
     }
-    Ok(Held {
-        at: HashMap::new(),
-        fps: RefCell::new(fps),
-    })
+    Ok(Held { fps })
 }
 
+/// How a full write carried the chain's entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// No full write: a delta, or nothing written.
+    Delta,
+    /// One streamed pass over the chain, newest layer first: each frame
+    /// retagged, or decoded, renumbered and re-encoded when `remap`.
+    Copy { remap: bool },
+    /// A pass that keeps only each visible entry's metadata, to evict or
+    /// to drop the dependents of an oversized fresh entry, then a streamed
+    /// pass over the entries that stay.
+    TwoPass { remap: bool },
+}
+
+/// Frames a full write reads from the chain per
+/// [`MemoBackend::read_entries`] call.
+pub(crate) const STREAM_BATCH: usize = 256;
+
 /// Writes the next full generation from `input` and, when `merged`, every
-/// entry `chain` shows that was not rewritten.
+/// entry `chain` shows that was not rewritten, streaming the chain's
+/// frames into the write a batch at a time. Eviction runs when the result
+/// would exceed `max_bytes`, down to 0.9 of it on a backend with deltas so
+/// that the next checkpoints have room for deltas, and down to `max_bytes`
+/// on one without.
 fn write_full<B: MemoBackend + ?Sized>(
     backend: &B,
     chain: Option<&Chain>,
@@ -405,93 +442,122 @@ fn write_full<B: MemoBackend + ?Sized>(
 ) -> Result<Checkpointed> {
     let seq = next.seq;
     let mut stats = CheckpointStats::default();
-    let mut tables = input.tables;
-    let based = match chain.filter(|_| merged) {
-        Some(chain) => read_chain(backend, chain.layers(), &mut tables, &mut stats)?,
-        None => Vec::new(),
+    let layers: &[Arc<Generation>] = match chain.filter(|_| merged) {
+        Some(chain) => chain.layers(),
+        None => &[],
     };
-    let unkept = unkept(&input.fresh, &Held::new(&based));
+    let mut tables = input.tables;
+    let mut remaps = vec![Vec::new(); layers.len()];
+    for (at, layer) in layers.iter().enumerate().rev() {
+        remaps[at] = remap_into(layer.header(), &mut tables);
+    }
+    let remap = remaps
+        .iter()
+        .any(|remap| (0..).zip(remap).any(|(i, &to)| to != Some(i)));
+
+    let held = match layers.first() {
+        Some(base) => held_in_chain(
+            backend,
+            layers,
+            &input.fresh,
+            |table| base.header().table_index(&tables[table as usize]),
+            |stored| decodes_into(stored, &remaps[0]),
+        )?,
+        None => Held::none(),
+    };
+    let unkept = unkept(&input.fresh, &held);
+    drop(held);
     let mut fates = vec![Fate::Written; input.fresh.len()];
-    let mut entries: Vec<Entry> = Vec::with_capacity(input.fresh.len() + based.len());
-    let mut origin: Vec<Option<usize>> = Vec::with_capacity(entries.capacity());
+    let mut fresh = Vec::with_capacity(input.fresh.len());
+    let mut origin = Vec::with_capacity(input.fresh.len());
     for (i, (mut entry, drop)) in input.fresh.into_iter().zip(unkept).enumerate() {
         if drop {
             stats.unkept += 1;
             fates[i] = Fate::Unkept;
         } else {
             entry.last_used = seq;
-            entries.push(entry);
-            origin.push(Some(i));
+            fresh.push(entry);
+            origin.push(i);
         }
     }
-    let mut present: HashSet<(u32, Vec<u8>)> =
-        entries.iter().map(|e| (e.table, e.key.clone())).collect();
-    for entry in based {
-        if present.insert((entry.table, entry.key.clone())) {
-            stats.merged += 1;
-            entries.push(entry);
-            origin.push(None);
-        }
-    }
-    drop(present);
-    let merged_at = Instant::now();
-    stats.times.merge = merged_at - next.started;
-
     let header = GenHeader {
         build: input.build,
         seq,
         tables,
     };
     let tag = header.frame_tag();
-    let encode = |entry: &Entry| encode(entry, tag);
-    let frames = encode_fitting(&entries, encode, &mut stats.oversized)?;
-    let mut fitting = Vec::with_capacity(entries.len());
-    let mut fitting_origin = Vec::with_capacity(entries.len());
-    let mut encoded = Vec::with_capacity(entries.len());
-    for ((entry, from), frame) in entries.into_iter().zip(origin).zip(frames) {
-        match frame {
-            Some(frame) => {
-                fitting.push(entry);
-                fitting_origin.push(from);
-                encoded.push(frame);
-            }
-            None => {
-                if let Some(i) = from {
-                    fates[i] = Fate::Oversized;
-                }
-            }
+    let frames = encode_fitting(&fresh, |entry| encode(entry, tag), &mut stats.oversized)?;
+    for (frame, &i) in frames.iter().zip(&origin) {
+        if frame.is_none() {
+            fates[i] = Fate::Oversized;
         }
     }
-    let sizes: Vec<u64> = encoded.iter().map(|e| e.frame.len() as u64).collect();
-    let evicted = evict(&fitting, &sizes, input.max_bytes);
+    let contested = contested(layers, &remaps, &fresh);
+    let target = if backend.supports_delta() {
+        input.max_bytes - input.max_bytes / 10
+    } else {
+        input.max_bytes
+    };
+    let evicting = shown_bytes(layers, &header.tables, &fresh, &frames) > input.max_bytes;
+    let two_pass = evicting || frames.iter().any(Option::is_none);
+
+    let source = Source {
+        backend,
+        layers,
+        remaps: &remaps,
+        remap,
+        tag,
+        encode: &encode,
+    };
     let mut evicted_base = Vec::new();
-    let mut kept = Vec::with_capacity(encoded.len());
-    for (((entry, from), frame), gone) in fitting
-        .into_iter()
-        .zip(fitting_origin)
-        .zip(encoded)
-        .zip(evicted)
-    {
-        if !gone {
-            kept.push(frame);
-            continue;
+    let (mut copier, mode) = if two_pass {
+        let stored = scan(&source, &fresh, &contested, &mut stats)?;
+        stats.merged = stored.len();
+        let bound = Bound {
+            max_bytes: input.max_bytes,
+            target,
+        };
+        let chosen = choose(
+            &fresh, frames, stored, bound, &origin, &mut fates, &mut stats,
+        );
+        let mut picked = vec![Vec::new(); layers.len()];
+        for meta in chosen.stored {
+            picked[meta.layer].push(meta.item);
         }
-        stats.evicted += 1;
-        match from {
-            Some(i) => fates[i] = Fate::Evicted,
-            None => evicted_base.push((entry.table, entry.key)),
-        }
-    }
-    stats.written = kept.len();
-    stats.fresh_written = fates.iter().filter(|&&f| f == Fate::Written).count();
-    stats.bytes_appended = kept.iter().map(|e| e.frame.len() as u64).sum();
+        evicted_base = chosen.evicted_base;
+        let kept = chosen.fresh;
+        let walk = Walk::new(&source, Some(picked));
+        (Copier::new(walk, kept, None), Mode::TwoPass { remap })
+    } else {
+        let kept = frames.into_iter().flatten().collect();
+        let walk = Walk::new(&source, None);
+        let seen = fresh
+            .iter()
+            .map(|entry| (entry.table, entry.key.clone()))
+            .collect();
+        let copy = Copier::new(walk, kept, Some((contested, seen)));
+        (copy, Mode::Copy { remap })
+    };
+    drop(fresh);
+    let merged_at = Instant::now();
+    stats.times.merge = merged_at - next.started;
+
     let superseded: Vec<GenId> = chain
         .map(|chain| chain.layers().iter().map(|layer| layer.id()).collect())
         .unwrap_or_default();
-    stats.compacted = superseded.len() > 1;
     let tip = chain.map(|chain| chain.tip().id());
-    let generation = Arc::new(backend.write_generation(tip, next.id, &header, &kept)?);
+    let generation = backend.write_generation_streamed(tip, next.id, &header, &mut copier)?;
+    stats.corrupt += copier.corrupt;
+    stats.oversized += copier.oversized;
+    if !two_pass {
+        stats.merged = copier.carried + copier.oversized;
+    }
+    stats.written = generation.entry_count() as usize;
+    stats.fresh_written = fates.iter().filter(|&&f| f == Fate::Written).count();
+    stats.bytes_appended = generation.entry_bytes();
+    stats.compacted = superseded.len() > 1;
     stats.times.write = merged_at.elapsed();
+    let generation = Arc::new(generation);
     Ok(Checkpointed {
         chain: Chain::new(vec![Arc::clone(&generation)])?,
         generation,
@@ -499,7 +565,549 @@ fn write_full<B: MemoBackend + ?Sized>(
         stats,
         fates,
         evicted_base,
+        mode,
     })
+}
+
+/// When a two-pass write evicts: once its entries sum to more than
+/// `max_bytes`, down to `target`.
+#[derive(Clone, Copy)]
+struct Bound {
+    max_bytes: u64,
+    target: u64,
+}
+
+/// What a two-pass write carries once oversized entries' dependents and
+/// evicted entries are gone.
+struct Chosen {
+    /// The fitting fresh frames that stay.
+    fresh: Vec<EncodedEntry>,
+    /// The chain entries that stay, in scan order.
+    stored: Vec<Meta>,
+    /// The `(table, key)` of every chain entry evicted.
+    evicted_base: Vec<(u32, Vec<u8>)>,
+}
+
+/// Drops every entry that reads an oversized fresh entry transitively,
+/// then evicts within `bound`, recording each fresh entry's fate.
+/// `frames[i]` is fresh entry `i`'s frame, `None` when it was too large,
+/// and `origin[i]` its index in the checkpoint's input.
+fn choose(
+    fresh: &[Entry],
+    frames: Vec<Option<EncodedEntry>>,
+    stored: Vec<Meta>,
+    bound: Bound,
+    origin: &[usize],
+    fates: &mut [Fate],
+    stats: &mut CheckpointStats,
+) -> Chosen {
+    let nodes: Vec<Node> = fresh
+        .iter()
+        .zip(&frames)
+        .map(|(entry, frame)| {
+            let size = frame.as_ref().map_or(0, |f| f.frame.len() as u64);
+            Node::of(entry, size)
+        })
+        .chain(stored.iter().map(Meta::node))
+        .collect();
+    let dependents = node_edges(&nodes);
+    let mut dropped = vec![false; nodes.len()];
+    for root in (0..fresh.len()).filter(|&i| frames[i].is_none()) {
+        mark_with_dependents(&dependents, &mut dropped, root, |j| match frames.get(j) {
+            Some(None) => {}
+            Some(Some(_)) => {
+                fates[origin[j]] = Fate::Oversized;
+                stats.oversized += 1;
+            }
+            None => stats.oversized += 1,
+        });
+    }
+    let evicted = evict(&nodes, &dependents, &dropped, bound.max_bytes, bound.target);
+    drop(nodes);
+    let mut gone = dropped.into_iter().zip(evicted);
+    let mut chosen = Chosen {
+        fresh: Vec::new(),
+        stored: Vec::new(),
+        evicted_base: Vec::new(),
+    };
+    for ((i, frame), (dropped, evicted)) in frames.into_iter().enumerate().zip(gone.by_ref()) {
+        match frame {
+            Some(_) if dropped => {}
+            Some(_) if evicted => {
+                stats.evicted += 1;
+                fates[origin[i]] = Fate::Evicted;
+            }
+            Some(frame) => chosen.fresh.push(frame),
+            None => {}
+        }
+    }
+    for (meta, (dropped, evicted)) in stored.into_iter().zip(gone) {
+        if dropped {
+            continue;
+        }
+        if evicted {
+            stats.evicted += 1;
+            chosen.evicted_base.push((meta.table, meta.key));
+        } else {
+            chosen.stored.push(meta);
+        }
+    }
+    chosen
+}
+
+/// Whether every query dep of the stored `entry` names a table that
+/// survives `remap`, so a full write would carry it.
+fn decodes_into(entry: &Entry, remap: &[Option<u32>]) -> bool {
+    entry.deps.iter().all(|dep| match dep {
+        StoredDep::Query { table, .. } => remap.get(*table as usize).copied().flatten().is_some(),
+        _ => true,
+    })
+}
+
+/// The `(table, key_hash)`, in the new catalog, of every fresh entry and
+/// every delta item: the only places two layers, or a layer and a fresh
+/// entry, can hold the same key, so only these keys are compared.
+fn contested(
+    layers: &[Arc<Generation>],
+    remaps: &[Vec<Option<u32>>],
+    fresh: &[Entry],
+) -> HashSet<(u32, u64)> {
+    let mut out: HashSet<(u32, u64)> = fresh
+        .iter()
+        .map(|entry| (entry.table, key_hash(&entry.key)))
+        .collect();
+    for (layer, remap) in layers.iter().zip(remaps).skip(1) {
+        for item in layer.items().iter().filter(|item| !item.is_tombstone()) {
+            if let Some(table) = remap.get(item.table as usize).copied().flatten() {
+                out.insert((table, item.key_hash));
+            }
+        }
+    }
+    out
+}
+
+/// The summed frame lengths of the fitting fresh entries and of what
+/// `layers` show once the fresh keys replace theirs, by key hash as
+/// [`Live`] counts. Fresh tables are in `tables`, the new catalog.
+fn shown_bytes(
+    layers: &[Arc<Generation>],
+    tables: &[TableDesc],
+    fresh: &[Entry],
+    frames: &[Option<EncodedEntry>],
+) -> u64 {
+    let fresh_bytes: u64 = frames.iter().flatten().map(|f| f.frame.len() as u64).sum();
+    let Some(base) = layers.first() else {
+        return fresh_bytes;
+    };
+    let mut shadow: Vec<IndexItem> = fresh
+        .iter()
+        .filter_map(|entry| {
+            let table = base.header().table_index(&tables[entry.table as usize])?;
+            Some(IndexItem::tombstone(table, key_hash(&entry.key)))
+        })
+        .collect();
+    shadow.sort_unstable_by_key(|item| (item.table, item.key_hash));
+    let shown = Live::of_chain(layers).with_layer(layers, &shadow);
+    fresh_bytes.saturating_add(shown.bytes)
+}
+
+/// What a full write reads the chain from and how it carries a frame.
+struct Source<'a, B: ?Sized, E> {
+    backend: &'a B,
+    layers: &'a [Arc<Generation>],
+    /// Per layer, its catalog mapped into the new one.
+    remaps: &'a [Vec<Option<u32>>],
+    /// Some table moves, so frames are decoded and re-encoded instead of
+    /// retagged.
+    remap: bool,
+    tag: u64,
+    encode: &'a E,
+}
+
+enum Carried {
+    Frame(EncodedEntry),
+    /// Its table or a query dep's table did not survive.
+    Dropped,
+    Corrupt,
+    TooLarge,
+}
+
+impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Source<'_, B, E> {
+    /// `frame` of `item` in layer `at` as a frame of the new generation,
+    /// with its key when `with_key`.
+    fn carry(
+        &self,
+        at: usize,
+        item: &IndexItem,
+        frame: &[u8],
+        with_key: bool,
+    ) -> Result<(Carried, Option<Vec<u8>>)> {
+        let layer = &self.layers[at];
+        if !self.remap {
+            let carried = retag_frame(frame, layer.frame_tag(), self.tag)
+                .ok()
+                .filter(|e| e.table == item.table && e.key_hash == item.key_hash);
+            let Some(carried) = carried else {
+                return Ok((Carried::Corrupt, None));
+            };
+            if !with_key {
+                return Ok((Carried::Frame(carried), None));
+            }
+            return Ok(match decode_entry(frame, layer.frame_tag()) {
+                Ok(entry) => (Carried::Frame(carried), Some(entry.key)),
+                Err(_) => (Carried::Corrupt, None),
+            });
+        }
+        let mut corrupt = 0;
+        let entry = match decode_stored(frame, layer, item, &self.remaps[at], &mut corrupt) {
+            Stored::Kept(entry) => entry,
+            Stored::Dropped => return Ok((Carried::Dropped, None)),
+            Stored::Corrupt => return Ok((Carried::Corrupt, None)),
+        };
+        let key = with_key.then(|| entry.key.clone());
+        match (self.encode)(&entry, self.tag) {
+            Ok(frame) => Ok((Carried::Frame(frame), key)),
+            Err(Error::FrameTooLarge { .. }) => Ok((Carried::TooLarge, None)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Items read from one layer, the layer's index first, each with its frame.
+type Batch = (usize, Vec<(IndexItem, Vec<u8>)>);
+
+/// The contested `(table, key_hash)` and the keys already carried or fresh
+/// among them.
+type Dedup = (HashSet<(u32, u64)>, HashSet<(u32, Vec<u8>)>);
+
+/// Reads the chain's items newest layer first, each layer in frame order,
+/// [`STREAM_BATCH`] at a time. A layer's tombstones, and the items the
+/// reader [`hide`](Self::hide)s, hide the items of older layers with the
+/// same table and key hash. With `picked`, only those items are read.
+struct Walk<'s, 'a, B: ?Sized, E> {
+    source: &'s Source<'a, B, E>,
+    picked: Option<Vec<Vec<IndexItem>>>,
+    /// Layers not yet started; the next is `layers[unstarted - 1]`.
+    unstarted: usize,
+    current: Option<(usize, std::vec::IntoIter<IndexItem>)>,
+    hidden: HashSet<(u32, u64)>,
+    hides: Vec<(u32, u64)>,
+    gone: bool,
+}
+
+impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
+    fn new(source: &'s Source<'a, B, E>, picked: Option<Vec<Vec<IndexItem>>>) -> Self {
+        Walk {
+            source,
+            picked,
+            unstarted: source.layers.len(),
+            current: None,
+            hidden: HashSet::new(),
+            hides: Vec::new(),
+            gone: false,
+        }
+    }
+
+    /// `item`'s table in the new catalog, if it survives.
+    fn table(&self, at: usize, item: &IndexItem) -> Option<u32> {
+        self.source.remaps[at]
+            .get(item.table as usize)
+            .copied()
+            .flatten()
+    }
+
+    fn hide(&mut self, table: u32, key_hash: u64) {
+        self.hides.push((table, key_hash));
+    }
+
+    /// The next batch of `(item, frame)` with the layer they are from, or
+    /// `None` at the end or once a layer is gone, as when another handle
+    /// removed the chain: nothing more can be carried then.
+    fn next_batch(&mut self) -> Result<Option<Batch>> {
+        loop {
+            if self.gone {
+                return Ok(None);
+            }
+            let Some((at, items)) = self.current.as_mut() else {
+                if !self.start_layer() {
+                    return Ok(None);
+                }
+                continue;
+            };
+            let at = *at;
+            let remaps = self.source.remaps;
+            let hidden = &self.hidden;
+            let batch: Vec<IndexItem> = items
+                .by_ref()
+                .filter(|item| {
+                    remaps[at]
+                        .get(item.table as usize)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|table| !hidden.contains(&(table, item.key_hash)))
+                })
+                .take(STREAM_BATCH)
+                .collect();
+            if batch.is_empty() {
+                self.current = None;
+                continue;
+            }
+            let layer = &self.source.layers[at];
+            let frames = self.source.backend.read_entries(layer.id(), &batch)?;
+            let mut out = Vec::with_capacity(batch.len());
+            for (item, frame) in batch.into_iter().zip(frames) {
+                let Some(frame) = frame else {
+                    self.gone = true;
+                    break;
+                };
+                out.push((item, frame));
+            }
+            return Ok(Some((at, out)));
+        }
+    }
+
+    /// Commits the finished layer's hides and starts the next older one,
+    /// or returns `false` when none is left.
+    fn start_layer(&mut self) -> bool {
+        self.hidden.extend(self.hides.drain(..));
+        if self.unstarted == 0 {
+            return false;
+        }
+        self.unstarted -= 1;
+        let at = self.unstarted;
+        let items = match self.picked.as_mut() {
+            Some(picked) => std::mem::take(&mut picked[at]),
+            None => {
+                let layer = &self.source.layers[at];
+                let mut items = Vec::with_capacity(layer.items().len());
+                for item in layer.items() {
+                    if !item.is_tombstone() {
+                        items.push(*item);
+                    } else if let Some(table) = self.table(at, item) {
+                        self.hides.push((table, item.key_hash));
+                    }
+                }
+                items.sort_unstable_by_key(|item| item.loc);
+                items
+            }
+        };
+        self.current = Some((at, items.into_iter()));
+        true
+    }
+}
+
+/// The frames of a full write: the fresh ones, then the chain's, pulled a
+/// batch at a time. With `dedup`, the chain's entries are chosen as they
+/// come, as a newest-first probe sees them; without it the walk reads only
+/// entries a scan picked.
+struct Copier<'s, 'a, B: ?Sized, E> {
+    walk: Walk<'s, 'a, B, E>,
+    fresh: std::vec::IntoIter<EncodedEntry>,
+    pending: VecDeque<EncodedEntry>,
+    dedup: Option<Dedup>,
+    carried: usize,
+    corrupt: usize,
+    oversized: usize,
+}
+
+impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>
+    Copier<'s, 'a, B, E>
+{
+    fn new(walk: Walk<'s, 'a, B, E>, fresh: Vec<EncodedEntry>, dedup: Option<Dedup>) -> Self {
+        Copier {
+            walk,
+            fresh: fresh.into_iter(),
+            pending: VecDeque::new(),
+            dedup,
+            carried: 0,
+            corrupt: 0,
+            oversized: 0,
+        }
+    }
+
+    /// Carries the walk's next batch into `pending`; `false` at the end.
+    fn fill(&mut self) -> Result<bool> {
+        let Some((at, batch)) = self.walk.next_batch()? else {
+            return Ok(false);
+        };
+        let source = self.walk.source;
+        for (item, frame) in batch {
+            let table = self.walk.table(at, &item).expect("walked items survive");
+            let contested = self
+                .dedup
+                .as_ref()
+                .is_some_and(|(contested, _)| contested.contains(&(table, item.key_hash)));
+            let (carried, key) = source.carry(at, &item, &frame, contested)?;
+            match carried {
+                Carried::Frame(frame) => {
+                    if let (Some((_, seen)), Some(key)) = (self.dedup.as_mut(), key) {
+                        if !seen.insert((table, key)) {
+                            continue;
+                        }
+                    }
+                    self.carried += 1;
+                    self.pending.push_back(frame);
+                }
+                Carried::Dropped => self.walk.hide(table, item.key_hash),
+                Carried::Corrupt => {
+                    self.corrupt += 1;
+                    self.walk.hide(table, item.key_hash);
+                }
+                Carried::TooLarge => {
+                    self.oversized += 1;
+                    self.walk.hide(table, item.key_hash);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Iterator
+    for Copier<'_, '_, B, E>
+{
+    type Item = Result<EncodedEntry>;
+
+    fn next(&mut self) -> Option<Result<EncodedEntry>> {
+        if let Some(frame) = self.fresh.next() {
+            return Some(Ok(frame));
+        }
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(Ok(frame));
+            }
+            match self.fill() {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// A chain entry a two-pass write may carry: where its frame is and what
+/// eviction needs, without its value.
+struct Meta {
+    layer: usize,
+    item: IndexItem,
+    /// In the new catalog, as are the deps' tables.
+    table: u32,
+    key: Vec<u8>,
+    deps: Vec<(u32, Vec<u8>)>,
+    last_used: u64,
+    /// Its frame's length in the new generation.
+    size: u64,
+}
+
+impl Meta {
+    fn node(&self) -> Node<'_> {
+        Node {
+            table: self.table,
+            key: &self.key,
+            deps: self.deps.iter().map(|(t, k)| (*t, k.as_slice())).collect(),
+            last_used: self.last_used,
+            size: self.size,
+        }
+    }
+}
+
+/// The first pass of a two-pass write: every entry the chain shows that no
+/// fresh entry replaces, decoded one batch at a time and kept as [`Meta`].
+fn scan<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>(
+    source: &Source<'_, B, E>,
+    fresh: &[Entry],
+    contested: &HashSet<(u32, u64)>,
+    stats: &mut CheckpointStats,
+) -> Result<Vec<Meta>> {
+    let mut seen: HashSet<(u32, Vec<u8>)> = fresh
+        .iter()
+        .map(|entry| (entry.table, entry.key.clone()))
+        .collect();
+    let mut walk = Walk::new(source, None);
+    let mut out = Vec::new();
+    while let Some((at, batch)) = walk.next_batch()? {
+        let layer = &source.layers[at];
+        for (item, frame) in batch {
+            let table = walk.table(at, &item).expect("walked items survive");
+            let stored =
+                decode_stored(&frame, layer, &item, &source.remaps[at], &mut stats.corrupt);
+            let entry = match stored {
+                Stored::Kept(entry) => entry,
+                Stored::Dropped | Stored::Corrupt => {
+                    walk.hide(table, item.key_hash);
+                    continue;
+                }
+            };
+            if contested.contains(&(table, item.key_hash))
+                && !seen.insert((entry.table, entry.key.clone()))
+            {
+                continue;
+            }
+            let size = if source.remap {
+                match (source.encode)(&entry, source.tag) {
+                    Ok(frame) => frame.frame.len() as u64,
+                    Err(Error::FrameTooLarge { .. }) => {
+                        stats.oversized += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                u64::from(item.len)
+            };
+            out.push(Meta {
+                layer: at,
+                item,
+                table: entry.table,
+                deps: query_deps(&entry)
+                    .map(|((t, k), _)| (t, k.to_vec()))
+                    .collect(),
+                key: entry.key,
+                last_used: entry.last_used,
+                size,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// An entry as eviction and the oversized-dependents rule see it.
+struct Node<'a> {
+    table: u32,
+    key: &'a [u8],
+    deps: Vec<(u32, &'a [u8])>,
+    last_used: u64,
+    size: u64,
+}
+
+impl<'a> Node<'a> {
+    fn of(entry: &'a Entry, size: u64) -> Self {
+        Node {
+            table: entry.table,
+            key: &entry.key,
+            deps: query_deps(entry).map(|(dep, _)| dep).collect(),
+            last_used: entry.last_used,
+            size,
+        }
+    }
+}
+
+/// Per node, the nodes that read it through a query dep.
+fn node_edges(nodes: &[Node]) -> Vec<Vec<usize>> {
+    let at: HashMap<Identity, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| ((n.table, n.key), i))
+        .collect();
+    let mut dependents = vec![Vec::new(); nodes.len()];
+    for (i, node) in nodes.iter().enumerate() {
+        for dep in &node.deps {
+            if let Some(&j) = at.get(dep) {
+                dependents[j].push(i);
+            }
+        }
+    }
+    dependents
 }
 
 type Identity<'a> = (u32, &'a [u8]);
@@ -511,42 +1119,22 @@ fn query_deps(entry: &Entry) -> impl Iterator<Item = (Identity<'_>, u128)> {
     })
 }
 
-/// The base entries a fresh entry's query dep may name instead of a
+/// The stored entries a fresh entry's query dep may name instead of a
 /// fresh one: only at the fp of the stored value, which is what a restore
 /// compares, so a dep whose rewrite was not kept does not count.
 struct Held<'a> {
-    at: HashMap<Identity<'a>, &'a Entry>,
-    fps: RefCell<HashMap<Identity<'a>, u128>>,
+    fps: HashMap<Identity<'a>, u128>,
 }
 
 impl<'a> Held<'a> {
-    fn new(based: &'a [Entry]) -> Self {
-        Held {
-            at: based
-                .iter()
-                .map(|e| ((e.table, e.key.as_slice()), e))
-                .collect(),
-            fps: RefCell::new(HashMap::new()),
-        }
-    }
-
     fn none() -> Self {
         Held {
-            at: HashMap::new(),
-            fps: RefCell::new(HashMap::new()),
+            fps: HashMap::new(),
         }
     }
 
     fn holds(&self, dep: Identity<'a>, fp: u128) -> bool {
-        if let Some(&stored) = self.fps.borrow().get(&dep) {
-            return stored == fp;
-        }
-        let Some(entry) = self.at.get(&dep) else {
-            return false;
-        };
-        let stored = fingerprint(&entry.value);
-        self.fps.borrow_mut().insert(dep, stored);
-        stored == fp
+        self.fps.get(&dep) == Some(&fp)
     }
 }
 
@@ -612,90 +1200,6 @@ fn unkept<'a>(entries: &'a [Entry], held: &Held<'a>) -> Vec<bool> {
     out
 }
 
-/// Every entry `layers` (oldest first) show whose table survives, decoded
-/// and renumbered into `tables`, which gains the stored tables with no live
-/// namesake. Newer layers hide older entries of the same key, and a
-/// tombstone, a corrupt frame or a dropped entry those of its table and
-/// key hash. Entries
-/// come grouped by table, older layers first, each layer in frame order.
-fn read_chain<B: MemoBackend + ?Sized>(
-    backend: &B,
-    layers: &[Arc<Generation>],
-    tables: &mut Vec<TableDesc>,
-    stats: &mut CheckpointStats,
-) -> Result<Vec<Entry>> {
-    if let [base] = layers {
-        return read_base(backend, base, tables, stats);
-    }
-    let mut hidden: HashSet<(u32, u64)> = HashSet::new();
-    let mut seen: HashSet<(u32, Vec<u8>)> = HashSet::new();
-    let mut per_layer: Vec<Vec<Entry>> = Vec::with_capacity(layers.len());
-    'layers: for layer in layers.iter().rev() {
-        let remap = remap_into(layer.header(), tables);
-        let remap_table = |table: u32| remap.get(table as usize).copied().flatten();
-        let mut found = Vec::new();
-        let mut hides = Vec::new();
-        let mut items: Vec<&IndexItem> = layer.items().iter().collect();
-        items.sort_unstable_by_key(|item| item.loc);
-        for item in items {
-            let Some(table) = remap_table(item.table) else {
-                continue;
-            };
-            if hidden.contains(&(table, item.key_hash)) {
-                continue;
-            }
-            if item.is_tombstone() {
-                hides.push((table, item.key_hash));
-                continue;
-            }
-            let Some(frame) = backend.read_entry(layer.id(), item)? else {
-                // Another handle removed the chain; nothing more can be merged.
-                per_layer.push(found);
-                break 'layers;
-            };
-            match decode_stored(&frame, layer, item, &remap, stats) {
-                Stored::Kept(entry) => {
-                    if seen.insert((entry.table, entry.key.clone())) {
-                        found.push(entry);
-                    }
-                }
-                Stored::Dropped | Stored::Corrupt => hides.push((table, item.key_hash)),
-            }
-        }
-        hidden.extend(hides);
-        per_layer.push(found);
-    }
-    let mut by_table: Vec<Vec<Entry>> = vec![Vec::new(); tables.len()];
-    for entry in per_layer.into_iter().rev().flatten() {
-        by_table[entry.table as usize].push(entry);
-    }
-    Ok(by_table.into_iter().flatten().collect())
-}
-
-/// Every entry of the full generation `base` whose table survives, decoded
-/// and renumbered into `tables` as [`read_chain`] does.
-fn read_base<B: MemoBackend + ?Sized>(
-    backend: &B,
-    base: &Generation,
-    tables: &mut Vec<TableDesc>,
-    stats: &mut CheckpointStats,
-) -> Result<Vec<Entry>> {
-    let remap = remap_into(base.header(), tables);
-    let mut by_table: Vec<Vec<Entry>> = vec![Vec::new(); tables.len()];
-    let mut items: Vec<&IndexItem> = base.items().iter().collect();
-    items.sort_unstable_by_key(|item| item.loc);
-    for item in items {
-        let Some(frame) = backend.read_entry(base.id(), item)? else {
-            // Another handle removed the base; nothing more can be merged.
-            break;
-        };
-        if let Stored::Kept(entry) = decode_stored(&frame, base, item, &remap, stats) {
-            by_table[entry.table as usize].push(entry);
-        }
-    }
-    Ok(by_table.into_iter().flatten().collect())
-}
-
 enum Stored {
     Kept(Entry),
     /// Its table or a query dep's table did not survive.
@@ -710,14 +1214,14 @@ fn decode_stored(
     layer: &Generation,
     item: &IndexItem,
     remap: &[Option<u32>],
-    stats: &mut CheckpointStats,
+    corrupt: &mut usize,
 ) -> Stored {
     let remap_table = |table: u32| remap.get(table as usize).copied().flatten();
     let entry = decode_entry(frame, layer.frame_tag())
         .ok()
         .filter(|entry| entry.table == item.table && key_hash(&entry.key) == item.key_hash);
     let Some(mut entry) = entry else {
-        stats.corrupt += 1;
+        *corrupt += 1;
         return Stored::Corrupt;
     };
     let Some(table) = remap_table(entry.table) else {
@@ -784,23 +1288,38 @@ fn encode_fitting(
     Ok(encoded)
 }
 
-/// Index `i` is `true` when `entries[i]` must go so that the summed `sizes`
-/// of the rest fit in `max_bytes`. Entries go oldest `last_used` first, ties
-/// in slice order, each with every entry that reads it transitively.
-fn evict(entries: &[Entry], sizes: &[u64], max_bytes: u64) -> Vec<bool> {
-    let mut total: u64 = sizes.iter().sum();
-    let mut out = vec![false; entries.len()];
+/// Index `i` is `true` when node `i` must go, once the nodes `skip` does
+/// not name sum to more than `max_bytes`, so that the rest fit in
+/// `target`. Nodes go oldest `last_used` first, ties in slice order, each
+/// with every node that reads it transitively.
+fn evict(
+    nodes: &[Node],
+    dependents: &[Vec<usize>],
+    skip: &[bool],
+    max_bytes: u64,
+    target: u64,
+) -> Vec<bool> {
+    let mut total: u64 = nodes
+        .iter()
+        .zip(skip)
+        .filter(|(_, &skipped)| !skipped)
+        .map(|(node, _)| node.size)
+        .sum();
+    let mut out = vec![false; nodes.len()];
     if total <= max_bytes {
         return out;
     }
-    let (dependents, _) = query_edges(entries, &Held::none());
-    let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by_key(|&i| (entries[i].last_used, i));
+    let mut marked = skip.to_vec();
+    let mut order: Vec<usize> = (0..nodes.len()).filter(|&i| !skip[i]).collect();
+    order.sort_by_key(|&i| (nodes[i].last_used, i));
     for i in order {
-        if total <= max_bytes {
+        if total <= target {
             break;
         }
-        mark_with_dependents(&dependents, &mut out, i, |j| total -= sizes[j]);
+        mark_with_dependents(dependents, &mut marked, i, |j| {
+            out[j] = true;
+            total -= nodes[j].size;
+        });
     }
     out
 }
