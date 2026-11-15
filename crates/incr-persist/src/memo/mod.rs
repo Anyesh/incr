@@ -41,7 +41,7 @@ pub use checkpoint::{
 };
 pub use codec::*;
 pub use file::{FileMemo, FileMemoGuard};
-pub use generation::{GenId, Generation};
+pub use generation::{Chain, GenId, Generation};
 pub use handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
 pub(crate) use memo_core::Wake;
 pub use memo_core::{MemoCells, MemoStats};
