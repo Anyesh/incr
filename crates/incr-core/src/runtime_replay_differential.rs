@@ -12090,6 +12090,92 @@ fn replay_shrink() {
     );
 }
 
+/// Shrinks the two-thread run of `REPLAY_SEED`'s two-thread case at
+/// budget `REPLAY_FRAMES` (0 for none) frames, `REPLAY_BYTES` bytes, while
+/// one of `SHRINK_TRIES` runs (a race decides it) still fails with a
+/// message containing every `|`-separated part of `SHRINK_NEEDLE`, and
+/// prints the case it ends at.
+#[test]
+#[ignore = "a diagnostic that shrinks one seed's two-thread case"]
+fn replay_shrink_two() {
+    let seed = u64::from_str_radix(&std::env::var("REPLAY_SEED").expect("REPLAY_SEED"), 16)
+        .expect("a hex seed");
+    let frames: u32 = std::env::var("REPLAY_FRAMES").map_or(0, |v| v.parse().expect("frames"));
+    let frames = (frames > 0).then_some(frames);
+    let bytes: usize = std::env::var("REPLAY_BYTES").map_or(0, |v| v.parse().expect("bytes"));
+    let tries: u32 = std::env::var("SHRINK_TRIES").map_or(300, |v| v.parse().expect("tries"));
+    let needle = std::env::var("SHRINK_NEEDLE").unwrap_or_else(|_| "differs".into());
+    let parts: Vec<&str> = needle.split('|').collect();
+    let mut case = gen_case(seed, false, true);
+    let fails = |c: &Case| -> Option<bool> {
+        let phases = phases(c, seed);
+        let serial = Serial::new(c, &phases);
+        let mut other = false;
+        for _ in 0..tries {
+            let r = catch_unwind(AssertUnwindSafe(|| {
+                serial.differential(&budget_label(seed, frames, bytes), frames, bytes, &|_| {});
+            }));
+            if let Err(p) = r {
+                let m = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                if parts.iter().all(|n| m.contains(n)) {
+                    return Some(true);
+                }
+                other |= !m.contains("differs");
+            }
+        }
+        if other {
+            None
+        } else {
+            Some(false)
+        }
+    };
+    let size = |c: &Case| format!("{:?}{:?}", c.specs, c.ops).len();
+    let (mut tried, mut other) = (0, 0);
+    quiet(|| {
+        assert_eq!(
+            fails(&case),
+            Some(true),
+            "seed {seed:#x} does not fail as asked"
+        );
+        loop {
+            let before = size(&case);
+            let next = shrink_case(&case).into_iter().find(|d| {
+                if size(d) >= before {
+                    return false;
+                }
+                tried += 1;
+                match fails(d) {
+                    Some(f) => f,
+                    None => {
+                        other += 1;
+                        false
+                    }
+                }
+            });
+            match next {
+                Some(d) => {
+                    eprintln!("size {}: ops {:?}", size(&d), d.ops);
+                    case = d;
+                }
+                None => break,
+            }
+        }
+    });
+    eprintln!(
+        "SHRUNK seed {seed:#x}: {tried} candidates run, {other} panicked otherwise, size {}",
+        size(&case)
+    );
+    for (i, s) in case.specs.iter().enumerate() {
+        eprintln!("{i}: {s:?}");
+    }
+    eprintln!("ops: {:?}", case.ops);
+    eprintln!("phases: {:?}", phases(&case, seed));
+}
+
 /// Op 9 of `seed` truncated after it, as `(output, Failed set)`, for the
 /// unbounded run and for budget 3, under `C`.
 fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
