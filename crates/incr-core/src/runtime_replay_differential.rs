@@ -3102,13 +3102,14 @@ fn seed_c1c333d3_case() -> Case {
 /// group at 9 with its record then and its external 11, and waits on 16
 /// under op 2's (`TryGet(16)`) claim. Op 2's episode at 17 replaces the
 /// group's record and leaves 16 Dirty. Woken, op 3's walk expands 16 again
-/// and, through it, the replaced record at 17, a second time, so it runs 17
-/// before 11: the cycle is entered at 17, 9's fallback settles it, and op 3
-/// returns `Value(1)` where every order enters it at 11 and op 3 panics
-/// with the cycle. Op 3's walk holds before its visit of 16 until op 2's
-/// thread has claimed 16, which then holds until that walk waits on it.
+/// and reaches the replacing record at 17, which it must not expand a
+/// second time: run before 11, 17 enters the cycle where 9's fallback
+/// settles it and op 3 gets `Value(1)`, where every order enters it at 11
+/// and op 3 panics with the cycle. Op 3's walk holds before its visit of 16
+/// until op 2's thread has claimed 16, which then holds until that walk
+/// waits on it.
 #[test]
-#[ignore = "F-2T: a walk woken on a non-root entry expands a replaced group record at a second member"]
+#[cfg_attr(miri, ignore)]
 fn seed_c1c333d3_two_threads_match_an_order() {
     let case = seed_c1c333d3_case();
     let phases = [
