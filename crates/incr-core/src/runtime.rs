@@ -1115,9 +1115,9 @@ struct Expanded {
     /// New nodes with installed deps the walk has expanded.
     new: HashSet<NodeId>,
     /// The cycle groups the walk has expanded whole, each with the member
-    /// it was expanded at (at most one per member) and this thread's count
-    /// of record changes then.
-    groups: Vec<(NodeId, Arc<GroupInfo>, usize)>,
+    /// it was expanded at (at most one per member), this thread's count of
+    /// record changes then, and the runtime's.
+    groups: Vec<(NodeId, Arc<GroupInfo>, usize, u64)>,
 }
 
 /// Walk work buffers above this many entries are freed, not kept.
@@ -1159,7 +1159,7 @@ impl Walk {
         self.expanded
             .as_ref()
             .and_then(|e| e.groups.iter().find(|(at, ..)| *at == id))
-            .map_or(Seen::Group(std::ptr::null(), 0), |(_, group, notes)| {
+            .map_or(Seen::Group(std::ptr::null(), 0), |(_, group, notes, _)| {
                 Seen::Group(Arc::as_ptr(group), *notes)
             })
     }
@@ -1234,7 +1234,7 @@ impl Walk {
         (self.work.iter())
             .map(|e| e.id.0)
             .chain([cur.0])
-            .chain(groups.flat_map(|(_, g, _)| g.members.iter().map(|&(slot, _)| slot)))
+            .chain(groups.flat_map(|(_, g, ..)| g.members.iter().map(|&(slot, _)| slot)))
     }
 
     /// Pushes back `entry`, whose compute a discard undid, for the reading
@@ -1447,7 +1447,7 @@ impl Walk {
             expanded.new.retain(|id| !gone(id));
             expanded
                 .groups
-                .retain(|(_, g, _)| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
+                .retain(|(_, g, ..)| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
         }
     }
 
@@ -5698,11 +5698,34 @@ impl<C: Cells> Runtime<C> {
         // expanded at the member a second time.
         if groups
             .iter()
-            .any(|(at, g, _)| *at == cur || Arc::ptr_eq(g, &group))
+            .any(|(at, g, ..)| *at == cur || Arc::ptr_eq(g, &group))
         {
             return true;
         }
-        groups.push((cur, group.clone(), cycle_state::recs_left_count()));
+        // Nor is a record another thread landed at a member the walk
+        // expanded a group at, after that expansion, expanded again at
+        // another member: run there, that member would precede the first
+        // record's externals and enter the cycle where no serial order
+        // does. The first record's marked entry replans it, as above.
+        if !C::SINGLE_THREADED
+            && groups.iter().any(|(at, g, notes, changes)| {
+                *changes != rec_changes
+                    && g.members
+                        .binary_search_by_key(&at.0, |&(s, _)| s)
+                        .is_ok_and(|i| group.has_member(at.0, g.members[i].1))
+                    && (self.inner.read().member_recs.get(&at.0))
+                        .is_some_and(|r| Arc::ptr_eq(r, &group))
+                    && !cycle_state::left_rec_since(*notes, self.runtime_id, at.0, Some(&group))
+            })
+        {
+            return true;
+        }
+        groups.push((
+            cur,
+            group.clone(),
+            cycle_state::recs_left_count(),
+            rec_changes,
+        ));
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

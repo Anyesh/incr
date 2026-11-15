@@ -2880,6 +2880,7 @@ fn a_plan_is_reached_through_its_entries_and_expanded_groups() {
                 cycle: crate::cycle::Cycle::new(vec![member]),
             }),
             0,
+            0,
         )],
     }));
     let mut slots: Vec<u32> = walk.plan_slots(NodeId(3)).collect();
