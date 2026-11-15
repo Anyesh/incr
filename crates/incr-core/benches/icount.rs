@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use workloads::{
     BatchRebuild, Chain, ChildrenChurn, ChildrenRerun, DeleteCascade, DeleteOwnedTree,
     DeleteSingle, Diamond, EarlyCutoff, Fanout, ForeignRead, GetClean, GetContended,
-    InsertThenRead, TableHit, TableMiss, ValueSlotRead, Workload,
+    InsertThenRead, KeyedWrite, TableHit, TableMiss, ValueSlotRead, Workload,
 };
 
 // Allowed because the criterion helpers in the shared workloads are
@@ -100,6 +100,8 @@ registry! {
     "table_hit_shared", 10_000_000 => TableHit::<Shared>::new();
     "table_hit_sip_local", 10_000_000 =>
         TableHit::<Local, std::collections::hash_map::RandomState>::with_hasher(Default::default());
+    "keyed_write_local", 100_000 => KeyedWrite::<Local>::new();
+    "keyed_write_shared", 100_000 => KeyedWrite::<Shared>::new();
     "table_miss_local", 100_000 => TableMiss::<Local>::new();
     "table_miss_shared", 100_000 => TableMiss::<Shared>::new();
     "value_slot_read_local", 10_000_000 => ValueSlotRead::<Local>::new();
