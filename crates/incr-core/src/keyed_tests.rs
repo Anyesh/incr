@@ -1336,6 +1336,25 @@ fn replayed_pairs_move_the_membership_only_when_a_key_appears_or_goes<C: Cells>(
     assert_eq!(runs_of(&runs), 2);
 }
 
+fn a_pair_swap_in_one_write_keeps_the_membership<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let (q, runs) = keys_reader(&rt, &kc);
+    assert_eq!(rt.get(q), vec![1]);
+    kc.apply_pairs_with(
+        &rt,
+        [PairOp::Remove((1, 10), 0), PairOp::Insert((1, 11), 0)],
+        &mut (),
+        None,
+    );
+    assert_eq!(rt.get(q), vec![1]);
+    assert_eq!(runs_of(&runs), 1);
+    kc.apply_pairs_with(&rt, [PairOp::Remove((1, 11), 0)], &mut (), None);
+    assert_eq!(rt.get(q), Vec::<u8>::new());
+    assert_eq!(runs_of(&runs), 2);
+}
+
 fn get_keys_outside_a_query_creates_nothing<C: Cells>() {
     let rt = Runtime::<C>::new();
     let kc = Plain::<C>::new(&rt);
@@ -1383,6 +1402,7 @@ for_both!(
     one_upsert_among_many_keys_reruns_one_reader,
     a_keys_reader_reruns_on_insert_and_remove_only,
     replayed_pairs_move_the_membership_only_when_a_key_appears_or_goes,
+    a_pair_swap_in_one_write_keeps_the_membership,
     get_keys_outside_a_query_creates_nothing,
     keys_readers_and_key_readers_do_not_wake_each_other,
 );

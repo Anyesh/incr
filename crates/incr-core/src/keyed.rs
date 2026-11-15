@@ -796,6 +796,13 @@ where
         self.keys.iter().all(StagedKey::untouched)
     }
 
+    /// Whether a key the write staged goes from holding no pair to holding
+    /// one or back, judged over the whole write, so a key that loses its
+    /// held pair and takes another in one write does not count.
+    fn membership_changed(&self) -> bool {
+        self.keys.iter().any(|k| (k.held > 0) != !k.now.is_empty())
+    }
+
     /// The changes to the pair collection: each held pair a key lets go,
     /// then each new pair it takes.
     fn log_changes(&self, table: &KeyTable<P, R>) -> Vec<Change<P>> {
@@ -1292,7 +1299,7 @@ where
             drop(table);
             drop(log);
             let hashes = mem::take(&mut stage.changed_hashes);
-            let membership = stage.counts.inserted + stage.counts.removed != 0;
+            let membership = self.versions.any_listed() && stage.membership_changed();
             let queued = self.bump(rt, &hashes, membership);
             let outcome = stage.outcome(epoch);
             match keep.as_deref_mut() {
