@@ -224,6 +224,16 @@ pub fn check_value_code() {
     check();
 }
 
+/// Whether `message` is the message of a contract panic: `contract_panic`'s,
+/// or a refusal that names what was refused and ends in the same contract
+/// text (`keyed::refused`).
+#[doc(hidden)]
+pub fn is_contract_panic_message(message: &str) -> bool {
+    message
+        .strip_prefix("incr-core: ")
+        .is_some_and(|rest| rest.ends_with(CONTRACT_MESSAGE))
+}
+
 /// Whether this thread is inside value code, for the crates that return
 /// an error instead of the contract panic where their signature allows.
 #[doc(hidden)]

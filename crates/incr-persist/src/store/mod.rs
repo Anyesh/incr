@@ -1021,8 +1021,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// the holder may be waiting on a claim the calling compute or value
     /// code's caller holds, and value code may be running on the thread
     /// that holds the mutex. Re-entry is checked first, so a `Drop` the
-    /// engine runs as value code under the mutex gets the error, not the
-    /// value-code panic.
+    /// engine runs as value code under the mutex gets the error too, and a
+    /// call from value code returns [`Error::Reentrant`] instead of
+    /// panicking.
     fn state(&self) -> Result<Locked<'_, C>> {
         if self.holder.is_current() {
             return Err(Error::Reentrant);

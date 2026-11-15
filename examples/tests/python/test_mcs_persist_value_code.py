@@ -2,6 +2,7 @@
 memo call gets a RuntimeError, a runtime call that would compute gets the
 contract RuntimeError, and neither prints a Rust panic line on stderr."""
 
+import importlib
 import pickle
 
 import incr.persist
@@ -123,3 +124,27 @@ def test_a_memo_checkpoint_from_value_code_raises_and_prints_nothing(
     with pytest.raises(RuntimeError):
         store.insert(rows, Probe(1))
     assert_quiet(capfd)
+
+
+@pytest.mark.parametrize("method", ["keys", "get"])
+def test_a_keyed_read_from_a_key_method_raises_and_prints_nothing(
+    persist, capfd, method
+):
+    pkg = importlib.import_module(persist.__name__.rpartition(".")[0])
+    rt = pkg.Runtime()
+    kc = pkg.KeyedCollection(rt)
+    kc.upsert("held", 0)
+    capfd.readouterr()
+
+    class Key:
+        def __hash__(self):
+            kc.keys() if method == "keys" else kc.get("held")
+            return 1
+
+        def __eq__(self, other):
+            return self is other
+
+    with pytest.raises(RuntimeError, match="key or row method"):
+        kc.upsert(Key(), 1)
+    assert_quiet(capfd)
+    assert kc.items() == [("held", 0)]

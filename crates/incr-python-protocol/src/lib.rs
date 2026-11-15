@@ -154,7 +154,7 @@ impl Drop for RestoreActive {
 }
 
 /// Installs, once, a panic hook that stays silent for the value-code
-/// contract panic while a `pyerr_boundary` is active on the thread, since
+/// contract panics while a `pyerr_boundary` is active on the thread, since
 /// the boundary turns it into a `RuntimeError` carrying the same message.
 /// Every other panic reaches the hook that was installed before.
 pub fn install_panic_hook() {
@@ -174,9 +174,14 @@ fn in_boundary() -> bool {
 }
 
 fn is_contract_panic(payload: &(dyn std::any::Any + Send)) -> bool {
-    payload.downcast_ref::<String>().is_some_and(|message| {
-        message.strip_prefix("incr-core: ") == Some(incr_core::CONTRACT_MESSAGE)
-    })
+    let message = match payload.downcast_ref::<String>() {
+        Some(message) => message.as_str(),
+        None => match payload.downcast_ref::<&str>() {
+            Some(message) => message,
+            None => return false,
+        },
+    };
+    incr_core::is_contract_panic_message(message)
 }
 
 /// Marks a `pyerr_boundary` in progress; the outermost one drops every
