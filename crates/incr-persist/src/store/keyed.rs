@@ -299,6 +299,16 @@ where
         self.keyed.version_input(key)
     }
 
+    /// [`KeyedCollection::forget_key`] on this collection.
+    pub fn forget_key(&self, rt: &Runtime<C>, key: &K) -> bool {
+        self.keyed.forget_key(rt, key)
+    }
+
+    /// How many version inputs this collection holds.
+    pub fn version_input_count(&self) -> usize {
+        self.keyed.version_input_count()
+    }
+
     pub fn contains(&self, key: &K) -> bool {
         self.keyed.contains(key)
     }

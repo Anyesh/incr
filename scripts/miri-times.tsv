@@ -1370,3 +1370,9 @@
 10	walk_ring::tests::concurrent_setters_leave_walked_at_the_last_revision
 0	walk_ring::tests::out_of_order_completion_advances_over_the_prefix
 0	walk_ring::tests::slots_are_reused_after_consumption
+2	keyed::tests::rows_local::forget_key_frees_the_input_of_a_never_written_key
+2	keyed::tests::rows_local::forget_key_of_an_unread_or_orphaned_key
+2	keyed::tests::rows_shared::forget_key_frees_the_input_of_a_never_written_key
+2	keyed::tests::rows_shared::forget_key_of_an_unread_or_orphaned_key
+2	keyed::tests::rows_local::forget_key_inside_a_compute_is_refused
+2	keyed::tests::rows_shared::forget_key_inside_a_compute_is_refused

@@ -959,7 +959,7 @@ fn records_reads<C: Cells>(rt: &Runtime<C>) -> bool {
 /// where deleting it could race a reader holding its handle, so their
 /// number grows with the keys ever read in a query. Under `Local` a write
 /// that leaves a key without a row deletes its input if no query depends
-/// on it.
+/// on it; [`Self::forget_key`] does the same for a key no write changed.
 pub struct KeyedCollection<K, V, C, P = (K, V), R = ()>
 where
     K: 'static,
@@ -1342,6 +1342,21 @@ where
                     .collect()
             })
         };
+        let (_, keys) = self.release_inputs(rt, candidates);
+        match keep {
+            Some(keep) => keep.keys.extend(keys),
+            None => drop(keys),
+        }
+    }
+
+    /// Deletes the version input of each candidate that holds no row and
+    /// has no dependent, and unmaps it. Returns how many inputs it freed
+    /// and every key it handled, whose drops the caller places.
+    fn release_inputs(
+        &self,
+        rt: &Runtime<C>,
+        candidates: Vec<(u64, K, Incr<u64>)>,
+    ) -> (usize, Vec<K>) {
         let mut freed = Vec::new();
         for (hash, key, handle) in &candidates {
             if self.held(key) {
@@ -1353,21 +1368,56 @@ where
             }
         }
         let mut keys: Vec<K> = Vec::new();
+        let mut unmapped = 0;
         if !freed.is_empty() {
             let mut map = self.versions.map.write();
             for (hash, handle) in freed {
                 let forgotten = map.forget(hash, handle);
                 if !forgotten.is_empty() {
                     C::u64_fetch_add(&self.versions.live, u64::MAX);
+                    unmapped += 1;
                     keys.extend(forgotten);
                 }
             }
         }
         keys.extend(candidates.into_iter().map(|(_, key, _)| key));
-        match keep {
-            Some(keep) => keep.keys.extend(keys),
-            None => drop(keys),
+        (unmapped, keys)
+    }
+
+    /// Under `Local`, deletes `key`'s version input when no query depends
+    /// on it and the key holds no row, for a key a write never changed
+    /// after its readers went away. Returns whether it freed the input;
+    /// under `Shared` it frees nothing and returns false, since a reader
+    /// may still hold the handle. Panics inside a compute of any runtime,
+    /// like every write.
+    pub fn forget_key(&self, rt: &Runtime<C>, key: &K) -> bool {
+        refuse_value_code();
+        assert!(
+            !rt.frame_active(),
+            "incr-core: KeyedCollection::forget_key called from inside a compute; a run the \
+             engine discards would delete an input its own read created",
+        );
+        if !C::SINGLE_THREADED || !self.versions.any() {
+            return false;
         }
+        let hash = value_code::run(|| self.index.hasher.hash_one(key));
+        let candidates: Vec<(u64, K, Incr<u64>)> = {
+            let map = self.versions.map.read();
+            value_code::run(|| {
+                map.find(hash, key)
+                    .map(|handle| (hash, key.clone(), handle))
+                    .into_iter()
+                    .collect()
+            })
+        };
+        let (freed, keys) = self.release_inputs(rt, candidates);
+        value_code::run(|| drop(keys));
+        freed > 0
+    }
+
+    /// How many version inputs this collection holds.
+    pub fn version_input_count(&self) -> usize {
+        C::u64_load_acquire(&self.versions.live) as usize
     }
 
     /// Whether `key` holds a row, read as value code under the index's
