@@ -1405,4 +1405,137 @@ for_both!(
     a_pair_swap_in_one_write_keeps_the_membership,
     get_keys_outside_a_query_creates_nothing,
     keys_readers_and_key_readers_do_not_wake_each_other,
+    a_partition_reader_reruns_only_for_its_own_partition,
+    partitions_register_over_existing_keys_and_a_reader_of_a_new_partition_wakes,
+    a_raising_partition_fn_refuses_the_write_and_changes_nothing,
+    a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent,
 );
+
+fn parity(k: &u8) -> u8 {
+    k % 2
+}
+
+/// A query listing partition `part` through `get_partition`, and how often
+/// it ran.
+fn part_reader<C: Cells>(
+    rt: &Runtime<C>,
+    kc: &Plain<C>,
+    parts: crate::keyed::KeyPartitions<u8>,
+    part: u8,
+) -> (Incr<Vec<u8>>, Runs) {
+    let runs: Runs = Arc::default();
+    let counted = Arc::clone(&runs);
+    let kc = Captured(kc.clone());
+    let q = rt.create_query(move |rt| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut keys = kc.get().get_partition(rt, &parts, &part);
+        keys.sort_unstable();
+        keys
+    });
+    (q, runs)
+}
+
+fn a_partition_reader_reruns_only_for_its_own_partition<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    kc.upsert(&rt, 2, 20);
+    let parts = kc.key_partitions(parity);
+    let (odd, odd_runs) = part_reader(&rt, &kc, parts, 1);
+    let (even, even_runs) = part_reader(&rt, &kc, parts, 0);
+    assert_eq!((rt.get(odd), rt.get(even)), (vec![1], vec![2]));
+
+    kc.upsert(&rt, 1, 11);
+    kc.upsert(&rt, 2, 21);
+    assert_eq!((rt.get(odd), rt.get(even)), (vec![1], vec![2]));
+    assert_eq!(
+        (runs_of(&odd_runs), runs_of(&even_runs)),
+        (1, 1),
+        "row updates"
+    );
+
+    kc.upsert(&rt, 3, 30);
+    assert_eq!((rt.get(odd), rt.get(even)), (vec![1, 3], vec![2]));
+    assert_eq!(
+        (runs_of(&odd_runs), runs_of(&even_runs)),
+        (2, 1),
+        "an odd insert"
+    );
+
+    kc.remove(&rt, &2);
+    assert_eq!((rt.get(odd), rt.get(even)), (vec![1, 3], Vec::new()));
+    assert_eq!(
+        (runs_of(&odd_runs), runs_of(&even_runs)),
+        (2, 2),
+        "an even remove"
+    );
+
+    kc.reconcile(&rt, [(1, 1), (4, 4), (6, 6)]);
+    assert_eq!((rt.get(odd), rt.get(even)), (vec![1], vec![4, 6]));
+    assert_eq!((runs_of(&odd_runs), runs_of(&even_runs)), (3, 3));
+}
+
+fn partitions_register_over_existing_keys_and_a_reader_of_a_new_partition_wakes<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.reconcile(&rt, (0..10).map(|k| (k, k)));
+    let parts = kc.key_partitions(|k: &u8| k % 3);
+    let (two, runs) = part_reader(&rt, &kc, parts, 2);
+    let (nine, _) = part_reader(&rt, &kc, parts, 9);
+    assert_eq!(rt.get(two), vec![2, 5, 8]);
+    assert_eq!(rt.get(nine), Vec::<u8>::new());
+    kc.upsert(&rt, 11, 11);
+    assert_eq!(rt.get(two), vec![2, 5, 8, 11]);
+    assert_eq!(runs_of(&runs), 2);
+    kc.remove(&rt, &5);
+    kc.remove(&rt, &8);
+    assert_eq!(rt.get(two), vec![2, 11]);
+    assert_eq!(runs_of(&runs), 3);
+}
+
+fn a_raising_partition_fn_refuses_the_write_and_changes_nothing<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let parts = kc.key_partitions(|k: &u8| {
+        assert_ne!(*k, 9, "no partition for 9");
+        k % 2
+    });
+    let (odd, runs) = part_reader(&rt, &kc, parts, 1);
+    assert_eq!(rt.get(odd), vec![1]);
+    let epoch = kc.epoch();
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        kc.reconcile(&rt, [(1, 10), (3, 30), (9, 90)]);
+    }));
+    assert!(refused.is_err());
+    assert_eq!(kc.keys(), vec![1]);
+    assert_eq!(kc.epoch(), epoch);
+    assert_eq!(rt.get(odd), vec![1]);
+    assert_eq!(runs_of(&runs), 1);
+    kc.upsert(&rt, 3, 30);
+    assert_eq!(rt.get(odd), vec![1, 3]);
+}
+
+fn a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Plain::<C>::new(&rt);
+    kc.upsert(&rt, 1, 10);
+    let parts = kc.key_partitions(parity);
+    let (odd, odd_runs) = part_reader(&rt, &kc, parts, 1);
+    let (all, all_runs) = keys_reader(&rt, &kc);
+    rt.get(odd);
+    rt.get(all);
+    kc.apply_pairs_with(
+        &rt,
+        [PairOp::Remove((1, 10), 0), PairOp::Insert((1, 11), 0)],
+        &mut (),
+        None,
+    );
+    rt.get(odd);
+    rt.get(all);
+    assert_eq!((runs_of(&odd_runs), runs_of(&all_runs)), (1, 1));
+    kc.upsert(&rt, 2, 20);
+    rt.get(odd);
+    rt.get(all);
+    assert_eq!((runs_of(&odd_runs), runs_of(&all_runs)), (1, 2));
+}
