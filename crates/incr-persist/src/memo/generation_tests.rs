@@ -171,3 +171,18 @@ fn a_chain_is_a_full_generation_then_deltas_each_on_the_last() {
         assert!(matches!(Chain::new(layers), Err(Error::Corrupt(_))));
     }
 }
+
+#[test]
+fn an_empty_delta_holds_nothing_and_keeps_its_chain_place() {
+    let base = Arc::new(Generation::new(GenId(1), header(), vec![item(0, 7, 0)]));
+    let damaged = Generation::empty_delta(GenId(2), GenId(1), GenId(1));
+    assert!(damaged.items().is_empty());
+    assert_eq!(
+        (damaged.base(), damaged.parent()),
+        (Some(GenId(1)), Some(GenId(1)))
+    );
+    assert_eq!(damaged.header().build, 0);
+    let next = Arc::new(Generation::new_delta(GenId(3), delta(3), Vec::new()));
+    let chain = Chain::new(vec![base, Arc::new(damaged), next]).unwrap();
+    assert_eq!(chain.depth(), 2);
+}

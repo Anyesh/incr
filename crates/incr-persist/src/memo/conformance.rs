@@ -708,10 +708,10 @@ pub fn streamed_write_reads_the_base_through_the_same_handle<H: MemoHarness>(mut
         let _ = done.send(());
         (backend, written)
     });
-    if result.recv_timeout(STREAM_TIMEOUT).is_err() {
+    if let Err(mpsc::RecvTimeoutError::Timeout) = result.recv_timeout(STREAM_TIMEOUT) {
         panic!("a streamed write that reads through its own handle did not finish");
     }
-    let (backend, written) = worker.join().unwrap();
+    let (backend, written) = worker.join().expect("the streamed write panicked");
     let generation = written.expect("write_generation_streamed failed");
     assert_eq!(generation.id(), GenId(2));
     let loaded = backend.load().unwrap().unwrap();

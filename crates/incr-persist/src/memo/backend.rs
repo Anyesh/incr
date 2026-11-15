@@ -80,9 +80,9 @@ pub trait MemoBackend: Send + Sync {
     /// miss.
     fn lock_checkpoint(&self) -> Result<Self::Guard>;
 
-    /// Loads the current generation's header and index, without entry
-    /// values, or `None` when no generation was ever written. Once a chain
-    /// holds deltas, this is the chain's base.
+    /// Loads the header and index of the current chain's base, without
+    /// entry values, or `None` when no generation was ever written. Without
+    /// deltas the base is the current generation.
     ///
     /// When the current generation's header or index is damaged it returns
     /// [`Generation::empty`] with the current id, so restores miss and the
@@ -91,7 +91,8 @@ pub trait MemoBackend: Send + Sync {
     fn load(&self) -> Result<Option<Generation>>;
 
     /// Returns the frame `item` locates in `generation`, exactly as it was
-    /// written, or `None` when the generation has been removed.
+    /// written, or `None` when the generation has been removed. `item` is
+    /// not a tombstone, which has no frame.
     ///
     /// The bytes are not checked here: a damaged or short frame, or one of
     /// another generation, is returned as found, and the caller's
@@ -107,8 +108,8 @@ pub trait MemoBackend: Send + Sync {
     /// The new generation replaces the whole chain `base` ends.
     ///
     /// - `id` is greater than every id this store has used.
-    /// - Atomic: a crash at any point leaves `load` returning either `base`
-    ///   or the new generation, whole.
+    /// - Atomic: a crash at any point leaves either `base` or the new
+    ///   generation, whole, current.
     /// - Durable: once this returns `Ok`, a later open loads the new
     ///   generation.
     /// - The returned [`Generation`] equals what `load` returns next: the
@@ -174,8 +175,10 @@ pub trait MemoBackend: Send + Sync {
     ///
     /// `known` holds layers this handle loaded earlier. Generations are
     /// immutable, so a backend may return a known layer's `Arc` for the
-    /// same id instead of reloading its index. Damage is handled as in
-    /// `load`. The default wraps `load` in a chain of one generation.
+    /// same id instead of reloading its index. A damaged base is handled
+    /// as in `load`, and a damaged delta loads as
+    /// [`Generation::empty_delta`] in its place. The default wraps `load`
+    /// in a chain of one generation.
     fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
         let _ = known;
         Ok(self.load()?.map(Chain::from))

@@ -104,6 +104,27 @@ impl Generation {
         Generation::new(id, header, Vec::new())
     }
 
+    /// What a backend's `load_chain` returns for a delta layer whose header
+    /// or index is unreadable: a delta that holds nothing, so probes fall
+    /// through to older layers. Its build fingerprint is 0 and its catalog
+    /// empty.
+    pub fn empty_delta(id: GenId, base: GenId, parent: GenId) -> Self {
+        let header = GenHeader {
+            build: 0,
+            seq: 0,
+            tables: Vec::new(),
+        };
+        Generation::new_delta(
+            id,
+            DeltaHeader {
+                header,
+                base,
+                parent,
+            },
+            Vec::new(),
+        )
+    }
+
     pub fn id(&self) -> GenId {
         self.id
     }
