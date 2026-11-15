@@ -164,6 +164,11 @@
     "doc": "",
     "kind": "getset_descriptor"
    },
+   "forget_key": {
+    "doc": "Free `key`'s version input if no query depends on it and the key\nholds no row, for a key whose readers were deleted without a write\nto it. Returns whether it freed the input; always False for a\nShared runtime. Raises `RuntimeError` inside an overlay.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, key)"
+   },
    "get": {
     "doc": "The row held for `key`, or `None`. Registers no dependency: inside a\nquery, read a key with `ctx.get_key(kc, key)` so the query reruns\nwhen that key's row changes.",
     "kind": "method_descriptor",
@@ -193,6 +198,11 @@
     "doc": "Hold `row` for `key`: nothing happens if the held row is `==` to\nit, otherwise the pair is replaced or inserted.",
     "kind": "method_descriptor",
     "signature": "(self, /, key, row)"
+   },
+   "version_input_count": {
+    "doc": "How many version inputs this collection holds: one per key a query\nread through `ctx.get_key` that no write or `forget_key` freed.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
    }
   },
   "signature": "(runtime, label=None)"
