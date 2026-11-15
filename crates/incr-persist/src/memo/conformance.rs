@@ -476,8 +476,8 @@ fn newest<B: MemoBackend>(backend: &B, chain: &Chain, entry: &EncodedEntry) -> O
     None
 }
 
-/// Deltas written one on another load oldest first, each naming the base
-/// and its predecessor, and a key every layer rewrites resolves to the
+/// Deltas written one on another survive the checkpoint lock and load
+/// oldest first, each naming the base and its predecessor, and a key every layer rewrites resolves to the
 /// newest layer's frame when probed newest first.
 pub fn chain_of_deltas_resolves_newest_first<H: MemoHarness>(mut h: H) {
     let store = h.new_store();
@@ -491,6 +491,7 @@ pub fn chain_of_deltas_resolves_newest_first<H: MemoHarness>(mut h: H) {
         last = delta_entries(1, 2, &delta_header(1, id - 1, id));
         write_delta(&backend, 1, id - 1, id, &last, &[]);
     }
+    drop(backend.lock_checkpoint().expect("lock failed"));
     let chain = h.open(&store).load_chain(&[]).unwrap().unwrap();
     assert_eq!(chain.depth(), 3);
     assert_eq!(chain.base().id(), GenId(1));
@@ -550,8 +551,8 @@ pub fn delta_frames_reject_a_bad_tag<H: MemoHarness>(mut h: H) {
     }
 }
 
-/// A delta from a tip that is no longer current is `Busy` and writes
-/// nothing visible, and once a full write replaces the chain, `load_chain`
+/// A delta from a tip that is no longer current, or a full write from the
+/// base under a delta, is `Busy` and writes nothing visible, and once a full write replaces the chain, `load_chain`
 /// returns only the new generation, never a delta of the old base.
 pub fn stale_delta_is_not_returned<H: MemoHarness>(mut h: H) {
     let store = h.new_store();
@@ -568,28 +569,38 @@ pub fn stale_delta_is_not_returned<H: MemoHarness>(mut h: H) {
         &delta_entries(10, 1, &delta_header(1, 1, 2)),
         &[],
     );
-    let header = delta_header(1, 1, 3);
-    let stale = backend.write_delta(
+    let stale = delta_header(1, 1, 3);
+    let refused = backend.write_delta(
         GenId(1),
         GenId(3),
-        &header,
-        &delta_entries(10, 1, &header),
+        &stale,
+        &delta_entries(10, 1, &stale),
         &[],
     );
-    assert!(matches!(stale, Err(Error::Busy)), "got {stale:?}");
+    assert!(matches!(refused, Err(Error::Busy)), "got {refused:?}");
+    assert_eq!(chain_ids(&backend), [GenId(1), GenId(2)]);
+    let from_base = backend.write_generation(Some(GenId(1)), GenId(3), &header(3), &entries(1));
+    assert!(matches!(from_base, Err(Error::Busy)), "got {from_base:?}");
+    let from_base = backend.write_generation_streamed(
+        Some(GenId(1)),
+        GenId(3),
+        &header(3),
+        &mut entries(1).into_iter().map(Ok),
+    );
+    assert!(matches!(from_base, Err(Error::Busy)), "got {from_base:?}");
     assert_eq!(chain_ids(&backend), [GenId(1), GenId(2)]);
 
     let full = entries(3);
     write(&backend, Some(GenId(2)), 4, &full);
-    let header = delta_header(1, 2, 5);
-    let stale = backend.write_delta(
+    let stale = delta_header(1, 2, 5);
+    let refused = backend.write_delta(
         GenId(2),
         GenId(5),
-        &header,
-        &delta_entries(10, 1, &header),
+        &stale,
+        &delta_entries(10, 1, &stale),
         &[],
     );
-    assert!(matches!(stale, Err(Error::Busy)), "got {stale:?}");
+    assert!(matches!(refused, Err(Error::Busy)), "got {refused:?}");
     for handle in [&backend, &h.open(&store)] {
         let chain = handle.load_chain(&[]).unwrap().unwrap();
         assert_eq!(chain.depth(), 0);

@@ -51,6 +51,7 @@ pub struct Tombstone {
 /// [`load`](Self::load) returns the chain's base, which is what a reader
 /// that knows nothing of deltas sees. A backend that does not opt in never
 /// holds a delta, so its current generation is its only one.
+///
 /// [`write_checkpoint`](super::write_checkpoint) calls, in order:
 /// [`lock_checkpoint`](Self::lock_checkpoint), [`load`](Self::load),
 /// [`read_entry`](Self::read_entry) on the loaded generation, and
@@ -84,8 +85,8 @@ pub trait MemoBackend: Send + Sync {
     /// entry values, or `None` when no generation was ever written. Without
     /// deltas the base is the current generation.
     ///
-    /// When the current generation's header or index is damaged it returns
-    /// [`Generation::empty`] with the current id, so restores miss and the
+    /// When the base's header or index is damaged it returns
+    /// [`Generation::empty`] with the base's id, so restores miss and the
     /// next checkpoint replaces it. A header of another format version is
     /// treated the same way. Errors are I/O failures only.
     fn load(&self) -> Result<Option<Generation>>;
@@ -210,7 +211,7 @@ pub trait MemoBackend: Send + Sync {
     }
 
     /// Deletes a generation that is no longer in the current chain.
-    /// Removing one that is already gone succeeds. Handles still reading it get `None` from
-    /// `read_entry`.
+    /// Removing one that is already gone succeeds. Handles still reading
+    /// it get `None` from `read_entry`.
     fn remove_generation(&self, generation: GenId) -> Result<()>;
 }

@@ -148,6 +148,7 @@ impl MemoBackend for MemoryMemo {
     }
 
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
+        assert!(!item.is_tombstone(), "reading a tombstone's frame");
         let state = lock(&self.state);
         Ok(state
             .generations
@@ -192,6 +193,10 @@ impl MemoBackend for MemoryMemo {
     }
 
     fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
+        assert!(
+            items.iter().all(|item| !item.is_tombstone()),
+            "reading a tombstone's frame"
+        );
         let state = lock(&self.state);
         let stored = state.generations.get(&generation);
         Ok(items
