@@ -1710,23 +1710,19 @@ where
         })
     }
 
-    /// Runs every registered partition function on `key` and discards the
-    /// results, so a caller about to log a write can refuse it before it
-    /// is durable when a function would panic on one of its keys. Runs
-    /// the functions as value code.
-    pub fn check_partitions<Q>(&self, parts: &KeyPartitions<Q>, key: &K)
-    where
-        Q: Value + Hash + Eq,
-    {
+    /// Whether a partitioning is registered.
+    pub fn has_partitions(&self) -> bool {
+        !self.index.table.read().parts.is_empty()
+    }
+
+    /// Runs every registered partition function on `pair`'s key and
+    /// discards the results, so a caller about to log a write can refuse
+    /// it before it is durable when a function panics on one of its keys.
+    /// Runs the functions as value code.
+    pub fn check_partitions(&self, pair: &P) {
         refuse_value_code();
         let table = self.index.table.read();
-        value_code::run(|| {
-            table.parts[parts.sink]
-                .as_any()
-                .downcast_ref::<PartState<K, V, Q, P>>()
-                .expect("incr-core: a KeyPartitions belongs to its collection")
-                .check(key);
-        });
+        value_code::run(|| table.parts.iter().for_each(|sink| sink.check(pair)));
     }
 
     /// `key`'s version input, if a read created one.

@@ -8,8 +8,8 @@ use std::sync::{Arc, Weak};
 use incr_core::persist_hooks::Deferred;
 use incr_core::{
     find_element, with_value_code, Cells, DeleteError, ElementRank, ErasedIncr, Incr,
-    IncrCollection, KeyCounts, KeyIndex, KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp,
-    Runtime, Shared, Value,
+    IncrCollection, KeyCounts, KeyIndex, KeyPartitions, KeyedChange, KeyedCollection, KeyedSpent,
+    Pair, PairOp, Runtime, Shared, Value,
 };
 
 use super::after_lock::AfterLock;
@@ -298,6 +298,27 @@ where
     /// unsaveable.
     pub fn get_keys(&self, rt: &Runtime<C>) -> Vec<K> {
         self.keyed.get_keys(rt)
+    }
+
+    /// Registers a partitioning of the keys by `f`, as
+    /// [`KeyedCollection::key_partitions`] does. A write whose function
+    /// panics on a key it inserts or removes is refused before it is
+    /// logged. `f` must return the same partition for a key every time.
+    pub fn key_partitions<Q>(&self, f: impl Fn(&K) -> Q + Send + Sync + 'static) -> KeyPartitions<Q>
+    where
+        Q: Value + Hash + Eq,
+    {
+        self.keyed.key_partitions(f)
+    }
+
+    /// The keys of partition `q`, as [`KeyedCollection::get_partition`]
+    /// reads them: inside a query, a dependency on that partition alone.
+    /// A memo entry reading it is unsaveable.
+    pub fn get_partition<Q>(&self, rt: &Runtime<C>, parts: &KeyPartitions<Q>, q: &Q) -> Vec<K>
+    where
+        Q: Value + Hash + Eq,
+    {
+        self.keyed.get_partition(rt, parts, q)
     }
 
     /// `key`'s version input, if a read with [`Self::get_key`] or a memo
@@ -724,6 +745,10 @@ where
     /// Set by a reconcile: the stage names every key the collection is to
     /// hold.
     complete: bool,
+    /// Whether a key partitioning was registered when the stage began, so
+    /// a staged insert or remove runs its function before anything is
+    /// logged.
+    partitioned: bool,
     spent: Vec<P>,
 }
 
@@ -737,6 +762,7 @@ where
     fn new(keyed: PersistedKeyed<K, V, C, P>) -> Self {
         KeyedStage {
             epoch: keyed.epoch(),
+            partitioned: keyed.keyed.has_partitions(),
             keyed,
             keys: Vec::new(),
             by_key: HashMap::new(),
@@ -779,13 +805,19 @@ where
             return;
         }
         let pair = with_value_code(|| P::new(staged.key.clone(), row));
-        staged.next = Next::Row(pair);
+        if self.partitioned && self.keys[at].held.is_empty() {
+            self.keyed.keyed.check_partitions(&pair);
+        }
+        self.keys[at].next = Next::Row(pair);
     }
 
     fn remove(&mut self, key: &K) -> bool {
         let at = self.locate(with_value_code(|| key.clone()));
         let staged = &mut self.keys[at];
         let present = staged.target().is_some();
+        if let Some((pair, _)) = staged.held.first().filter(|_| self.partitioned) {
+            self.keyed.keyed.check_partitions(pair);
+        }
         staged.next = Next::Gone;
         present
     }
@@ -852,12 +884,19 @@ where
     fn records(&mut self, state: &State<C>) -> Result<Vec<Record>> {
         let key = self.key(state)?;
         let mut out = Vec::new();
+        let partitioned = self.partitioned;
         for staged in &self.keys {
             let next = match &staged.next {
                 Next::Held => continue,
                 Next::Row(pair) => Some(pair),
                 Next::Gone => None,
             };
+            if partitioned && staged.held.is_empty() != next.is_none() {
+                let flipped = next.or(staged.held.first().map(|(pair, _)| pair));
+                if let Some(pair) = flipped {
+                    self.keyed.keyed.check_partitions(pair);
+                }
+            }
             let first = out.len();
             for (pair, rank) in &staged.held {
                 out.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);

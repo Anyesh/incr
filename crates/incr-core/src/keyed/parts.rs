@@ -32,6 +32,8 @@ pub(super) trait PartSink<P>: Send + Sync {
     /// Applies a plan made against this state. Runs no user code; the pairs
     /// it lets go go to `gone`.
     fn apply(&mut self, plan: Box<dyn Any + Send>, gone: &mut Vec<P>);
+    /// Runs the partition function on `pair`'s key, discarding the result.
+    fn check(&self, pair: &P);
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -117,12 +119,6 @@ where
             .iter()
             .copied()
             .find(|&at| self.parts[at].q == *q)
-    }
-
-    /// Runs the partition function on `key`, discarding the result.
-    pub(super) fn check(&self, key: &K) {
-        let q = (self.f)(key);
-        FxBuildHasher.hash_one(&q);
     }
 
     /// A copy of each key in partition `q`, in no particular order.
@@ -250,6 +246,11 @@ where
             };
             self.parts[at].pairs.entry(hash).or_default().push(pair);
         }
+    }
+
+    fn check(&self, pair: &P) {
+        let q = (self.f)(&pair.key());
+        FxBuildHasher.hash_one(&q);
     }
 
     fn as_any(&self) -> &dyn Any {
