@@ -192,11 +192,13 @@ impl FileMemo {
                 remove_if_present(&entry.path())?;
             } else if let Some(id) = generation_of(&name).map(GenId) {
                 if Some(id) != current {
-                    self.remove_generation(id)?;
+                    self.cache().remove(&id);
+                    remove_if_present(&entry.path())?;
                 }
             } else if let Some(id) = delta_of(&name).map(GenId) {
                 if !deltas.contains(&id) {
-                    self.remove_generation(id)?;
+                    self.cache().remove(&id);
+                    remove_if_present(&entry.path())?;
                 }
             }
         }

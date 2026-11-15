@@ -597,3 +597,21 @@ fn the_open_file_cache_stays_small_across_many_generations() {
     }
     assert!(memo.cache().len() <= CACHE_LIMIT);
 }
+
+#[test]
+fn a_stale_delta_sharing_the_current_generations_id_does_not_remove_it() {
+    let (dir, memo, _delta) = memo_with_delta();
+    let (other_dir, other) = store();
+    other
+        .write_generation(None, GenId(2), &header(2), &entries(0..4))
+        .unwrap();
+    fs::copy(gen_file(other_dir.path(), 2), gen_file(dir.path(), 2)).unwrap();
+    fs::write(dir.path().join(CURRENT), current_bytes(GenId(2))).unwrap();
+    assert!(dir.path().join("MEMO_DELTA.2").exists());
+
+    let fresh = FileMemo::open(dir.path()).unwrap();
+    drop(fresh.lock_checkpoint().unwrap());
+    let loaded = reload(dir.path()).unwrap();
+    assert_eq!(loaded.id(), GenId(2));
+    assert_eq!(loaded.items().len(), 4);
+}
