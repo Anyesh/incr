@@ -14,6 +14,7 @@ use crate::{Error, Result};
 #[derive(Clone, Debug, Default)]
 pub struct MemoryMemo {
     state: Arc<Mutex<State>>,
+    without_deltas: bool,
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +112,15 @@ impl MemoryMemo {
         MemoryMemo::default()
     }
 
+    /// A store whose handles report no delta support, so checkpoints write
+    /// full generations as on a backend from before deltas.
+    pub fn without_deltas() -> Self {
+        MemoryMemo {
+            without_deltas: true,
+            ..MemoryMemo::default()
+        }
+    }
+
     /// Overwrites the stored frame of `item` in `generation`, so tests can
     /// damage an entry.
     pub fn replace_frame(&self, generation: GenId, item: &IndexItem, frame: Vec<u8>) {
@@ -206,7 +216,7 @@ impl MemoBackend for MemoryMemo {
     }
 
     fn supports_delta(&self) -> bool {
-        true
+        !self.without_deltas
     }
 
     fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {

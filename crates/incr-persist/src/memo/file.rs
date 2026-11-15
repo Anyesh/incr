@@ -33,6 +33,13 @@ const FOOTER_LEN: usize = 20;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// An open generation or delta file.
+#[derive(Debug)]
+struct Opened {
+    delta: bool,
+    file: Arc<File>,
+}
+
 /// A memo store kept in a directory, which may be the directory of a
 /// [`FileBackend`](crate::FileBackend) log.
 ///
@@ -81,7 +88,7 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct FileMemo {
     dir: PathBuf,
-    open: Mutex<BTreeMap<GenId, Arc<File>>>,
+    open: Mutex<BTreeMap<GenId, Opened>>,
 }
 
 /// The checkpoint lock of a [`FileMemo`], released on drop.
@@ -112,8 +119,15 @@ impl FileMemo {
 
     // Holds only plain data replaced in one assignment, so a panic while it
     // is held leaves nothing half-written.
-    fn cache(&self) -> MutexGuard<'_, BTreeMap<GenId, Arc<File>>> {
+    fn cache(&self) -> MutexGuard<'_, BTreeMap<GenId, Opened>> {
         self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn uncache(&self, id: GenId, delta: bool) {
+        let mut cache = self.cache();
+        if cache.get(&id).is_some_and(|opened| opened.delta == delta) {
+            cache.remove(&id);
+        }
     }
 
     /// The id `MEMO_CURRENT` names, or `None` when no generation was ever
@@ -192,13 +206,13 @@ impl FileMemo {
                 remove_if_present(&entry.path())?;
             } else if let Some(id) = generation_of(&name).map(GenId) {
                 if Some(id) != current {
-                    self.cache().remove(&id);
                     remove_if_present(&entry.path())?;
+                    self.uncache(id, false);
                 }
             } else if let Some(id) = delta_of(&name).map(GenId) {
                 if !deltas.contains(&id) {
-                    self.cache().remove(&id);
                     remove_if_present(&entry.path())?;
+                    self.uncache(id, true);
                 }
             }
         }
@@ -206,21 +220,44 @@ impl FileMemo {
     }
 
     /// The open file of generation or delta `id`, or `None` when its file
-    /// is gone or is not `id`.
-    fn generation_file(&self, id: GenId) -> Result<Option<Arc<File>>> {
-        if let Some(file) = self.cache().get(&id) {
-            return Ok(Some(Arc::clone(file)));
+    /// is gone or is not `id`. `delta` names the kind to open; `None` takes
+    /// the kind last opened for `id`, else a generation, else a delta. A
+    /// beta.9 writer on a chained directory can give a generation the id of
+    /// an existing delta, so both files may exist.
+    fn generation_file(&self, id: GenId, delta: Option<bool>) -> Result<Option<Arc<File>>> {
+        if let Some(opened) = self.cache().get(&id) {
+            if delta.is_none_or(|delta| delta == opened.delta) {
+                return Ok(Some(Arc::clone(&opened.file)));
+            }
         }
-        let file = match File::open(self.gen_path(id)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                match File::open(self.delta_path(id)) {
-                    Ok(file) => file,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => return Err(e.into()),
+        let kinds: &[bool] = match delta {
+            Some(delta) => {
+                if delta {
+                    &[true]
+                } else {
+                    &[false]
                 }
             }
-            Err(e) => return Err(e.into()),
+            None => &[false, true],
+        };
+        let mut found = None;
+        for &kind in kinds {
+            let path = if kind {
+                self.delta_path(id)
+            } else {
+                self.gen_path(id)
+            };
+            match File::open(path) {
+                Ok(file) => {
+                    found = Some((kind, file));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let Some((kind, file)) = found else {
+            return Ok(None);
         };
         let len = file.metadata()?.len();
         if read_footer(&file, len)?.is_none_or(|footer| footer.id != id) {
@@ -228,7 +265,13 @@ impl FileMemo {
         }
         let file = Arc::new(file);
         let mut cache = self.cache();
-        cache.insert(id, Arc::clone(&file));
+        cache.insert(
+            id,
+            Opened {
+                delta: kind,
+                file: Arc::clone(&file),
+            },
+        );
         while cache.len() > CACHE_LIMIT {
             let Some(oldest) = cache.keys().copied().find(|&cached| cached != id) else {
                 break;
@@ -239,7 +282,7 @@ impl FileMemo {
     }
 
     fn read_layer(&self, id: GenId, link: Option<(GenId, GenId)>) -> Result<Option<Generation>> {
-        let Some(file) = self.generation_file(id)? else {
+        let Some(file) = self.generation_file(id, Some(link.is_some()))? else {
             return Ok(None);
         };
         read_generation(&file, id, link)
@@ -333,7 +376,7 @@ impl MemoBackend for FileMemo {
         // Another handle may publish the next generation and remove this
         // one between reading `MEMO_CURRENT` and opening the file.
         let file = loop {
-            if let Some(file) = self.generation_file(id)? {
+            if let Some(file) = self.generation_file(id, Some(false))? {
                 break file;
             }
             match self.current()? {
@@ -347,7 +390,7 @@ impl MemoBackend for FileMemo {
     }
 
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
-        let Some(file) = self.generation_file(generation)? else {
+        let Some(file) = self.generation_file(generation, None)? else {
             return Ok(None);
         };
         read_item(&file, item).map(Some)
@@ -379,7 +422,7 @@ impl MemoBackend for FileMemo {
     }
 
     fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
-        let Some(file) = self.generation_file(generation)? else {
+        let Some(file) = self.generation_file(generation, None)? else {
             return Ok(vec![None; items.len()]);
         };
         let mut order: Vec<usize> = (0..items.len()).collect();
@@ -405,7 +448,12 @@ impl MemoBackend for FileMemo {
             for (at, id) in std::iter::once(base).chain(deltas).enumerate() {
                 let link = (at > 0).then_some((base, parent));
                 parent = id;
-                if let Some(layer) = known.iter().find(|layer| layer.id() == id) {
+                let same = |layer: &&Arc<Generation>| {
+                    layer.id() == id
+                        && layer.base() == link.map(|(base, _)| base)
+                        && layer.parent() == link.map(|(_, parent)| parent)
+                };
+                if let Some(layer) = known.iter().find(same) {
                     layers.push(Arc::clone(layer));
                     continue;
                 }
@@ -438,6 +486,11 @@ impl MemoBackend for FileMemo {
             tombstones,
             |tmp| self.publish_delta(header.base, tip, id, tmp),
         )?;
+        // Caches the delta's file now: a later read by id alone would open
+        // a generation file a beta.9 writer published under the same id.
+        // The delta is already live, so a failed open must not fail the
+        // checkpoint; such a read then only misses as corrupt.
+        let _ = self.generation_file(id, Some(true));
         Ok(Generation::new_delta(id, header.clone(), items))
     }
 

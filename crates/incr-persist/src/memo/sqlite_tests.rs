@@ -127,11 +127,12 @@ fn damaged_frames_are_counted_corrupt_and_dropped_at_checkpoint() {
     let truncated = frame_of(&conn, items[1].loc);
     set_frame(&conn, items[1].loc, &truncated[..truncated.len() - 1]);
 
-    let second = checkpoint(&memo, Vec::new());
+    let second = checkpoint(&memo, vec![entry(10), entry(11)]);
+    assert!(!second.stats.delta);
     assert_eq!(second.stats.corrupt, 2);
     assert_eq!(second.stats.merged, 2);
-    assert_eq!(second.generation.items().len(), 2);
-    assert_eq!(second.replaced, Some(first.id()));
+    assert_eq!(second.generation.items().len(), 4);
+    assert_eq!(second.superseded, [first.id()]);
 }
 
 #[test]
@@ -154,7 +155,7 @@ fn damaged_header_loads_an_empty_generation_that_the_next_checkpoint_replaces() 
     assert_eq!(loaded.header().build, 0);
 
     let second = checkpoint(&memo, vec![entry(9)]);
-    assert_eq!(second.replaced, Some(first.id()));
+    assert_eq!(second.superseded, [first.id()]);
     assert_eq!(second.stats.merged, 0);
     assert_eq!(memo.load().unwrap().unwrap().items().len(), 1);
 }
@@ -234,7 +235,7 @@ fn a_checkpoint_after_current_pointed_back_replaces_the_newer_generation() {
         .unwrap();
 
     let first = checkpoint(&memo, vec![entry(9)]);
-    assert_eq!(first.replaced, Some(GenId(1)));
+    assert_eq!(first.superseded, [GenId(1)]);
     assert_eq!(memo.load().unwrap().unwrap().id(), first.generation.id());
     memo.remove_generation(GenId(1)).unwrap();
     let second = checkpoint(&memo, vec![entry(8)]);
@@ -255,7 +256,7 @@ fn a_checkpoint_after_current_was_deleted_replaces_every_generation() {
     assert!(memo.load().unwrap().is_none());
 
     let first = checkpoint(&memo, vec![entry(9)]);
-    assert_eq!(first.replaced, None);
+    assert!(first.superseded.is_empty());
     let loaded = memo.load().unwrap().unwrap();
     assert_eq!(loaded.id(), first.generation.id());
     assert_eq!(loaded.items().len(), 1);

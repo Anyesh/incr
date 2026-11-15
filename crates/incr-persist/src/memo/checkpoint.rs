@@ -1,12 +1,18 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::layers::{self, Live, Probe};
 use super::{
-    decode_entry, fingerprint, key_hash, EncodedEntry, Entry, GenHeader, GenId, Generation,
-    IndexItem, MemoBackend, StoredDep, TableDesc,
+    decode_entry, fingerprint, key_hash, Chain, DeltaHeader, EncodedEntry, Entry, GenHeader, GenId,
+    Generation, IndexItem, MemoBackend, StoredDep, TableDesc, Tombstone,
 };
 use crate::{Error, Result};
+
+/// The most deltas a chain holds; the checkpoint that would add one more
+/// rewrites the chain as a full generation.
+pub const MAX_CHAIN_DEPTH: usize = 8;
 
 /// The `max_bytes` a memo uses unless configured otherwise: 512 MiB.
 pub const DEFAULT_MAX_BYTES: u64 = 512 << 20;
@@ -88,11 +94,16 @@ pub(crate) enum Fate {
 
 #[derive(Debug)]
 pub struct Checkpointed {
-    pub generation: Generation,
-    /// The generation this one replaced. The caller removes it with
+    /// The generation written: a delta or a full generation.
+    pub generation: Arc<Generation>,
+    /// The current chain after the write, `generation` its tip. Its older
+    /// layers may have been written by other handles.
+    pub chain: Chain,
+    /// The layers of the chain a full write replaced, oldest first, empty
+    /// after a delta. The caller removes them with
     /// [`MemoBackend::remove_generation`] once nothing in this process
-    /// reads it any more.
-    pub replaced: Option<GenId>,
+    /// reads them any more.
+    pub superseded: Vec<GenId>,
     pub stats: CheckpointStats,
     /// Per `fresh` entry, in input order.
     pub(crate) fates: Vec<Fate>,
@@ -102,55 +113,301 @@ pub struct Checkpointed {
 }
 
 /// Runs a checkpoint's write step against `backend`: takes the checkpoint
-/// lock, loads the current generation as the base, keeps the fresh entries
-/// whose query deps are kept fresh entries or base entries at the same fp
-/// (to a fixpoint),
-/// stamps them with the new sequence number, merges the base entries that
-/// were not rewritten, drops
-/// the entries too large for a frame and evicts by oldest `last_used`, each
-/// with transitive dependents, down to `max_bytes`, and writes the result as
-/// the next generation.
+/// lock, loads the current chain, and writes the fresh entries either as a
+/// delta on it or, merged with the entries the chain shows, as the next
+/// full generation. Fresh entries are kept when their query deps are kept
+/// fresh entries or stored entries at the same fp (to a fixpoint) and
+/// stamped with the new sequence number; entries too large for a frame are
+/// dropped with their transitive dependents.
 ///
-/// The base is merged only when its build matches and its seq is below
-/// `u64::MAX`; otherwise numbering restarts at seq 1. A base table whose name
-/// matches a live table with a different descriptor is dropped; a base
-/// table with no live namesake is carried over, appended to the catalog.
+/// A delta is written when the backend
+/// [supports one](MemoBackend::supports_delta), the base's build matches,
+/// its seq can advance, every live table is in the base's catalog, the
+/// chain holds fewer than [`MAX_CHAIN_DEPTH`] deltas, the delta's frames
+/// come to at most a quarter of the base's bytes and the chain's live bytes
+/// stay within `max_bytes`. It holds only the fresh entries, numbered in
+/// the base's catalog, and a tombstone for each oversized one the chain
+/// shows; unkept ones write nothing, so their stored versions stay. A delta
+/// with nothing to write publishes no layer.
+///
+/// Otherwise the full write merges the chain's entries that were not
+/// rewritten and evicts by oldest `last_used`, each with transitive
+/// dependents, down to `max_bytes`. It merges only when the base's build
+/// matches and seq is below `u64::MAX`; otherwise numbering restarts at
+/// seq 1. A stored table whose name matches a live table with a different
+/// descriptor is dropped; a stored table with no live namesake is carried
+/// over, appended to the catalog.
+///
 /// Fails with [`Error::Busy`](crate::Error::Busy) when another handle holds
-/// the lock or replaced the base meanwhile, and with
-/// [`Error::Corrupt`](crate::Error::Corrupt) when the base's id is
+/// the lock or changed the chain meanwhile, and with
+/// [`Error::Corrupt`](crate::Error::Corrupt) when the tip's id is
 /// `u64::MAX`; nothing is written then.
 pub fn write_checkpoint<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
 ) -> Result<Checkpointed> {
-    write_with(backend, input, EncodedEntry::new)
+    write_known(backend, input, &[])
 }
 
+/// [`write_checkpoint`] given the layers the caller's index holds, which
+/// [`MemoBackend::load_chain`] may reuse.
+pub(crate) fn write_known<B: MemoBackend + ?Sized>(
+    backend: &B,
+    input: CheckpointInput,
+    known: &[Arc<Generation>],
+) -> Result<Checkpointed> {
+    write_chain(backend, input, known, EncodedEntry::new)
+}
+
+#[cfg(test)]
 fn write_with<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
     encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
 ) -> Result<Checkpointed> {
+    write_chain(backend, input, &[], encode)
+}
+
+fn write_chain<B: MemoBackend + ?Sized>(
+    backend: &B,
+    input: CheckpointInput,
+    known: &[Arc<Generation>],
+    encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
+) -> Result<Checkpointed> {
     let _guard = backend.lock_checkpoint()?;
     let started = Instant::now();
-    let base = backend.load()?;
-    let id = base
-        .as_ref()
+    let chain = backend.load_chain(known)?;
+    let tip = chain.as_ref().map(Chain::tip);
+    let id = tip
         .map_or(Some(1), |g| g.id().0.checked_add(1))
         .map(GenId)
         .ok_or(Error::Corrupt(
             "the current memo generation has the largest id",
         ))?;
-    let next_seq = base
+    let newest_seq = chain
         .as_ref()
-        .map_or(Some(1), |g| g.header().seq.checked_add(1));
-    let seq = next_seq.unwrap_or(1);
-    let mut stats = CheckpointStats::default();
+        .and_then(|chain| chain.layers().iter().map(|layer| layer.header().seq).max());
+    let next_seq = newest_seq.map_or(Some(1), |seq| seq.checked_add(1));
+    let mergeable = chain
+        .as_ref()
+        .filter(|chain| next_seq.is_some() && chain.base().header().build == input.build);
+    let next = Next {
+        id,
+        seq: next_seq.unwrap_or(1),
+        started,
+    };
+    let input = match mergeable
+        .filter(|chain| backend.supports_delta() && chain.depth() < MAX_CHAIN_DEPTH)
+    {
+        Some(chain) => match write_delta(backend, chain, input, &next, &encode)? {
+            Ok(done) => return Ok(done),
+            Err(input) => input,
+        },
+        None => input,
+    };
+    let merged = mergeable.is_some();
+    write_full(backend, chain.as_ref(), merged, input, &next, encode)
+}
 
+/// The id and sequence number the checkpoint writes under.
+struct Next {
+    id: GenId,
+    seq: u64,
+    started: Instant,
+}
+
+/// Writes `input` as a delta on `chain`, or hands it back when a delta
+/// would break one of the rules [`write_checkpoint`] lists.
+fn write_delta<B: MemoBackend + ?Sized>(
+    backend: &B,
+    chain: &Chain,
+    input: CheckpointInput,
+    next: &Next,
+    encode: &impl Fn(&Entry, u64) -> Result<EncodedEntry>,
+) -> Result<std::result::Result<Checkpointed, CheckpointInput>> {
+    let base = chain.base();
+    let base_bytes = base.entry_bytes();
+    let to_base: Option<Vec<u32>> = input
+        .tables
+        .iter()
+        .map(|desc| base.header().table_index(desc))
+        .collect();
+    let Some(to_base) = to_base else {
+        return Ok(Err(input));
+    };
+    let least: u64 = input
+        .fresh
+        .iter()
+        .map(|e| (e.key.len() + e.value.len()) as u64)
+        .sum();
+    if least.saturating_mul(4) > base_bytes {
+        return Ok(Err(input));
+    }
+    let mut stats = CheckpointStats {
+        delta: true,
+        chain_depth: chain.depth() + 1,
+        ..CheckpointStats::default()
+    };
+    let held = held_in_chain(backend, chain, &input.fresh, &to_base)?;
+    let unkept = unkept(&input.fresh, &held);
+    drop(held);
+    let mut fates = vec![Fate::Written; input.fresh.len()];
+    let mut kept = Vec::new();
+    let mut origin = Vec::new();
+    for (i, (entry, drop)) in input.fresh.iter().zip(unkept).enumerate() {
+        if drop {
+            stats.unkept += 1;
+            fates[i] = Fate::Unkept;
+            continue;
+        }
+        let mut entry = entry.clone();
+        entry.last_used = next.seq;
+        renumber(&mut entry, &to_base);
+        kept.push(entry);
+        origin.push(i);
+    }
+    let merged_at = Instant::now();
+    stats.times.merge = merged_at - next.started;
+
+    let header = DeltaHeader {
+        header: GenHeader {
+            build: input.build,
+            seq: next.seq,
+            tables: base.header().tables.clone(),
+        },
+        base: base.id(),
+        parent: chain.tip().id(),
+    };
+    let tag = header.frame_tag();
+    let frames = encode_fitting(&kept, |entry| encode(entry, tag), &mut stats.oversized)?;
+    let mut written = Vec::with_capacity(frames.len());
+    let mut tombstones = Vec::new();
+    for ((entry, i), frame) in kept.iter().zip(origin).zip(frames) {
+        match frame {
+            Some(frame) => written.push(frame),
+            None => {
+                fates[i] = Fate::Oversized;
+                let hash = key_hash(&entry.key);
+                if layers::may_hold(chain.layers(), entry.table, hash) {
+                    tombstones.push(Tombstone {
+                        table: entry.table,
+                        key_hash: hash,
+                    });
+                }
+            }
+        }
+    }
+    drop(kept);
+    if written.is_empty() && tombstones.is_empty() {
+        stats.delta = false;
+        stats.chain_depth = chain.depth();
+        stats.times.write = merged_at.elapsed();
+        return Ok(Ok(Checkpointed {
+            generation: Arc::clone(chain.tip()),
+            chain: chain.clone(),
+            superseded: Vec::new(),
+            stats,
+            fates,
+            evicted_base: Vec::new(),
+        }));
+    }
+    let bytes: u64 = written.iter().map(|e| e.frame.len() as u64).sum();
+    let mut items: Vec<IndexItem> = written
+        .iter()
+        .map(|e| IndexItem {
+            table: e.table,
+            key_hash: e.key_hash,
+            loc: 0,
+            len: e.frame.len() as u32,
+        })
+        .chain(
+            tombstones
+                .iter()
+                .map(|t| IndexItem::tombstone(t.table, t.key_hash)),
+        )
+        .collect();
+    items.sort_unstable_by_key(|item| (item.table, item.key_hash));
+    let live = Live::of_chain(chain.layers()).with_layer(chain.layers(), &items);
+    if bytes.saturating_mul(4) > base_bytes || live.bytes > input.max_bytes {
+        return Ok(Err(input));
+    }
+    stats.written = written.len();
+    stats.fresh_written = written.len();
+    stats.tombstones = tombstones.len();
+    stats.bytes_appended = bytes;
+    let generation =
+        backend.write_delta(chain.tip().id(), next.id, &header, &written, &tombstones)?;
+    stats.times.write = merged_at.elapsed();
+    let generation = Arc::new(generation);
+    let mut layers = chain.layers().to_vec();
+    layers.push(Arc::clone(&generation));
+    Ok(Ok(Checkpointed {
+        generation,
+        chain: Chain::new(layers)?,
+        superseded: Vec::new(),
+        stats,
+        fates,
+        evicted_base: Vec::new(),
+    }))
+}
+
+/// Moves `entry`'s table and query-dep tables from the live catalog to
+/// the base's through `to_base`.
+fn renumber(entry: &mut Entry, to_base: &[u32]) {
+    entry.table = to_base[entry.table as usize];
+    for dep in &mut entry.deps {
+        if let StoredDep::Query { table, .. } = dep {
+            *table = to_base[*table as usize];
+        }
+    }
+}
+
+/// The fps of the stored entries the fresh entries' query deps name, read
+/// through `chain` newest first; deps are keyed in the live catalog.
+fn held_in_chain<'a, B: MemoBackend + ?Sized>(
+    backend: &B,
+    chain: &Chain,
+    fresh: &'a [Entry],
+    to_base: &[u32],
+) -> Result<Held<'a>> {
+    let mut fps = HashMap::new();
+    for entry in fresh {
+        for (dep, _) in query_deps(entry) {
+            if fps.contains_key(&dep) {
+                continue;
+            }
+            let Some(&table) = to_base.get(dep.0 as usize) else {
+                continue;
+            };
+            let probe = layers::probe(chain.layers(), table, dep.1, |id, item| {
+                backend.read_entry(id, item)
+            })?;
+            if let Probe::Found(stored) = probe {
+                fps.insert(dep, fingerprint(&stored.value));
+            }
+        }
+    }
+    Ok(Held {
+        at: HashMap::new(),
+        fps: RefCell::new(fps),
+    })
+}
+
+/// Writes the next full generation from `input` and, when `merged`, every
+/// entry `chain` shows that was not rewritten.
+fn write_full<B: MemoBackend + ?Sized>(
+    backend: &B,
+    chain: Option<&Chain>,
+    merged: bool,
+    input: CheckpointInput,
+    next: &Next,
+    encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
+) -> Result<Checkpointed> {
+    let seq = next.seq;
+    let mut stats = CheckpointStats::default();
     let mut tables = input.tables;
-    let mergeable = |g: &&Generation| next_seq.is_some() && g.header().build == input.build;
-    let based = match base.as_ref().filter(mergeable) {
-        Some(base) => read_base(backend, base, &mut tables, &mut stats)?,
+    let based = match chain.filter(|_| merged) {
+        Some(chain) => read_chain(backend, chain.layers(), &mut tables, &mut stats)?,
         None => Vec::new(),
     };
     let unkept = unkept(&input.fresh, &Held::new(&based));
@@ -178,7 +435,7 @@ fn write_with<B: MemoBackend + ?Sized>(
     }
     drop(present);
     let merged_at = Instant::now();
-    stats.times.merge = merged_at - started;
+    stats.times.merge = merged_at - next.started;
 
     let header = GenHeader {
         build: input.build,
@@ -228,12 +485,17 @@ fn write_with<B: MemoBackend + ?Sized>(
     stats.written = kept.len();
     stats.fresh_written = fates.iter().filter(|&&f| f == Fate::Written).count();
     stats.bytes_appended = kept.iter().map(|e| e.frame.len() as u64).sum();
-    let base_id = base.as_ref().map(Generation::id);
-    let generation = backend.write_generation(base_id, id, &header, &kept)?;
+    let superseded: Vec<GenId> = chain
+        .map(|chain| chain.layers().iter().map(|layer| layer.id()).collect())
+        .unwrap_or_default();
+    stats.compacted = superseded.len() > 1;
+    let tip = chain.map(|chain| chain.tip().id());
+    let generation = Arc::new(backend.write_generation(tip, next.id, &header, &kept)?);
     stats.times.write = merged_at.elapsed();
     Ok(Checkpointed {
+        chain: Chain::new(vec![Arc::clone(&generation)])?,
         generation,
-        replaced: base_id,
+        superseded,
         stats,
         fates,
         evicted_base,
@@ -276,14 +538,14 @@ impl<'a> Held<'a> {
     }
 
     fn holds(&self, dep: Identity<'a>, fp: u128) -> bool {
+        if let Some(&stored) = self.fps.borrow().get(&dep) {
+            return stored == fp;
+        }
         let Some(entry) = self.at.get(&dep) else {
             return false;
         };
-        let stored = *self
-            .fps
-            .borrow_mut()
-            .entry(dep)
-            .or_insert_with(|| fingerprint(&entry.value));
+        let stored = fingerprint(&entry.value);
+        self.fps.borrow_mut().insert(dep, stored);
         stored == fp
     }
 }
@@ -350,16 +612,134 @@ fn unkept<'a>(entries: &'a [Entry], held: &Held<'a>) -> Vec<bool> {
     out
 }
 
-/// Every base entry whose table survives, decoded and renumbered into
-/// `tables`, which gains the base tables with no live namesake.
+/// Every entry `layers` (oldest first) show whose table survives, decoded
+/// and renumbered into `tables`, which gains the stored tables with no live
+/// namesake. Newer layers hide older entries of the same key, and a
+/// tombstone, a corrupt frame or a dropped entry those of its table and
+/// key hash. Entries
+/// come grouped by table, older layers first, each layer in frame order.
+fn read_chain<B: MemoBackend + ?Sized>(
+    backend: &B,
+    layers: &[Arc<Generation>],
+    tables: &mut Vec<TableDesc>,
+    stats: &mut CheckpointStats,
+) -> Result<Vec<Entry>> {
+    if let [base] = layers {
+        return read_base(backend, base, tables, stats);
+    }
+    let mut hidden: HashSet<(u32, u64)> = HashSet::new();
+    let mut seen: HashSet<(u32, Vec<u8>)> = HashSet::new();
+    let mut per_layer: Vec<Vec<Entry>> = Vec::with_capacity(layers.len());
+    'layers: for layer in layers.iter().rev() {
+        let remap = remap_into(layer.header(), tables);
+        let remap_table = |table: u32| remap.get(table as usize).copied().flatten();
+        let mut found = Vec::new();
+        let mut hides = Vec::new();
+        let mut items: Vec<&IndexItem> = layer.items().iter().collect();
+        items.sort_unstable_by_key(|item| item.loc);
+        for item in items {
+            let Some(table) = remap_table(item.table) else {
+                continue;
+            };
+            if hidden.contains(&(table, item.key_hash)) {
+                continue;
+            }
+            if item.is_tombstone() {
+                hides.push((table, item.key_hash));
+                continue;
+            }
+            let Some(frame) = backend.read_entry(layer.id(), item)? else {
+                // Another handle removed the chain; nothing more can be merged.
+                per_layer.push(found);
+                break 'layers;
+            };
+            match decode_stored(&frame, layer, item, &remap, stats) {
+                Stored::Kept(entry) => {
+                    if seen.insert((entry.table, entry.key.clone())) {
+                        found.push(entry);
+                    }
+                }
+                Stored::Dropped | Stored::Corrupt => hides.push((table, item.key_hash)),
+            }
+        }
+        hidden.extend(hides);
+        per_layer.push(found);
+    }
+    let mut by_table: Vec<Vec<Entry>> = vec![Vec::new(); tables.len()];
+    for entry in per_layer.into_iter().rev().flatten() {
+        by_table[entry.table as usize].push(entry);
+    }
+    Ok(by_table.into_iter().flatten().collect())
+}
+
+/// Every entry of the full generation `base` whose table survives, decoded
+/// and renumbered into `tables` as [`read_chain`] does.
 fn read_base<B: MemoBackend + ?Sized>(
     backend: &B,
     base: &Generation,
     tables: &mut Vec<TableDesc>,
     stats: &mut CheckpointStats,
 ) -> Result<Vec<Entry>> {
-    let remap: Vec<Option<u32>> = base
-        .header()
+    let remap = remap_into(base.header(), tables);
+    let mut by_table: Vec<Vec<Entry>> = vec![Vec::new(); tables.len()];
+    let mut items: Vec<&IndexItem> = base.items().iter().collect();
+    items.sort_unstable_by_key(|item| item.loc);
+    for item in items {
+        let Some(frame) = backend.read_entry(base.id(), item)? else {
+            // Another handle removed the base; nothing more can be merged.
+            break;
+        };
+        if let Stored::Kept(entry) = decode_stored(&frame, base, item, &remap, stats) {
+            by_table[entry.table as usize].push(entry);
+        }
+    }
+    Ok(by_table.into_iter().flatten().collect())
+}
+
+enum Stored {
+    Kept(Entry),
+    /// Its table or a query dep's table did not survive.
+    Dropped,
+    /// Counted in [`CheckpointStats::corrupt`].
+    Corrupt,
+}
+
+/// Decodes `item`'s `frame` of `layer` and renumbers it through `remap`.
+fn decode_stored(
+    frame: &[u8],
+    layer: &Generation,
+    item: &IndexItem,
+    remap: &[Option<u32>],
+    stats: &mut CheckpointStats,
+) -> Stored {
+    let remap_table = |table: u32| remap.get(table as usize).copied().flatten();
+    let entry = decode_entry(frame, layer.frame_tag())
+        .ok()
+        .filter(|entry| entry.table == item.table && key_hash(&entry.key) == item.key_hash);
+    let Some(mut entry) = entry else {
+        stats.corrupt += 1;
+        return Stored::Corrupt;
+    };
+    let Some(table) = remap_table(entry.table) else {
+        return Stored::Dropped;
+    };
+    entry.table = table;
+    let deps_remapped = entry.deps.iter_mut().all(|dep| match dep {
+        StoredDep::Query { table, .. } => remap_table(*table).map(|t| *table = t).is_some(),
+        _ => true,
+    });
+    if deps_remapped {
+        Stored::Kept(entry)
+    } else {
+        Stored::Dropped
+    }
+}
+
+/// Per table of `header`'s catalog, its index in `tables`: a table equal
+/// to a live one maps to it, one whose name a live table has under another
+/// descriptor maps to nothing, and any other is appended to `tables`.
+fn remap_into(header: &GenHeader, tables: &mut Vec<TableDesc>) -> Vec<Option<u32>> {
+    header
         .tables
         .iter()
         .map(|desc| {
@@ -372,38 +752,7 @@ fn read_base<B: MemoBackend + ?Sized>(
             tables.push(desc.clone());
             Some(tables.len() as u32 - 1)
         })
-        .collect();
-    let remap_table = |table: u32| remap.get(table as usize).copied().flatten();
-
-    let mut by_table: Vec<Vec<Entry>> = vec![Vec::new(); tables.len()];
-    let mut items: Vec<&IndexItem> = base.items().iter().collect();
-    items.sort_unstable_by_key(|item| item.loc);
-    for item in items {
-        let Some(frame) = backend.read_entry(base.id(), item)? else {
-            // Another handle removed the base; nothing more can be merged.
-            break;
-        };
-        let Ok(mut entry) = decode_entry(&frame, base.frame_tag()) else {
-            stats.corrupt += 1;
-            continue;
-        };
-        if entry.table != item.table || key_hash(&entry.key) != item.key_hash {
-            stats.corrupt += 1;
-            continue;
-        }
-        let Some(table) = remap_table(entry.table) else {
-            continue;
-        };
-        entry.table = table;
-        let deps_remapped = entry.deps.iter_mut().all(|dep| match dep {
-            StoredDep::Query { table, .. } => remap_table(*table).map(|t| *table = t).is_some(),
-            _ => true,
-        });
-        if deps_remapped {
-            by_table[entry.table as usize].push(entry);
-        }
-    }
-    Ok(by_table.into_iter().flatten().collect())
+        .collect()
 }
 
 /// Each entry's frame, `None` for one whose frame would be too long and

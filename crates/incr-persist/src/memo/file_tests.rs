@@ -302,7 +302,7 @@ fn checkpoints_merge_across_handles_and_reopen() {
             },
         )
         .unwrap();
-        if let Some(old) = done.replaced {
+        for &old in &done.superseded {
             memo.remove_generation(old).unwrap();
         }
         done.generation
@@ -614,4 +614,121 @@ fn a_stale_delta_sharing_the_current_generations_id_does_not_remove_it() {
     let loaded = reload(dir.path()).unwrap();
     assert_eq!(loaded.id(), GenId(2));
     assert_eq!(loaded.items().len(), 4);
+}
+
+/// A beta.9 writer on a chained directory loads only the base and writes
+/// its next generation under the id a delta already has: both
+/// `MEMO_GEN.2` and `MEMO_DELTA.2` exist and `MEMO_CURRENT` names 2. A
+/// handle that loaded the chain before reads the new full generation, not
+/// its old delta, and its next checkpoint succeeds.
+#[test]
+fn a_generation_numbered_like_a_delta_is_not_read_as_that_delta() {
+    let (dir, memo) = store();
+    let (other_dir, other) = store();
+    let base_entries = entries(0..8);
+    memo.write_generation(None, GenId(1), &header(1), &base_entries)
+        .unwrap();
+    other
+        .write_generation(None, GenId(1), &header(1), &base_entries)
+        .unwrap();
+    let full_entries = entries(20..23);
+    let full = other
+        .write_generation(Some(GenId(1)), GenId(2), &header(2), &full_entries)
+        .unwrap();
+    let delta = DeltaHeader {
+        header: header(2),
+        base: GenId(1),
+        parent: GenId(1),
+    };
+    let tag = delta.frame_tag();
+    let delta_entries: Vec<_> = (10..12)
+        .map(|key| EncodedEntry::new(&entry(key), tag).unwrap())
+        .collect();
+    memo.write_delta(GenId(1), GenId(2), &delta, &delta_entries, &[])
+        .unwrap();
+    let known = memo.load_chain(&[]).unwrap().unwrap().into_layers();
+    for item in known[1].items() {
+        memo.read_entry(GenId(2), item).unwrap();
+    }
+
+    fs::copy(
+        other_dir.path().join("MEMO_GEN.2"),
+        dir.path().join("MEMO_GEN.2"),
+    )
+    .unwrap();
+    fs::copy(other_dir.path().join(CURRENT), dir.path().join(CURRENT)).unwrap();
+
+    for chain in [
+        memo.load_chain(&known).unwrap().unwrap(),
+        FileMemo::open(dir.path())
+            .unwrap()
+            .load_chain(&[])
+            .unwrap()
+            .unwrap(),
+    ] {
+        assert_eq!(chain.depth(), 0);
+        let tip = chain.tip();
+        assert_eq!(tip.base(), None);
+        assert_eq!(tip.items(), full.items());
+    }
+    for written in &full_entries {
+        let item = full.find(written.table, written.key_hash)[0];
+        let frame = memo.read_entry(GenId(2), &item).unwrap().unwrap();
+        assert_eq!(frame, written.frame, "the full generation's frame");
+    }
+    let done = write_checkpoint(
+        &memo,
+        CheckpointInput {
+            build: 9,
+            tables: vec![desc()],
+            fresh: vec![entry(30)],
+            max_bytes: DEFAULT_MAX_BYTES,
+        },
+    )
+    .unwrap();
+    assert_eq!(done.generation.id(), GenId(3));
+    assert_eq!(done.superseded, [GenId(2)]);
+}
+
+/// The handle that wrote delta 2 reads its frames from `MEMO_DELTA.2`
+/// even after a beta.9 writer published `MEMO_GEN.2` before that handle's
+/// first read of the delta.
+#[test]
+fn a_written_delta_is_read_from_its_own_file() {
+    let (dir, memo) = store();
+    let (other_dir, other) = store();
+    let base_entries = entries(0..8);
+    memo.write_generation(None, GenId(1), &header(1), &base_entries)
+        .unwrap();
+    other
+        .write_generation(None, GenId(1), &header(1), &base_entries)
+        .unwrap();
+    other
+        .write_generation(Some(GenId(1)), GenId(2), &header(2), &entries(20..23))
+        .unwrap();
+    let delta = DeltaHeader {
+        header: header(2),
+        base: GenId(1),
+        parent: GenId(1),
+    };
+    let tag = delta.frame_tag();
+    let delta_entries: Vec<_> = (10..12)
+        .map(|key| EncodedEntry::new(&entry(key), tag).unwrap())
+        .collect();
+    let written = memo
+        .write_delta(GenId(1), GenId(2), &delta, &delta_entries, &[])
+        .unwrap();
+
+    fs::copy(
+        other_dir.path().join("MEMO_GEN.2"),
+        dir.path().join("MEMO_GEN.2"),
+    )
+    .unwrap();
+    fs::copy(other_dir.path().join(CURRENT), dir.path().join(CURRENT)).unwrap();
+
+    for entry in &delta_entries {
+        let item = written.find(entry.table, entry.key_hash)[0];
+        let frame = memo.read_entry(GenId(2), &item).unwrap().unwrap();
+        assert_eq!(frame, entry.frame, "the delta's frame");
+    }
 }

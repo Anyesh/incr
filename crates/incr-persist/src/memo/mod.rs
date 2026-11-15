@@ -19,6 +19,7 @@ mod dirty;
 mod file;
 mod generation;
 mod handle;
+mod layers;
 mod mapping;
 mod memo_core;
 mod memory;
@@ -37,7 +38,7 @@ pub(crate) const VALUE_BATCH: usize = 256;
 pub use backend::{EncodedEntry, MemoBackend, Tombstone};
 pub use checkpoint::{
     write_checkpoint, CheckpointInput, CheckpointStats, CheckpointTimes, Checkpointed,
-    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_BYTES, MAX_CHAIN_DEPTH,
 };
 pub use codec::*;
 pub use file::{FileMemo, FileMemoGuard};
