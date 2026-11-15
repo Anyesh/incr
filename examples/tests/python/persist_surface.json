@@ -909,7 +909,7 @@
    "load_chain": {
     "doc": null,
     "kind": "method_descriptor",
-    "signature": "(self, /)"
+    "signature": "(self, /, known=None)"
    },
    "lock_checkpoint": {
     "doc": null,

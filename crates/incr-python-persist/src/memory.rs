@@ -8,6 +8,8 @@
 #[macro_export]
 macro_rules! memory_classes {
     ($exc:ty, $module:literal) => {
+        use std::collections::HashSet;
+
         use $crate::incr_persist::memo::{
             decode_delta_header, decode_header, encode_delta_header, encode_header, DeltaHeader,
             EncodedEntry, GenId, Generation, IndexItem, MemoBackend, MemoryMemo, Tombstone,
@@ -288,10 +290,13 @@ macro_rules! memory_classes {
             }
 
             #[allow(clippy::type_complexity)]
+            #[pyo3(signature = (known=None))]
             fn load_chain(
                 &self,
                 py: Python<'_>,
-            ) -> PyResult<Option<Vec<(u64, Py<PyBytes>, Vec<ItemTuple>)>>> {
+                known: Option<HashSet<u64>>,
+            ) -> PyResult<Option<Vec<(u64, Option<Py<PyBytes>>, Option<Vec<ItemTuple>>)>>> {
+                let known = known.unwrap_or_default();
                 let Some(chain) = self
                     .inner
                     .load_chain(&[])
@@ -302,7 +307,13 @@ macro_rules! memory_classes {
                 let layers = chain
                     .layers()
                     .iter()
-                    .map(|layer| layer_tuple(py, layer))
+                    .map(|layer| {
+                        if known.contains(&layer.id().0) {
+                            return Ok((layer.id().0, None, None));
+                        }
+                        let (id, header, items) = layer_tuple(py, layer)?;
+                        Ok((id, Some(header), Some(items)))
+                    })
                     .collect::<PyResult<Vec<_>>>()?;
                 Ok(Some(layers))
             }

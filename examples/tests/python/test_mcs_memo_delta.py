@@ -283,3 +283,37 @@ def test_an_unknown_layer_id_in_a_known_placeholder_is_a_bad_return(persist):
     graph.read(5)
     with pytest.raises(TypeError):
         graph.memo.checkpoint()
+
+
+def test_memory_memo_sends_a_placeholder_for_each_known_layer(persist):
+    backend = persist.MemoryMemo()
+    graph = Graph(persist, persist.MemoryBackend(), backend)
+    graph.read_all(range(10))
+    graph.memo.checkpoint()
+    for key in (10, 11):
+        graph.read(key)
+        graph.memo.checkpoint()
+
+    layers = backend.load_chain()
+    ids = [layer[0] for layer in layers]
+    assert len(ids) == 3
+    assert all(layer[1] is not None and layer[2] is not None for layer in layers)
+
+    partial = backend.load_chain(frozenset(ids[:2]))
+    assert partial[:2] == [(ids[0], None, None), (ids[1], None, None)]
+    assert partial[2] == layers[2]
+    assert backend.load_chain(frozenset()) == layers
+
+
+def test_memory_memo_takes_known_when_the_store_opens_it(persist):
+    backend = persist.MemoryMemo()
+    graph = Graph(persist, persist.MemoryBackend(), backend)
+    graph.read_all(range(10))
+    graph.memo.checkpoint()
+    state = graph.memo.stats()
+    assert state["chain_depth"] == 0
+    held = {layer[0] for layer in backend.load_chain()}
+    again = Graph(persist, persist.MemoryBackend(), backend)
+    again.read_all(range(10, 12))
+    assert again.memo.checkpoint()["delta"] is True
+    assert held <= {layer[0] for layer in backend.load_chain()}
