@@ -140,7 +140,8 @@ pub struct Checkpointed {
 /// over, appended to the catalog.
 ///
 /// Fails with [`Error::Busy`](crate::Error::Busy) when another handle holds
-/// the lock or changed the chain meanwhile, and with
+/// the lock, changed the chain meanwhile or removed a layer the write was
+/// carrying entries from, and with
 /// [`Error::Corrupt`](crate::Error::Corrupt) when the tip's id is
 /// `u64::MAX`; nothing is written then.
 pub fn write_checkpoint<B: MemoBackend + ?Sized>(
@@ -793,7 +794,6 @@ struct Walk<'s, 'a, B: ?Sized, E> {
     current: Option<(usize, std::vec::IntoIter<IndexItem>)>,
     hidden: HashSet<(u32, u64)>,
     hides: Vec<(u32, u64)>,
-    gone: bool,
 }
 
 impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
@@ -805,7 +805,6 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
             current: None,
             hidden: HashSet::new(),
             hides: Vec::new(),
-            gone: false,
         }
     }
 
@@ -822,13 +821,11 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
     }
 
     /// The next batch of `(item, frame)` with the layer they are from, or
-    /// `None` at the end or once a layer is gone, as when another handle
-    /// removed the chain: nothing more can be carried then.
+    /// `None` at the end. Fails with [`Error::Busy`] once a layer is gone,
+    /// as when another handle removed the chain, so that no write carries
+    /// only part of it.
     fn next_batch(&mut self) -> Result<Option<Batch>> {
         loop {
-            if self.gone {
-                return Ok(None);
-            }
             let Some((at, items)) = self.current.as_mut() else {
                 if !self.start_layer() {
                     return Ok(None);
@@ -855,14 +852,16 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
             }
             let layer = &self.source.layers[at];
             let frames = self.source.backend.read_entries(layer.id(), &batch)?;
-            let mut out = Vec::with_capacity(batch.len());
-            for (item, frame) in batch.into_iter().zip(frames) {
-                let Some(frame) = frame else {
-                    self.gone = true;
-                    break;
-                };
-                out.push((item, frame));
+            if frames.len() != batch.len() {
+                return Err(Error::Corrupt(
+                    "a memo backend returned another number of frames than it was asked for",
+                ));
             }
+            let out = batch
+                .into_iter()
+                .zip(frames)
+                .map(|(item, frame)| frame.map(|frame| (item, frame)).ok_or(Error::Busy))
+                .collect::<Result<_>>()?;
             return Ok(Some((at, out)));
         }
     }

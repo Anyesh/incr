@@ -1181,3 +1181,162 @@ fn an_oversized_entry_no_layer_holds_writes_no_tombstone() {
     assert_eq!(done.generation.id(), base.generation.id());
     assert_eq!(done.fates, [Fate::Oversized]);
 }
+
+/// A [`MemoryMemo`] that counts the frames it hands out before a full
+/// write starts pulling (`probed`, with the `read_entries` calls among
+/// them) and in all, and that answers `None` for the item `dropping`
+/// names. Without `batches` it reads one frame per call, as a backend
+/// with only `read_entry` does.
+struct Counting {
+    memo: MemoryMemo,
+    batches: bool,
+    writing: AtomicBool,
+    reads: AtomicUsize,
+    probed: AtomicUsize,
+    probe_calls: AtomicUsize,
+    single_probes: AtomicUsize,
+    dropping: std::sync::Mutex<Option<(u32, u64)>>,
+}
+
+impl Counting {
+    fn new(memo: MemoryMemo, batches: bool) -> Self {
+        Counting {
+            memo,
+            batches,
+            writing: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+            probed: AtomicUsize::new(0),
+            probe_calls: AtomicUsize::new(0),
+            single_probes: AtomicUsize::new(0),
+            dropping: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn reset(&self) {
+        for counter in [
+            &self.reads,
+            &self.probed,
+            &self.probe_calls,
+            &self.single_probes,
+        ] {
+            counter.store(0, SeqCst);
+        }
+    }
+
+    fn read(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
+        self.reads.fetch_add(1, SeqCst);
+        if !self.writing.load(SeqCst) {
+            self.probed.fetch_add(1, SeqCst);
+        }
+        if *self.dropping.lock().unwrap() == Some((item.table, item.key_hash)) {
+            return Ok(None);
+        }
+        self.memo.read_entry(generation, item)
+    }
+}
+
+impl MemoBackend for Counting {
+    type Guard = <MemoryMemo as MemoBackend>::Guard;
+
+    fn lock_checkpoint(&self) -> Result<Self::Guard> {
+        self.memo.lock_checkpoint()
+    }
+
+    fn load(&self) -> Result<Option<Generation>> {
+        self.memo.load()
+    }
+
+    fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
+        if !self.writing.load(SeqCst) {
+            self.single_probes.fetch_add(1, SeqCst);
+        }
+        self.read(generation, item)
+    }
+
+    fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
+        if !self.batches {
+            return items
+                .iter()
+                .map(|item| self.read_entry(generation, item))
+                .collect();
+        }
+        if !self.writing.load(SeqCst) {
+            self.probe_calls.fetch_add(1, SeqCst);
+        }
+        items
+            .iter()
+            .map(|item| self.read(generation, item))
+            .collect()
+    }
+
+    fn write_generation(
+        &self,
+        base: Option<GenId>,
+        id: GenId,
+        header: &GenHeader,
+        entries: &[EncodedEntry],
+    ) -> Result<Generation> {
+        self.memo.write_generation(base, id, header, entries)
+    }
+
+    fn write_generation_streamed(
+        &self,
+        base: Option<GenId>,
+        id: GenId,
+        header: &GenHeader,
+        entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
+    ) -> Result<Generation> {
+        self.writing.store(true, SeqCst);
+        let pulled = entries.collect::<Result<Vec<_>>>();
+        self.writing.store(false, SeqCst);
+        self.memo.write_generation(base, id, header, &pulled?)
+    }
+
+    fn supports_delta(&self) -> bool {
+        self.memo.supports_delta()
+    }
+
+    fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
+        self.memo.load_chain(known)
+    }
+
+    fn write_delta(
+        &self,
+        tip: GenId,
+        id: GenId,
+        header: &DeltaHeader,
+        entries: &[EncodedEntry],
+        tombstones: &[Tombstone],
+    ) -> Result<Generation> {
+        self.memo.write_delta(tip, id, header, entries, tombstones)
+    }
+
+    fn remove_generation(&self, generation: GenId) -> Result<()> {
+        self.memo.remove_generation(generation)
+    }
+}
+
+#[test]
+fn a_frame_gone_mid_stream_fails_the_checkpoint_and_publishes_nothing() {
+    let tables = vec![desc("a", 1)];
+    for evicting in [false, true] {
+        let memo = Counting::new(MemoryMemo::without_deltas(), true);
+        let base = write_checkpoint(&memo, wide_input(tables.clone(), 0..400, 1)).unwrap();
+        let gone = base.generation.items()[300];
+        *memo.dropping.lock().unwrap() = Some((gone.table, gone.key_hash));
+        let mut next = wide_input(tables.clone(), 1000..1010, 2);
+        if evicting {
+            next.max_bytes = base.generation.entry_bytes();
+        }
+        memo.reset();
+        let result = write_known(&memo, next, base.chain.layers());
+        assert!(
+            matches!(result, Err(Error::Busy)),
+            "evicting {evicting}: {result:?}"
+        );
+        assert!(memo.reads.load(SeqCst) > 0);
+        let current = memo.load().unwrap().unwrap();
+        assert_eq!(current.id(), base.generation.id());
+        assert_eq!(current.items().len(), 400);
+    }
+}
