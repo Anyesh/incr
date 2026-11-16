@@ -48,6 +48,14 @@ fn proc_status_kib(field: &str) -> Option<u64> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
+fn proc_read_mib() -> u64 {
+    let io = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+    let line = io.lines().find(|l| l.starts_with("rchar:"));
+    line.and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .unwrap_or(0)
+        >> 20
+}
+
 fn env_or(name: &str, default: u64) -> u64 {
     match std::env::var(name) {
         Ok(v) => v
@@ -234,13 +242,14 @@ fn cycle<C: BenchCells>(name: &str, backend: fn(&TempDir) -> Box<dyn MemoBackend
         let (stats, total) = filled.checkpoint_stats();
         let kind = shape::kind(&stats);
         eprintln!(
-            "memo_stall_{name}{}: #{n} {kind} total {:.1} ms (snapshot {:.1}, merge {:.1}, write {:.1}) VmRSS {} KiB",
+            "memo_stall_{name}{}: #{n} {kind} total {:.1} ms (snapshot {:.1}, merge {:.1}, write {:.1}) VmRSS {} KiB, read {} MiB",
             C::SUFFIX,
             ms(total),
             ms(stats.times.snapshot),
             ms(stats.times.merge),
             ms(stats.times.write),
             proc_status_kib("VmRSS:").unwrap_or(0),
+            proc_read_mib(),
         );
         all += total;
         if shape::is_delta(&stats) {
