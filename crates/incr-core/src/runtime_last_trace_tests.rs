@@ -9,7 +9,7 @@ use crate::cells::{Cells, Local, Shared};
 use crate::handle::Incr;
 use crate::node::NodeId;
 use crate::state::NodeState;
-use crate::trace::TraceAction;
+use crate::trace::{Retain, RootEntries, StampPair, TraceAction, TraceCapture};
 use crate::value::Value;
 
 fn traced<C: Cells, T: Value>(rt: &Runtime<C>, q: Incr<T>, tag: &'static str) -> T {
@@ -212,6 +212,67 @@ fn node_info_reads_one_node_by_id<C: Cells>() {
     assert!(rt.node_info(NodeId(u32::MAX - 1), 0).is_none());
     rt.delete_node(q);
     assert!(rt.node_info(NodeId(q.slot()), 0).is_none());
+}
+
+fn pair(verified_at: u64, changed_at: u64) -> StampPair {
+    StampPair {
+        verified_at,
+        changed_at,
+    }
+}
+
+fn capture(before: StampPair, entries: &[(TraceAction, StampPair)]) -> TraceCapture {
+    let mut root = RootEntries::default();
+    for (action, stamps) in entries {
+        root.see(action, *stamps);
+    }
+    TraceCapture {
+        slot: 0,
+        generation: 0,
+        before,
+        root,
+    }
+}
+
+#[test]
+fn a_capture_keeps_only_what_its_root_entries_vouch_for() {
+    let verified = TraceAction::VerifiedClean;
+    let recomputed = TraceAction::Recomputed {
+        value_changed: true,
+    };
+    assert_eq!(
+        capture(pair(4, 3), &[(verified.clone(), pair(6, 3))]).decide(),
+        Retain::Restamp {
+            from: pair(4, 3),
+            to: pair(6, 3)
+        }
+    );
+    assert_eq!(
+        capture(pair(4, 3), &[(verified.clone(), pair(6, 5))]).decide(),
+        Retain::Nothing,
+        "a verify never moves changed_at, so another run did"
+    );
+    assert_eq!(
+        capture(
+            pair(4, 3),
+            &[
+                (recomputed.clone(), pair(6, 6)),
+                (verified.clone(), pair(7, 6))
+            ]
+        )
+        .decide(),
+        Retain::Nothing
+    );
+    assert_eq!(
+        capture(pair(4, 3), &[(recomputed.clone(), pair(0, 6))]).decide(),
+        Retain::Nothing,
+        "a poisoned or memo landing reads verified_at 0"
+    );
+    assert_eq!(
+        capture(pair(4, 3), &[(recomputed, pair(6, 6))]).decide(),
+        Retain::Keep(pair(6, 6))
+    );
+    assert_eq!(capture(pair(4, 3), &[]).decide(), Retain::Nothing);
 }
 
 fn cases<C: Cells>() {

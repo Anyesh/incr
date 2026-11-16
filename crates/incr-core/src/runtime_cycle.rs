@@ -2670,14 +2670,14 @@ impl<C: Cells> Runtime<C> {
             self.children_landing(id, flags, children, e.opened(), bag);
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
-            let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
-            self.end_reservation_landed(id, node, landed);
             self.record_trace(
                 id,
                 crate::trace::TraceAction::Recomputed {
                     value_changed: changed,
                 },
             );
+            let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
+            self.end_reservation_landed(id, node, landed);
             Some(landed)
         };
         bag.push_erased(Box::new(e.into_values()));

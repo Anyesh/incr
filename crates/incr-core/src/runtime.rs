@@ -4018,12 +4018,12 @@ impl<C: Cells> Runtime<C> {
         }
         let disarm = Disarm(self);
         self.check_handle(handle);
-        let before = self.stamp_pair(handle.slot());
-        {
+        let before = {
             let mut inner = self.inner.write();
             inner.trace_log.clear();
             inner.trace_root = Some((handle.slot(), Default::default()));
-        }
+            self.stamp_pair(handle.slot())
+        };
         self.instrument_state.write().trace_times.clear();
 
         // std has no clock on wasm32-unknown-unknown and `Instant::now()`
@@ -6750,6 +6750,9 @@ impl<C: Cells> Runtime<C> {
                 // The run computed the node alone, as the unbounded run's
                 // does, so the node leaves its group.
                 self.drop_takes(id, node.generation(), cidx);
+                // Recorded while the claim is held, so a traced root's entry
+                // reads the stamps this run left, not a later run's.
+                self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                 let landed =
                     self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag);
                 self.end_reservation_landed(id, node, landed);
@@ -6763,10 +6766,8 @@ impl<C: Cells> Runtime<C> {
                             cycle::POISONED
                         },
                     );
-                    self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
-                self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                 return Computed::Done;
             }
         }

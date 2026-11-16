@@ -249,7 +249,11 @@ impl TraceCapture {
     pub(crate) fn decide(&self) -> Retain {
         match self.root.last {
             Some((true, stamps)) if stamps.is_landed() => Retain::Keep(stamps),
-            Some((false, stamps)) if self.root.count == 1 && stamps.is_landed() => {
+            Some((false, stamps))
+                if self.root.count == 1
+                    && stamps.is_landed()
+                    && stamps.changed_at == self.before.changed_at =>
+            {
                 Retain::Restamp {
                     from: self.before,
                     to: stamps,

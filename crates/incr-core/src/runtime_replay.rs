@@ -1040,14 +1040,14 @@ impl<C: Cells> Runtime<C> {
             };
             self.land_children(a.id, landing, index.opened, bag);
         }
-        let landed = self.land_single(a.id, node, flags, target, NodeState::Dirty);
-        self.end_reservation_landed(a.id, node, landed);
         self.record_trace(
             a.id,
             crate::trace::TraceAction::Recomputed {
                 value_changed: changed,
             },
         );
+        let landed = self.land_single(a.id, node, flags, target, NodeState::Dirty);
+        self.end_reservation_landed(a.id, node, landed);
         Landing::Landed(landed)
     }
 
