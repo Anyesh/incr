@@ -50,10 +50,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-python-protocol --exclude incr-python-persist --exclude incr-wasm-tests --features incr-persist/sqlite
-      - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-python-protocol --exclude incr-python-persist --exclude incr-wasm-tests --features incr-persist/sqlite
+      - name: Replay depth 1
+        shell: bash
         env:
           INCR_MAX_DEPTH: "1"
           INCR_TEST_ALL_REPLAYABLE: "1"
+        run: |
+          rc=0
+          timeout 2400 cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-python-protocol --exclude incr-python-persist --exclude incr-wasm-tests --features incr-persist/sqlite 2>&1 | tee test.log || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            grep -E "has been running for over|^test .* FAILED|panicked at|Running " test.log | tail -30 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit "$rc"
 
   wasm:
     name: wasm32 (Node)
