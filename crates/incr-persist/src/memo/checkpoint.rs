@@ -145,7 +145,8 @@ pub struct Checkpointed {
 /// the lock, changed the chain meanwhile or removed a layer the write was
 /// carrying entries from, and with
 /// [`Error::Corrupt`](crate::Error::Corrupt) when the tip's id is
-/// `u64::MAX`; nothing is written then.
+/// `u64::MAX` or a frame the current chain lists is missing; nothing is
+/// written then.
 pub fn write_checkpoint<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
@@ -652,7 +653,8 @@ fn write_full<B: MemoBackend + ?Sized>(
     let (mut copier, mode) = if two_pass {
         let stored = match probes.summary().filter(|_| !remap) {
             Some(base) => scan_summary(base, &fresh, &contested),
-            None => scan(&source, &fresh, &contested, &mut stats)?,
+            None => scan(&source, &fresh, &contested, &mut stats)
+                .map_err(|e| frame_lost(backend, chain, e))?,
         };
         stats.merged = stored.len();
         let bound = Bound {
@@ -689,7 +691,9 @@ fn write_full<B: MemoBackend + ?Sized>(
         .map(|chain| chain.layers().iter().map(|layer| layer.id()).collect())
         .unwrap_or_default();
     let tip = chain.map(|chain| chain.tip().id());
-    let generation = backend.write_generation_streamed(tip, next.id, &header, &mut copier)?;
+    let generation = backend
+        .write_generation_streamed(tip, next.id, &header, &mut copier)
+        .map_err(|e| frame_lost(backend, chain, e))?;
     stats.corrupt += copier.corrupt;
     stats.oversized += copier.oversized;
     if !two_pass {
@@ -713,6 +717,21 @@ fn write_full<B: MemoBackend + ?Sized>(
         evicted_base,
         mode,
     })
+}
+
+/// `error`, or [`Error::Corrupt`] in place of a [`Error::Busy`] while
+/// `chain` is still current: a frame it lists is missing, so the backend
+/// lost it and a retry would fail the same way.
+fn frame_lost<B: MemoBackend + ?Sized>(backend: &B, chain: Option<&Chain>, error: Error) -> Error {
+    let (Error::Busy, Some(chain)) = (&error, chain) else {
+        return error;
+    };
+    match backend.load_chain(chain.layers()) {
+        Ok(Some(now)) if now.tip().id() == chain.tip().id() => {
+            Error::Corrupt("a frame of the current memo chain is missing")
+        }
+        _ => error,
+    }
 }
 
 /// When a two-pass write evicts: once its entries sum to more than

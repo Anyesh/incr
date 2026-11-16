@@ -1422,7 +1422,7 @@ fn a_frame_gone_mid_stream_fails_the_checkpoint_and_publishes_nothing() {
         memo.reset();
         let result = write_known(&memo, next, base.chain.layers());
         assert!(
-            matches!(result, Err(Error::Busy)),
+            matches!(result, Err(Error::Corrupt(_))),
             "evicting {evicting}: {result:?}"
         );
         assert!(memo.reads.load(SeqCst) > 0);
