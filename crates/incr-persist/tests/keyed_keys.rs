@@ -254,3 +254,39 @@ fn a_second_late_partitioning_checks_a_staged_replacement_whose_key_was_removed_
     store.upsert(&rows, 3, "c".into()).unwrap();
     assert_eq!(rows.keys().len(), 1);
 }
+
+#[test]
+fn a_replayed_history_with_emptied_partitions_matches_the_live_partitions() {
+    let log = MemoryBackend::new();
+    let mut live = Vec::new();
+    {
+        let store = Store::<Shared, _>::open(log.clone(), Options::default()).unwrap();
+        let rows: Rows = store.keyed_collection("rows").unwrap();
+        let parts = rows.key_partitions(|k: &u32| k % 29);
+        let rt = store.runtime();
+        let mut state = 7_u32;
+        for _ in 0..600 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let key = (state >> 8) % 90;
+            if (state >> 4).is_multiple_of(3) {
+                store.remove(&rows, &key).unwrap();
+            } else {
+                store.upsert(&rows, key, state.to_string()).unwrap();
+            }
+        }
+        for q in 0..29 {
+            let mut keys = rows.get_partition(rt, &parts, &q);
+            keys.sort_unstable();
+            live.push(keys);
+        }
+    }
+    let store = Store::<Shared, _>::open(log, Options::default()).unwrap();
+    let rows: Rows = store.keyed_collection("rows").unwrap();
+    let parts = rows.key_partitions(|k: &u32| k % 29);
+    let rt = store.runtime();
+    for (q, want) in (0..29).zip(&live) {
+        let mut keys = rows.get_partition(rt, &parts, &q);
+        keys.sort_unstable();
+        assert_eq!(&keys, want, "partition {q}");
+    }
+}
