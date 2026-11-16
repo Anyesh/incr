@@ -244,6 +244,7 @@ impl<C: Cells, B: Backend> StagedBatch<'_, C, B> {
         let mut pending = pending;
         let StagedBatch { store, run, .. } = self;
         let store = &**store;
+        pending.check_partitions();
         let mut state = store.state()?;
         let written = store.write_pending_with(&mut state, &mut pending, &mut |state, records| {
             for record in records {

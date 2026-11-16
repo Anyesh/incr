@@ -1617,6 +1617,16 @@ where
         self.versions.map.read().membership
     }
 
+    /// Every partition input a read created, in no particular order.
+    pub fn partition_inputs(&self) -> Vec<ErasedIncr> {
+        self.versions
+            .partition_inputs
+            .read()
+            .values()
+            .map(|handle| handle.erase())
+            .collect()
+    }
+
     /// Whether a read created the membership input.
     pub fn has_membership_input(&self) -> bool {
         self.versions.any_listed()

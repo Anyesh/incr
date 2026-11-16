@@ -154,3 +154,39 @@ fn a_panicking_partition_fn_refuses_the_write_before_it_is_logged() {
         .unwrap();
     assert_eq!(after.len(), before + 1, "only the later write was logged");
 }
+
+#[test]
+fn a_partition_reader_counts_as_a_dependent_of_its_collection() {
+    let store = Store::<Shared, _>::open(MemoryBackend::new(), Options::default()).unwrap();
+    let rows: Rows = store.keyed_collection("rows").unwrap();
+    store.upsert(&rows, 1, "a".into()).unwrap();
+    let parts = rows.key_partitions(|k: &u32| k % 2);
+    let (odd, _) = partition_reader(&store, &rows, parts, 1);
+    let rt = store.runtime();
+    assert_eq!(rt.get(odd), vec![1]);
+    assert!(store.undeclare(&rows).is_err());
+    rt.delete_node(odd);
+    store.undeclare(&rows).unwrap();
+    assert_eq!(rt.node_count(), 0);
+}
+
+#[test]
+fn a_partitioning_registered_after_a_write_was_staged_still_refuses_it() {
+    let log = MemoryBackend::new();
+    let store = Store::<Shared, _>::open(log.clone(), Options::default()).unwrap();
+    let rows: Rows = store.keyed_collection("rows").unwrap();
+    store.upsert(&rows, 1, "a".into()).unwrap();
+    let mut pending = incr_persist::PendingWrite::new();
+    pending.upsert(&rows, 9, "z".into());
+    rows.key_partitions(|k: &u32| {
+        assert_ne!(*k, 9, "no partition for 9");
+        k % 2
+    });
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.write_pending(pending)
+    }));
+    assert!(refused.is_err());
+    assert_eq!(rows.keys().len(), 1);
+    store.upsert(&rows, 3, "c".into()).unwrap();
+    assert_eq!(rows.keys().len(), 2);
+}
