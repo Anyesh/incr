@@ -4,6 +4,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use incr_core::persist_hooks::changed_at;
+use incr_core::Runtime;
 use serde::{Deserialize, Serialize};
 
 use super::binding::encode;
@@ -19,8 +20,8 @@ fn h<T: Serialize>(value: &T) -> u128 {
     fp_of(&encode("k", value).unwrap())
 }
 
-fn known(deps: &DepIndex, key: &str) -> u128 {
-    match deps.fp(key) {
+fn known<C: Cells>(rt: &Runtime<C>, deps: &DepIndex, key: &str) -> u128 {
+    match deps.fp(rt, key) {
         Some(DepFp::Known(fp)) => fp,
         other => panic!("{key}: expected a known fingerprint, found {other:?}"),
     }
@@ -31,7 +32,7 @@ fn an_input_starts_at_the_hash_of_the_bytes_it_decoded() {
     let store = open::<Local>();
     store.input("x", 5u32).unwrap();
     let deps = store.open_dep_index().unwrap();
-    assert_eq!(known(&deps, "x"), h(&5u32));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&5u32));
 }
 
 #[test]
@@ -45,7 +46,7 @@ fn an_input_declared_over_a_logged_value_starts_at_its_bytes() {
     let store = Store::<Local, _>::open(backend, Options::default()).unwrap();
     let deps = store.open_dep_index().unwrap();
     store.input("x", 1u32).unwrap();
-    assert_eq!(known(&deps, "x"), h(&8u32));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&8u32));
 }
 
 #[test]
@@ -54,7 +55,7 @@ fn mapped_writes_keep_the_input_fingerprint_without_a_memo() {
     let x = store.input("x", 1u32).unwrap();
     store.set(x, 2).unwrap();
     let deps = store.open_dep_index().unwrap();
-    assert_eq!(known(&deps, "x"), h(&2u32));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&2u32));
 }
 
 fn mapped_writes_update_the_index<C: Cells>() {
@@ -62,7 +63,7 @@ fn mapped_writes_update_the_index<C: Cells>() {
     let x = store.input("x", 1u32).unwrap();
     let deps = store.open_dep_index().unwrap();
     store.set(x, 3).unwrap();
-    assert_eq!(known(&deps, "x"), h(&3u32));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&3u32));
 }
 
 #[test]
@@ -81,9 +82,9 @@ fn an_equal_write_leaves_the_fingerprint_of_the_value_the_runtime_holds() {
     let x = store.input("x", 0.0f64).unwrap();
     store.set(x, -0.0).unwrap();
     let deps = store.open_dep_index().unwrap();
-    assert_eq!(known(&deps, "x"), h(&0.0f64));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&0.0f64));
     store.set(x, -0.0).unwrap();
-    assert_eq!(known(&deps, "x"), h(&0.0f64));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&0.0f64));
     assert_ne!(h(&0.0f64), h(&-0.0f64));
 }
 
@@ -166,7 +167,7 @@ fn a_delete_resets_the_fingerprint_to_the_logged_default() {
     let deps = store.open_dep_index().unwrap();
     store.set(x, 9).unwrap();
     store.delete(x).unwrap();
-    assert_eq!(known(&deps, "x"), h(&4u32));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&4u32));
 }
 
 #[test]
@@ -175,17 +176,76 @@ fn a_collection_fingerprint_sums_its_stored_occurrences() {
     let c = store.collection::<u32>("c").unwrap();
     c.insert(&store, 1).unwrap();
     let deps = store.open_dep_index().unwrap();
-    assert_eq!(known(&deps, "c"), h(&1u32));
+    assert_eq!(known(store.runtime(), &deps, "c"), h(&1u32));
     c.insert(&store, 2).unwrap();
     c.insert(&store, 2).unwrap();
     let sum = h(&1u32).wrapping_add(h(&2u32)).wrapping_add(h(&2u32));
-    assert_eq!(known(&deps, "c"), sum);
+    assert_eq!(known(store.runtime(), &deps, "c"), sum);
     c.delete(&store, &2).unwrap();
-    assert_eq!(known(&deps, "c"), h(&1u32).wrapping_add(h(&2u32)));
+    assert_eq!(
+        known(store.runtime(), &deps, "c"),
+        h(&1u32).wrapping_add(h(&2u32))
+    );
     c.replace(&store, Some(&1), 3).unwrap();
-    assert_eq!(known(&deps, "c"), h(&3u32).wrapping_add(h(&2u32)));
+    assert_eq!(
+        known(store.runtime(), &deps, "c"),
+        h(&3u32).wrapping_add(h(&2u32))
+    );
     store.delete(&c).unwrap();
-    assert_eq!(known(&deps, "c"), 0);
+    assert_eq!(known(store.runtime(), &deps, "c"), 0);
+}
+
+fn opening_the_index_encodes_no_collection_and_writes_leave_it_pending<C: Cells>() {
+    let store = open::<C>();
+    let c = store.collection::<u32>("c").unwrap();
+    c.insert(&store, 1).unwrap();
+    let k = store.keyed_collection::<u32, u32, (u32, u32)>("k").unwrap();
+    store.upsert(&k, 1, 10).unwrap();
+    let mut deps = None;
+    let opened = hashes(|| deps = Some(store.open_dep_index().unwrap()));
+    let deps = deps.unwrap();
+    assert_eq!(opened, 0, "opening the index hashed collection elements");
+    assert!(deps.pending("c") && deps.pending("k"));
+    let wrote = hashes(|| {
+        c.insert(&store, 2).unwrap();
+        c.replace(&store, Some(&1), 3).unwrap();
+    });
+    assert_eq!(wrote, 0, "a write to a pending collection hashed elements");
+    store.upsert(&k, 2, 20).unwrap();
+    store.reconcile(&k, [(5, 50)]).unwrap();
+    assert!(deps.pending("c") && deps.pending("k"));
+    assert_eq!(
+        known(store.runtime(), &deps, "c"),
+        h(&2u32).wrapping_add(h(&3u32))
+    );
+    assert_eq!(known(store.runtime(), &deps, "k"), h(&(5u32, 50u32)));
+    assert!(!deps.pending("c") && !deps.pending("k"));
+}
+
+#[test]
+fn opening_the_index_encodes_no_collection_and_writes_leave_it_pending_local() {
+    opening_the_index_encodes_no_collection_and_writes_leave_it_pending::<Local>();
+}
+
+#[test]
+fn opening_the_index_encodes_no_collection_and_writes_leave_it_pending_shared() {
+    opening_the_index_encodes_no_collection_and_writes_leave_it_pending::<Shared>();
+}
+
+#[test]
+fn a_fingerprint_computed_while_an_unlogged_scope_is_open_is_not_kept() {
+    let store = open::<Local>();
+    let c = store.collection::<u32>("c").unwrap();
+    c.insert(&store, 1).unwrap();
+    let deps = store.open_dep_index().unwrap();
+    let scope = store.unlogged_scope().unwrap();
+    let handle = scope.collection(&c).unwrap();
+    handle.insert(store.runtime(), 2);
+    assert_eq!(deps.fp(store.runtime(), "c"), Some(DepFp::Untrusted));
+    assert!(deps.pending("c"));
+    handle.delete(store.runtime(), &2);
+    scope.close().unwrap();
+    assert_eq!(known(store.runtime(), &deps, "c"), h(&1u32));
 }
 
 /// Equal across signs, as `f64` is, so a replace of 0.0 by -0.0 is equal.
@@ -213,7 +273,7 @@ fn an_equal_replace_of_a_single_occurrence_stores_the_new_encoding() {
     c.insert(&store, Num(0.0)).unwrap();
     let deps = store.open_dep_index().unwrap();
     c.replace(&store, Some(&Num(0.0)), Num(-0.0)).unwrap();
-    assert_eq!(known(&deps, "c"), h(&Num(-0.0)));
+    assert_eq!(known(store.runtime(), &deps, "c"), h(&Num(-0.0)));
 }
 
 #[test]
@@ -224,9 +284,12 @@ fn a_collection_declared_after_the_index_opens_is_registered_converged() {
     c.insert(&store, 7).unwrap();
     store.undeclare(&c).unwrap();
     let deps = store.open_dep_index().unwrap();
-    assert_eq!(deps.fp("c"), None);
+    assert_eq!(deps.fp(store.runtime(), "c"), None);
     let c = store.collection::<u32>("c").unwrap();
-    assert_eq!(known(&deps, "c"), h(&6u32).wrapping_add(h(&7u32)));
+    assert_eq!(
+        known(store.runtime(), &deps, "c"),
+        h(&6u32).wrapping_add(h(&7u32))
+    );
     assert_eq!(
         deps.key_of(c.handle().version_node().erase()).as_deref(),
         Some("c")
@@ -240,7 +303,7 @@ fn undeclare_unregisters_the_key() {
     let deps = store.open_dep_index().unwrap();
     assert_eq!(deps.key_of(x.handle().erase()).as_deref(), Some("x"));
     store.undeclare(x).unwrap();
-    assert_eq!(deps.fp("x"), None);
+    assert_eq!(deps.fp(store.runtime(), "x"), None);
     assert_eq!(deps.key_of(x.handle().erase()), None);
 }
 
@@ -253,7 +316,7 @@ fn an_undeclare_that_fails_keeps_the_key_registered() {
     assert_eq!(store.runtime().get(reader), 2);
     let deps = store.open_dep_index().unwrap();
     assert!(store.undeclare(x).is_err());
-    assert_eq!(known(&deps, "x"), h(&1u32));
+    assert_eq!(known(store.runtime(), &deps, "x"), h(&1u32));
 }
 
 #[test]
@@ -290,7 +353,7 @@ fn a_panic_in_a_mapped_input_write_leaves_the_key_untrusted() {
     let deps = store.open_dep_index().unwrap();
     let outcome = catch_unwind(AssertUnwindSafe(|| store.set(x, Bomb(13))));
     assert!(outcome.is_err());
-    assert_eq!(deps.fp("x"), Some(DepFp::Untrusted));
+    assert_eq!(deps.fp(store.runtime(), "x"), Some(DepFp::Untrusted));
     assert_eq!(deps.stamp("x"), None, "an untrusted key keeps no stamp");
 }
 
@@ -313,7 +376,7 @@ fn a_panic_in_a_mapped_collection_write_leaves_the_key_untrusted() {
     let deps = store.open_dep_index().unwrap();
     let outcome = catch_unwind(AssertUnwindSafe(|| c.insert(&store, HashBomb(13))));
     assert!(outcome.is_err());
-    assert_eq!(deps.fp("c"), Some(DepFp::Untrusted));
+    assert_eq!(deps.fp(store.runtime(), "c"), Some(DepFp::Untrusted));
 }
 
 thread_local! {
@@ -370,12 +433,15 @@ fn a_catch_up_across_a_compaction_keeps_the_fingerprints() {
     c.insert(&b, 4).unwrap();
     b.checkpoint().unwrap();
     a.refresh().unwrap();
-    assert_eq!(known(&deps, "x"), h(&5u32));
-    assert_eq!(known(&deps, "c"), h(&3u32).wrapping_add(h(&4u32)));
+    assert_eq!(known(a.runtime(), &deps, "x"), h(&5u32));
+    assert_eq!(
+        known(a.runtime(), &deps, "c"),
+        h(&3u32).wrapping_add(h(&4u32))
+    );
 }
 
 #[test]
-fn a_collection_whose_node_was_deleted_registers_untrusted() {
+fn a_collection_whose_node_was_deleted_reads_untrusted() {
     let store = open::<Local>();
     let c = store.collection::<u32>("c").unwrap();
     c.insert(&store, 1).unwrap();
@@ -384,7 +450,7 @@ fn a_collection_whose_node_was_deleted_registers_untrusted() {
         .try_delete_node(c.handle().version_node())
         .unwrap();
     let deps = store.open_dep_index().unwrap();
-    assert_eq!(deps.fp("c"), Some(DepFp::Untrusted));
+    assert_eq!(deps.fp(store.runtime(), "c"), Some(DepFp::Untrusted));
 }
 
 fn stamp(deps: &DepIndex, key: &str) -> u64 {

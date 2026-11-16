@@ -9,9 +9,9 @@ use serde::Serialize;
 use crate::value_context::in_key;
 
 use super::after_lock::AfterLock;
-use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard};
+use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard, Registered};
 use super::logged::{Elements, LoggedKey};
-use crate::{Error, Kind, Record, Result};
+use crate::{Error, Kind, Record, Result, ValueScope};
 
 /// A key this process declared, tied to the runtime node that mirrors it.
 ///
@@ -46,9 +46,10 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// through the runtime and can no longer be read, changes nothing.
     fn unbind(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Option<Elements>>;
 
-    /// The key's fingerprint now, for registering it in a [`DepIndex`].
-    /// Computed with no incr lock held and before the index is held.
-    fn dep_fp(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<DepFp>;
+    /// The key's fingerprint for registering it in a [`DepIndex`]: an
+    /// input's now, a collection's source for the first memo read that
+    /// needs it, which runs its value code in `scope`, the store's.
+    fn dep_fp(&self, scope: Option<ValueScope>) -> Registered;
 
     /// An input's mapped stamp, which registering it in a [`DepIndex`]
     /// copies; `None` for a collection.
@@ -229,8 +230,8 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         Ok(None)
     }
 
-    fn dep_fp(&self, _rt: &Runtime<C>, _bag: &AfterLock) -> Result<DepFp> {
-        Ok(DepFp::Known(self.fp))
+    fn dep_fp(&self, _scope: Option<ValueScope>) -> Registered {
+        Registered::Now(DepFp::Known(self.fp))
     }
 
     fn mapped_stamp(&self) -> Option<u64> {

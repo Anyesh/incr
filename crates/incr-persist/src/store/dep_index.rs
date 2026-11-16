@@ -2,11 +2,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
-    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+    Weak,
 };
 
 use incr_core::lock_order::{LockKind, Ordered};
-use incr_core::{ErasedIncr, Incr};
+use incr_core::persist_hooks::Deferred;
+use incr_core::{Cells, ErasedIncr, Incr, Runtime};
 
 use crate::memo::Wake;
 use crate::Kind;
@@ -32,14 +34,85 @@ pub(crate) enum DepFp {
     Untrusted,
 }
 
+/// Computes a collection's fingerprint when a memo first needs it. Called
+/// under the memo lock and a `DepIndex` read hold, which keeps every mapped
+/// write out, and possibly inside a compute.
+pub(crate) trait FpSource<C: Cells>: Send + Sync {
+    /// Reads the collection without recording a dependency, running its
+    /// value code in the store's value scope, and moves every value it
+    /// materialises into `bag`. `Untrusted` when an element does not
+    /// encode or the node was deleted through the runtime.
+    fn fp(&self, rt: &Runtime<C>, bag: &mut Deferred<C>) -> DepFp;
+}
+
+/// An [`FpSource`] as a `DepIndex` holds it, behind `Any`.
+pub(crate) type Fps<C> = Arc<dyn FpSource<C>>;
+
+fn fps_of<C: Cells>(source: &(dyn Any + Send + Sync)) -> &Fps<C> {
+    source
+        .downcast_ref::<Fps<C>>()
+        .expect("a store registers fingerprint sources of its own cells")
+}
+
+/// How a key's fingerprint is registered.
+pub(crate) enum Registered {
+    Now(DepFp),
+    /// A collection's [`Fps`], computed when first read.
+    Later(Box<dyn Any + Send + Sync>),
+}
+
+#[derive(Debug)]
+enum FpState {
+    Ready(DepFp),
+    /// A leaf lock, held while the first reader computes the fingerprint
+    /// so that concurrent readers wait for it instead of computing it too.
+    Pending {
+        source: Box<dyn Any + Send + Sync>,
+        computed: Mutex<Option<DepFp>>,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct DepEntry {
     pub(crate) handle: ErasedIncr,
     pub(crate) kind: Kind,
-    pub(crate) fp: DepFp,
+    fp: FpState,
     /// An input's mapped stamp: its `changed_at` after the last mapped write
     /// that wrote. `None` for a collection and for an untrusted key.
     pub(crate) stamp: Option<u64>,
+}
+
+impl DepEntry {
+    /// The fingerprint, unless it is pending and no reader has computed it
+    /// or one is computing it now.
+    fn known_fp(&self) -> Option<DepFp> {
+        match &self.fp {
+            FpState::Ready(fp) => Some(*fp),
+            FpState::Pending { computed, .. } => match computed.try_lock() {
+                Ok(computed) => *computed,
+                Err(TryLockError::Poisoned(computed)) => *computed.into_inner(),
+                Err(TryLockError::WouldBlock) => None,
+            },
+        }
+    }
+
+    /// Whether no panic or failed encode untrusted the key. A pending
+    /// fingerprint counts as trusted without being computed.
+    pub(crate) fn trusted(&self) -> bool {
+        self.known_fp() != Some(DepFp::Untrusted)
+    }
+
+    /// Whether writes keep the fingerprint current: it is known, and
+    /// neither pending nor untrusted.
+    fn tracked(&mut self) -> bool {
+        if let FpState::Pending { computed, .. } = &mut self.fp {
+            let computed = computed.get_mut().unwrap_or_else(PoisonError::into_inner);
+            if let Some(fp) = computed.take() {
+                self.fp = FpState::Ready(fp);
+            }
+        }
+        matches!(self.fp, FpState::Ready(DepFp::Known(_)))
+    }
 }
 
 /// A memo external's input, its fp and the stamp the fp vouches for.
@@ -52,13 +125,13 @@ pub(crate) struct External {
 
 /// Every declared key of a store, with its node and fingerprint, while a
 /// memo is open over the store.
-#[derive(Default)]
 pub(crate) struct DepIndex {
     map: RwLock<DepMap>,
     /// Set while an unlogged scope is open on the store: a memo then
     /// neither restores nor checkpoints, because its fingerprints describe
-    /// the logged state while the runtime holds something else.
-    unlogged: AtomicBool,
+    /// the logged state while the runtime holds something else. Shared
+    /// with the map, whose pending fingerprints it guards.
+    unlogged: Arc<AtomicBool>,
     /// Set while a staged batch is open on the store: a memo then refuses
     /// to checkpoint, because the runtime holds writes the log may never
     /// receive.
@@ -70,6 +143,22 @@ pub(crate) struct DepIndex {
     /// resumed when the last staged batch or unlogged scope closes. A leaf
     /// lock outside the lock order, held only to take a [`Wake`]'s.
     waiters: Mutex<Vec<Weak<Wake>>>,
+}
+
+impl Default for DepIndex {
+    fn default() -> Self {
+        let unlogged = Arc::<AtomicBool>::default();
+        DepIndex {
+            map: RwLock::new(DepMap {
+                unlogged: Arc::clone(&unlogged),
+                ..DepMap::default()
+            }),
+            unlogged,
+            staged: AtomicBool::default(),
+            poisoned: AtomicBool::default(),
+            waiters: Mutex::default(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -84,6 +173,10 @@ pub(crate) struct DepMap {
     /// Each keyed collection's rows by its key, a `keyed::Rows<C>` of the
     /// store's cells.
     rows: HashMap<String, Box<dyn Any + Send + Sync>>,
+    /// The index's unlogged flag. An unlogged scope's writes bypass the
+    /// index's hold, and its close takes the hold for writing, so a
+    /// fingerprint computed while the flag is clear afterwards saw none.
+    unlogged: Arc<AtomicBool>,
 }
 
 impl DepIndex {
@@ -173,9 +266,23 @@ impl DepIndex {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn fp(&self, key: &str) -> Option<DepFp> {
-        self.read().entry(key).map(|entry| entry.fp)
+    /// The fingerprint of `key`, computed if pending.
+    #[cfg(test)]
+    pub(crate) fn fp<C: Cells>(&self, rt: &Runtime<C>, key: &str) -> Option<DepFp> {
+        let mut bag = Deferred::new();
+        let map = self.read();
+        let fp = map.entry(key).map(|entry| map.fp(entry, rt, &mut bag));
+        drop(map);
+        bag.drain(rt);
+        fp
+    }
+
+    /// Whether `key` is registered with a fingerprint no reader computed.
+    #[cfg(test)]
+    pub(crate) fn pending(&self, key: &str) -> bool {
+        self.read()
+            .entry(key)
+            .is_some_and(|entry| entry.known_fp().is_none())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -199,15 +306,50 @@ impl DepMap {
         self.by_key.get(key)
     }
 
+    /// `entry`'s fingerprint. A pending one is computed by the first caller,
+    /// while concurrent callers wait for it, and kept unless an unlogged
+    /// scope is open, whose writes it may have seen: it then reads
+    /// `Untrusted` for this caller and stays pending.
+    pub(crate) fn fp<C: Cells>(
+        &self,
+        entry: &DepEntry,
+        rt: &Runtime<C>,
+        bag: &mut Deferred<C>,
+    ) -> DepFp {
+        let FpState::Pending { source, computed } = &entry.fp else {
+            return entry.known_fp().expect("a ready fingerprint is known");
+        };
+        let mut computed = computed.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(fp) = *computed {
+            return fp;
+        }
+        if self.unlogged.load(Ordering::SeqCst) {
+            return DepFp::Untrusted;
+        }
+        let fp = fps_of::<C>(&**source).fp(rt, bag);
+        if self.unlogged.load(Ordering::SeqCst) {
+            return DepFp::Untrusted;
+        }
+        *computed = Some(fp);
+        fp
+    }
+
     pub(crate) fn register(
         &mut self,
         key: &str,
         handle: ErasedIncr,
         kind: Kind,
-        fp: DepFp,
+        fp: Registered,
         stamp: Option<u64>,
     ) {
-        let stamp = stamp.filter(|_| fp != DepFp::Untrusted);
+        let fp = match fp {
+            Registered::Now(fp) => FpState::Ready(fp),
+            Registered::Later(source) => FpState::Pending {
+                source,
+                computed: Mutex::new(None),
+            },
+        };
+        let stamp = stamp.filter(|_| !matches!(fp, FpState::Ready(DepFp::Untrusted)));
         let entry = DepEntry {
             handle,
             kind,
@@ -227,11 +369,30 @@ impl DepMap {
         Some(entry)
     }
 
-    /// Sets the fingerprint of a registered key; an untrusted one stays so.
+    /// Whether writes to `key` keep its fingerprint current, so a write
+    /// works out the change: not for a pending or untrusted one, which a
+    /// write leaves as it is.
+    pub(crate) fn tracks(&mut self, key: &str) -> bool {
+        self.by_key.get_mut(key).is_some_and(DepEntry::tracked)
+    }
+
+    /// Sets the fingerprint of a registered key whose fingerprint is
+    /// [tracked](Self::tracks); a pending or untrusted one stays so.
     pub(crate) fn set_fp(&mut self, key: &str, fp: u128) {
         if let Some(entry) = self.by_key.get_mut(key) {
-            if entry.fp != DepFp::Untrusted {
-                entry.fp = DepFp::Known(fp);
+            if entry.tracked() {
+                entry.fp = FpState::Ready(DepFp::Known(fp));
+            }
+        }
+    }
+
+    /// Moves a tracked fingerprint by `delta`.
+    pub(crate) fn shift_fp(&mut self, key: &str, delta: u128) {
+        if let Some(entry) = self.by_key.get_mut(key) {
+            if entry.tracked() {
+                if let FpState::Ready(DepFp::Known(fp)) = &mut entry.fp {
+                    *fp = fp.wrapping_add(delta);
+                }
             }
         }
     }
@@ -240,8 +401,8 @@ impl DepMap {
     /// that wrote; an untrusted one stays so.
     pub(crate) fn set_written(&mut self, key: &str, fp: u128, stamp: u64) {
         if let Some(entry) = self.by_key.get_mut(key) {
-            if entry.fp != DepFp::Untrusted {
-                entry.fp = DepFp::Known(fp);
+            if entry.tracked() {
+                entry.fp = FpState::Ready(DepFp::Known(fp));
                 entry.stamp = Some(stamp);
             }
         }
@@ -291,7 +452,7 @@ impl DepMap {
 
     pub(crate) fn untrust(&mut self, key: &str) {
         if let Some(entry) = self.by_key.get_mut(key) {
-            entry.fp = DepFp::Untrusted;
+            entry.fp = FpState::Ready(DepFp::Untrusted);
             entry.stamp = None;
         }
     }

@@ -53,7 +53,7 @@ fn restoring_a_swapped_representative_leaves_the_fingerprint_and_checkpoint_at_t
         let elements = c.handle().values(rt);
         fp_of_elements("c", &elements).unwrap()
     };
-    let known = || match deps.fp("c") {
+    let known = || match deps.fp(rt, "c") {
         Some(DepFp::Known(fp)) => fp,
         other => panic!("expected a known fingerprint, found {other:?}"),
     };
