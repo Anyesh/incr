@@ -1422,7 +1422,8 @@ fn emptied_partitions_free_their_records_and_unread_inputs<C: Cells>() {
     let rt = Runtime::<C>::new();
     let kc = Counted::<C>::new(&rt);
     let parts = kc.key_partitions(|k: &u32| *k);
-    for k in 0..10_000 {
+    let distinct: u32 = if cfg!(miri) { 60 } else { 10_000 };
+    for k in 0..distinct {
         kc.upsert(&rt, k, k);
         kc.remove(&rt, &k);
     }
@@ -1452,7 +1453,8 @@ fn an_emptied_partition_with_a_reader_keeps_its_input_and_wakes_on_refill<C: Cel
     kc.upsert(&rt, 1007, 0);
     assert_eq!(rt.get(reader), vec![1007]);
     assert_eq!(runs_of(&runs), 3);
-    for k in 0..2000 {
+    let churn: u32 = if cfg!(miri) { 40 } else { 2000 };
+    for k in 0..churn {
         kc.upsert(&rt, 2_000_000 + k, 0);
         kc.remove(&rt, &(2_000_000 + k));
     }
@@ -1488,7 +1490,8 @@ fn partition_records_match_a_model_across_many_empties_and_refills<C: Cells>() {
     let parts = kc.key_partitions(|k: &u32| *k % 37);
     let mut model: BTreeMap<u32, u32> = BTreeMap::new();
     let mut state = 12345_u32;
-    for _ in 0..3000 {
+    let steps = if cfg!(miri) { 150 } else { 3000 };
+    for _ in 0..steps {
         state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
         let key = (state >> 8) % 120;
         if (state >> 4).is_multiple_of(3) {
