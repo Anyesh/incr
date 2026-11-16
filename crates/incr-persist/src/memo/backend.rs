@@ -221,9 +221,13 @@ pub trait MemoBackend: Send + Sync {
     /// `generations`, which a backend may do in fewer steps. Every one is
     /// attempted; the first error is returned.
     fn remove_generations(&self, generations: &[GenId]) -> Result<()> {
-        generations
-            .iter()
-            .map(|&generation| self.remove_generation(generation))
-            .fold(Ok(()), |all, one| all.and(one))
+        let mut first = Ok(());
+        for &generation in generations {
+            let removed = self.remove_generation(generation);
+            if first.is_ok() {
+                first = removed;
+            }
+        }
+        first
     }
 }
