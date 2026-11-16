@@ -968,7 +968,7 @@ struct KeyVersions<K: 'static, C: Cells> {
     listed: C::U64,
     /// The input each query reading a partition depends on, by partitioning
     /// and partition hash: a partition whose hash collides shares it.
-    partition_inputs: OrderedLock<HashMap<(usize, u64), Incr<u64>, FxBuildHasher>, C>,
+    partition_inputs: OrderedLock<PartitionInputs, C>,
     /// How many inputs `partition_inputs` holds.
     partition_live: C::U64,
 }
@@ -1073,6 +1073,9 @@ where
         }
     }
 }
+
+/// The input per (partitioning, partition hash).
+type PartitionInputs = HashMap<(usize, u64), Incr<u64>, FxBuildHasher>;
 
 /// A partitioning of a keyed collection's keys, from
 /// [`KeyedCollection::key_partitions`]; use it with that collection only.
