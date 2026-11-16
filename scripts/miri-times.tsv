@@ -25,18 +25,24 @@
 0	cells::tests::shared_roundtrips
 0	cells::tests::shared_state_cas
 9	changes::tests::folded_counts_decide_as_their_reads
+7	collection::apply_tests::local_a_rehash_left_by_a_panicking_write_invalidates_element_slots
 50	collection::apply_tests::local_apply_is_atomic_under_user_panics
 17	collection::apply_tests::local_apply_lands_values_that_share_one_probe_run
 13	collection::apply_tests::local_apply_of_changes_that_cancel_is_a_no_op
 59	collection::apply_tests::local_apply_operators_match_one_by_one_changes
 5	collection::apply_tests::local_apply_removal_returns_the_stored_value
 7	collection::apply_tests::local_apply_sets_the_version_once_per_call
+35	collection::apply_tests::local_element_slots_read_each_distinct_element_once
+9	collection::apply_tests::local_visiting_elements_stops_at_the_first_error
+8	collection::apply_tests::shared_a_rehash_left_by_a_panicking_write_invalidates_element_slots
 62	collection::apply_tests::shared_apply_is_atomic_under_user_panics
 12	collection::apply_tests::shared_apply_lands_values_that_share_one_probe_run
 7	collection::apply_tests::shared_apply_of_changes_that_cancel_is_a_no_op
 64	collection::apply_tests::shared_apply_operators_match_one_by_one_changes
 5	collection::apply_tests::shared_apply_removal_returns_the_stored_value
 7	collection::apply_tests::shared_apply_sets_the_version_once_per_call
+15	collection::apply_tests::shared_element_slots_read_each_distinct_element_once
+8	collection::apply_tests::shared_visiting_elements_stops_at_the_first_error
 9	collection::cycle_tests::local_aggregate_combine_member_lands_a_fresh_aggregates_output
 2	collection::cycle_tests::local_aggregate_member_lands_a_fresh_aggregates_output
 4	collection::cycle_tests::local_filter_dissolves_after_iteration_1
@@ -291,6 +297,7 @@
 5	keyed::tests::apply_pairs_keeping_drops_nothing_until_the_kept_value_drops
 5	keyed::tests::local::a_held_key_object_is_kept
 5	keyed::tests::local::a_key_with_two_pairs_reads_the_smallest_rank
+7	keyed::tests::local::a_pair_handle_reads_nothing_once_the_index_changes
 5	keyed::tests::local::a_remove_then_insert_of_one_key_reports_two_changes
 5	keyed::tests::local::an_equal_row_changes_nothing_downstream
 5	keyed::tests::local::an_inverted_journal_restores_the_previous_state
@@ -298,6 +305,7 @@
 5	keyed::tests::local::journaled_writes_are_undone_by_their_inverted_journal
 5	keyed::tests::local::keys_and_items_are_snapshots_and_len_counts_keys
 5	keyed::tests::local::model_matches
+9	keyed::tests::local::pair_handles_read_every_held_pair_in_rank_order
 5	keyed::tests::local::reconcile_makes_the_rows_equal_the_pairs
 5	keyed::tests::local::removing_an_absent_pair_is_a_no_op
 5	keyed::tests::local::runtime_calls_from_key_or_row_eq_are_refused
@@ -307,6 +315,7 @@
 39	keyed::tests::rows_shared::one_upsert_among_many_keys_reruns_one_reader
 5	keyed::tests::shared::a_held_key_object_is_kept
 5	keyed::tests::shared::a_key_with_two_pairs_reads_the_smallest_rank
+8	keyed::tests::shared::a_pair_handle_reads_nothing_once_the_index_changes
 5	keyed::tests::shared::a_remove_then_insert_of_one_key_reports_two_changes
 5	keyed::tests::shared::an_equal_row_changes_nothing_downstream
 5	keyed::tests::shared::an_inverted_journal_restores_the_previous_state
@@ -314,6 +323,7 @@
 5	keyed::tests::shared::journaled_writes_are_undone_by_their_inverted_journal
 5	keyed::tests::shared::keys_and_items_are_snapshots_and_len_counts_keys
 40	keyed::tests::shared::model_matches
+8	keyed::tests::shared::pair_handles_read_every_held_pair_in_rank_order
 3	keyed::tests::shared::reconcile_makes_the_rows_equal_the_pairs
 5	keyed::tests::shared::removing_an_absent_pair_is_a_no_op
 5	keyed::tests::shared::runtime_calls_from_key_or_row_eq_are_refused

@@ -76,7 +76,9 @@ pub mod walk_ring;
 
 pub use arena::PrimitiveArena;
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
-pub use collection::{Change, CollectionLog, Delta, GroupedCollection, IncrCollection};
+pub use collection::{
+    Change, CollectionLog, Delta, ElementSlot, ElementsStamp, GroupedCollection, IncrCollection,
+};
 pub use cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay};
 #[doc(hidden)]
 pub use cycle_state::{
@@ -90,7 +92,7 @@ pub use grid_table::{GridKey, GridTable};
 pub use handle::{ErasedIncr, Incr, RuntimeId};
 pub use keyed::{
     find_element, same_element, ElementRank, KeyCounts, KeyIndex, KeyPartitions, KeyTable,
-    KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp, UNIDENTIFYING_RANK,
+    KeyedChange, KeyedCollection, KeyedSpent, Pair, PairHandle, PairOp, UNIDENTIFYING_RANK,
 };
 pub use locks::{LocalLock, Lock};
 pub use memory::{
