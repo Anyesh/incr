@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use super::layers::Live;
+use super::summary::Summary;
 use super::{DeltaHeader, GenHeader, IndexItem};
 use crate::{Error, Result};
 
@@ -36,6 +37,9 @@ pub struct Generation {
     /// For a delta, what its chain up to and including it shows, once
     /// computed: its older layers are fixed by its base and parent ids.
     shown: OnceLock<Live>,
+    /// The eviction metadata of its entries, when a checkpoint of this
+    /// process wrote it on a backend without deltas.
+    summary: OnceLock<Arc<Summary>>,
 }
 
 /// The first slot probed for `(table, key_hash)`: the top bits of the hash,
@@ -104,6 +108,7 @@ impl Generation {
             entries,
             entry_bytes,
             shown: OnceLock::new(),
+            summary: OnceLock::new(),
         }
     }
 
@@ -209,6 +214,14 @@ impl Generation {
 
     pub(crate) fn set_shown(&self, live: Live) {
         let _ = self.shown.set(live);
+    }
+
+    pub(crate) fn summary(&self) -> Option<&Summary> {
+        self.summary.get().map(|summary| &**summary)
+    }
+
+    pub(crate) fn set_summary(&self, summary: Summary) {
+        let _ = self.summary.set(Arc::new(summary));
     }
 }
 

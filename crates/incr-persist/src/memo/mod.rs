@@ -29,6 +29,7 @@ mod restore;
 mod snapshot;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+mod summary;
 mod table_core;
 
 /// Values a checkpoint clones, encodes or maps inside one hold of the
