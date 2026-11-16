@@ -1228,6 +1228,37 @@ impl PyKeyedCollection {
         })?
     }
 
+    /// Free the input of partition `p` of `parts`, a `key_partitions`
+    /// result of this collection, when the partition holds no key and no
+    /// query depends on it, for a partition no write emptied or whose
+    /// readers left later. Returns whether it freed the input; always
+    /// False for a Shared runtime. Raises `RuntimeError` inside an overlay
+    /// and `ValueError` for partitions of another collection.
+    fn forget_partition(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        parts: &PyKeyPartitions,
+        partition: Py<PyAny>,
+    ) -> PyResult<bool> {
+        let this = slf.borrow();
+        this.check_alive()?;
+        if !parts.owner.is(slf) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "partitions belong to another keyed collection",
+            ));
+        }
+        if this.state(py).overlay_active() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "forget_partition cannot run inside an overlay",
+            ));
+        }
+        let q = PyKey(partition);
+        this.engine_write(py, |rt| {
+            let (source, _) = this.key_source(py, rt)?;
+            Ok(source.forget_partition(rt, &parts.parts, &q))
+        })?
+    }
+
     /// Partition the keys by `fn(key)`, which must be deterministic and
     /// total over every key it is ever given: the same hashable value for
     /// a key every time, and no exception for a key it accepted before.

@@ -175,6 +175,21 @@ impl<B: PyBinding> KeyedSource<'_, B> {
         }
     }
 
+    /// [`incr_core::KeyedCollection::forget_partition`]. Runs the
+    /// partition's `__hash__`: the caller runs it inside its package's
+    /// engine boundary.
+    pub fn forget_partition(
+        &self,
+        rt: &Runtime<B::C>,
+        parts: &incr_core::KeyPartitions<PyKey>,
+        q: &PyKey,
+    ) -> bool {
+        match self {
+            KeyedSource::Plain(keyed) => keyed.forget_partition(rt, parts, q),
+            KeyedSource::Persisted(persisted) => persisted.forget_partition(rt, parts, q),
+        }
+    }
+
     /// How many version inputs the collection holds.
     pub fn version_input_count(&self) -> usize {
         match self {

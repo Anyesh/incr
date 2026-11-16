@@ -1413,6 +1413,11 @@ for_both!(
     an_emptied_partition_with_a_reader_keeps_its_input_and_wakes_on_refill,
     removing_a_key_that_is_in_no_partition_leaves_no_record,
     an_emptied_partition_whose_reader_went_away_frees_its_input_on_local_only,
+    forget_partition_frees_an_emptied_partition_after_its_reader_moves_on,
+    a_live_reader_keeps_its_partition_input_and_still_reruns_on_refill,
+    a_partition_read_but_never_filled_is_freed_once_its_reader_goes,
+    forget_partition_keeps_an_input_shared_with_a_colliding_partition,
+    forget_partition_inside_a_compute_is_refused,
     partition_records_match_a_model_across_many_empties_and_refills,
     reconciles_that_empty_and_fill_many_partitions_with_colliding_hashes_match_a_model,
 );
@@ -1479,6 +1484,14 @@ fn emptied_partitions_free_their_records_and_unread_inputs<C: Cells>() {
     }
     assert_eq!(kc.partition_records(&parts), 0);
     assert_eq!(kc.partition_input_count(), 0);
+    let shared = Captured(kc.clone());
+    let reader = rt.create_query(move |rt| shared.get().get_partition(rt, &parts, &0).len());
+    kc.upsert(&rt, 0, 0);
+    assert_eq!(rt.get(reader), 1);
+    assert_eq!(kc.partition_input_count(), 1);
+    rt.try_delete_node(reader).unwrap();
+    kc.remove(&rt, &0);
+    assert_eq!(kc.partition_input_count(), usize::from(!C::SINGLE_THREADED));
 }
 
 fn an_emptied_partition_with_a_reader_keeps_its_input_and_wakes_on_refill<C: Cells>() {
@@ -1532,6 +1545,124 @@ fn an_emptied_partition_whose_reader_went_away_frees_its_input_on_local_only<C: 
     assert_eq!(rt.get(late), 0);
     kc.upsert(&rt, 23, 0);
     assert_eq!(rt.get(late), 1);
+}
+
+fn forget_partition_frees_an_emptied_partition_after_its_reader_moves_on<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| *k % 100);
+    let which = rt.create_input(7_u32);
+    let shared = Captured(kc.clone());
+    let reader = rt.create_query(move |rt| {
+        let at = rt.get(which);
+        shared.get().get_partition(rt, &parts, &at).len()
+    });
+    kc.upsert(&rt, 7, 0);
+    assert_eq!(rt.get(reader), 1);
+    kc.remove(&rt, &7);
+    assert_eq!(
+        kc.partition_input_count(),
+        1,
+        "the reader still depends on it"
+    );
+    assert!(
+        !kc.forget_partition(&rt, &parts, &7),
+        "a live reader keeps it"
+    );
+    rt.set(which, 8);
+    assert_eq!(rt.get(reader), 0);
+    assert_eq!(kc.partition_input_count(), 2);
+    assert_eq!(kc.forget_partition(&rt, &parts, &7), C::SINGLE_THREADED);
+    assert_eq!(
+        kc.partition_input_count(),
+        if C::SINGLE_THREADED { 1 } else { 2 }
+    );
+    assert!(
+        !kc.forget_partition(&rt, &parts, &7),
+        "already freed or shared"
+    );
+    kc.upsert(&rt, 8, 0);
+    assert_eq!(rt.get(reader), 1);
+    rt.set(which, 7);
+    kc.upsert(&rt, 107, 0);
+    assert_eq!(rt.get(reader), 1, "a forgotten partition is read again");
+}
+
+fn a_live_reader_keeps_its_partition_input_and_still_reruns_on_refill<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| *k % 100);
+    let shared = Captured(kc.clone());
+    let reader = rt.create_query(move |rt| shared.get().get_partition(rt, &parts, &4).len());
+    assert_eq!(rt.get(reader), 0);
+    kc.upsert(&rt, 4, 0);
+    assert_eq!(rt.get(reader), 1);
+    assert!(!kc.forget_partition(&rt, &parts, &4), "it holds a key");
+    kc.remove(&rt, &4);
+    assert!(
+        !kc.forget_partition(&rt, &parts, &4),
+        "a reader depends on it"
+    );
+    assert_eq!(kc.partition_input_count(), 1);
+    kc.upsert(&rt, 104, 0);
+    assert_eq!(rt.get(reader), 1);
+}
+
+fn a_partition_read_but_never_filled_is_freed_once_its_reader_goes<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| *k % 100);
+    let shared = Captured(kc.clone());
+    let reader = rt.create_query(move |rt| shared.get().get_partition(rt, &parts, &9).len());
+    assert_eq!(rt.get(reader), 0);
+    assert_eq!(kc.partition_input_count(), 1);
+    assert!(
+        !kc.forget_partition(&rt, &parts, &9),
+        "a reader depends on it"
+    );
+    rt.try_delete_node(reader).unwrap();
+    assert_eq!(kc.forget_partition(&rt, &parts, &9), C::SINGLE_THREADED);
+    assert_eq!(kc.partition_input_count(), usize::from(!C::SINGLE_THREADED));
+    assert!(!kc.forget_partition(&rt, &parts, &1000), "never read");
+}
+
+fn forget_partition_keeps_an_input_shared_with_a_colliding_partition<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| Collide(*k % 6));
+    let shared = Captured(kc.clone());
+    let reader =
+        rt.create_query(move |rt| shared.get().get_partition(rt, &parts, &Collide(0)).len());
+    assert_eq!(rt.get(reader), 0);
+    rt.try_delete_node(reader).unwrap();
+    kc.upsert(&rt, 3, 0);
+    assert!(
+        !kc.forget_partition(&rt, &parts, &Collide(0)),
+        "Collide(3) shares the hash and holds a key"
+    );
+    assert_eq!(kc.partition_input_count(), 1);
+    kc.remove(&rt, &3);
+    assert_eq!(kc.partition_input_count(), usize::from(!C::SINGLE_THREADED));
+    assert!(
+        !kc.forget_partition(&rt, &parts, &Collide(0)),
+        "freed by the write"
+    );
+}
+
+fn forget_partition_inside_a_compute_is_refused<C: Cells>() {
+    let rt = Arc::new(Runtime::<C>::new());
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| *k);
+    let captured = Captured(kc.clone());
+    let q = rt.create_query(move |rt| {
+        catch_unwind(AssertUnwindSafe(|| {
+            captured.get().forget_partition(rt, &parts, &3)
+        }))
+        .map_err(panic_text)
+        .err()
+    });
+    let text = rt.get(q).expect("forget_partition panics");
+    assert!(text.contains("inside a compute"), "{text}");
 }
 
 fn partition_records_match_a_model_across_many_empties_and_refills<C: Cells>() {

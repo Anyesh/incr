@@ -38,6 +38,8 @@ pub(super) trait PartSink<P>: Send + Sync {
     fn check(&self, pair: &P);
     /// How many partition records the partitioning holds.
     fn records(&self) -> usize;
+    /// Whether a record exists for a partition with this hash.
+    fn has_hash(&self, qhash: u64) -> bool;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -299,6 +301,10 @@ where
 
     fn records(&self) -> usize {
         self.parts.len()
+    }
+
+    fn has_hash(&self, qhash: u64) -> bool {
+        self.by_qhash.contains_key(&qhash)
     }
 
     fn as_any(&self) -> &dyn Any {
