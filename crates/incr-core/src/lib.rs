@@ -106,7 +106,8 @@ pub use state::NodeState;
 pub use table::{NodeTable, TableKey};
 pub use trace::{
     label_group, BoundedSnapshot, ComputeCounts, Direction, GraphQuery, GraphSummary, GroupEdge,
-    GroupKind, GroupSummary, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction,
+    GroupKind, GroupSummary, LastTrace, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace,
+    TraceAction, TraceCapture, TracePayload,
 };
 pub use value::Value;
 #[doc(hidden)]

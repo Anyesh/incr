@@ -1418,3 +1418,7 @@
 3	keyed::tests::rows_local::forget_partition_inside_a_compute_is_refused
 3	keyed::tests::rows_shared::forget_partition_inside_a_compute_is_refused
 1	collection::tests::shared_snapshot_values_records_no_dependency
+4	runtime::last_trace_tests::local_last_trace_cases
+7	runtime::last_trace_tests::shared_last_trace_cases
+1	runtime::last_trace_tests::local_last_trace_payloads_drop_outside_the_lock
+1	runtime::last_trace_tests::shared_last_trace_payloads_drop_outside_the_lock

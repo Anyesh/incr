@@ -177,6 +177,12 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) arena_tags: ArenaTags,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
+    /// The slot of the root the armed `get_traced` reads, and its entries
+    /// in `trace_log`.
+    pub(crate) trace_root: Option<(u32, crate::trace::RootEntries)>,
+    /// Kept trace payloads of `get_traced` roots by slot; empty until a
+    /// binding keeps one.
+    pub(crate) last_traces: HashMap<u32, crate::trace::RetainedTrace>,
     /// Node slots released by delete_node, awaiting recycling.
     pub(crate) free_nodes: Vec<u32>,
     pub(crate) observers: Observers<C>,
@@ -286,6 +292,8 @@ impl<C: Cells> Inner<C> {
             arena_tags: ArenaTags::default(),
             labels: HashMap::new(),
             trace_log: Vec::new(),
+            trace_root: None,
+            last_traces: HashMap::new(),
             free_nodes: Vec::new(),
             observers: Observers::new(),
             owned: HashMap::new(),
@@ -2069,7 +2077,11 @@ impl<C: Cells> Runtime<C> {
                 .count(&action);
         }
         if flags & crate::instrument::TRACE != 0 {
-            self.inner.write().trace_log.push(crate::trace::NodeTrace {
+            let mut inner = self.inner.write();
+            if let Some((_, root)) = inner.trace_root.as_mut().filter(|(slot, _)| *slot == id.0) {
+                root.see(&action, self.stamp_pair(id.0));
+            }
+            inner.trace_log.push(crate::trace::NodeTrace {
                 id,
                 action,
                 dependencies: Vec::new(),
@@ -3270,6 +3282,11 @@ impl<C: Cells> Runtime<C> {
         } else {
             inner.labels.remove(&slot)
         };
+        let trace = if inner.last_traces.is_empty() {
+            None
+        } else {
+            inner.last_traces.remove(&slot).map(|kept| kept.payload)
+        };
         if C::u8_load_relaxed(&self.instrument_used) != 0 {
             self.instrument_state.write().release(slot, label);
         }
@@ -3282,6 +3299,7 @@ impl<C: Cells> Runtime<C> {
             observers,
             arena,
             arena_slot: retired.arena_slot,
+            trace,
         };
         (drops, retired.dep_list)
     }
@@ -3966,6 +3984,19 @@ impl<C: Cells> Runtime<C> {
     /// If another `get_traced` on this runtime is in progress, whether on
     /// another thread or in a compute this one runs.
     pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
+        let (value, trace, _) = self.get_traced_capturing(handle);
+        (value, trace)
+    }
+
+    /// [`Self::get_traced`], with what the trace saw of its root.
+    fn get_traced_capturing<T: Value>(
+        &self,
+        handle: Incr<T>,
+    ) -> (
+        T,
+        crate::trace::PropagationTrace,
+        crate::trace::TraceCapture,
+    ) {
         use crate::trace::TraceAction;
         value_code::check();
         // The trace's counts are read with no dependency.
@@ -3986,7 +4017,13 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let disarm = Disarm(self);
-        self.inner.write().trace_log.clear();
+        self.check_handle(handle);
+        let before = self.stamp_pair(handle.slot());
+        {
+            let mut inner = self.inner.write();
+            inner.trace_log.clear();
+            inner.trace_root = Some((handle.slot(), Default::default()));
+        }
         self.instrument_state.write().trace_times.clear();
 
         // std has no clock on wasm32-unknown-unknown and `Instant::now()`
@@ -4002,9 +4039,13 @@ impl<C: Cells> Runtime<C> {
 
         self.park(ParkPoint::TraceHandOff);
         // Taken before disarming: the next tracer's CAS clears the log.
-        let mut node_traces: Vec<crate::trace::NodeTrace> = {
+        let (mut node_traces, root): (Vec<crate::trace::NodeTrace>, _) = {
             let mut inner = self.inner.write();
-            std::mem::take(&mut inner.trace_log)
+            let root = inner.trace_root.take().map(|(_, root)| root);
+            (
+                std::mem::take(&mut inner.trace_log),
+                root.unwrap_or_default(),
+            )
         };
         let times = std::mem::take(&mut self.instrument_state.write().trace_times);
         drop(disarm);
@@ -4035,7 +4076,13 @@ impl<C: Cells> Runtime<C> {
             nodes_cutoff,
             elapsed_ns,
         };
-        (value, trace)
+        let capture = crate::trace::TraceCapture {
+            slot: handle.slot(),
+            generation: handle.generation(),
+            before,
+            root,
+        };
+        (value, trace, capture)
     }
 
     /// Number of live nodes in the runtime (deleted-and-not-yet-recycled
@@ -8188,6 +8235,9 @@ mod seed_impl;
 #[path = "runtime_routing.rs"]
 mod routing_impl;
 
+#[path = "runtime_last_trace.rs"]
+mod last_trace_impl;
+
 #[cfg(all(test, not(loom)))]
 pub(crate) use routing_impl::{owed_to, queued_routers};
 pub use routing_impl::{RoutingFailed, RoutingHold};
@@ -8304,6 +8354,10 @@ mod value_code_race_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_trace_tests.rs"]
 mod trace_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_last_trace_tests.rs"]
+mod last_trace_tests;
 
 /// Queues the readers of `id` among a set walk's pending held edges.
 #[inline(always)]
