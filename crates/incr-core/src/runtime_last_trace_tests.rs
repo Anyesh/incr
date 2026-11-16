@@ -297,6 +297,38 @@ fn a_capture_from_another_runtime_is_refused<C: Cells>() {
     assert_eq!(other.inner.read().last_traces.capacity(), 0);
 }
 
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|m| m.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
+fn only_this_runtimes_handles_arm_a_trace_root<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    rt.set_placeholder::<i64>(-1);
+    let own = rt.create_input(1_i64);
+    assert_eq!(
+        rt.trace_root_for(own).map(|(slot, _)| slot),
+        Some(own.slot())
+    );
+    assert!(rt.trace_root_for(rt.pending_handle::<i64>()).is_none());
+
+    let other: Runtime<C> = Runtime::new();
+    let foreign = other.create_input(2_i64);
+    assert!(rt.trace_root_for(foreign).is_none());
+    let by_get = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(foreign)));
+    let by_trace = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.get_traced_retaining(foreign).0
+    }));
+    assert_eq!(
+        panic_text(by_trace.expect_err("a foreign handle was traced")),
+        panic_text(by_get.expect_err("a foreign handle was read"))
+    );
+    assert!(!rt.tracing_is_armed());
+}
+
 fn cases<C: Cells>() {
     recomputed_root_keeps_its_trace_until_dirty::<C>();
     traced_read_of_a_clean_root_leaves_the_trace::<C>();
@@ -306,6 +338,7 @@ fn cases<C: Cells>() {
     delete_drops_the_payload_and_a_reused_slot_starts_empty::<C>();
     node_info_reads_one_node_by_id::<C>();
     a_capture_from_another_runtime_is_refused::<C>();
+    only_this_runtimes_handles_arm_a_trace_root::<C>();
 }
 
 #[test]

@@ -4049,7 +4049,7 @@ impl<C: Cells> Runtime<C> {
         let before = {
             let mut inner = self.inner.write();
             inner.trace_log.clear();
-            inner.trace_root = Some((handle.slot(), Default::default()));
+            inner.trace_root = self.trace_root_for(handle);
             self.handle_stamps(handle)
         };
         self.instrument_state.write().trace_times.clear();

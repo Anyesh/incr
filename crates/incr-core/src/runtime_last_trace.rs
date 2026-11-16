@@ -103,6 +103,16 @@ impl<C: Cells> Runtime<C> {
             .filter(|info| info.generation == generation)
     }
 
+    /// The trace root a `get_traced` of `handle` records entries for:
+    /// none for a handle of another runtime, or a pending one, whose slot
+    /// may be a live node's here.
+    pub(crate) fn trace_root_for<T: Value>(
+        &self,
+        handle: Incr<T>,
+    ) -> Option<(u32, crate::trace::RootEntries)> {
+        (handle.runtime_id() == self.runtime_id).then(|| (handle.slot(), Default::default()))
+    }
+
     /// `handle`'s stamps, or zeros, which no kept payload matches, for a
     /// handle of another runtime or past this one's slots, which `get`
     /// refuses or reads as a placeholder.
