@@ -1405,3 +1405,5 @@
 2	keyed::tests::rows_shared::removing_a_key_that_is_in_no_partition_leaves_no_record
 50	keyed::tests::rows_local::partition_records_match_a_model_across_many_empties_and_refills
 50	keyed::tests::rows_shared::partition_records_match_a_model_across_many_empties_and_refills
+34	keyed::tests::rows_local::reconciles_that_empty_and_fill_many_partitions_with_colliding_hashes_match_a_model
+34	keyed::tests::rows_shared::reconciles_that_empty_and_fill_many_partitions_with_colliding_hashes_match_a_model
