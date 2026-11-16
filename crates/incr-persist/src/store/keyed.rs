@@ -334,6 +334,14 @@ where
         self.keyed.forget_key(rt, key)
     }
 
+    /// [`KeyedCollection::forget_partition`] on this collection.
+    pub fn forget_partition<Q>(&self, rt: &Runtime<C>, parts: &KeyPartitions<Q>, q: &Q) -> bool
+    where
+        Q: Value + Hash + Eq,
+    {
+        self.keyed.forget_partition(rt, parts, q)
+    }
+
     /// How many version inputs this collection holds.
     pub fn version_input_count(&self) -> usize {
         self.keyed.version_input_count()

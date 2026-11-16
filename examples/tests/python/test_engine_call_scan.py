@@ -56,6 +56,7 @@ MUTATING = {
     "reconcile_journaled",
     "apply_pairs_with",
     "forget_key",
+    "forget_partition",
     "key_partitions",
 }
 ENTRIES = {

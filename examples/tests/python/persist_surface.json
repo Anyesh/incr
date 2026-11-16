@@ -169,6 +169,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /, key)"
    },
+   "forget_partition": {
+    "doc": "Free the input of partition `p` of `parts`, a `key_partitions`\nresult of this collection, when the partition holds no key and no\nquery depends on it, for a partition no write emptied or whose\nreaders left later. Returns whether it freed the input; always\nFalse for a Shared runtime. Raises `RuntimeError` inside an overlay\nand `ValueError` for partitions of another collection.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, parts, partition)"
+   },
    "get": {
     "doc": "The row held for `key`, or `None`. Registers no dependency: inside a\nquery, read a key with `ctx.get_key(kc, key)` so the query reruns\nwhen that key's row changes.",
     "kind": "method_descriptor",

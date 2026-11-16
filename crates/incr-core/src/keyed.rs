@@ -1524,9 +1524,15 @@ where
         {
             return;
         }
+        self.free_partition_inputs(rt, emptied);
+    }
+
+    /// Deletes the input of each slot that no query depends on and unmaps
+    /// it, and returns how many it freed.
+    fn free_partition_inputs(&self, rt: &Runtime<C>, slots: &[(usize, u64)]) -> usize {
         let candidates: Vec<((usize, u64), Incr<u64>)> = {
             let inputs = self.versions.partition_inputs.read();
-            emptied
+            slots
                 .iter()
                 .filter_map(|slot| inputs.get(slot).map(|handle| (*slot, *handle)))
                 .collect()
@@ -1539,14 +1545,17 @@ where
             }
         }
         if freed.is_empty() {
-            return;
+            return 0;
         }
         let mut inputs = self.versions.partition_inputs.write();
+        let mut unmapped = 0;
         for slot in freed {
             if inputs.remove(&slot).is_some() {
                 C::u64_fetch_add(&self.versions.partition_live, u64::MAX);
+                unmapped += 1;
             }
         }
+        unmapped
     }
 
     /// Deletes the version input of each candidate that holds no row and
@@ -1613,6 +1622,32 @@ where
         let (freed, keys) = self.release_inputs(rt, candidates);
         value_code::run(|| drop(keys));
         freed > 0
+    }
+
+    /// Under `Local`, deletes partition `q`'s input when the partition
+    /// holds no key (nor does another partition with the same hash, which
+    /// shares the input) and no query depends on it, for an input a write
+    /// never emptied or whose readers left after it. Returns whether it
+    /// freed the input; under `Shared` it frees nothing and returns false.
+    /// Panics inside a compute of any runtime, like every write.
+    pub fn forget_partition<Q>(&self, rt: &Runtime<C>, parts: &KeyPartitions<Q>, q: &Q) -> bool
+    where
+        Q: Value + Hash + Eq,
+    {
+        refuse_value_code();
+        assert!(
+            !rt.frame_active(),
+            "incr-core: KeyedCollection::forget_partition called from inside a compute; a run \
+             the engine discards would delete an input its own read created",
+        );
+        if !C::SINGLE_THREADED || C::u64_load_acquire(&self.versions.partition_live) == 0 {
+            return false;
+        }
+        let qhash = value_code::run(|| FxBuildHasher.hash_one(q));
+        if self.index.table.read().parts[parts.sink].has_hash(qhash) {
+            return false;
+        }
+        self.free_partition_inputs(rt, &[(parts.sink, qhash)]) > 0
     }
 
     /// How many version inputs this collection holds.
@@ -1786,7 +1821,8 @@ where
     /// A partition record exists only while the partition holds a key. Under
     /// `Local` a write that empties a partition also deletes its input when
     /// no query depends on it; under `Shared` the input stays, as version
-    /// inputs do, and a later insert still bumps it.
+    /// inputs do, and a later insert still bumps it. [`Self::forget_partition`]
+    /// frees an input no write emptied or whose readers left later.
     pub fn get_partition<Q>(&self, rt: &Runtime<C>, parts: &KeyPartitions<Q>, q: &Q) -> Vec<K>
     where
         Q: Value + Hash + Eq,

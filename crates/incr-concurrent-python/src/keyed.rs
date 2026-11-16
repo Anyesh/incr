@@ -245,6 +245,27 @@ impl PyKeyedCollection {
         engine_call(py, rt, || source.forget_key(rt, &key))
     }
 
+    /// Free the input of partition `p` of `parts` as the Local package
+    /// does; a Shared runtime never frees one, so this returns False.
+    /// Raises `ValueError` for partitions of another collection.
+    fn forget_partition(
+        slf: &Bound<'_, Self>,
+        parts: &PyKeyPartitions,
+        partition: Py<PyAny>,
+    ) -> PyResult<bool> {
+        let py = slf.py();
+        if !parts.owner.is(slf) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "partitions belong to another keyed collection",
+            ));
+        }
+        let this = slf.get();
+        let rt = this.runtime();
+        let (source, _) = this.key_source(rt)?;
+        let q = PyKey(partition);
+        engine_call(py, rt, || source.forget_partition(rt, &parts.parts, &q))
+    }
+
     /// Partition the keys by `fn(key)`, which must be deterministic and
     /// total over every key it is ever given: the same hashable value for
     /// a key every time, and no exception for a key it accepted before.
