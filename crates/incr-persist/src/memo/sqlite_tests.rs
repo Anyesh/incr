@@ -687,10 +687,10 @@ fn a_batched_frame_read_and_a_generation_delete_go_by_rowid_not_through_the_inde
     );
 
     let mut plan = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {DELETE_ENTRIES}"))
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", delete_range_sql(2)))
         .unwrap();
     let details: Vec<String> = plan
-        .query_map([1, 255, 1], |row| row.get(3))
+        .query_map([1, 255, 1, 2], |row| row.get(3))
         .unwrap()
         .collect::<std::result::Result<_, _>>()
         .unwrap();
@@ -698,4 +698,51 @@ fn a_batched_frame_read_and_a_generation_delete_go_by_rowid_not_through_the_inde
         details.iter().all(|d| d.contains("INTEGER PRIMARY KEY")),
         "{details:?}"
     );
+}
+
+fn row_count(memo: &SqliteMemo) -> i64 {
+    lock(&memo.writer)
+        .query_row("SELECT count(*) FROM memo_entry", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn superseded_chain(memo: &SqliteMemo) -> [GenId; 2] {
+    memo.write_generation(None, GenId(1), &header(1), &encoded(100))
+        .unwrap();
+    memo.write_generation(Some(GenId(1)), GenId(2), &header(2), &encoded(100))
+        .unwrap();
+    memo.write_generation(Some(GenId(2)), GenId(3), &header(3), &encoded(100))
+        .unwrap();
+    [GenId(1), GenId(2)]
+}
+
+#[test]
+fn several_superseded_generations_are_removed_in_rowid_ranges_and_the_current_one_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
+    let old = superseded_chain(&memo);
+    remove_in_chunks(&mut lock(&memo.writer), &old, 16, None).unwrap();
+    assert_eq!(row_count(&memo), 100);
+    assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
+    assert!(memo.remove_generations(&[GenId(3)]).is_err());
+    memo.remove_generations(&old).unwrap();
+}
+
+#[test]
+fn a_removal_stopped_between_ranges_is_finished_by_the_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memo.db");
+    {
+        let memo = SqliteMemo::open(&path).unwrap();
+        let old = superseded_chain(&memo);
+        let stopped = remove_in_chunks(&mut lock(&memo.writer), &old, 16, Some(2));
+        assert!(stopped.is_err());
+        let left = row_count(&memo);
+        assert!(100 < left && left < 300, "{left} rows");
+        assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
+    }
+    let memo = SqliteMemo::open(&path).unwrap();
+    drop(memo.lock_checkpoint().unwrap());
+    assert_eq!(row_count(&memo), 100);
+    assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
 }

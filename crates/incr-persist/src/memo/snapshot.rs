@@ -270,10 +270,8 @@ impl<C: MemoCells> CoreRef<C> {
         // Restores hold M, so none is still reading the old chain.
         // The new one is current either way, so a failed removal only
         // leaves a stale generation behind.
-        for &old in &done.superseded {
-            if self.backend.remove_generation(old).is_err() {
-                state.stats.stale_generations += 1;
-            }
+        if self.backend.remove_generations(&done.superseded).is_err() {
+            state.stats.stale_generations += done.superseded.len() as u64;
         }
         drop(state);
         drop(saved);

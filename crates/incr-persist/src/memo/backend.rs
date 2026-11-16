@@ -216,4 +216,14 @@ pub trait MemoBackend: Send + Sync {
     /// Removing one that is already gone succeeds. Handles still reading
     /// it get `None` from `read_entry`.
     fn remove_generation(&self, generation: GenId) -> Result<()>;
+
+    /// [`remove_generation`](Self::remove_generation) for each of
+    /// `generations`, which a backend may do in fewer steps. Every one is
+    /// attempted; the first error is returned.
+    fn remove_generations(&self, generations: &[GenId]) -> Result<()> {
+        generations
+            .iter()
+            .map(|&generation| self.remove_generation(generation))
+            .fold(Ok(()), |all, one| all.and(one))
+    }
 }

@@ -84,6 +84,7 @@ pub(crate) trait ErasedBackend: Send + Sync {
     fn checkpoint(&self, input: CheckpointInput, known: &[Arc<Generation>])
         -> Result<Checkpointed>;
     fn remove_generation(&self, generation: GenId) -> Result<()>;
+    fn remove_generations(&self, generations: &[GenId]) -> Result<()>;
 }
 
 impl<M: MemoBackend> ErasedBackend for M {
@@ -101,6 +102,10 @@ impl<M: MemoBackend> ErasedBackend for M {
 
     fn remove_generation(&self, generation: GenId) -> Result<()> {
         MemoBackend::remove_generation(self, generation)
+    }
+
+    fn remove_generations(&self, generations: &[GenId]) -> Result<()> {
+        MemoBackend::remove_generations(self, generations)
     }
 }
 
