@@ -1417,3 +1417,4 @@
 3	keyed::tests::rows_shared::forget_partition_keeps_an_input_shared_with_a_colliding_partition
 3	keyed::tests::rows_local::forget_partition_inside_a_compute_is_refused
 3	keyed::tests::rows_shared::forget_partition_inside_a_compute_is_refused
+1	collection::tests::shared_snapshot_values_records_no_dependency

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use incr_core::lock_order::{acquire, LockKind};
-use incr_core::PairOp;
+use incr_core::{PairOp, Runtime};
 use serde::{Deserialize, Serialize};
 
 use super::collection::fp_of_elements;
@@ -405,8 +405,8 @@ fn a_foreign_decode_failure_leaves_index_and_collection_equal<C: Cells>() {
     assert_eq!(items(&kb), pairs(&b, &kb));
 }
 
-fn known(deps: &DepIndex, key: &str) -> u128 {
-    match deps.fp(key) {
+fn known<C: Cells>(rt: &Runtime<C>, deps: &DepIndex, key: &str) -> u128 {
+    match deps.fp(rt, key) {
         Some(DepFp::Known(fp)) => fp,
         other => panic!("{key}: expected a known fingerprint, found {other:?}"),
     }
@@ -414,7 +414,10 @@ fn known(deps: &DepIndex, key: &str) -> u128 {
 
 fn assert_fp<C: Cells, B: Backend>(store: &Store<C, B>, kc: &Kc<C>, deps: &DepIndex) {
     let held = kc.pairs().values(store.runtime());
-    assert_eq!(known(deps, "k"), fp_of_elements("k", &held).unwrap());
+    assert_eq!(
+        known(store.runtime(), deps, "k"),
+        fp_of_elements("k", &held).unwrap()
+    );
 }
 
 fn the_dep_index_fingerprint_is_the_fingerprint_of_the_pairs<C: Cells>() {
@@ -441,7 +444,7 @@ fn the_dep_index_fingerprint_is_the_fingerprint_of_the_pairs<C: Cells>() {
     store.refresh().unwrap();
     assert_fp(&store, &kc, &deps);
     store.delete(&kc).unwrap();
-    assert_eq!(known(&deps, "k"), 0);
+    assert_eq!(known(store.runtime(), &deps, "k"), 0);
 
     store.upsert(&kc, 6, s("f")).unwrap();
     let reopened = open::<C, _>(log.clone());

@@ -14,8 +14,8 @@ use incr_core::{
 
 use super::after_lock::AfterLock;
 use super::binding::{decode, encode, Binding};
-use super::collection::{fp_of_elements, FpDelta};
-use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard};
+use super::collection::{fp_in_scope, fp_of_elements, FpDelta};
+use super::dep_index::{fp_of, DepFp, DepIndex, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
 use super::{set_record, Input, KeyRef, PersistValue, PersistedCollection, State, Store};
 use crate::value_context::hold;
@@ -213,6 +213,28 @@ where
     }
 }
 
+impl<K, V, C, P> FpSource<C> for KeyedRows<K, V, C, P>
+where
+    K: PersistValue + Hash + Eq,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V> + PersistValue,
+{
+    fn fp(&self, rt: &Runtime<C>, bag: &mut Deferred<C>) -> DepFp {
+        if !rt.is_alive(self.keyed.pairs().version_node().erase()) {
+            return DepFp::Untrusted;
+        }
+        let pairs = self.keyed.ranked_pairs();
+        let fp = fp_in_scope(
+            self.scope.as_ref(),
+            &self.key,
+            pairs.iter().map(|(pair, _)| pair),
+        );
+        bag.push(pairs);
+        fp
+    }
+}
+
 /// A persisted keyed collection: a collection key in the log whose
 /// elements are `P` pairs, bound to a [`KeyedCollection`] that reads at
 /// most one row per key. Each pair is ranked by the fingerprint of the
@@ -249,6 +271,8 @@ where
     key: String,
     pub(super) keyed: Core<K, V, C, P>,
     rows: Rows<C>,
+    /// The same rows, as the source of the collection's fingerprint.
+    fps: Fps<C>,
 }
 
 // SAFETY: the parts of `KeyedCollection<K, V, C, P, R>` that are not
@@ -1158,15 +1182,15 @@ where
     /// for the caller to drop once user `Drop` may run.
     fn fp(&self, rt: &Runtime<C>, read: &mut Vec<P>) -> DepFp {
         *read = self.keyed.pairs().values(rt);
-        match fp_of_elements(&self.key, read) {
+        match fp_of_elements(&self.key, read.iter()) {
             Ok(fp) => DepFp::Known(fp),
             Err(_) => DepFp::Untrusted,
         }
     }
 
-    /// Applies `ops` as one mapped write. With `deps`, the fingerprint
-    /// moves by what the pair collection reports, or is recomputed from
-    /// the pairs when `recompute`, which also trusts it again.
+    /// Applies `ops` as one mapped write. When `deps` tracks the key, the
+    /// fingerprint moves by what the pair collection reports, or is
+    /// recomputed from the pairs when `recompute`.
     fn apply_ops(
         &self,
         rt: &Runtime<C>,
@@ -1178,8 +1202,9 @@ where
         let mut read = Vec::new();
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
+        let tracked = guard.deps().is_some_and(|map| map.tracks(&self.key));
         let change = bag.with(|spent: &mut KeyedSpent<K, V, P, u128>| {
-            if guard.deps().is_some() && !recompute {
+            if tracked && !recompute {
                 let mut sink = FpDelta::new(&self.key);
                 let change = self
                     .keyed
@@ -1193,7 +1218,7 @@ where
                     .apply_pairs_keeping(rt, ops, &mut (), None, spent)
             }
         });
-        if recompute && guard.deps().is_some() {
+        if recompute && tracked {
             let fp = self.fp(rt, &mut read);
             if let Some(map) = guard.deps() {
                 map.store_fp(&self.key, fp);
@@ -1319,14 +1344,8 @@ where
         Ok(Some(Elements::from_encoded(self.encoded(rt, bag)?)))
     }
 
-    fn dep_fp(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<DepFp> {
-        if !rt.is_alive(self.node()) {
-            return Ok(DepFp::Untrusted);
-        }
-        let pairs = self.keyed.pairs().values(rt);
-        let fp = fp_of_elements(&self.key, &pairs);
-        bag.push_vec(pairs);
-        Ok(DepFp::Known(fp?))
+    fn dep_fp(&self, _scope: Option<ValueScope>) -> Registered {
+        Registered::Later(Box::new(Arc::clone(&self.fps)))
     }
 
     fn mapped_stamp(&self) -> Option<u64> {
@@ -1482,7 +1501,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             logged.elements = Elements::default();
         }
         let keyed = KeyedCollection::new(&self.runtime);
-        let rows: Rows<C> = Arc::new(KeyedRows {
+        let rows = Arc::new(KeyedRows {
             key: key.to_owned(),
             keyed: keyed.clone(),
             scope: self.value_scope(),
@@ -1490,9 +1509,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let binding = KeyedBinding {
             key: key.to_owned(),
             keyed,
+            fps: rows.clone(),
             rows,
         };
-        let mut read = Vec::new();
         let mut hold = state.deps.as_deref().map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), key);
         let change = state.after.with(|spent: &mut KeyedSpent<K, V, P, u128>| {
@@ -1500,21 +1519,22 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 .keyed
                 .apply_pairs_keeping(&self.runtime, ops, &mut (), None, spent)
         });
-        if guard.deps().is_some() {
-            let fp = binding.fp(&self.runtime, &mut read);
+        if let Some(map) = guard.deps() {
             let node = Binding::<C>::node(&binding);
-            let rows = Binding::<C>::row_source(&binding);
-            if let Some(map) = guard.deps() {
-                map.register(key, node, Kind::Collection, fp, None);
-                if let Some(rows) = rows {
-                    map.register_rows(key, rows);
-                }
+            map.register(
+                key,
+                node,
+                Kind::Collection,
+                Binding::<C>::dep_fp(&binding, None),
+                None,
+            );
+            if let Some(rows) = Binding::<C>::row_source(&binding) {
+                map.register_rows(key, rows);
             }
         }
         guard.disarm();
         drop(hold);
         keep_changed(&state.after, change);
-        state.after.push_vec(read);
         let keyed = binding.keyed.clone();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedKeyed { id, keyed })

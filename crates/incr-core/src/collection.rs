@@ -941,6 +941,16 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         self.log.read().len()
     }
 
+    /// Current elements, with multiset duplicates expanded, as the log
+    /// holds them now: unlike [`Self::values`], forces no `version_node`
+    /// and records no dependency, so it suits a source collection whose
+    /// writes the caller holds out, read from inside a compute.
+    pub fn snapshot_values(&self) -> Vec<T> {
+        value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        self.log.read().elements_vec()
+    }
+
     /// Current elements, with multiset duplicates expanded. Forces
     /// `version_node` first, so an operator output (a `filter`/`map`
     /// result, say) is brought up to date with its upstream before the
@@ -2076,6 +2086,31 @@ mod tests {
         c.insert(&rt, 20);
         c.insert(&rt, 30);
         assert_eq!(c.snapshot_len(), 3);
+    }
+
+    #[test]
+    fn shared_snapshot_values_records_no_dependency() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        c.insert(&rt, 4);
+        c.insert(&rt, 4);
+        c.insert(&rt, 5);
+        let read = c.clone();
+        let runs = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&runs);
+        let q = rt.create_query(move |_| {
+            counted.fetch_add(1, MemOrdering::SeqCst);
+            let mut values = read.snapshot_values();
+            values.sort_unstable();
+            values
+        });
+        assert_eq!(rt.get(q), vec![4, 4, 5]);
+        c.insert(&rt, 6);
+        assert_eq!(rt.get(q), vec![4, 4, 5]);
+        assert_eq!(runs.load(MemOrdering::SeqCst), 1);
+        let mut values = c.snapshot_values();
+        values.sort_unstable();
+        assert_eq!(values, vec![4, 4, 5, 6]);
     }
 
     #[test]

@@ -2,18 +2,20 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
+use std::sync::Arc;
 
-use incr_core::persist_hooks::{self, Displaced, RepSide, RepSink};
+use incr_core::persist_hooks::{self, Deferred, Displaced, RepSide, RepSink};
 use incr_core::{with_value_code, Cells, ErasedIncr, Incr, IncrCollection, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::after_lock::AfterLock;
 use super::binding::{decode, encode, Binding};
-use super::dep_index::{fp_of, DepFp, DepIndex, DepMap, PanicGuard};
+use super::dep_index::{fp_of, DepFp, DepIndex, DepMap, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
 use super::{Batch, KeyRef, PersistValue, State, Store};
-use crate::{Backend, Error, Kind, Position, Record, Result};
+use crate::value_context::{enter_value_scope, hold};
+use crate::{Backend, Error, Kind, Position, Record, Result, ValueScope};
 
 /// A persisted collection: a key in the log bound to a multiset collection
 /// of the store's runtime.
@@ -45,6 +47,36 @@ pub(super) struct CollectionBinding<T: Value + Hash + Eq, C: Cells> {
 // leaves the store's thread.
 unsafe impl<T: Value + Hash + Eq, C: Cells> Send for CollectionBinding<T, C> {}
 unsafe impl<T: Value + Hash + Eq, C: Cells> Sync for CollectionBinding<T, C> {}
+
+/// A plain collection's [`FpSource`].
+struct CollectionFp<T: Value + Hash + Eq, C: Cells> {
+    key: String,
+    collection: IncrCollection<T, C>,
+    scope: Option<ValueScope>,
+}
+
+// SAFETY: as for `CollectionBinding`: the source is reachable only through
+// the `DepIndex` of the store that created it, and that store owns a
+// `Runtime<C>`, which is Send or Sync exactly when C's cells are.
+unsafe impl<T: Value + Hash + Eq, C: Cells> Send for CollectionFp<T, C> {}
+// SAFETY: see `Send`.
+unsafe impl<T: Value + Hash + Eq, C: Cells> Sync for CollectionFp<T, C> {}
+
+impl<T, C> FpSource<C> for CollectionFp<T, C>
+where
+    T: Value + Hash + Eq + Serialize,
+    C: Cells,
+{
+    fn fp(&self, rt: &Runtime<C>, bag: &mut Deferred<C>) -> DepFp {
+        if !rt.is_alive(self.collection.version_node().erase()) {
+            return DepFp::Untrusted;
+        }
+        let values = self.collection.snapshot_values();
+        let fp = fp_in_scope(self.scope.as_ref(), &self.key, &values);
+        bag.push(values);
+        fp
+    }
+}
 
 impl<T: Value + Hash + Eq, C: Cells> PersistedCollection<T, C> {
     /// The runtime collection, for reads, operators (`filter`, `count`,
@@ -244,8 +276,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
             key: key.to_owned(),
             collection: self.runtime.create_collection(),
         };
-        let fp = binding.run_converge(&self.runtime, &plan, hold.as_deref_mut(), &mut spent);
-        if let (Some(map), Some(fp)) = (hold.as_deref_mut(), fp) {
+        binding.run_converge(&self.runtime, &plan, hold.as_deref_mut(), &mut spent);
+        if let Some(map) = hold.as_deref_mut() {
+            let fp = Binding::<C>::dep_fp(&binding, self.value_scope());
             map.register(key, binding.node(), Kind::Collection, fp, None);
         }
         drop(hold);
@@ -259,10 +292,31 @@ impl<C: Cells, B: Backend> Store<C, B> {
 
 /// The sum, mod 2^128, of the fingerprints of the encodings of `values`,
 /// one per stored occurrence: a collection's fingerprint.
-pub(super) fn fp_of_elements<T: Serialize>(key: &str, values: &[T]) -> Result<u128> {
-    values.iter().try_fold(0u128, |sum, value| {
+pub(super) fn fp_of_elements<'a, T: Serialize + 'a>(
+    key: &str,
+    values: impl IntoIterator<Item = &'a T>,
+) -> Result<u128> {
+    values.into_iter().try_fold(0u128, |sum, value| {
         Ok(sum.wrapping_add(fp_of(&encode(key, value)?)))
     })
+}
+
+/// [`fp_of_elements`] in one hold of `scope`, the store's value scope,
+/// made current for the encodes; `Untrusted` when an element does not
+/// encode.
+pub(super) fn fp_in_scope<'a, T: Serialize + 'a>(
+    scope: Option<&ValueScope>,
+    key: &str,
+    values: impl IntoIterator<Item = &'a T>,
+) -> DepFp {
+    let _scope = scope.cloned().map(enter_value_scope);
+    let mut fp = DepFp::Untrusted;
+    hold(scope, || {
+        if let Ok(sum) = fp_of_elements(key, values) {
+            fp = DepFp::Known(sum);
+        }
+    });
+    fp
 }
 
 /// What a single mutation changes in a collection's fingerprint, from the
@@ -296,11 +350,13 @@ impl<'a> FpDelta<'a> {
         }
     }
 
+    /// Applies the change to `key`'s fingerprint, which the caller found
+    /// [tracked](DepMap::tracks).
     pub(super) fn apply_to(&self, map: &mut DepMap, key: &str) {
-        match map.entry(key).map(|entry| entry.fp) {
-            _ if self.failed => map.untrust(key),
-            Some(DepFp::Known(fp)) => map.set_fp(key, fp.wrapping_add(self.delta)),
-            _ => {}
+        if self.failed {
+            map.untrust(key);
+        } else {
+            map.shift_fp(key, self.delta);
         }
     }
 }
@@ -403,7 +459,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         let mut spent = Spent::default();
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
-        if guard.deps().is_some() {
+        if guard.deps().is_some_and(|map| map.tracks(&self.key)) {
             let mut sink = FpDelta::new(&self.key);
             self.mutate(rt, op, &mut sink, &mut spent);
             if let Some(map) = guard.deps() {
@@ -498,7 +554,8 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
     }
 
     /// The changes of a [`Converge`], made inside the caller's hold of
-    /// `map`, if any. With `map`, returns the fingerprint after them.
+    /// `map`, if any. When `map` [tracks](DepMap::tracks) the key, returns
+    /// the fingerprint after them.
     fn run_converge(
         &self,
         rt: &Runtime<C>,
@@ -532,7 +589,8 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
                 );
             }
         }
-        let fp = guard.deps().is_some().then(|| {
+        let tracked = guard.deps().is_some_and(|map| map.tracks(&self.key));
+        let fp = tracked.then(|| {
             spent.values = self.collection.values(rt);
             match fp_of_elements(&self.key, &spent.values) {
                 Ok(fp) => DepFp::Known(fp),
@@ -576,15 +634,13 @@ where
         None
     }
 
-    fn dep_fp(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<DepFp> {
-        // Deleted through the runtime: nothing can say what it holds.
-        if !rt.is_alive(self.node()) {
-            return Ok(DepFp::Untrusted);
-        }
-        let values = self.collection.values(rt);
-        let fp = fp_of_elements(&self.key, &values);
-        bag.push_vec(values);
-        Ok(DepFp::Known(fp?))
+    fn dep_fp(&self, scope: Option<ValueScope>) -> Registered {
+        let source: Fps<C> = Arc::new(CollectionFp {
+            key: self.key.clone(),
+            collection: self.collection.as_view(),
+            scope,
+        });
+        Registered::Later(Box::new(source))
     }
 
     fn apply(

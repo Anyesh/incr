@@ -4,7 +4,7 @@ use incr_core::persist_hooks::{changed_at_erased, Deferred};
 use incr_core::{Cells, ErasedIncr, Runtime};
 
 use super::{StoredDep, VALUE_BATCH};
-use crate::store::dep_index::{DepFp, DepMap};
+use crate::store::dep_index::{DepEntry, DepFp, DepMap};
 use crate::store::keyed::rows_of;
 use crate::Kind;
 
@@ -37,7 +37,7 @@ pub(crate) fn map_live<C: Cells>(
 ) -> Vec<LiveDep> {
     let mut mapped: Vec<Option<LiveDep>> = deps
         .iter()
-        .map(|&dep| map_unkeyed(map, rt, memo, dep))
+        .map(|&dep| map_unkeyed(map, rt, memo, dep, bag))
         .collect();
     for (collection, rows) in map.all_rows() {
         let (at, pending): (Vec<usize>, Vec<ErasedIncr>) = mapped
@@ -77,16 +77,18 @@ pub(crate) fn map_live<C: Cells>(
 }
 
 /// What `dep` stores as if it is a store key or an external; `None` for
-/// any other node.
+/// any other node. A collection's pending fingerprint is computed, with
+/// what it reads going to `bag`.
 fn map_unkeyed<C: Cells>(
     map: &DepMap,
     rt: &Runtime<C>,
     memo: u64,
     dep: ErasedIncr,
+    bag: &mut Deferred<C>,
 ) -> Option<LiveDep> {
     if let Some(key) = map.key_of(dep) {
         let entry = map.entry(key).expect("a handle's key is registered");
-        return Some(match (entry.kind, entry.fp) {
+        return Some(match (entry.kind, map.fp(entry, rt, bag)) {
             (_, DepFp::Untrusted) => LiveDep::Unmapped,
             (Kind::Input, DepFp::Known(fp)) => {
                 if vouches(rt, dep, entry.stamp) {
@@ -118,18 +120,18 @@ fn map_unkeyed<C: Cells>(
     })
 }
 
-/// Whether the keyed collection `collection` is registered with a known
-/// fingerprint, so a panic part-way through one of its writes leaves its
-/// rows unmapped.
+/// Whether the keyed collection `collection` is registered and trusted,
+/// so a panic part-way through one of its writes leaves its rows unmapped.
+/// Computes no pending fingerprint.
 fn trusted(map: &DepMap, collection: &str) -> bool {
-    map.entry(collection)
-        .is_some_and(|entry| matches!(entry.fp, DepFp::Known(_)))
+    map.entry(collection).is_some_and(DepEntry::trusted)
 }
 
 /// A stored store-key or external dep's live node and whether its
 /// fingerprint still matches; `None` when nothing live vouches for it.
 /// `None` for a query dep, which the restore walk maps. A row dep's
-/// decoded key goes to `bag`.
+/// decoded key, and what computing a pending collection fingerprint
+/// reads, go to `bag`.
 pub(crate) fn map_stored<C: Cells>(
     map: &DepMap,
     rt: &Runtime<C>,
@@ -140,7 +142,7 @@ pub(crate) fn map_stored<C: Cells>(
     match dep {
         StoredDep::Input { key, fp } => {
             let entry = map.entry(key)?;
-            match (entry.kind, entry.fp) {
+            match (entry.kind, map.fp(entry, rt, bag)) {
                 (Kind::Input, DepFp::Known(live)) if vouches(rt, entry.handle, entry.stamp) => {
                     Some((entry.handle, live == *fp))
                 }
@@ -149,7 +151,7 @@ pub(crate) fn map_stored<C: Cells>(
         }
         StoredDep::Collection { key, fp } => {
             let entry = map.entry(key)?;
-            match (entry.kind, entry.fp) {
+            match (entry.kind, map.fp(entry, rt, bag)) {
                 (Kind::Collection, DepFp::Known(live)) => Some((entry.handle, live == *fp)),
                 _ => None,
             }

@@ -21,7 +21,10 @@ use incr_core::{CycleStrategy, Fixpoint, Incr, QueryOpts};
 use incr_persist::memo::{
     BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoValue, MemoryMemo,
 };
-use incr_persist::{Error, Local, MemoryBackend, Options, Shared, Store};
+use incr_persist::{
+    Error, Local, MemoryBackend, Options, PersistedCollection, PersistedKeyed, Shared, Store,
+    ValueScope,
+};
 use serde::{Deserialize, Serialize};
 
 const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
@@ -716,4 +719,149 @@ fn a_declare_catches_up_a_foreign_insert_under_a_memo<C: MemoCells>() {
 
     a.collection::<u64>("other").unwrap();
     assert_eq!(items.handle().values(a.runtime()), vec![7]);
+}
+
+static GIL: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static IN_GIL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A stand-in for the GIL: the lock a binding's value code takes per call,
+/// and that the store's value-scope hold takes once for a batch.
+fn gil_hold(f: &mut dyn FnMut()) {
+    if IN_GIL.with(Cell::get) {
+        return f();
+    }
+    let _gil = GIL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    IN_GIL.with(|held| held.set(true));
+    f();
+    IN_GIL.with(|held| held.set(false));
+}
+
+/// Encodes holding [`GIL`], as a Python codec does.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize)]
+struct Gil(u64);
+
+impl Serialize for Gil {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut s = Some(s);
+        let mut out = None;
+        gil_hold(&mut || out = s.take().map(|s| s.serialize_u64(self.0)));
+        out.expect("gil_hold runs its batch")
+    }
+}
+
+const GIL_ROWS: u64 = 16;
+const GIL_ELEMENTS: u64 = 256;
+
+struct GilGraph {
+    store: Arc<Store<Shared, MemoryBackend>>,
+    xs: PersistedCollection<Gil, Shared>,
+    rows: PersistedKeyed<u64, Gil, Shared>,
+    memo: Memo<Shared, MemoryBackend>,
+    sum: MemoTable<u32, u64>,
+    row: MemoTable<u32, Option<u64>>,
+}
+
+fn gil_graph(backends: &Backends) -> GilGraph {
+    let scoped = Options {
+        value_scope: Some(ValueScope::new(Arc::new(())).holding(gil_hold)),
+        ..Options::default()
+    };
+    let store = Arc::new(Store::<Shared, _>::open(backends.log.clone(), scoped).unwrap());
+    let xs = store.collection::<Gil>("xs").unwrap();
+    let rows = store
+        .keyed_collection::<u64, Gil, (u64, Gil)>("rows")
+        .unwrap();
+    let mut builder = MemoBuilder::new(options());
+    let sum = builder.table::<u32, u64>("sum", 1);
+    let row = builder.table::<u32, Option<u64>>("row", 1);
+    let view = xs.handle().clone();
+    builder.define(sum, move |ctx, _| {
+        view.values(ctx.rt()).iter().map(|x| x.0).sum()
+    });
+    let read = rows.clone();
+    builder.define(row, move |ctx, &k| {
+        read.get_key(ctx.rt(), &u64::from(k)).map(|x| x.0)
+    });
+    let memo = builder.open(&store, backends.memo.clone()).unwrap();
+    GilGraph {
+        store,
+        xs,
+        rows,
+        memo,
+        sum,
+        row,
+    }
+}
+
+/// Each round reopens a memo whose collection fingerprint is pending, so a
+/// check of `sum` encodes the collection in the store's value scope, under
+/// the memo lock and a `DepIndex` read hold, while another thread writes
+/// mapped rows, encoding each through the same lock, and a third takes that
+/// lock between them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_memo_check_encoding_a_collection_races_mapped_row_writes() {
+    run_in_child(
+        "a_memo_check_encoding_a_collection_races_mapped_row_writes",
+        || {
+            let backends = Backends::new();
+            let mut total: u64 = (0..GIL_ELEMENTS).sum();
+            {
+                let g = gil_graph(&backends);
+                for i in 0..GIL_ELEMENTS {
+                    g.xs.insert(&g.store, Gil(i)).unwrap();
+                }
+                g.store
+                    .reconcile(&g.rows, (0..GIL_ROWS).map(|k| (k, Gil(k))))
+                    .unwrap();
+                assert_eq!(read(&g.memo, g.sum, 0), total);
+                for k in 0..GIL_ROWS as u32 {
+                    read(&g.memo, g.row, k);
+                }
+                g.memo.checkpoint().unwrap();
+            }
+            for round in 0..ROUNDS {
+                let g = gil_graph(&backends);
+                let start = Barrier::new(3);
+                let added = 1_000 + u64::from(round);
+                thread::scope(|s| {
+                    s.spawn(|| {
+                        start.wait();
+                        let sum = read(&g.memo, g.sum, 0);
+                        assert!(sum == total || sum == total + added, "{sum}");
+                        for k in 0..GIL_ROWS as u32 {
+                            read(&g.memo, g.row, k);
+                        }
+                    });
+                    s.spawn(|| {
+                        start.wait();
+                        for k in 0..GIL_ROWS {
+                            g.store
+                                .upsert(&g.rows, k, Gil(k + u64::from(round) + 1))
+                                .unwrap();
+                        }
+                        g.xs.insert(&g.store, Gil(added)).unwrap();
+                    });
+                    s.spawn(|| {
+                        start.wait();
+                        for _ in 0..64 {
+                            gil_hold(&mut thread::yield_now);
+                        }
+                    });
+                });
+                total += added;
+                assert_eq!(read(&g.memo, g.sum, 0), total);
+                let last = u64::from(round) + 1;
+                assert_eq!(read(&g.memo, g.row, 0), Some(last));
+                assert_invariants(g.memo.runtime());
+                g.memo.checkpoint().unwrap();
+            }
+        },
+    )
+    .assert_clean();
 }

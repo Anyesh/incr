@@ -16,7 +16,7 @@ use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, Snapsho
 
 use after_lock::{AfterLock, Drained, Holder, HolderMark};
 use binding::{decode, encode, Binding, InputBinding};
-use dep_index::{fp_of, DepFp, DepIndex};
+use dep_index::{fp_of, DepFp, DepIndex, Registered};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
 pub use collection::PersistedCollection;
@@ -499,8 +499,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 
     /// The store's [`DepIndex`], created on the first call with every key
-    /// this store has declared. From then on every mapped write keeps it
-    /// current.
+    /// this store has declared. Encodes nothing: a collection registers a
+    /// pending fingerprint that the first memo read needing it computes.
+    /// From then on every mapped write keeps it current.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_dep_index(&self) -> Result<Arc<DepIndex>> {
         let mut guard = self.state()?;
@@ -516,7 +517,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 key,
                 binding.node(),
                 binding.kind(),
-                binding.dep_fp(&self.runtime, &state.after)?,
+                binding.dep_fp(self.value_scope()),
                 binding.mapped_stamp(),
                 binding.row_source(),
             ));
@@ -600,7 +601,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 key,
                 handle.erase(),
                 Kind::Input,
-                DepFp::Known(fp),
+                Registered::Now(DepFp::Known(fp)),
                 Some(stamp),
             );
         }
