@@ -950,7 +950,7 @@ impl<C: Cells> Runtime<C> {
             }))
         });
         for action in e.trace {
-            self.push_trace_now(id, action);
+            self.push_trace_now(id, action, None);
         }
         self.set_held_mark(node, false);
         self.park(super::ParkPoint::HeldLanding(id));

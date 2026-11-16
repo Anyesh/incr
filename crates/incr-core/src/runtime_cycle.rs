@@ -2670,14 +2670,14 @@ impl<C: Cells> Runtime<C> {
             self.children_landing(id, flags, children, e.opened(), bag);
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
-            let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
-            self.end_reservation_landed(id, node, landed);
             self.record_trace(
                 id,
                 crate::trace::TraceAction::Recomputed {
                     value_changed: changed,
                 },
             );
+            let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
+            self.end_reservation_landed(id, node, landed);
             Some(landed)
         };
         bag.push_erased(Box::new(e.into_values()));
@@ -3326,10 +3326,11 @@ impl<C: Cells> Runtime<C> {
                     "incr-core: group verify re-lands member {m} over an empty slot"
                 );
                 node.max_verified_at(verify_rev);
+                let stamps = self.verify_stamps(NodeId(m));
                 let landed = self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty);
                 self.end_reservation_landed(NodeId(m), node, landed);
                 if landed == NodeState::Clean {
-                    self.record_trace(NodeId(m), crate::trace::TraceAction::VerifiedClean);
+                    self.record_verified(NodeId(m), stamps);
                 }
             }
             return GroupEnd::Done(Computed::Done);

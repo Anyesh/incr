@@ -67,6 +67,9 @@ pub(crate) struct NodeDrops<'rt, C: Cells> {
     pub(crate) observers: Vec<ObserverEntry<C>>,
     pub(crate) arena: &'rt dyn ErasedArena<C>,
     pub(crate) arena_slot: u32,
+    /// The node's kept trace payload, which a binding fills with its own
+    /// objects.
+    pub(crate) trace: Option<crate::trace::TracePayload>,
 }
 
 impl<C: Cells> NodeDrops<'_, C> {
@@ -80,6 +83,7 @@ impl<C: Cells> NodeDrops<'_, C> {
         drop(self.compute.take());
         drop(self.strategy.take());
         drop(mem::take(&mut self.observers));
+        drop(self.trace.take());
         self.arena.release(self.arena_slot);
         reclaim_probe::reached(RetireSite::DeleteRetire);
     }

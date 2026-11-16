@@ -177,6 +177,12 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) arena_tags: ArenaTags,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
+    /// The slot of the root the armed `get_traced` reads, and its entries
+    /// in `trace_log`.
+    pub(crate) trace_root: Option<(u32, crate::trace::RootEntries)>,
+    /// Kept trace payloads of `get_traced` roots by slot; empty until a
+    /// binding keeps one.
+    pub(crate) last_traces: HashMap<u32, crate::trace::RetainedTrace>,
     /// Node slots released by delete_node, awaiting recycling.
     pub(crate) free_nodes: Vec<u32>,
     pub(crate) observers: Observers<C>,
@@ -286,6 +292,8 @@ impl<C: Cells> Inner<C> {
             arena_tags: ArenaTags::default(),
             labels: HashMap::new(),
             trace_log: Vec::new(),
+            trace_root: None,
+            last_traces: HashMap::new(),
             free_nodes: Vec::new(),
             observers: Observers::new(),
             owned: HashMap::new(),
@@ -2001,7 +2009,25 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     fn record_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
         if self.instrumented() {
-            self.push_trace(id, action);
+            self.push_trace(id, action, None);
+        }
+    }
+
+    /// The stamps a verify left on `id`, read before it lands, while its
+    /// claim keeps other runs off, for [`Self::record_verified`]. `None`
+    /// with tracing and stats off.
+    #[inline(always)]
+    pub(crate) fn verify_stamps(&self, id: NodeId) -> Option<crate::trace::StampPair> {
+        self.instrumented().then(|| self.stamp_pair(id.0))
+    }
+
+    /// Records a verify that landed `id` Clean, with the stamps
+    /// [`Self::verify_stamps`] read before the landing; a verify that
+    /// began before tracing or stats were on records nothing.
+    #[inline(always)]
+    pub(crate) fn record_verified(&self, id: NodeId, stamps: Option<crate::trace::StampPair>) {
+        if let Some(stamps) = stamps {
+            self.push_trace(id, crate::trace::TraceAction::VerifiedClean, Some(stamps));
         }
     }
 
@@ -2043,7 +2069,12 @@ impl<C: Cells> Runtime<C> {
 
     #[cold]
     #[inline(never)]
-    fn push_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
+    fn push_trace(
+        &self,
+        id: NodeId,
+        action: crate::trace::TraceAction,
+        stamps: Option<crate::trace::StampPair>,
+    ) {
         let action = if !C::SINGLE_THREADED && hold::active() {
             match hold::defer_trace(
                 state::cell_key::<C>(self.nodes.get(id.0).state_cell()),
@@ -2055,10 +2086,17 @@ impl<C: Cells> Runtime<C> {
         } else {
             action
         };
-        self.push_trace_now(id, action);
+        self.push_trace_now(id, action, stamps);
     }
 
-    fn push_trace_now(&self, id: NodeId, action: crate::trace::TraceAction) {
+    /// `stamps` are the root's when read under its claim; `None` reads
+    /// them now, which only a caller that still holds the claim may do.
+    fn push_trace_now(
+        &self,
+        id: NodeId,
+        action: crate::trace::TraceAction,
+        stamps: Option<crate::trace::StampPair>,
+    ) {
         let flags = C::u8_load_relaxed(&self.instrument);
         if flags & crate::instrument::STATS != 0 {
             self.instrument_state
@@ -2069,7 +2107,11 @@ impl<C: Cells> Runtime<C> {
                 .count(&action);
         }
         if flags & crate::instrument::TRACE != 0 {
-            self.inner.write().trace_log.push(crate::trace::NodeTrace {
+            let mut inner = self.inner.write();
+            if let Some((_, root)) = inner.trace_root.as_mut().filter(|(slot, _)| *slot == id.0) {
+                root.see(&action, stamps.unwrap_or_else(|| self.stamp_pair(id.0)));
+            }
+            inner.trace_log.push(crate::trace::NodeTrace {
                 id,
                 action,
                 dependencies: Vec::new(),
@@ -3270,6 +3312,11 @@ impl<C: Cells> Runtime<C> {
         } else {
             inner.labels.remove(&slot)
         };
+        let trace = if inner.last_traces.is_empty() {
+            None
+        } else {
+            inner.last_traces.remove(&slot).map(|kept| kept.payload)
+        };
         if C::u8_load_relaxed(&self.instrument_used) != 0 {
             self.instrument_state.write().release(slot, label);
         }
@@ -3282,6 +3329,7 @@ impl<C: Cells> Runtime<C> {
             observers,
             arena,
             arena_slot: retired.arena_slot,
+            trace,
         };
         (drops, retired.dep_list)
     }
@@ -3966,6 +4014,19 @@ impl<C: Cells> Runtime<C> {
     /// If another `get_traced` on this runtime is in progress, whether on
     /// another thread or in a compute this one runs.
     pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
+        let (value, trace, _) = self.get_traced_capturing(handle);
+        (value, trace)
+    }
+
+    /// [`Self::get_traced`], with what the trace saw of its root.
+    fn get_traced_capturing<T: Value>(
+        &self,
+        handle: Incr<T>,
+    ) -> (
+        T,
+        crate::trace::PropagationTrace,
+        crate::trace::TraceCapture,
+    ) {
         use crate::trace::TraceAction;
         value_code::check();
         // The trace's counts are read with no dependency.
@@ -3986,7 +4047,12 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let disarm = Disarm(self);
-        self.inner.write().trace_log.clear();
+        let before = {
+            let mut inner = self.inner.write();
+            inner.trace_log.clear();
+            inner.trace_root = self.trace_root_for(handle);
+            self.handle_stamps(handle)
+        };
         self.instrument_state.write().trace_times.clear();
 
         // std has no clock on wasm32-unknown-unknown and `Instant::now()`
@@ -4002,9 +4068,13 @@ impl<C: Cells> Runtime<C> {
 
         self.park(ParkPoint::TraceHandOff);
         // Taken before disarming: the next tracer's CAS clears the log.
-        let mut node_traces: Vec<crate::trace::NodeTrace> = {
+        let (mut node_traces, root): (Vec<crate::trace::NodeTrace>, _) = {
             let mut inner = self.inner.write();
-            std::mem::take(&mut inner.trace_log)
+            let root = inner.trace_root.take().map(|(_, root)| root);
+            (
+                std::mem::take(&mut inner.trace_log),
+                root.unwrap_or_default(),
+            )
         };
         let times = std::mem::take(&mut self.instrument_state.write().trace_times);
         drop(disarm);
@@ -4035,7 +4105,14 @@ impl<C: Cells> Runtime<C> {
             nodes_cutoff,
             elapsed_ns,
         };
-        (value, trace)
+        let capture = crate::trace::TraceCapture {
+            runtime: self.runtime_id,
+            slot: handle.slot(),
+            generation: handle.generation(),
+            before,
+            root,
+        };
+        (value, trace, capture)
     }
 
     /// Number of live nodes in the runtime (deleted-and-not-yet-recycled
@@ -6389,11 +6466,12 @@ impl<C: Cells> Runtime<C> {
                         );
                     }
                     node.max_verified_at(verify_rev);
+                    let stamps = self.verify_stamps(id);
                     let landed =
                         self.land_single(id, node, flags, NodeState::Clean, NodeState::Dirty);
                     self.end_reservation_landed(id, node, landed);
                     if landed == NodeState::Clean {
-                        self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
+                        self.record_verified(id, stamps);
                     } else {
                         self.poison_reader(walked, cycle::POISONED);
                     }
@@ -6703,6 +6781,9 @@ impl<C: Cells> Runtime<C> {
                 // The run computed the node alone, as the unbounded run's
                 // does, so the node leaves its group.
                 self.drop_takes(id, node.generation(), cidx);
+                // Recorded while the claim is held, so a traced root's entry
+                // reads the stamps this run left, not a later run's.
+                self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                 let landed =
                     self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag);
                 self.end_reservation_landed(id, node, landed);
@@ -6716,10 +6797,8 @@ impl<C: Cells> Runtime<C> {
                             cycle::POISONED
                         },
                     );
-                    self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
-                self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                 return Computed::Done;
             }
         }
@@ -8188,6 +8267,9 @@ mod seed_impl;
 #[path = "runtime_routing.rs"]
 mod routing_impl;
 
+#[path = "runtime_last_trace.rs"]
+mod last_trace_impl;
+
 #[cfg(all(test, not(loom)))]
 pub(crate) use routing_impl::{owed_to, queued_routers};
 pub use routing_impl::{RoutingFailed, RoutingHold};
@@ -8304,6 +8386,10 @@ mod value_code_race_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_trace_tests.rs"]
 mod trace_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_last_trace_tests.rs"]
+mod last_trace_tests;
 
 /// Queues the readers of `id` among a set walk's pending held edges.
 #[inline(always)]

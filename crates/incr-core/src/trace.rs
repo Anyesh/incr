@@ -190,3 +190,93 @@ pub struct PropagationTrace {
     /// Always 0 on wasm32-unknown-unknown, which has no clock std can read.
     pub elapsed_ns: u64,
 }
+
+/// What a binding keeps for a `get_traced` root, rendered from its trace;
+/// [`crate::Runtime::retain_trace`] stores it and
+/// [`crate::Runtime::last_trace`] hands it back.
+pub type TracePayload = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+/// A node's `verified_at` (memo bit masked) and `changed_at`. Zero in
+/// either names no landing a trace could describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StampPair {
+    pub(crate) verified_at: u64,
+    pub(crate) changed_at: u64,
+}
+
+impl StampPair {
+    pub(crate) fn is_landed(self) -> bool {
+        self.verified_at != 0 && self.changed_at != 0
+    }
+}
+
+/// The traced root's entries as the trace log recorded them, each with
+/// the root's stamps read when it was recorded.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RootEntries {
+    pub(crate) count: u32,
+    pub(crate) last: Option<(bool, StampPair)>,
+}
+
+impl RootEntries {
+    pub(crate) fn see(&mut self, action: &TraceAction, stamps: StampPair) {
+        self.count += 1;
+        self.last = Some((matches!(action, TraceAction::Recomputed { .. }), stamps));
+    }
+}
+
+/// What one `get_traced_retaining` saw of its root, for
+/// [`crate::Runtime::retain_trace`].
+#[must_use]
+#[derive(Debug)]
+pub struct TraceCapture {
+    pub(crate) runtime: crate::handle::RuntimeId,
+    pub(crate) slot: u32,
+    pub(crate) generation: u32,
+    pub(crate) before: StampPair,
+    pub(crate) root: RootEntries,
+}
+
+/// What a store does with a capture: keep a new payload at these stamps,
+/// move the kept payload to them, or leave everything as it is.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Retain {
+    Keep(StampPair),
+    Restamp { from: StampPair, to: StampPair },
+    Nothing,
+}
+
+impl TraceCapture {
+    pub(crate) fn decide(&self) -> Retain {
+        match self.root.last {
+            Some((true, stamps)) if stamps.is_landed() => Retain::Keep(stamps),
+            Some((false, stamps))
+                if self.root.count == 1
+                    && stamps.is_landed()
+                    && stamps.changed_at == self.before.changed_at =>
+            {
+                Retain::Restamp {
+                    from: self.before,
+                    to: stamps,
+                }
+            }
+            _ => Retain::Nothing,
+        }
+    }
+}
+
+/// A root's kept payload and the stamps it describes.
+pub(crate) struct RetainedTrace {
+    pub(crate) generation: u32,
+    pub(crate) stamps: StampPair,
+    pub(crate) payload: TracePayload,
+}
+
+/// [`crate::Runtime::last_trace`]'s answer for a live node.
+pub struct LastTrace {
+    /// The node's state when read.
+    pub state: crate::state::NodeState,
+    /// The kept payload, when the node is Clean at the stamps it was kept
+    /// with.
+    pub payload: Option<TracePayload>,
+}

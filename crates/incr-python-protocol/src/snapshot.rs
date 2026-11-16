@@ -106,7 +106,7 @@ impl SnapshotRequest {
 }
 
 /// `NodeInfo::state` as `graph_snapshot(values=True)` reports it.
-fn status(state: NodeState) -> &'static str {
+pub fn status(state: NodeState) -> &'static str {
     match state {
         NodeState::New => "new",
         NodeState::Dirty => "dirty",
