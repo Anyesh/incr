@@ -230,6 +230,7 @@ impl RootEntries {
 #[must_use]
 #[derive(Debug)]
 pub struct TraceCapture {
+    pub(crate) runtime: crate::handle::RuntimeId,
     pub(crate) slot: u32,
     pub(crate) generation: u32,
     pub(crate) before: StampPair,

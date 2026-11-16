@@ -4106,6 +4106,7 @@ impl<C: Cells> Runtime<C> {
             elapsed_ns,
         };
         let capture = crate::trace::TraceCapture {
+            runtime: self.runtime_id,
             slot: handle.slot(),
             generation: handle.generation(),
             before,

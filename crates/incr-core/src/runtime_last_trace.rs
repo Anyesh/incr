@@ -29,7 +29,15 @@ impl<C: Cells> Runtime<C> {
     /// Anything else leaves the kept payload as it is. A payload this
     /// replaces, or `payload` when it is not kept, drops after the
     /// runtime lock is released.
+    ///
+    /// # Panics
+    ///
+    /// If `capture` came from another runtime.
     pub fn retain_trace(&self, capture: TraceCapture, payload: TracePayload) {
+        assert!(
+            capture.runtime == self.runtime_id,
+            "incr-core: retain_trace given a capture from another runtime"
+        );
         let slot = capture.slot;
         let replaced = match capture.decide() {
             Retain::Nothing => None,

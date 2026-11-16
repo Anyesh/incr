@@ -227,6 +227,7 @@ fn capture(before: StampPair, entries: &[(TraceAction, StampPair)]) -> TraceCapt
         root.see(action, *stamps);
     }
     TraceCapture {
+        runtime: crate::handle::RuntimeId::PENDING,
         slot: 0,
         generation: 0,
         before,
@@ -275,6 +276,27 @@ fn a_capture_keeps_only_what_its_root_entries_vouch_for() {
     assert_eq!(capture(pair(4, 3), &[]).decide(), Retain::Nothing);
 }
 
+fn a_capture_from_another_runtime_is_refused<C: Cells>() {
+    let traced: Runtime<C> = Runtime::new();
+    let (_, q, _) = counted(&traced);
+    for _ in 0..3 {
+        traced.create_input(0_i64);
+    }
+    let other: Runtime<C> = Runtime::new();
+    let (_, _, capture) = traced.get_traced_retaining(q);
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        other.retain_trace(capture, Arc::new("foreign"));
+    }));
+    let payload = refused.expect_err("a foreign capture was accepted");
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|m| m.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(message.contains("another runtime"), "got: {message}");
+    assert_eq!(other.inner.read().last_traces.capacity(), 0);
+}
+
 fn cases<C: Cells>() {
     recomputed_root_keeps_its_trace_until_dirty::<C>();
     traced_read_of_a_clean_root_leaves_the_trace::<C>();
@@ -283,6 +305,7 @@ fn cases<C: Cells>() {
     plain_get_traced_and_get_store_nothing::<C>();
     delete_drops_the_payload_and_a_reused_slot_starts_empty::<C>();
     node_info_reads_one_node_by_id::<C>();
+    a_capture_from_another_runtime_is_refused::<C>();
 }
 
 #[test]
