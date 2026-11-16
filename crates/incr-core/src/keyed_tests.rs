@@ -1414,7 +1414,57 @@ for_both!(
     removing_a_key_that_is_in_no_partition_leaves_no_record,
     an_emptied_partition_whose_reader_went_away_frees_its_input_on_local_only,
     partition_records_match_a_model_across_many_empties_and_refills,
+    reconciles_that_empty_and_fill_many_partitions_with_colliding_hashes_match_a_model,
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Collide(u32);
+
+impl std::hash::Hash for Collide {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.0 % 3).hash(state);
+    }
+}
+
+fn reconciles_that_empty_and_fill_many_partitions_with_colliding_hashes_match_a_model<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| Collide(*k % 17));
+    let shared = Captured(kc.clone());
+    let readers: Vec<Incr<Vec<u32>>> = (0..17)
+        .step_by(4)
+        .map(|q| {
+            let shared = Captured(shared.get().clone());
+            rt.create_query(move |rt| {
+                let mut keys = shared.get().get_partition(rt, &parts, &Collide(q));
+                keys.sort_unstable();
+                keys
+            })
+        })
+        .collect();
+    let mut state = 99_u32;
+    let rounds = if cfg!(miri) { 12 } else { 300 };
+    for _ in 0..rounds {
+        let mut rows = BTreeMap::new();
+        for _ in 0..12 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            rows.insert((state >> 8) % 60, state);
+        }
+        kc.reconcile(&rt, rows.iter().map(|(k, v)| (*k, *v)));
+        let live: std::collections::BTreeSet<u32> = rows.keys().map(|k| k % 17).collect();
+        assert_eq!(kc.partition_records(&parts), live.len());
+        for q in 0..17 {
+            let mut got = kc.get_partition(&rt, &parts, &Collide(q));
+            got.sort_unstable();
+            let want: Vec<u32> = rows.keys().copied().filter(|k| k % 17 == q).collect();
+            assert_eq!(got, want);
+        }
+        for (reader, q) in readers.iter().zip((0..17).step_by(4)) {
+            let want: Vec<u32> = rows.keys().copied().filter(|k| k % 17 == q).collect();
+            assert_eq!(rt.get(*reader), want);
+        }
+    }
+}
 
 type Counted<C> = KeyedCollection<u32, u32, C, (u32, u32), u8>;
 
