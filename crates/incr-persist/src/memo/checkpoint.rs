@@ -537,9 +537,9 @@ impl Hit {
         }
     }
 
-    fn of_row(row: &Row) -> Self {
+    fn of_row((row, fp): (&Row, u128)) -> Self {
         Hit {
-            fp: row.fp,
+            fp,
             dep_tables: row.deps.iter().map(|&(table, _)| table).collect(),
         }
     }
@@ -1024,7 +1024,7 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
                         self.hides.push((table, item.key_hash));
                     }
                 }
-                items.sort_unstable_by_key(|item| item.loc);
+                items.sort_by_key(|item| item.loc);
                 items
             }
         };
@@ -1210,12 +1210,7 @@ fn scan<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>(
                 layer: at,
                 item,
                 table: entry.table,
-                row: Cow::Owned(Row::new(
-                    &entry.key,
-                    &entry.value,
-                    &entry.deps,
-                    entry.last_used,
-                )),
+                row: Cow::Owned(Row::new(&entry.key, &entry.deps, entry.last_used)),
                 size,
             });
         }
@@ -1225,7 +1220,7 @@ fn scan<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>(
 
 /// [`scan`] of a chain that is the one generation `base` summarizes, with
 /// no table moving: reads nothing, and takes the entries in the order a
-/// scan walks them, by `loc`.
+/// scan walks them, by `loc` and then index order.
 fn scan_summary<'s>(
     base: Summarized<'s>,
     fresh: &[Entry],
@@ -1234,7 +1229,7 @@ fn scan_summary<'s>(
     let items = base.generation.items();
     let rows = base.summary.rows();
     let mut order: Vec<usize> = (0..items.len()).collect();
-    order.sort_unstable_by_key(|&i| items[i].loc);
+    order.sort_by_key(|&i| items[i].loc);
     let mut seen: HashSet<Identity> = fresh
         .iter()
         .map(|entry| (entry.table, entry.key.as_slice()))
