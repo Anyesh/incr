@@ -48,9 +48,9 @@ fn proc_status_kib(field: &str) -> Option<u64> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn proc_read_mib() -> u64 {
+fn proc_io_mib(field: &str) -> u64 {
     let io = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
-    let line = io.lines().find(|l| l.starts_with("rchar:"));
+    let line = io.lines().find(|l| l.starts_with(field));
     line.and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
         .unwrap_or(0)
         >> 20
@@ -242,14 +242,15 @@ fn cycle<C: BenchCells>(name: &str, backend: fn(&TempDir) -> Box<dyn MemoBackend
         let (stats, total) = filled.checkpoint_stats();
         let kind = shape::kind(&stats);
         eprintln!(
-            "memo_stall_{name}{}: #{n} {kind} total {:.1} ms (snapshot {:.1}, merge {:.1}, write {:.1}) VmRSS {} KiB, read {} MiB",
+            "memo_stall_{name}{}: #{n} {kind} total {:.1} ms (snapshot {:.1}, merge {:.1}, write {:.1}) VmRSS {} KiB, read {} MiB, written {} MiB",
             C::SUFFIX,
             ms(total),
             ms(stats.times.snapshot),
             ms(stats.times.merge),
             ms(stats.times.write),
             proc_status_kib("VmRSS:").unwrap_or(0),
-            proc_read_mib(),
+            proc_io_mib("rchar:"),
+            proc_io_mib("wchar:"),
         );
         all += total;
         if shape::is_delta(&stats) {
