@@ -2,6 +2,44 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.11] - Unreleased
+
+### Added
+
+- **Streamed store compaction (R21).** `Backend::compact_streamed(upto, records)` hands a backend the snapshot as a lazy iterator; the default collects and calls `compact`, so existing backends keep working. The file, SQLite and memory backends stream, and a store checkpoint folds each record as the backend pulls it. Python backends opt in with `compact_streamed(upto, records)`, where `records` is an iterator of `bytes` valid only during the call and on its thread; the Python `MemoryBackend` reference implements it.
+- **incr-core: element reads by handle without cloning (R21).** `KeyedCollection::pair_handles`/`with_pair` and `IncrCollection::visit_elements`/`with_element`, with `ElementsStamp` to detect a change between reads.
+- **Python: `rt.peek_by_id(id, generation)` and `rt.last_trace_by_id(id, generation)` (R22).** Both return the node's status and never run a compute. `peek_by_id` gives the stored value of a Clean node; `last_trace_by_id` gives what the last `get_traced` or `get_traced_by_id` that recomputed the node returned, while the node stays Clean at the stamps that call left, and `None` otherwise. A stale id raises `StaleNodeError`. incr-core gains `Runtime::get_traced_retaining`, `retain_trace`, `last_trace` and `node_info`.
+
+### Changed
+
+- **`open_memo` encodes no collection rows (R20).** A collection's dependency fingerprint is computed the first time a memo check or save needs it, once, under the memo's existing locks; writes before then leave it pending. A Python memo entry cannot depend on a whole collection, so Python stores never compute one.
+- **Intended change: a codec that fails on a stored collection element no longer fails `open_memo` (R20).** The collection reads as untrusted when its fingerprint is first needed, so entries depending on it recompute and are not saved over it.
+- **Intended change: a snapshot lists a collection's elements in rank order instead of byte order (R21).** Keyed collections use each pair's stored rank, plain collections the high 64 bits of each encoding's fingerprint with ties broken by the encodings. Contents and restored values are unchanged. A reader that does not declare a collection falls back to a Delete plus the full contents across a compaction more often, and a beta.10 reader of a beta.11 snapshot does so every time.
+- **Intended change: a store checkpoint fails cleanly on a mid-stream fold error (R21).** A value that fails to encode fails the checkpoint with that error and changes nothing. A backend that returns `Ok` from `compact_streamed` after a failed pull or before the last record fails the checkpoint with `Error::Corrupt` and poisons the store; a Python backend that returns normally after a pull raised does the same.
+- **`Error::Bypassed` is also returned in release builds** when a collection changes under a checkpoint's fold (a write around the store), and its message names the key as "key" instead of "input" (R21).
+- **SQLite enables rusqlite's `blob` feature (R21).** The on-disk schema is unchanged, so beta.10 opens beta.11 logs.
+- **`get_by_id` and `get_traced_by_id` docstrings say they recompute (R22).** The beta.10 entry above said they read without recomputing; they read as `get` and `get_traced` do. `peek_by_id` is the read that never computes.
+- **Traced reads pay one relaxed flag load per verify landing and an emptiness test per node delete (R22).** Recomputed trace entries are pushed just before the node lands rather than after; single-thread log order and stats counts are unchanged.
+
+### Figures
+
+Store checkpoint, 600,000 rows of about 100 bytes, Local runtime, release, this project's NVMe box; rise is VmHWM during `checkpoint()` over VmRSS before it:
+
+| case | beta.11 rise | beta.11 time | beta.10 rise | beta.10 time |
+|---|---|---|---|---|
+| keyed, file | 1.33% | 0.62 s | 84.5% | 1.37 s |
+| keyed, SQLite | 2.37% | 1.10 s | 121.7% | 1.71 s |
+| plain, file | 8.0% | 0.57 s | 240.7% | 1.13 s |
+| Python keyed, streaming backend that discards records | 1.23% | 1.29 s | 60.0% (list path) | 2.02 s |
+
+### Known limitations
+
+- SQLite holds its write transaction while the fold encodes every row, where beta.10 encoded before beginning it, so other writer processes wait longer and can hit `busy_timeout` on a large store with a slow codec. It also stages the snapshot in a TEMP table, writing its bytes twice; peak memory stays flat.
+- A `key_partitions` registration on a Shared runtime while another thread checkpoints fails the checkpoint with a false `Error::Bypassed`; nothing changes and a retry succeeds.
+- A backend that commits after a failed pull and then raises is indistinguishable from one that abandoned the write; the store neither resyncs nor poisons, and a later catch-up adopts the truncated snapshot. Such a backend violates the documented contract.
+- Only roots of `get_traced`/`get_traced_by_id` keep a last trace. A plain `get` that verifies the node clean makes `last_trace_by_id` return `None` until the next traced recompute, and on Shared a traced call that races another thread's run of the root keeps nothing. The kept trace is the same object `get_traced` returned, so mutating it changes later reads.
+- On the Local wheel `peek_by_id` and `last_trace_by_id` first route queued `group_by` changes, as every read does, which runs key functions and can raise a routing error.
+
 ## [0.2.0-beta.10] - 2026-11-17
 
 ### Added
