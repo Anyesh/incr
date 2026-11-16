@@ -303,7 +303,9 @@ where
     /// Registers a partitioning of the keys by `f`, as
     /// [`KeyedCollection::key_partitions`] does. A write whose function
     /// panics on a key it inserts or removes is refused before it is
-    /// logged. `f` must return the same partition for a key every time.
+    /// logged. `f` must be deterministic and total over every key it was
+    /// ever given: a panic on a key it accepted before (a replay, a repair,
+    /// a reconcile removal) poisons the store.
     pub fn key_partitions<Q>(&self, f: impl Fn(&K) -> Q + Send + Sync + 'static) -> KeyPartitions<Q>
     where
         Q: Value + Hash + Eq,

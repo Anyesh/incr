@@ -1074,6 +1074,31 @@ where
     }
 }
 
+/// How many times a registration builds its partitions under the table's
+/// read lock, which a commit in between invalidates, before it builds them
+/// under the write lock, which no commit can interleave with.
+const OPTIMISTIC_REGISTRATIONS: usize = 3;
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static AFTER_OPTIMISTIC_BUILD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(loom)))]
+fn set_after_optimistic_build(hook: Option<Box<dyn FnMut()>>) {
+    AFTER_OPTIMISTIC_BUILD.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(all(test, not(loom)))]
+fn after_optimistic_build() {
+    let mut hook = AFTER_OPTIMISTIC_BUILD.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook.as_mut() {
+        hook();
+    }
+    AFTER_OPTIMISTIC_BUILD.with(|slot| *slot.borrow_mut() = hook);
+}
+
 /// The input per (partitioning, partition hash).
 type PartitionInputs = HashMap<(usize, u64), Incr<u64>, FxBuildHasher>;
 
@@ -1651,15 +1676,25 @@ where
     /// Registers a partitioning of the keys by `f`, run as value code on
     /// each key a write inserts or removes (in staging, so a function that
     /// panics refuses the write with nothing committed) and on the keys
-    /// held now. A row replacement runs nothing. `f` must return the same
-    /// partition for a key every time.
+    /// held now. A row replacement runs nothing.
+    ///
+    /// `f` must be deterministic and total over every key it was ever given:
+    /// the same partition for a key every time, and no panic on a key it
+    /// accepted before. A panic on a new key refuses that write; a panic on
+    /// a key it accepted before (a replay, a repair, a reconcile removal)
+    /// leaves a persisted collection's store poisoned.
+    ///
+    /// Registration is bounded: it builds under the table's read lock for a
+    /// few attempts, each invalidated by a commit in between, then under the
+    /// write lock, which blocks commits and readers of the index for the
+    /// build.
     pub fn key_partitions<Q>(&self, f: impl Fn(&K) -> Q + Send + Sync + 'static) -> KeyPartitions<Q>
     where
         Q: Value + Hash + Eq,
     {
         refuse_value_code();
         let f: Arc<dyn Fn(&K) -> Q + Send + Sync> = Arc::new(f);
-        loop {
+        for _ in 0..OPTIMISTIC_REGISTRATIONS {
             let (epoch, state) = {
                 let table = self.index.table.read();
                 let epoch = C::u64_load_relaxed(&self.index.epoch);
@@ -1671,6 +1706,8 @@ where
                 });
                 (epoch, state)
             };
+            #[cfg(all(test, not(loom)))]
+            after_optimistic_build();
             let mut table = self.index.table.write();
             if C::u64_load_relaxed(&self.index.epoch) == epoch {
                 table.parts.push(Box::new(state));
@@ -1680,6 +1717,20 @@ where
                     _q: PhantomData,
                 };
             }
+        }
+        let mut table = self.index.table.write();
+        let state = value_code::run(|| {
+            PartState::<K, V, Q, P>::build(
+                Arc::clone(&f),
+                table.buckets().map(|(_, b)| (b.hash, &b.read().0)),
+            )
+        });
+        let epoch = C::u64_load_relaxed(&self.index.epoch);
+        table.parts.push(Box::new(state));
+        C::u64_store_release(&self.index.epoch, epoch + 1);
+        KeyPartitions {
+            sink: table.parts.len() - 1,
+            _q: PhantomData,
         }
     }
 

@@ -130,9 +130,10 @@ impl<B: PyBinding> KeyedSource<'_, B> {
     /// Registers `f` as a partitioning of the keys, as
     /// [`incr_core::KeyedCollection::key_partitions`] does: `f` is called
     /// with each key a write inserts or removes and with the keys held
-    /// now, and must return the same hashable partition for a key every
-    /// time. An exception it raises refuses the write. The caller runs it
-    /// inside its package's engine boundary.
+    /// now, and must be deterministic and total over every key it is ever
+    /// given. An exception it raises for a new key refuses the write; one
+    /// for a key it accepted before poisons a persisted store. The caller
+    /// runs it inside its package's engine boundary.
     pub fn key_partitions(
         &self,
         _rt: &Runtime<B::C>,

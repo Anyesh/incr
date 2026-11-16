@@ -245,11 +245,15 @@ impl PyKeyedCollection {
         engine_call(py, rt, || source.forget_key(rt, &key))
     }
 
-    /// Partition the keys by `fn(key)`, which must return the same
-    /// hashable value for a key every time. `fn` runs on the keys held now
-    /// and on each key a write inserts or removes, never on a row update;
-    /// an exception it raises refuses the write and leaves the collection
-    /// unchanged. Read a partition with `ctx.keys(parts, p)`.
+    /// Partition the keys by `fn(key)`, which must be deterministic and
+    /// total over every key it is ever given: the same hashable value for
+    /// a key every time, and no exception for a key it accepted before.
+    /// `fn` runs on the keys held now and on each key a write inserts or
+    /// removes, never on a row update; an exception it raises for a new key
+    /// refuses the write and leaves the collection unchanged, while one for
+    /// a key it accepted before (a replay, a repair, a reconcile removal)
+    /// leaves a persisted store poisoned. Read a partition with
+    /// `ctx.keys(parts, p)`.
     fn key_partitions(slf: &Bound<'_, Self>, f: Py<PyAny>) -> PyResult<PyKeyPartitions> {
         let py = slf.py();
         let this = slf.get();

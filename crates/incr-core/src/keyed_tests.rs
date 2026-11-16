@@ -1539,3 +1539,44 @@ fn a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent<C: Cel
     rt.get(all);
     assert_eq!((runs_of(&odd_runs), runs_of(&all_runs)), (1, 2));
 }
+
+#[test]
+fn registering_partitions_finishes_when_a_commit_lands_after_every_optimistic_build() {
+    use std::time::Duration;
+
+    type Wide = KeyedCollection<u64, u64, crate::cells::Shared, (u64, u64), u8>;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let rt = Arc::new(Runtime::<crate::cells::Shared>::new());
+            let kc = Arc::new(Wide::new(&rt));
+            kc.reconcile(&rt, (0..64).map(|k| (k, k)));
+            let (hook_kc, hook_rt, next) = (Arc::clone(&kc), Arc::clone(&rt), Cell::new(1_000));
+            set_after_optimistic_build(Some(Box::new(move || {
+                if !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    hook_kc.upsert(&hook_rt, next.get(), next.get());
+                    next.set(next.get() + 1);
+                }
+            })));
+            let parts = kc.key_partitions(|k: &u64| k % 4);
+            set_after_optimistic_build(None);
+            let mut held: Vec<u64> = (0..4)
+                .flat_map(|q| kc.get_partition(&rt, &parts, &q))
+                .collect();
+            let mut expected = kc.keys();
+            held.sort_unstable();
+            expected.sort_unstable();
+            let _ = done_tx.send(held == expected);
+        })
+    };
+    let finished = done_rx.recv_timeout(Duration::from_secs(10));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    worker.join().unwrap();
+    assert_eq!(
+        finished,
+        Ok(true),
+        "registration must finish and match the keys while a commit follows each optimistic build"
+    );
+}

@@ -1394,3 +1394,4 @@
 5	keyed::tests::rows_shared::a_raising_partition_fn_refuses_the_write_and_changes_nothing
 7	keyed::tests::rows_local::a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent
 8	keyed::tests::rows_shared::a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent
+40	keyed::tests::registering_partitions_finishes_when_a_commit_lands_after_every_optimistic_build

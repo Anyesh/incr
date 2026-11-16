@@ -180,7 +180,7 @@
     "signature": "(self, /)"
    },
    "key_partitions": {
-    "doc": "Partition the keys by `fn(key)`, which must return the same\nhashable value for a key every time. `fn` runs on the keys held now\nand on each key a write inserts or removes, never on a row update;\nan exception it raises refuses the write and leaves the collection\nunchanged. Read a partition with `ctx.keys(parts, p)`.",
+    "doc": "Partition the keys by `fn(key)`, which must be deterministic and\ntotal over every key it is ever given: the same hashable value for\na key every time, and no exception for a key it accepted before.\n`fn` runs on the keys held now and on each key a write inserts or\nremoves, never on a row update; an exception it raises for a new key\nrefuses the write and leaves the collection unchanged, while one for\na key it accepted before (a replay, a repair, a reconcile removal)\nleaves a persisted store poisoned. Read a partition with\n`ctx.keys(parts, p)`.",
     "kind": "method_descriptor",
     "signature": "(self, /, f)"
    },
