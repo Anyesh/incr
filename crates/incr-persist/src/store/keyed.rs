@@ -666,11 +666,10 @@ trait Stage<C: Cells> {
     /// pairs it staged against may be out of date.
     fn stale(&self) -> bool;
 
-    /// Runs the partition functions registered now on each key the stage
-    /// writes or removes, whether or not it still looks like an insert or
-    /// a remove, since the keys held may have moved since the stage began:
-    /// a function registered after the stage began raises before the store
-    /// lock is taken.
+    /// Runs every partition function registered now on each key the stage
+    /// inserts or removes against the keys held now, before the store lock
+    /// is taken, so a function that raises refuses the write before
+    /// anything is logged.
     fn check_partitions(&self);
 
     /// The records that make the staged changes: per key, a `Remove` of
@@ -758,10 +757,6 @@ where
     /// Set by a reconcile: the stage names every key the collection is to
     /// hold.
     complete: bool,
-    /// Whether a key partitioning was registered when the stage began, so
-    /// a staged insert or remove runs its function before anything is
-    /// logged.
-    partitioned: bool,
     spent: Vec<P>,
 }
 
@@ -775,7 +770,6 @@ where
     fn new(keyed: PersistedKeyed<K, V, C, P>) -> Self {
         KeyedStage {
             epoch: keyed.epoch(),
-            partitioned: keyed.keyed.has_partitions(),
             keyed,
             keys: Vec::new(),
             by_key: HashMap::new(),
@@ -818,9 +812,6 @@ where
             return;
         }
         let pair = with_value_code(|| P::new(staged.key.clone(), row));
-        if self.partitioned && self.keys[at].held.is_empty() {
-            self.keyed.keyed.check_partitions(&pair);
-        }
         self.keys[at].next = Next::Row(pair);
     }
 
@@ -828,9 +819,6 @@ where
         let at = self.locate(with_value_code(|| key.clone()));
         let staged = &mut self.keys[at];
         let present = staged.target().is_some();
-        if let Some((pair, _)) = staged.held.first().filter(|_| self.partitioned) {
-            self.keyed.keyed.check_partitions(pair);
-        }
         staged.next = Next::Gone;
         present
     }
@@ -895,7 +883,7 @@ where
     }
 
     fn check_partitions(&self) {
-        if self.partitioned || !self.keyed.keyed.has_partitions() {
+        if !self.keyed.keyed.has_partitions() {
             return;
         }
         for staged in &self.keys {
@@ -904,7 +892,11 @@ where
                 Next::Row(pair) => Some(pair),
                 Next::Gone => None,
             };
-            if let Some(pair) = next.or(staged.held.first().map(|(pair, _)| pair)) {
+            let held = self.keyed.keyed.held_pairs(&staged.key);
+            if held.is_empty() == next.is_none() {
+                continue;
+            }
+            if let Some(pair) = next.or(held.first().map(|(pair, _)| pair)) {
                 self.keyed.keyed.check_partitions(pair);
             }
         }
@@ -913,19 +905,12 @@ where
     fn records(&mut self, state: &State<C>) -> Result<Vec<Record>> {
         let key = self.key(state)?;
         let mut out = Vec::new();
-        let partitioned = self.partitioned;
         for staged in &self.keys {
             let next = match &staged.next {
                 Next::Held => continue,
                 Next::Row(pair) => Some(pair),
                 Next::Gone => None,
             };
-            if partitioned && staged.held.is_empty() != next.is_none() {
-                let flipped = next.or(staged.held.first().map(|(pair, _)| pair));
-                if let Some(pair) = flipped {
-                    self.keyed.keyed.check_partitions(pair);
-                }
-            }
             let first = out.len();
             for (pair, rank) in &staged.held {
                 out.push(logged_remove_record(&key, pair, *rank, &mut self.spent)?);

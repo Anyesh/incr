@@ -212,3 +212,45 @@ fn a_late_partitioning_checks_a_staged_replacement_whose_key_was_removed_meanwhi
     store.upsert(&rows, 3, "c".into()).unwrap();
     assert_eq!(rows.keys().len(), 1);
 }
+
+#[test]
+fn a_second_late_partitioning_refuses_a_staged_new_key_before_the_store_lock() {
+    let store = Store::<Shared, _>::open(MemoryBackend::new(), Options::default()).unwrap();
+    let rows: Rows = store.keyed_collection("rows").unwrap();
+    rows.key_partitions(|k: &u32| k % 2);
+    let mut pending = incr_persist::PendingWrite::new();
+    pending.upsert(&rows, 9, "z".into());
+    rows.key_partitions(|k: &u32| {
+        assert_ne!(*k, 9, "no partition for 9");
+        k % 3
+    });
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.write_pending(pending)
+    }));
+    assert!(refused.is_err());
+    assert!(rows.keys().is_empty());
+    store.upsert(&rows, 3, "c".into()).unwrap();
+    assert_eq!(rows.keys().len(), 1);
+}
+
+#[test]
+fn a_second_late_partitioning_checks_a_staged_replacement_whose_key_was_removed_meanwhile() {
+    let store = Store::<Shared, _>::open(MemoryBackend::new(), Options::default()).unwrap();
+    let rows: Rows = store.keyed_collection("rows").unwrap();
+    rows.key_partitions(|k: &u32| k % 2);
+    store.upsert(&rows, 9, "a".into()).unwrap();
+    let mut pending = incr_persist::PendingWrite::new();
+    pending.upsert(&rows, 9, "z".into());
+    store.remove(&rows, &9).unwrap();
+    rows.key_partitions(|k: &u32| {
+        assert_ne!(*k, 9, "no partition for 9");
+        k % 3
+    });
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.write_pending(pending)
+    }));
+    assert!(refused.is_err());
+    assert!(rows.keys().is_empty());
+    store.upsert(&rows, 3, "c".into()).unwrap();
+    assert_eq!(rows.keys().len(), 1);
+}
