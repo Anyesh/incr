@@ -1386,3 +1386,11 @@
 5	keyed::tests::rows_shared::get_keys_outside_a_query_creates_nothing
 8	keyed::tests::rows_shared::keys_readers_and_key_readers_do_not_wake_each_other
 15	keyed::tests::rows_shared::replayed_pairs_move_the_membership_only_when_a_key_appears_or_goes
+19	keyed::tests::rows_local::a_partition_reader_reruns_only_for_its_own_partition
+19	keyed::tests::rows_shared::a_partition_reader_reruns_only_for_its_own_partition
+9	keyed::tests::rows_local::partitions_register_over_existing_keys_and_a_reader_of_a_new_partition_wakes
+9	keyed::tests::rows_shared::partitions_register_over_existing_keys_and_a_reader_of_a_new_partition_wakes
+7	keyed::tests::rows_local::a_raising_partition_fn_refuses_the_write_and_changes_nothing
+5	keyed::tests::rows_shared::a_raising_partition_fn_refuses_the_write_and_changes_nothing
+7	keyed::tests::rows_local::a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent
+8	keyed::tests::rows_shared::a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent

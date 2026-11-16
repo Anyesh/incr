@@ -105,3 +105,37 @@ fn a_key_set_entry_recomputes_after_a_restore_and_follows_inserts() {
     assert_eq!(w.names(), vec![1, 2, 3]);
     assert_eq!(w.name_runs.load(SeqCst), 2);
 }
+
+#[test]
+fn a_memo_entry_reading_a_partition_is_unsaveable_and_recomputes_after_a_restore() {
+    let (log, memo) = (MemoryBackend::new(), MemoryMemo::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let open = |runs: &Arc<AtomicUsize>| {
+        let store = Arc::new(Store::<Shared, _>::open(log.clone(), Options::default()).unwrap());
+        let rows: PersistedKeyed<u32, String, Shared> = store.keyed_collection("rows").unwrap();
+        let parts = rows.key_partitions(|k: &u32| k % 2);
+        let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(0x15b)));
+        let odd = builder.table::<u32, Vec<u32>>("odd", 1);
+        let (counted, read) = (Arc::clone(runs), rows.clone());
+        builder.define(odd, move |ctx, _| {
+            counted.fetch_add(1, SeqCst);
+            let mut keys = read.get_partition(ctx.rt(), &parts, &1);
+            keys.sort_unstable();
+            keys
+        });
+        let memo = builder.open(&store, memo.clone()).unwrap();
+        (store, rows, memo, odd)
+    };
+    {
+        let (store, rows, memo, odd) = open(&runs);
+        store.upsert(&rows, 1, "a".into()).unwrap();
+        store.upsert(&rows, 2, "b".into()).unwrap();
+        assert_eq!(memo.runtime().get(memo.get_or_insert(odd, 0)), vec![1]);
+        memo.checkpoint().unwrap();
+        assert_eq!(memo.stats().unsaveable, 1);
+    }
+    let (store, rows, memo, odd) = open(&runs);
+    store.upsert(&rows, 3, "c".into()).unwrap();
+    assert_eq!(memo.runtime().get(memo.get_or_insert(odd, 0)), vec![1, 3]);
+    assert_eq!(runs.load(SeqCst), 2);
+}

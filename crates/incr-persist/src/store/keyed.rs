@@ -8,8 +8,8 @@ use std::sync::{Arc, Weak};
 use incr_core::persist_hooks::Deferred;
 use incr_core::{
     find_element, with_value_code, Cells, DeleteError, ElementRank, ErasedIncr, Incr,
-    IncrCollection, KeyCounts, KeyIndex, KeyedChange, KeyedCollection, KeyedSpent, Pair, PairOp,
-    Runtime, Shared, Value,
+    IncrCollection, KeyCounts, KeyIndex, KeyPartitions, KeyedChange, KeyedCollection, KeyedSpent,
+    Pair, PairOp, Runtime, Shared, Value,
 };
 
 use super::after_lock::AfterLock;
@@ -300,6 +300,27 @@ where
         self.keyed.get_keys(rt)
     }
 
+    /// Registers a partitioning of the keys by `f`, as
+    /// [`KeyedCollection::key_partitions`] does. A write whose function
+    /// panics on a key it inserts or removes is refused before it is
+    /// logged. `f` must return the same partition for a key every time.
+    pub fn key_partitions<Q>(&self, f: impl Fn(&K) -> Q + Send + Sync + 'static) -> KeyPartitions<Q>
+    where
+        Q: Value + Hash + Eq,
+    {
+        self.keyed.key_partitions(f)
+    }
+
+    /// The keys of partition `q`, as [`KeyedCollection::get_partition`]
+    /// reads them: inside a query, a dependency on that partition alone.
+    /// A memo entry reading it is unsaveable.
+    pub fn get_partition<Q>(&self, rt: &Runtime<C>, parts: &KeyPartitions<Q>, q: &Q) -> Vec<K>
+    where
+        Q: Value + Hash + Eq,
+    {
+        self.keyed.get_partition(rt, parts, q)
+    }
+
     /// `key`'s version input, if a read with [`Self::get_key`] or a memo
     /// restore created one.
     pub fn version_input(&self, key: &K) -> Option<Incr<u64>> {
@@ -500,6 +521,12 @@ impl<C: Cells> PendingWrite<C> {
         Self::default()
     }
 
+    pub(super) fn check_partitions(&self) {
+        self.stages
+            .iter()
+            .for_each(|stage| stage.check_partitions());
+    }
+
     /// Whether nothing was added. A write staging only unchanged rows is
     /// not empty, though it appends nothing.
     pub fn is_empty(&self) -> bool {
@@ -638,6 +665,12 @@ trait Stage<C: Cells> {
     /// Whether the index changed since the stage started, so the held
     /// pairs it staged against may be out of date.
     fn stale(&self) -> bool;
+
+    /// Runs every partition function registered now on each key the stage
+    /// inserts or removes against the keys held now, before the store lock
+    /// is taken, so a function that raises refuses the write before
+    /// anything is logged.
+    fn check_partitions(&self);
 
     /// The records that make the staged changes: per key, a `Remove` of
     /// each pair it held, then an `Insert` of its new pair; a key that
@@ -779,7 +812,7 @@ where
             return;
         }
         let pair = with_value_code(|| P::new(staged.key.clone(), row));
-        staged.next = Next::Row(pair);
+        self.keys[at].next = Next::Row(pair);
     }
 
     fn remove(&mut self, key: &K) -> bool {
@@ -847,6 +880,26 @@ where
 {
     fn stale(&self) -> bool {
         self.keyed.epoch() != self.epoch
+    }
+
+    fn check_partitions(&self) {
+        if !self.keyed.keyed.has_partitions() {
+            return;
+        }
+        for staged in &self.keys {
+            let next = match &staged.next {
+                Next::Held => continue,
+                Next::Row(pair) => Some(pair),
+                Next::Gone => None,
+            };
+            let held = self.keyed.keyed.held_pairs(&staged.key);
+            if held.is_empty() == next.is_none() {
+                continue;
+            }
+            if let Some(pair) = next.or(held.first().map(|(pair, _)| pair)) {
+                self.keyed.keyed.check_partitions(pair);
+            }
+        }
     }
 
     fn records(&mut self, state: &State<C>) -> Result<Vec<Record>> {
@@ -1245,6 +1298,7 @@ where
         let mut nodes = vec![self.node(), self.keyed.rows().version_node().erase()];
         nodes.extend(self.keyed.version_inputs());
         nodes.extend(self.keyed.membership_input().map(Incr::erase));
+        nodes.extend(self.keyed.partition_inputs());
         rt.try_delete_nodes(&nodes)
     }
 
@@ -1472,6 +1526,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// behave as for [`Store::batch`].
     pub fn write_pending(&self, pending: PendingWrite<C>) -> Result<Position> {
         let mut pending = pending;
+        pending.check_partitions();
         let mut locked = self.state()?;
         let written = self.write_pending_with(&mut locked, &mut pending, &mut |state, records| {
             self.write_counted(state, records)

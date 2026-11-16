@@ -17,6 +17,7 @@
 //! index with no user code in between. It releases both, sets the version,
 //! and only then drops what it displaced and routes.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::marker::PhantomData;
@@ -36,6 +37,9 @@ use crate::persist_hooks::RepSink;
 use crate::runtime::{DeleteError, Runtime};
 use crate::value::Value;
 use crate::value_code;
+
+mod parts;
+use parts::{Flip, PartSink, PartState};
 
 /// An element of a keyed collection's pair collection: a key and its row.
 ///
@@ -245,6 +249,9 @@ pub struct KeyTable<P, R> {
     pairs: usize,
     growth_left: usize,
     spilled_bytes: usize,
+    /// The key-set partitionings registered with
+    /// [`KeyedCollection::key_partitions`], changed with each commit.
+    parts: Vec<Box<dyn PartSink<P>>>,
 }
 
 impl<P, R: Ord + Copy> KeyTable<P, R> {
@@ -255,7 +262,32 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
             pairs: 0,
             growth_left: 0,
             spilled_bytes: 0,
+            parts: Vec::new(),
         }
+    }
+
+    /// A plan per partitioning for `flips`, run as value code against the
+    /// table as it is; empty when none is registered.
+    fn plan_parts(&self, flips: &[Flip<'_, P>]) -> Vec<Box<dyn Any + Send>> {
+        self.parts.iter().map(|sink| sink.plan(flips)).collect()
+    }
+
+    /// Applies the plans made against this table, running no user code,
+    /// and returns the (partitioning, partition hash) pairs they touch.
+    fn apply_parts(
+        &mut self,
+        plans: Vec<Box<dyn Any + Send>>,
+        gone: &mut Vec<P>,
+    ) -> Vec<(usize, u64)> {
+        if self.parts.is_empty() {
+            return Vec::new();
+        }
+        let mut touched = Vec::new();
+        for (sink, (at, plan)) in self.parts.iter_mut().zip(plans.into_iter().enumerate()) {
+            touched.extend(sink.touched(&*plan).into_iter().map(|hash| (at, hash)));
+            sink.apply(plan, gone);
+        }
+        touched
     }
 
     fn heap_bytes(&self) -> usize {
@@ -796,6 +828,29 @@ where
         self.keys.iter().all(StagedKey::untouched)
     }
 
+    /// The keys that go from holding no pair to holding one or back.
+    fn flips<'a>(&'a self, table: &'a KeyTable<P, R>) -> Vec<Flip<'a, P>> {
+        let mut flips = Vec::new();
+        for (at, k) in self.keys.iter().enumerate() {
+            let inserted = !k.now.is_empty();
+            if (k.held > 0) == inserted {
+                continue;
+            }
+            let src = if inserted {
+                self.read(table, at)
+                    .expect("incr-core: a held key reads a pair")
+            } else {
+                Src::Held(0)
+            };
+            flips.push(Flip {
+                pair: &self.pair(table, at, src).0,
+                hash: k.hash,
+                inserted,
+            });
+        }
+        flips
+    }
+
     /// Whether a key the write staged goes from holding no pair to holding
     /// one or back, judged over the whole write, so a key that loses its
     /// held pair and takes another in one write does not count.
@@ -911,6 +966,11 @@ struct KeyVersions<K: 'static, C: Cells> {
     /// 1 once `map` holds the membership input, so a write that inserts or
     /// removes a key in a collection no query lists takes no lock.
     listed: C::U64,
+    /// The input each query reading a partition depends on, by partitioning
+    /// and partition hash: a partition whose hash collides shares it.
+    partition_inputs: OrderedLock<PartitionInputs, C>,
+    /// How many inputs `partition_inputs` holds.
+    partition_live: C::U64,
 }
 
 impl<K: 'static, C: Cells> KeyVersions<K, C> {
@@ -927,6 +987,8 @@ impl<K: 'static, C: Cells> KeyVersions<K, C> {
             changes: C::new_u64(1),
             live: C::new_u64(0),
             listed: C::new_u64(0),
+            partition_inputs: OrderedLock::new(LockKind::KeyVersions, HashMap::default()),
+            partition_live: C::new_u64(0),
         }
     }
 
@@ -1011,6 +1073,24 @@ where
         }
     }
 }
+
+/// The input per (partitioning, partition hash).
+type PartitionInputs = HashMap<(usize, u64), Incr<u64>, FxBuildHasher>;
+
+/// A partitioning of a keyed collection's keys, from
+/// [`KeyedCollection::key_partitions`]; use it with that collection only.
+pub struct KeyPartitions<Q> {
+    sink: usize,
+    _q: PhantomData<fn() -> Q>,
+}
+
+impl<Q> Clone for KeyPartitions<Q> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Q> Copy for KeyPartitions<Q> {}
 
 /// What keyed writes let go, from [`KeyedCollection::apply_pairs_keeping`]:
 /// their ops, staged pairs and keys they did not use, pairs they displaced,
@@ -1264,12 +1344,18 @@ where
         let index = &*self.index;
         loop {
             let mut stage = KeyStage::new(journal);
-            let changes = {
+            let (changes, plans) = {
                 let table = index.table.read();
                 stage.epoch = C::u64_load_relaxed(&index.epoch);
                 value_code::run(|| {
                     stage_ops(&mut stage, &table, &index.hasher);
-                    stage.log_changes(&table)
+                    let changes = stage.log_changes(&table);
+                    let plans = if table.parts.is_empty() {
+                        Vec::new()
+                    } else {
+                        table.plan_parts(&stage.flips(&table))
+                    };
+                    (changes, plans)
                 })
             };
             if stage.is_empty() {
@@ -1293,6 +1379,8 @@ where
             }
             let committed = log.apply_batch(batch, false, sink);
             let dropped = table.commit(&mut stage);
+            let mut gone = Vec::new();
+            let touched = table.apply_parts(plans, &mut gone);
             let epoch = stage.epoch + 1;
             C::u64_store_release(&index.epoch, epoch);
             index.settle(&table);
@@ -1300,7 +1388,7 @@ where
             drop(log);
             let hashes = mem::take(&mut stage.changed_hashes);
             let membership = self.versions.any_listed() && stage.membership_changed();
-            let queued = self.bump(rt, &hashes, membership);
+            let queued = self.bump(rt, &hashes, membership, &touched);
             let outcome = stage.outcome(epoch);
             match keep.as_deref_mut() {
                 Some(keep) => {
@@ -1311,11 +1399,14 @@ where
                         &mut keep.displaced,
                     );
                     keep.pairs.extend(dropped);
+                    if !gone.is_empty() {
+                        keep.unused.extend(gone);
+                    }
                     stage.spend_into(keep);
                 }
                 None => {
                     self.pairs
-                        .publish_batch(rt, committed, move || drop((dropped, stage)));
+                        .publish_batch(rt, committed, move || drop((dropped, gone, stage)));
                 }
             }
             if queued {
@@ -1330,10 +1421,17 @@ where
     /// membership input when `membership`, to a fresh value without
     /// routing: whether a set queued a router, which the caller routes once
     /// the write's other sets are done. Runs no user code.
-    fn bump(&self, rt: &Runtime<C>, hashes: &[u64], membership: bool) -> bool {
+    fn bump(
+        &self,
+        rt: &Runtime<C>,
+        hashes: &[u64],
+        membership: bool,
+        touched: &[(usize, u64)],
+    ) -> bool {
         let keyed = !hashes.is_empty() && self.versions.any();
         let listed = membership && self.versions.any_listed();
-        if !keyed && !listed {
+        let parted = !touched.is_empty() && C::u64_load_acquire(&self.versions.partition_live) != 0;
+        if !keyed && !listed && !parted {
             return false;
         }
         let value = C::u64_fetch_add(&self.versions.changes, 1);
@@ -1346,6 +1444,11 @@ where
             };
             if listed {
                 handles.extend(map.membership);
+            }
+            drop(map);
+            if parted {
+                let inputs = self.versions.partition_inputs.read();
+                handles.extend(touched.iter().filter_map(|t| inputs.get(t).copied()));
             }
             handles
         };
@@ -1514,6 +1617,16 @@ where
         self.versions.map.read().membership
     }
 
+    /// Every partition input a read created, in no particular order.
+    pub fn partition_inputs(&self) -> Vec<ErasedIncr> {
+        self.versions
+            .partition_inputs
+            .read()
+            .values()
+            .map(|handle| handle.erase())
+            .collect()
+    }
+
     /// Whether a read created the membership input.
     pub fn has_membership_input(&self) -> bool {
         self.versions.any_listed()
@@ -1533,6 +1646,101 @@ where
         map.membership = Some(handle);
         C::u64_store_release(&self.versions.listed, 1);
         handle
+    }
+
+    /// Registers a partitioning of the keys by `f`, run as value code on
+    /// each key a write inserts or removes (in staging, so a function that
+    /// panics refuses the write with nothing committed) and on the keys
+    /// held now. A row replacement runs nothing. `f` must return the same
+    /// partition for a key every time.
+    pub fn key_partitions<Q>(&self, f: impl Fn(&K) -> Q + Send + Sync + 'static) -> KeyPartitions<Q>
+    where
+        Q: Value + Hash + Eq,
+    {
+        refuse_value_code();
+        let f: Arc<dyn Fn(&K) -> Q + Send + Sync> = Arc::new(f);
+        loop {
+            let (epoch, state) = {
+                let table = self.index.table.read();
+                let epoch = C::u64_load_relaxed(&self.index.epoch);
+                let state = value_code::run(|| {
+                    PartState::<K, V, Q, P>::build(
+                        Arc::clone(&f),
+                        table.buckets().map(|(_, b)| (b.hash, &b.read().0)),
+                    )
+                });
+                (epoch, state)
+            };
+            let mut table = self.index.table.write();
+            if C::u64_load_relaxed(&self.index.epoch) == epoch {
+                table.parts.push(Box::new(state));
+                C::u64_store_release(&self.index.epoch, epoch + 1);
+                return KeyPartitions {
+                    sink: table.parts.len() - 1,
+                    _q: PhantomData,
+                };
+            }
+        }
+    }
+
+    /// The keys of partition `q` of `parts`. Inside a compute of `rt` the
+    /// read depends on that partition's input, created at 0 on the first
+    /// such read, so the query reruns when a write inserts or removes a key
+    /// of the partition and not for any other change. Outside one it reads
+    /// the partition and creates nothing.
+    pub fn get_partition<Q>(&self, rt: &Runtime<C>, parts: &KeyPartitions<Q>, q: &Q) -> Vec<K>
+    where
+        Q: Value + Hash + Eq,
+    {
+        refuse_value_code();
+        if !records_reads(rt) {
+            return self.read_partition(parts, q);
+        }
+        let qhash = value_code::run(|| FxBuildHasher.hash_one(q));
+        let slot = (parts.sink, qhash);
+        let found = self.versions.partition_inputs.read().get(&slot).copied();
+        let handle = match found {
+            Some(handle) => handle,
+            None if rt.frame_doomed() => return self.read_partition(parts, q),
+            None => {
+                let mut inputs = self.versions.partition_inputs.write();
+                *inputs.entry(slot).or_insert_with(|| {
+                    C::u64_fetch_add(&self.versions.partition_live, 1);
+                    rt.create_input_unchecked(0_u64)
+                })
+            }
+        };
+        rt.get(handle);
+        self.read_partition(parts, q)
+    }
+
+    fn read_partition<Q>(&self, parts: &KeyPartitions<Q>, q: &Q) -> Vec<K>
+    where
+        Q: Value + Hash + Eq,
+    {
+        let table = self.index.table.read();
+        value_code::run(|| {
+            table.parts[parts.sink]
+                .as_any()
+                .downcast_ref::<PartState<K, V, Q, P>>()
+                .expect("incr-core: a KeyPartitions belongs to its collection")
+                .keys_of(q)
+        })
+    }
+
+    /// Whether a partitioning is registered.
+    pub fn has_partitions(&self) -> bool {
+        !self.index.table.read().parts.is_empty()
+    }
+
+    /// Runs every registered partition function on `pair`'s key and
+    /// discards the results, so a caller about to log a write can refuse
+    /// it before it is durable when a function panics on one of its keys.
+    /// Runs the functions as value code.
+    pub fn check_partitions(&self, pair: &P) {
+        refuse_value_code();
+        let table = self.index.table.read();
+        value_code::run(|| table.parts.iter().for_each(|sink| sink.check(pair)));
     }
 
     /// `key`'s version input, if a read created one.

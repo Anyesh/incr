@@ -58,6 +58,14 @@ pub(crate) struct PyKeyedCollection {
 
 const _: () = assert!(std::mem::align_of::<PyKeyedCollection>() <= 16);
 
+/// The result of `KeyedCollection.key_partitions`: read one partition with
+/// `ctx.keys(parts, p)`.
+#[pyclass(name = "KeyPartitions", module = "incr_concurrent", frozen)]
+pub(crate) struct PyKeyPartitions {
+    pub(crate) parts: incr_python_persist::incr_core::KeyPartitions<PyKey>,
+    pub(crate) owner: Py<PyKeyedCollection>,
+}
+
 const PERSISTED: &str = "keyed collection is persisted: write it with store.upsert, store.remove, store.reconcile or a store.batch";
 
 impl PyKeyedCollection {
@@ -235,6 +243,23 @@ impl PyKeyedCollection {
         let (source, _) = self.key_source(rt)?;
         let key = PyKey(key);
         engine_call(py, rt, || source.forget_key(rt, &key))
+    }
+
+    /// Partition the keys by `fn(key)`, which must return the same
+    /// hashable value for a key every time. `fn` runs on the keys held now
+    /// and on each key a write inserts or removes, never on a row update;
+    /// an exception it raises refuses the write and leaves the collection
+    /// unchanged. Read a partition with `ctx.keys(parts, p)`.
+    fn key_partitions(slf: &Bound<'_, Self>, f: Py<PyAny>) -> PyResult<PyKeyPartitions> {
+        let py = slf.py();
+        let this = slf.get();
+        let rt = this.runtime();
+        let (source, _) = this.key_source(rt)?;
+        let parts = engine_call(py, rt, || source.key_partitions(rt, f))?;
+        Ok(PyKeyPartitions {
+            parts,
+            owner: slf.clone().unbind(),
+        })
     }
 
     /// How many version inputs this collection holds: one per key a query

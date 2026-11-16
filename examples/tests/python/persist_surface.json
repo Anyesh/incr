@@ -179,6 +179,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /)"
    },
+   "key_partitions": {
+    "doc": "Partition the keys by `fn(key)`, which must return the same\nhashable value for a key every time. `fn` runs on the keys held now\nand on each key a write inserts or removes, never on a row update;\nan exception it raises refuses the write and leaves the collection\nunchanged. Read a partition with `ctx.keys(parts, p)`.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, f)"
+   },
    "keys": {
     "doc": "A new list of the held keys, in no particular order. Registers no\ndependency, like `get`.",
     "kind": "method_descriptor",
@@ -625,9 +630,9 @@
     "signature": "(self, /, node)"
    },
    "keys": {
-    "doc": "A new list of the keys `kc` holds, with a dependency on which keys\nexist: the query reruns when a write inserts or removes a key, not\nwhen it only changes a row. Raises `ValueError` for a keyed\ncollection of another runtime.",
+    "doc": "A new list of the keys `kc` holds, with a dependency on which keys\nexist: the query reruns when a write inserts or removes a key, not\nwhen it only changes a row. Raises `ValueError` for a keyed\ncollection of another runtime.\n\n`keys(parts, p)` reads one partition of a `kc.key_partitions(fn)`\nresult instead: the keys `fn` maps to `p`, rerunning the query only\nwhen a write inserts or removes a key of that partition.",
     "kind": "method_descriptor",
-    "signature": "(self, /, kc)"
+    "signature": "(self, /, source, *partition)"
    },
    "lookup": {
     "doc": "The value of `key`'s lookup (see `Runtime.create_lookup`), read as\n`get` reads a node: `Pending` makes this query's value `Pending`.",
