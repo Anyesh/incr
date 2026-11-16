@@ -29,11 +29,15 @@ pub(super) trait PartSink<P>: Send + Sync {
     fn plan(&self, flips: &[Flip<'_, P>]) -> Box<dyn Any + Send>;
     /// The hashes of the partitions `plan` touches.
     fn touched(&self, plan: &dyn Any) -> Vec<u64>;
-    /// Applies a plan made against this state. Runs no user code; the pairs
-    /// it lets go go to `gone`.
-    fn apply(&mut self, plan: Box<dyn Any + Send>, gone: &mut Vec<P>);
+    /// Applies a plan made against this state and drops every partition it
+    /// leaves without a key. Runs no user code; the pairs it lets go go to
+    /// `gone`. Returns the hashes that no record has any more, whose inputs
+    /// no write can bump until a partition of that hash returns.
+    fn apply(&mut self, plan: Box<dyn Any + Send>, gone: &mut Vec<P>) -> Vec<u64>;
     /// Runs the partition function on `pair`'s key, discarding the result.
     fn check(&self, pair: &P);
+    /// How many partition records the partitioning holds.
+    fn records(&self) -> usize;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -113,6 +117,35 @@ where
         at
     }
 
+    /// Removes the record at `at` by moving the last record into its place,
+    /// and returns its hash.
+    fn drop_record(&mut self, at: usize) -> u64 {
+        let qhash = self.parts[at].qhash;
+        let bucket = self
+            .by_qhash
+            .get_mut(&qhash)
+            .expect("incr-core: a record is indexed");
+        bucket.retain(|&i| i != at);
+        if bucket.is_empty() {
+            self.by_qhash.remove(&qhash);
+        }
+        let last = self.parts.len() - 1;
+        self.parts.swap_remove(at);
+        if at != last {
+            let moved = self.parts[at].qhash;
+            for i in self
+                .by_qhash
+                .get_mut(&moved)
+                .expect("incr-core: a record is indexed")
+            {
+                if *i == last {
+                    *i = at;
+                }
+            }
+        }
+        qhash
+    }
+
     fn find(&self, qhash: u64, q: &Q) -> Option<usize> {
         self.by_qhash
             .get(&qhash)?
@@ -152,27 +185,27 @@ where
             let key = flip.pair.key();
             let q = (self.f)(&key);
             let qhash = FxBuildHasher.hash_one(&q);
-            let slot = match self.find(qhash, &q) {
-                Some(at) => Slot::Old(at),
-                None => match plan
-                    .fresh
-                    .iter()
-                    .position(|(fresh, h)| *h == qhash && *fresh == q)
-                {
-                    Some(j) => Slot::New(j),
-                    None => {
-                        plan.fresh.push((q, qhash));
-                        Slot::New(plan.fresh.len() - 1)
-                    }
-                },
-            };
             if flip.inserted {
+                let slot = match self.find(qhash, &q) {
+                    Some(at) => Slot::Old(at),
+                    None => match plan
+                        .fresh
+                        .iter()
+                        .position(|(fresh, h)| *h == qhash && *fresh == q)
+                    {
+                        Some(j) => Slot::New(j),
+                        None => {
+                            plan.fresh.push((q, qhash));
+                            Slot::New(plan.fresh.len() - 1)
+                        }
+                    },
+                };
                 plan.ops.push(Op::Insert {
                     part: slot,
                     hash: flip.hash,
                     pair: flip.pair.clone(),
                 });
-            } else if let Slot::Old(part) = slot {
+            } else if let Some(part) = self.find(qhash, &q) {
                 let at = self.parts[part].pairs.get(&flip.hash).and_then(|bucket| {
                     if bucket.len() == 1 {
                         Some(0)
@@ -211,7 +244,7 @@ where
             .collect()
     }
 
-    fn apply(&mut self, plan: Box<dyn Any + Send>, gone: &mut Vec<P>) {
+    fn apply(&mut self, plan: Box<dyn Any + Send>, gone: &mut Vec<P>) -> Vec<u64> {
         let Plan { fresh, ops } = *plan
             .downcast::<Plan<Q, P>>()
             .expect("incr-core: a partition plan fits its partitioning");
@@ -228,6 +261,8 @@ where
             }
         }
         removes.sort_unstable_by(|a, b| b.cmp(a));
+        let mut shrunk: Vec<usize> = removes.iter().map(|&(part, _, _)| part).collect();
+        shrunk.dedup();
         for (part, hash, at) in removes {
             let pairs = &mut self.parts[part].pairs;
             if let Some(bucket) = pairs.get_mut(&hash) {
@@ -246,11 +281,24 @@ where
             };
             self.parts[at].pairs.entry(hash).or_default().push(pair);
         }
+        shrunk.retain(|&at| self.parts[at].pairs.is_empty());
+        let mut emptied = Vec::new();
+        for at in shrunk {
+            let qhash = self.drop_record(at);
+            if !self.by_qhash.contains_key(&qhash) {
+                emptied.push(qhash);
+            }
+        }
+        emptied
     }
 
     fn check(&self, pair: &P) {
         let q = (self.f)(&pair.key());
         FxBuildHasher.hash_one(&q);
+    }
+
+    fn records(&self) -> usize {
+        self.parts.len()
     }
 
     fn as_any(&self) -> &dyn Any {

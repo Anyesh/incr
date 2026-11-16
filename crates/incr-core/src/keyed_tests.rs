@@ -1409,7 +1409,116 @@ for_both!(
     partitions_register_over_existing_keys_and_a_reader_of_a_new_partition_wakes,
     a_raising_partition_fn_refuses_the_write_and_changes_nothing,
     a_pair_swap_keeps_a_partition_and_the_two_reader_kinds_are_independent,
+    emptied_partitions_free_their_records_and_unread_inputs,
+    an_emptied_partition_with_a_reader_keeps_its_input_and_wakes_on_refill,
+    removing_a_key_that_is_in_no_partition_leaves_no_record,
+    an_emptied_partition_whose_reader_went_away_frees_its_input_on_local_only,
+    partition_records_match_a_model_across_many_empties_and_refills,
 );
+
+type Counted<C> = KeyedCollection<u32, u32, C, (u32, u32), u8>;
+
+fn emptied_partitions_free_their_records_and_unread_inputs<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| *k);
+    for k in 0..10_000 {
+        kc.upsert(&rt, k, k);
+        kc.remove(&rt, &k);
+    }
+    assert_eq!(kc.partition_records(&parts), 0);
+    assert_eq!(kc.partition_input_count(), 0);
+}
+
+fn an_emptied_partition_with_a_reader_keeps_its_input_and_wakes_on_refill<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| k % 1000);
+    let runs: Runs = Arc::default();
+    let counted = Arc::clone(&runs);
+    let shared = Captured(kc.clone());
+    let reader = rt.create_query(move |rt| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut keys = shared.get().get_partition(rt, &parts, &7);
+        keys.sort_unstable();
+        keys
+    });
+    kc.upsert(&rt, 7, 0);
+    assert_eq!(rt.get(reader), vec![7]);
+    kc.remove(&rt, &7);
+    assert_eq!(kc.partition_records(&parts), 0);
+    assert_eq!(kc.partition_input_count(), 1);
+    assert_eq!(rt.get(reader), Vec::<u32>::new());
+    kc.upsert(&rt, 1007, 0);
+    assert_eq!(rt.get(reader), vec![1007]);
+    assert_eq!(runs_of(&runs), 3);
+    for k in 0..2000 {
+        kc.upsert(&rt, 2_000_000 + k, 0);
+        kc.remove(&rt, &(2_000_000 + k));
+    }
+    assert_eq!(kc.partition_records(&parts), 1);
+    assert_eq!(kc.partition_input_count(), 1);
+}
+
+fn an_emptied_partition_whose_reader_went_away_frees_its_input_on_local_only<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| *k % 10);
+    let shared = Captured(kc.clone());
+    let reader = rt.create_query(move |rt| shared.get().get_partition(rt, &parts, &3).len());
+    kc.upsert(&rt, 3, 0);
+    assert_eq!(rt.get(reader), 1);
+    assert_eq!(kc.partition_input_count(), 1);
+    kc.remove(&rt, &3);
+    assert_eq!(kc.partition_input_count(), 1, "a reader depends on it");
+    rt.try_delete_node(reader).unwrap();
+    kc.upsert(&rt, 13, 0);
+    kc.remove(&rt, &13);
+    assert_eq!(kc.partition_input_count(), usize::from(!C::SINGLE_THREADED));
+    let again = Captured(kc.clone());
+    let late = rt.create_query(move |rt| again.get().get_partition(rt, &parts, &3).len());
+    assert_eq!(rt.get(late), 0);
+    kc.upsert(&rt, 23, 0);
+    assert_eq!(rt.get(late), 1);
+}
+
+fn partition_records_match_a_model_across_many_empties_and_refills<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    let parts = kc.key_partitions(|k: &u32| *k % 37);
+    let mut model: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut state = 12345_u32;
+    for _ in 0..3000 {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let key = (state >> 8) % 120;
+        if (state >> 4).is_multiple_of(3) {
+            kc.remove(&rt, &key);
+            model.remove(&key);
+        } else {
+            kc.upsert(&rt, key, state);
+            model.insert(key, state);
+        }
+        let live: std::collections::BTreeSet<u32> = model.keys().map(|k| k % 37).collect();
+        assert_eq!(kc.partition_records(&parts), live.len());
+    }
+    for q in 0..37 {
+        let mut got = kc.get_partition(&rt, &parts, &q);
+        got.sort_unstable();
+        let want: Vec<u32> = model.keys().copied().filter(|k| k % 37 == q).collect();
+        assert_eq!(got, want);
+    }
+}
+
+fn removing_a_key_that_is_in_no_partition_leaves_no_record<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = Counted::<C>::new(&rt);
+    kc.upsert(&rt, 1, 1);
+    let parts = kc.key_partitions(|k: &u32| *k);
+    kc.remove(&rt, &2);
+    kc.reconcile(&rt, [(1, 1), (3, 3)]);
+    kc.reconcile(&rt, [(1, 1)]);
+    assert_eq!(kc.partition_records(&parts), 1);
+}
 
 fn parity(k: &u8) -> u8 {
     k % 2
