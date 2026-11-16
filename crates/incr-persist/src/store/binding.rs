@@ -13,6 +13,10 @@ use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard, Registered};
 use super::logged::{Elements, LoggedKey};
 use crate::{Error, Kind, Record, Result, ValueScope};
 
+/// A key's snapshot records, made as they are pulled, as
+/// [`Binding::fold`] returns them.
+pub(crate) type Folded<'a> = Box<dyn Iterator<Item = Result<Record>> + 'a>;
+
 /// A key this process declared, tied to the runtime node that mirrors it.
 ///
 /// Every method that runs under the store mutex takes the call's
@@ -112,15 +116,10 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
         bag: &AfterLock,
     ) -> Result<Option<(u128, u64)>>;
 
-    /// The records a snapshot keeps for this key, given its logged state.
-    /// Empty when the key holds nothing beyond its logged default, which is
-    /// how compaction forgets it.
-    fn fold(
-        &self,
-        rt: &Runtime<C>,
-        logged: Option<&LoggedKey>,
-        bag: &AfterLock,
-    ) -> Result<Vec<Record>>;
+    /// The records a snapshot keeps for this key, given its logged state,
+    /// made as they are pulled. Empty when the key holds nothing beyond its
+    /// logged default, which is how compaction forgets it.
+    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>>;
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -333,15 +332,12 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         Ok(Some((self.fp, self.stamp)))
     }
 
-    fn fold(
-        &self,
-        _rt: &Runtime<C>,
-        logged: Option<&LoggedKey>,
-        _bag: &AfterLock,
-    ) -> Result<Vec<Record>> {
+    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>> {
         Ok(match logged {
-            Some(logged) if !logged.at_default() => logged.records(&self.key),
-            _ => Vec::new(),
+            Some(logged) if !logged.at_default() => {
+                Box::new(logged.iter_records(&self.key).map(Ok))
+            }
+            _ => Box::new(std::iter::empty()),
         })
     }
 

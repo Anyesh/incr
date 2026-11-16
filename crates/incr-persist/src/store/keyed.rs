@@ -9,11 +9,11 @@ use incr_core::persist_hooks::Deferred;
 use incr_core::{
     find_element, with_value_code, Cells, DeleteError, ElementRank, ErasedIncr, Incr,
     IncrCollection, KeyCounts, KeyIndex, KeyPartitions, KeyedChange, KeyedCollection, KeyedSpent,
-    Pair, PairOp, Runtime, Shared, Value,
+    Pair, PairHandle, PairOp, Runtime, Shared, Value,
 };
 
 use super::after_lock::AfterLock;
-use super::binding::{decode, encode, Binding};
+use super::binding::{decode, encode, Binding, Folded};
 use super::collection::{fp_in_scope, fp_of_elements, FpDelta};
 use super::dep_index::{fp_of, DepFp, DepIndex, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
@@ -1289,6 +1289,15 @@ where
         Ok(())
     }
 
+    /// The error a snapshot fold fails with when the key index changed
+    /// since it listed the pairs, which only a write around the store can
+    /// do while the store is locked.
+    fn bypassed(&self) -> Error {
+        Error::Bypassed {
+            key: self.key.clone(),
+        }
+    }
+
     /// Every pair encoded, in byte order, as a plain collection binding
     /// lists its elements.
     fn encoded(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Vec<Vec<u8>>> {
@@ -1433,23 +1442,35 @@ where
         Ok(None)
     }
 
-    fn fold(
-        &self,
-        rt: &Runtime<C>,
-        logged: Option<&LoggedKey>,
-        bag: &AfterLock,
-    ) -> Result<Vec<Record>> {
-        let elements = self.encoded(rt, bag)?;
+    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>> {
+        let (epoch, handles) = self.keyed.pair_handles();
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
-        if elements.is_empty() && !has_value {
-            return Ok(Vec::new());
+        if handles.is_empty() && !has_value {
+            return Ok(Box::new(std::iter::empty()));
         }
-        let mut out = logged.map_or_else(Vec::new, |logged| logged.records(&self.key));
-        out.extend(elements.into_iter().map(|element| Record::Insert {
-            key: self.key.clone(),
-            element,
-        }));
-        Ok(out)
+        let mut logged_pairs = handles.into_iter().peekable();
+        let mut unlogged = Vec::new();
+        while let Some(&handle) = logged_pairs.peek() {
+            let element = self.keyed.with_pair(epoch, handle, |pair, rank| {
+                (rank == UNLOGGED_RANK).then(|| encode(&self.key, pair))
+            });
+            match element.ok_or_else(|| self.bypassed())? {
+                Some(element) => unlogged.push((fp_of(&element?), handle)),
+                None => break,
+            }
+            logged_pairs.next();
+        }
+        unlogged.sort_unstable_by_key(|&(fp, _)| fp);
+        let head = logged.map(|logged| logged.iter_records(&self.key).map(Ok));
+        let elements = RankMerge {
+            binding: self,
+            epoch,
+            logged: logged_pairs,
+            logged_rank: None,
+            unlogged: unlogged.into_iter().peekable(),
+            failed: false,
+        };
+        Ok(Box::new(head.into_iter().flatten().chain(elements)))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1697,5 +1718,93 @@ impl<C: Cells, B: Backend> Store<C, B> {
             }
         }
         Ok(last)
+    }
+}
+
+/// A keyed binding's snapshot `Insert`s in rank order, each pair encoded
+/// as it is pulled: the pairs at a logged rank in the order the index
+/// listed them, merged with those at [`UNLOGGED_RANK`] ranked by the
+/// fingerprint of their encoding, the rank a reload gives them.
+struct RankMerge<'a, K, V, C, P>
+where
+    K: 'static,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V>,
+{
+    binding: &'a KeyedBinding<K, V, C, P>,
+    epoch: u64,
+    logged: std::iter::Peekable<std::vec::IntoIter<PairHandle>>,
+    /// The rank of the pair `logged` peeks at, once read.
+    logged_rank: Option<u128>,
+    unlogged: std::iter::Peekable<std::vec::IntoIter<(u128, PairHandle)>>,
+    failed: bool,
+}
+
+impl<K, V, C, P> RankMerge<'_, K, V, C, P>
+where
+    K: Value + Hash + Eq,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V> + PersistValue,
+{
+    fn next_handle(&mut self) -> Result<Option<PairHandle>> {
+        let take_logged = match (self.unlogged.peek(), self.logged.peek()) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(&(fp, _)), Some(&handle)) => {
+                let rank = match self.logged_rank {
+                    Some(rank) => rank,
+                    None => {
+                        let keyed = &self.binding.keyed;
+                        let rank = keyed
+                            .with_pair(self.epoch, handle, |_, rank| rank)
+                            .ok_or_else(|| self.binding.bypassed())?;
+                        *self.logged_rank.insert(rank)
+                    }
+                };
+                rank <= fp
+            }
+        };
+        Ok(if take_logged {
+            self.logged_rank = None;
+            self.logged.next()
+        } else {
+            self.unlogged.next().map(|(_, handle)| handle)
+        })
+    }
+
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        let Some(handle) = self.next_handle()? else {
+            return Ok(None);
+        };
+        let binding = self.binding;
+        let element = binding
+            .keyed
+            .with_pair(self.epoch, handle, |pair, _| encode(&binding.key, pair))
+            .ok_or_else(|| binding.bypassed())??;
+        Ok(Some(Record::Insert {
+            key: binding.key.clone(),
+            element,
+        }))
+    }
+}
+
+impl<K, V, C, P> Iterator for RankMerge<'_, K, V, C, P>
+where
+    K: Value + Hash + Eq,
+    V: Value + Hash + Eq,
+    C: Cells,
+    P: Pair<K, V> + PersistValue,
+{
+    type Item = Result<Record>;
+
+    fn next(&mut self) -> Option<Result<Record>> {
+        if self.failed {
+            return None;
+        }
+        let next = self.next_record();
+        self.failed = next.is_err();
+        next.transpose()
     }
 }

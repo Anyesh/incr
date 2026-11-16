@@ -301,7 +301,6 @@ fn a_row_drop_calling_its_store_completes_and_is_refused_only_inside_undeclare()
         ("replace", replace),
         ("refresh", refresh),
         ("reconcile", reconcile),
-        ("checkpoint", checkpoint),
     ] {
         assert!(!outcomes.is_empty(), "{name} dropped no row");
         assert!(
@@ -309,6 +308,12 @@ fn a_row_drop_calling_its_store_completes_and_is_refused_only_inside_undeclare()
             "{name}: {outcomes:?}"
         );
     }
+    // A checkpoint folds rows by reference; only the debug bypass check
+    // clones, and so drops, any.
+    assert!(
+        checkpoint.iter().all(|outcome| *outcome == Outcome::Ok),
+        "checkpoint: {checkpoint:?}"
+    );
     assert!(
         undeclare.contains(&Outcome::Reentrant),
         "undeclare: {undeclare:?}"

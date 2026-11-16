@@ -5,12 +5,15 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use incr_core::persist_hooks::{self, Deferred, Displaced, RepSide, RepSink};
-use incr_core::{with_value_code, Cells, ErasedIncr, Incr, IncrCollection, Runtime, Value};
+use incr_core::{
+    with_value_code, Cells, ElementSlot, ElementsStamp, ErasedIncr, Incr, IncrCollection, Runtime,
+    Value,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::after_lock::AfterLock;
-use super::binding::{decode, encode, Binding};
+use super::binding::{decode, encode, Binding, Folded};
 use super::dep_index::{fp_of, DepFp, DepIndex, DepMap, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
 use super::{Batch, KeyRef, PersistValue, State, Store};
@@ -473,11 +476,10 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         spent.keep_in(bag);
     }
 
-    /// The elements encoded, in byte order. A store that does not declare
-    /// the key diffs its catch-up by bytes in the order its elements were
-    /// listed, so hash order, which differs per process, would make what it
-    /// reports differ too. The runtime stores one value per class of equal
-    /// elements, so no order of them changes the state.
+    /// The elements encoded, in byte order, for the logged state an
+    /// unbound key keeps. Any order other than hash order, which differs
+    /// per process, would do; the runtime stores one value per class of
+    /// equal elements, so no order of them changes the state.
     fn encoded_values(&self, rt: &Runtime<C>, bag: &AfterLock) -> Result<Vec<Vec<u8>>> {
         let values = self.collection.values(rt);
         let encoded = values
@@ -488,6 +490,63 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         let mut encoded = encoded?;
         encoded.sort_unstable();
         Ok(encoded)
+    }
+
+    /// A snapshot's order of the distinct elements: by the high 64 bits of
+    /// each one's encoding's fingerprint, ties by the encodings themselves,
+    /// so every process lists the same elements in the same order. Keeps
+    /// 16 bytes per element rather than its encoding, which the caller
+    /// makes again as it yields.
+    fn ranked_slots(&self) -> Result<(ElementsStamp, Vec<ElementSlot>)> {
+        let mut slots = Vec::new();
+        let stamp = self.collection.visit_elements(|slot, value, _| {
+            let element = encode(&self.key, value)?;
+            slots.push(((fp_of(&element) >> 64) as u64, slot));
+            Ok::<(), Error>(())
+        })?;
+        slots.sort_unstable_by_key(|&(fp, _)| fp);
+        let mut at = 0;
+        while at < slots.len() {
+            let run = slots[at..]
+                .iter()
+                .take_while(|&&(fp, _)| fp == slots[at].0)
+                .count();
+            if run > 1 {
+                let mut tied = slots[at..at + run]
+                    .iter()
+                    .map(|&(fp, slot)| Ok((self.encode_slot(stamp, slot)?.0, fp, slot)))
+                    .collect::<Result<Vec<_>>>()?;
+                tied.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                for (into, (_, fp, slot)) in slots[at..at + run].iter_mut().zip(tied) {
+                    *into = (fp, slot);
+                }
+            }
+            at += run;
+        }
+        Ok((stamp, slots.into_iter().map(|(_, slot)| slot).collect()))
+    }
+
+    /// The encoding of the element at `slot` and its multiplicity. Fails
+    /// with [`Error::Bypassed`] when the collection changed since `stamp`,
+    /// which only a write around the store can do while the store is
+    /// locked.
+    fn encode_slot(&self, stamp: ElementsStamp, slot: ElementSlot) -> Result<(Vec<u8>, usize)> {
+        self.collection
+            .with_element(stamp, slot, |value, count| {
+                encode(&self.key, value).map(|element| (element, count))
+            })
+            .unwrap_or_else(|| {
+                Err(Error::Bypassed {
+                    key: self.key.clone(),
+                })
+            })
+    }
+
+    fn insert(&self, element: Vec<u8>) -> Record {
+        Record::Insert {
+            key: self.key.clone(),
+            element,
+        }
     }
 
     /// Brings the collection to exactly `target`, stored values included,
@@ -710,23 +769,44 @@ where
         Ok(None)
     }
 
-    fn fold(
-        &self,
-        rt: &Runtime<C>,
-        logged: Option<&LoggedKey>,
-        bag: &AfterLock,
-    ) -> Result<Vec<Record>> {
-        let elements = self.encoded_values(rt, bag)?;
+    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>> {
+        let (stamp, slots) = self.ranked_slots()?;
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
-        if elements.is_empty() && !has_value {
-            return Ok(Vec::new());
+        if slots.is_empty() && !has_value {
+            return Ok(Box::new(std::iter::empty()));
         }
-        let mut out = logged.map_or_else(Vec::new, |logged| logged.records(&self.key));
-        out.extend(elements.into_iter().map(|element| Record::Insert {
-            key: self.key.clone(),
-            element,
-        }));
-        Ok(out)
+        let head = logged.map(|logged| logged.iter_records(&self.key).map(Ok));
+        let mut slots = slots.into_iter();
+        let mut repeat: Option<(Vec<u8>, usize)> = None;
+        let mut failed = false;
+        let elements = std::iter::from_fn(move || {
+            if failed {
+                return None;
+            }
+            if let Some((element, left)) = &mut repeat {
+                *left -= 1;
+                let element = if *left == 0 {
+                    repeat.take().map(|(element, _)| element)?
+                } else {
+                    element.clone()
+                };
+                return Some(Ok(self.insert(element)));
+            }
+            let slot = slots.next()?;
+            match self.encode_slot(stamp, slot) {
+                Ok((element, count)) => {
+                    if count > 1 {
+                        repeat = Some((element.clone(), count - 1));
+                    }
+                    Some(Ok(self.insert(element)))
+                }
+                Err(e) => {
+                    failed = true;
+                    Some(Err(e))
+                }
+            }
+        });
+        Ok(Box::new(head.into_iter().flatten().chain(elements)))
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -96,12 +96,14 @@ pub enum Error {
     #[error("key {key:?} still has dependents in this process; delete them before undeclaring it")]
     HasDependents { key: String },
 
-    /// An input holds a value in the runtime that differs from the last
-    /// record the store applied to it, because something wrote it through
-    /// the runtime instead of the store. The log never saw that write, so a
-    /// restart would lose it. Reported by `Store::set`, `Batch::set` and
-    /// `Store::checkpoint` in debug builds only.
-    #[error("input {key:?} was written through the runtime, bypassing the store's log")]
+    /// A key's runtime node holds something other than what the store
+    /// applied to it, because something wrote it through the runtime
+    /// instead of the store. The log never saw that write, so a restart
+    /// would lose it. Reported for an input by `Store::set`, `Batch::set`
+    /// and `Store::checkpoint` in debug builds only, and for a collection
+    /// by `Store::checkpoint` in every build when the write lands while
+    /// the checkpoint folds it, which then changes nothing.
+    #[error("key {key:?} was written through the runtime, bypassing the store's log")]
     Bypassed { key: String },
 
     /// A store operation was attempted while an
