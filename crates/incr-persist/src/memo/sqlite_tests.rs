@@ -724,8 +724,8 @@ fn several_superseded_generations_are_removed_together_and_the_current_one_stays
     remove_in_one(&mut lock(&memo.writer), &old).unwrap();
     assert_eq!(row_count(&memo), 100);
     assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
-    assert!(memo.remove_generations(&[GenId(3)]).is_err());
-    memo.remove_generations(&old).unwrap();
+    assert_eq!(memo.remove_generations(&[GenId(3)]), vec![GenId(3)]);
+    assert!(memo.remove_generations(&old).is_empty());
 }
 
 #[test]

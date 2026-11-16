@@ -3,13 +3,20 @@
 //! `cargo test --release -p incr-persist --test memo_rss -- --ignored`.
 #![cfg(all(target_os = "linux", target_env = "gnu"))]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use incr_persist::memo::{BuildId, FileMemo, Memo, MemoBuilder, MemoCells, MemoOptions, MemoTable};
 use incr_persist::{Input, Local, MemoryBackend, Options, Shared, Store};
 
 const BUILD: u128 = 0x255;
+
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// VmRSS is per process, so the two tests must not overlap.
+fn exclusive() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
 const ENTRIES: u32 = 500_000;
 const DIRTY: u32 = ENTRIES / 100;
 const VALUE: usize = 100;
@@ -91,6 +98,7 @@ fn assert_within_slack(before: u64, after: u64) {
 #[test]
 #[ignore = "500000 entries; run in release"]
 fn a_one_percent_checkpoint_keeps_resident_memory_flat_on_local() {
+    let _exclusive = exclusive();
     let (dir, log) = written_memo();
     let rig = Rig::<Local>::open(&log, dir.path(), options());
     rig.read_all();
@@ -105,6 +113,7 @@ fn a_one_percent_checkpoint_keeps_resident_memory_flat_on_local() {
 #[test]
 #[ignore = "500000 entries; run in release"]
 fn a_one_percent_automatic_checkpoint_keeps_resident_memory_flat_on_shared() {
+    let _exclusive = exclusive();
     let (dir, log) = written_memo();
     let rig = Rig::<Shared>::open(
         &log,

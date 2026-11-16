@@ -314,11 +314,14 @@ impl MemoBackend for SqliteMemo {
     }
 
     fn remove_generation(&self, generation: GenId) -> Result<()> {
-        self.remove_generations(&[generation])
+        remove_in_one(&mut lock(&self.writer), &[generation])
     }
 
-    fn remove_generations(&self, generations: &[GenId]) -> Result<()> {
-        remove_in_one(&mut lock(&self.writer), generations)
+    fn remove_generations(&self, generations: &[GenId]) -> Vec<GenId> {
+        match remove_in_one(&mut lock(&self.writer), generations) {
+            Ok(()) => Vec::new(),
+            Err(_) => generations.to_vec(),
+        }
     }
 }
 

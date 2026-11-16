@@ -83,7 +83,7 @@ pub(crate) trait ErasedBackend: Send + Sync {
     /// `known` holds the layers this handle's index already loaded.
     fn checkpoint(&self, input: CheckpointInput, known: &[Arc<Generation>])
         -> Result<Checkpointed>;
-    fn remove_generations(&self, generations: &[GenId]) -> Result<()>;
+    fn remove_generations(&self, generations: &[GenId]) -> Vec<GenId>;
 }
 
 impl<M: MemoBackend> ErasedBackend for M {
@@ -99,7 +99,7 @@ impl<M: MemoBackend> ErasedBackend for M {
         write_known(self, input, known)
     }
 
-    fn remove_generations(&self, generations: &[GenId]) -> Result<()> {
+    fn remove_generations(&self, generations: &[GenId]) -> Vec<GenId> {
         MemoBackend::remove_generations(self, generations)
     }
 }

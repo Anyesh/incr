@@ -772,6 +772,7 @@ struct Streaming {
     ahead: AtomicUsize,
     last_loc: Mutex<HashMap<u64, u64>>,
     backwards: AtomicUsize,
+    refuse: Mutex<Vec<GenId>>,
 }
 
 impl Streaming {
@@ -865,8 +866,25 @@ impl MemoBackend for Streaming {
     }
 
     fn remove_generation(&self, generation: GenId) -> Result<()> {
+        if self.refuse.lock().unwrap().contains(&generation) {
+            return Err(Error::Backend("removal refused".into()));
+        }
         self.memo.remove_generation(generation)
     }
+}
+
+#[test]
+fn removing_several_generations_reports_only_those_that_stay() {
+    let memo = Streaming::default();
+    let tables = vec![desc("a", 1)];
+    let mut ids = Vec::new();
+    for round in 0..3 {
+        let done = write_checkpoint(&memo, wide_input(tables.clone(), 0..10, 1 + round)).unwrap();
+        ids.push(done.generation.id());
+    }
+    memo.refuse.lock().unwrap().push(ids[1]);
+    let left = memo.remove_generations(&[ids[0], ids[1]]);
+    assert_eq!(left, vec![ids[1]]);
 }
 
 #[test]
