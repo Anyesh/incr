@@ -267,17 +267,17 @@ impl<C: MemoCells> CoreRef<C> {
         }
         state.stats.unsaveable = unsaveable;
         state.stats.evicted_last_checkpoint = done.stats.evicted as u64;
-        // Restores hold M, so none is still reading the old chain.
-        // The new one is current either way, so a failed removal only
-        // leaves a stale generation behind.
-        for &old in &done.superseded {
-            if self.backend.remove_generation(old).is_err() {
-                state.stats.stale_generations += 1;
-            }
-        }
         drop(state);
         drop(saved);
         bag.drain(rt);
+        // After the memo lock is released: the new chain is current, and a
+        // reader still on the old one gets `None` from `read_entry`. A
+        // failed removal only leaves stale generations, which the next
+        // checkpoint removes.
+        let stale = self.backend.remove_generations(&done.superseded);
+        if !stale.is_empty() {
+            self.lock_memo().stats.stale_generations += stale.len() as u64;
+        }
         Ok(done.stats)
     }
 }

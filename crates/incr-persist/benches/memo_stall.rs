@@ -13,6 +13,16 @@
 //! backend, `file` and, with the `sqlite` feature, `sqlite`, each in a
 //! fresh directory under the workspace's `target/`.
 //!
+//! With `INCR_MEMO_STALL_CYCLE` set, the timed groups are skipped and each
+//! backend instead runs one chain cycle, `MAX_CHAIN_DEPTH` delta
+//! checkpoints and the compaction after them, printing per checkpoint its
+//! kind, step times and `VmRSS`, then the delta, compaction and amortized
+//! times (the cycle's total over its checkpoints) and `VmHWM`.
+//! `INCR_MEMO_STALL_CHECKPOINTS` sets the checkpoints run (default one
+//! cycle). A memo of 600000 entries with 6000 dirty:
+//! `INCR_MEMO_STALL_BYTES=600000000 INCR_MEMO_STALL_DIRTY=6000 INCR_MEMO_STALL_CYCLE=1
+//! cargo bench -p incr-persist --bench memo_stall`.
+//!
 //! A small run that checks the bench works:
 //! `INCR_MEMO_STALL_BYTES=4194304 cargo bench -p incr-persist --bench memo_stall -- --quick`.
 
@@ -24,12 +34,27 @@ use std::time::{Duration, Instant};
 use common::{bench_dir, BenchCells};
 use criterion::{criterion_group, criterion_main, Criterion};
 use incr_persist::memo::{
-    BuildId, CheckpointTimes, FileMemo, Memo, MemoBackend, MemoBuilder, MemoOptions, MemoTable,
+    BuildId, CheckpointStats, CheckpointTimes, FileMemo, Memo, MemoBackend, MemoBuilder,
+    MemoOptions, MemoTable,
 };
 use incr_persist::{Input, Local, MemoryBackend, Options, Store};
 use tempfile::TempDir;
 
 const BUILD: u128 = 0x57a11;
+
+fn proc_status_kib(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with(field))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn proc_io_mib(field: &str) -> u64 {
+    let io = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+    let line = io.lines().find(|l| l.starts_with(field));
+    line.and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .unwrap_or(0)
+        >> 20
+}
 
 fn env_or(name: &str, default: u64) -> u64 {
     match std::env::var(name) {
@@ -119,6 +144,11 @@ impl<C: BenchCells> Filled<C> {
 
     /// Dirties the first `dirty` entries, then checkpoints.
     fn checkpoint(&self) -> (CheckpointTimes, Duration) {
+        let (stats, total) = self.checkpoint_stats();
+        (stats.times, total)
+    }
+
+    fn checkpoint_stats(&self) -> (CheckpointStats, Duration) {
         let next = self.store.runtime().get(self.epoch.handle()) + 1;
         self.store.set(self.epoch, next).unwrap();
         for k in 0..self.sizes.dirty {
@@ -128,8 +158,8 @@ impl<C: BenchCells> Filled<C> {
         let stats = self.memo.checkpoint().unwrap();
         let total = started.elapsed();
         assert_eq!(stats.evicted, 0);
-        assert_eq!(stats.written as u32, self.sizes.entries);
-        (stats.times, total)
+        shape::assert_written(&stats, self.sizes.entries, self.sizes.dirty);
+        (stats, total)
     }
 }
 
@@ -166,6 +196,9 @@ fn stall<C: BenchCells>(
     name: &str,
     backend: fn(&TempDir) -> Box<dyn MemoBackendBox<C>>,
 ) {
+    if std::env::var_os("INCR_MEMO_STALL_CYCLE").is_some() {
+        return;
+    }
     let filled = Filled::<C>::open(backend);
     let mut group = c.benchmark_group(format!("memo_stall_{name}{}", C::SUFFIX));
     group.sample_size(10);
@@ -184,17 +217,107 @@ fn stall<C: BenchCells>(
     group.finish();
 }
 
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
+
+fn median(mut v: Vec<Duration>) -> Duration {
+    v.sort();
+    v[v.len() / 2]
+}
+
+fn cycle<C: BenchCells>(name: &str, backend: fn(&TempDir) -> Box<dyn MemoBackendBox<C>>) {
+    if std::env::var_os("INCR_MEMO_STALL_CYCLE").is_none() {
+        return;
+    }
+    let checkpoints = env_or("INCR_MEMO_STALL_CHECKPOINTS", shape::CYCLE as u64);
+    let filled = Filled::<C>::open(backend);
+    let rss_before = proc_status_kib("VmRSS:").unwrap_or(0);
+    eprintln!(
+        "memo_stall_{name}{}: VmRSS before {rss_before} KiB",
+        C::SUFFIX
+    );
+    let (mut deltas, mut fulls, mut all) = (Vec::new(), Vec::new(), Duration::ZERO);
+    for n in 1..=checkpoints {
+        let (stats, total) = filled.checkpoint_stats();
+        let kind = shape::kind(&stats);
+        eprintln!(
+            "memo_stall_{name}{}: #{n} {kind} total {:.1} ms (snapshot {:.1}, merge {:.1}, write {:.1}) VmRSS {} KiB, read {} MiB, written {} MiB",
+            C::SUFFIX,
+            ms(total),
+            ms(stats.times.snapshot),
+            ms(stats.times.merge),
+            ms(stats.times.write),
+            proc_status_kib("VmRSS:").unwrap_or(0),
+            proc_io_mib("rchar:"),
+            proc_io_mib("wchar:"),
+        );
+        all += total;
+        if shape::is_delta(&stats) {
+            deltas.push(total);
+        } else {
+            fulls.push(total);
+        }
+    }
+    let each = |v: &[Duration]| {
+        if v.is_empty() {
+            "n/a".to_string()
+        } else {
+            format!("{:.1} ms", ms(median(v.to_vec())))
+        }
+    };
+    eprintln!(
+        "memo_stall_{name}{}: delta median {}, full median {}, amortized {:.1} ms over {checkpoints} checkpoints, VmHWM {} KiB, VmRSS after {} KiB",
+        C::SUFFIX,
+        each(&deltas),
+        each(&fulls),
+        ms(all) / checkpoints as f64,
+        proc_status_kib("VmHWM:").unwrap_or(0),
+        proc_status_kib("VmRSS:").unwrap_or(0),
+    );
+}
+
 fn file(c: &mut Criterion) {
-    stall::<Local>(c, "file", |dir| {
-        Box::new(FileMemo::open(dir.path()).unwrap())
-    });
+    let open: fn(&TempDir) -> Box<dyn MemoBackendBox<Local>> =
+        |dir| Box::new(FileMemo::open(dir.path()).unwrap());
+    stall::<Local>(c, "file", open);
+    cycle::<Local>("file", open);
 }
 
 #[cfg(feature = "sqlite")]
 fn sqlite(c: &mut Criterion) {
-    stall::<Local>(c, "sqlite", |dir| {
-        Box::new(incr_persist::memo::SqliteMemo::open(dir.path().join("memo.db")).unwrap())
-    });
+    let open: fn(&TempDir) -> Box<dyn MemoBackendBox<Local>> =
+        |dir| Box::new(incr_persist::memo::SqliteMemo::open(dir.path().join("memo.db")).unwrap());
+    stall::<Local>(c, "sqlite", open);
+    cycle::<Local>("sqlite", open);
+}
+
+/// What a checkpoint's stats say about its shape; the one place the bench
+/// reads the delta fields.
+mod shape {
+    use incr_persist::memo::{CheckpointStats, MAX_CHAIN_DEPTH};
+
+    pub const CYCLE: usize = MAX_CHAIN_DEPTH + 1;
+
+    pub fn is_delta(stats: &CheckpointStats) -> bool {
+        stats.delta
+    }
+
+    pub fn kind(stats: &CheckpointStats) -> &'static str {
+        match (stats.delta, stats.compacted) {
+            (true, _) => "delta",
+            (false, true) => "compaction",
+            (false, false) => "full",
+        }
+    }
+
+    pub fn assert_written(stats: &CheckpointStats, entries: u32, dirty: u32) {
+        if stats.delta {
+            assert_eq!(stats.fresh_written as u32, dirty);
+        } else {
+            assert_eq!(stats.written as u32, entries);
+        }
+    }
 }
 
 #[cfg(feature = "sqlite")]

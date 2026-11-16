@@ -665,3 +665,80 @@ fn a_streamed_full_write_from_the_tip_replaces_the_chain() {
         .unwrap();
     assert_eq!(ids, 1);
 }
+
+#[test]
+fn a_batched_frame_read_goes_by_rowid_and_a_generation_delete_goes_through_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(255))
+        .unwrap();
+    let conn = lock(&memo.reader);
+    let sql = format!("EXPLAIN QUERY PLAN {}", read_entries_sql(READ_BATCH));
+    let mut plan = conn.prepare(&sql).unwrap();
+    let args = (0..=READ_BATCH as i64).map(|n| n.max(1));
+    let details: Vec<String> = plan
+        .query_map(rusqlite::params_from_iter(args), |row| row.get(3))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(
+        details.iter().all(|d| d.contains("INTEGER PRIMARY KEY")),
+        "{details:?}"
+    );
+
+    let mut plan = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", delete_generations_sql(2)))
+        .unwrap();
+    let details: Vec<String> = plan
+        .query_map([1, 2], |row| row.get(3))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(
+        details.iter().all(|d| d.contains("memo_entry_index")),
+        "{details:?}"
+    );
+}
+
+fn row_count(memo: &SqliteMemo) -> i64 {
+    lock(&memo.writer)
+        .query_row("SELECT count(*) FROM memo_entry", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn superseded_chain(memo: &SqliteMemo) -> [GenId; 2] {
+    memo.write_generation(None, GenId(1), &header(1), &encoded(100))
+        .unwrap();
+    memo.write_generation(Some(GenId(1)), GenId(2), &header(2), &encoded(100))
+        .unwrap();
+    memo.write_generation(Some(GenId(2)), GenId(3), &header(3), &encoded(100))
+        .unwrap();
+    [GenId(1), GenId(2)]
+}
+
+#[test]
+fn several_superseded_generations_are_removed_together_and_the_current_one_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
+    let old = superseded_chain(&memo);
+    remove_in_one(&mut lock(&memo.writer), &old).unwrap();
+    assert_eq!(row_count(&memo), 100);
+    assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
+    assert_eq!(memo.remove_generations(&[GenId(3)]), vec![GenId(3)]);
+    assert!(memo.remove_generations(&old).is_empty());
+}
+
+#[test]
+fn a_chain_left_by_a_crash_before_its_removal_is_finished_by_the_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memo.db");
+    {
+        let memo = SqliteMemo::open(&path).unwrap();
+        superseded_chain(&memo);
+        assert_eq!(row_count(&memo), 300);
+    }
+    let memo = SqliteMemo::open(&path).unwrap();
+    drop(memo.lock_checkpoint().unwrap());
+    assert_eq!(row_count(&memo), 100);
+    assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
+}
