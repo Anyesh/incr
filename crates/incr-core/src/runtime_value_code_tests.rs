@@ -786,6 +786,9 @@ fn collection_paths<C: Cells>() -> Vec<Path<C>> {
         ("snapshot_len", |_, f| {
             f.c.snapshot_len();
         }),
+        ("snapshot_values", |_, f| {
+            f.c.snapshot_values();
+        }),
         ("filter", |rt, f| {
             f.c.filter(rt, |_| true);
         }),
