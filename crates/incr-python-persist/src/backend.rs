@@ -7,11 +7,24 @@
 //! list of `(position, record)` or `("compacted", snapshot_position)`,
 //! `load_snapshot() -> (position, records) | None`,
 //! `snapshot_id() -> (position, generation) | None`,
-//! `compact(upto, records)` and `writable() -> bool`, and optionally
-//! `append_at(after, records) -> int`, which appends only while the tail
-//! is `after` and otherwise raises `incr.persist.TailMoved`, writing
-//! nothing; `store.batch(apply="on_write")` needs it. A raised exception
-//! fails the store call it happened in and reaches the caller as itself,
+//! `compact(upto, records)` and `writable() -> bool`, and optionally:
+//!
+//! - `append_at(after, records) -> int`, which appends only while the tail
+//!   is `after` and otherwise raises `incr.persist.TailMoved`, writing
+//!   nothing; `store.batch(apply="on_write")` needs it.
+//! - `compact_streamed(upto, records)`, `compact` with `records` a lazy
+//!   iterator of `bytes`, so a checkpoint never builds one list of every
+//!   record. Pull `records` on the calling thread, during the call: it is
+//!   invalid once the call returns, and a call that returns without
+//!   exhausting it (reading until `StopIteration`) fails the checkpoint
+//!   with `PersistError` and poisons the store. A pull that raises means
+//!   the compaction must be abandoned with nothing stored: let the
+//!   exception propagate and incr reports the pull's own failure. A call
+//!   that returns normally after a pull raised is treated as having stored
+//!   a truncated snapshot: the checkpoint raises (a codec's own exception
+//!   when a codec raised, else `PersistError`) and the store is poisoned.
+//!
+//! A raised exception fails the store call it happened in and reaches the caller as itself,
 //! except that `incr.persist.ReadOnly` (a write on a read-only handle),
 //! `InvalidCompaction(upto, snapshot_at, tail)` (a `compact` outside the
 //! snapshot and the tail) and `TailMoved` from `append_at` are the store's
@@ -23,6 +36,7 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::panic;
 
 use incr_persist::{
     Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId,
@@ -32,6 +46,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 
+use crate::lent::{self, Failure, Lending, Names};
 use crate::PersistExceptions;
 
 /// A Python exception a backend method raised, carried through
@@ -105,6 +120,7 @@ pub fn bad_return<E: PersistExceptions>(what: &str) -> Error {
 pub struct PyBackend<E> {
     backend: Py<PyAny>,
     has_append_at: bool,
+    streams: bool,
     exceptions: PhantomData<fn() -> E>,
 }
 
@@ -113,9 +129,11 @@ impl<E: PersistExceptions> PyBackend<E> {
     /// other than `AttributeError`.
     pub fn new(py: Python<'_>, backend: Py<PyAny>) -> PyResult<Self> {
         let has_append_at = backend.bind(py).hasattr(intern!(py, "append_at"))?;
+        let streams = backend.bind(py).hasattr(intern!(py, "compact_streamed"))?;
         Ok(PyBackend {
             backend,
             has_append_at,
+            streams,
             exceptions: PhantomData,
         })
     }
@@ -247,6 +265,35 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
         })
     }
 
+    fn compact_streamed(
+        &self,
+        upto: Position,
+        records: &mut dyn Iterator<Item = Result<Record>>,
+    ) -> Result<()> {
+        if !self.streams {
+            let folded = records.collect::<Result<Vec<_>>>()?;
+            return self.compact(upto, folded);
+        }
+        Python::attach(|py| {
+            let lent = Lent::new(py, records).map_err(raised::<E>)?;
+            let result = self.call(
+                py,
+                intern!(py, "compact_streamed"),
+                (upto.0, lent.records.clone_ref(py)),
+            );
+            let records = lent.end(py);
+            match (records.get().lending.failure(), result) {
+                (Some(Failure::Panic(payload)), _) => panic::resume_unwind(payload),
+                (Some(Failure::Error(error)), Err(_)) => Err(error),
+                // A call that returns normally after a failed pull may have
+                // committed what it pulled; the store poisons on this `Ok`
+                // when its fold failed.
+                (Some(Failure::Error(_)), Ok(_)) => Ok(()),
+                (None, result) => result.map(drop),
+            }
+        })
+    }
+
     fn writable(&self) -> bool {
         Python::attach(|py| {
             self.call(py, intern!(py, "writable"), ())
@@ -290,5 +337,66 @@ fn compacted<E: PersistExceptions>(tuple: &Bound<'_, PyTuple>) -> Result<Option<
             position::<E>(&tuple.get_item(1).map_err(raised::<E>)?, "read_from").map(Some)
         }
         _ => Ok(None),
+    }
+}
+
+type Pulls<'a> = lent::Pulls<'a, Record>;
+
+const RECORDS: Names = Names {
+    items: "compaction records",
+    call: "compact_streamed",
+    source: "compaction record source",
+};
+
+/// The lazy `records` iterator a streamed compaction hands its backend:
+/// it pulls the store's own iterator and encodes each record as `compact`'s
+/// list does, and is invalid once the call returns.
+#[pyclass(name = "CompactionRecords", module = "incr_python_persist", frozen)]
+pub struct Records {
+    lending: Lending<Record>,
+}
+
+#[pymethods]
+impl Records {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
+        match self.lending.pull()? {
+            Some(record) => match record.encode() {
+                Ok(bytes) => Ok(Some(PyBytes::new(py, &bytes).unbind())),
+                Err(error) => Err(self.lending.fail(error)),
+            },
+            None => Ok(None),
+        }
+    }
+}
+
+struct Lent {
+    records: Py<Records>,
+}
+
+impl Lent {
+    fn new(py: Python<'_>, records: &mut Pulls<'_>) -> PyResult<Self> {
+        let lending = Lending::new(records, RECORDS);
+        Ok(Lent {
+            records: Py::new(py, Records { lending })?,
+        })
+    }
+
+    fn end(self, py: Python<'_>) -> Bound<'_, Records> {
+        self.invalidate(py);
+        self.records.bind(py).clone()
+    }
+
+    fn invalidate(&self, py: Python<'_>) {
+        self.records.bind(py).get().lending.invalidate();
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        Python::attach(|py| self.invalidate(py));
     }
 }

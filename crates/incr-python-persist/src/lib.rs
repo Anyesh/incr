@@ -14,6 +14,7 @@ pub mod codec;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod keyed;
+mod lent;
 pub mod memo;
 pub mod memo_backend;
 mod memory;
