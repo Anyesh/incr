@@ -44,7 +44,8 @@ pub struct CheckpointStats {
     pub unkept: usize,
     /// Base entries carried into the new generation before eviction.
     pub merged: usize,
-    /// Base frames that failed to decode or did not match their index item.
+    /// Base frames that failed to decode, did not match their index item,
+    /// or that the backend no longer returned.
     pub corrupt: usize,
     /// Entries dropped to fit `max_bytes`.
     pub evicted: usize,
@@ -141,12 +142,13 @@ pub struct Checkpointed {
 /// descriptor is dropped; a stored table with no live namesake is carried
 /// over, appended to the catalog.
 ///
+/// A chain frame the backend no longer returns is skipped like a damaged
+/// one, so a lost entry costs only itself.
+///
 /// Fails with [`Error::Busy`](crate::Error::Busy) when another handle holds
-/// the lock, changed the chain meanwhile or removed a layer the write was
-/// carrying entries from, and with
+/// the lock or changed the chain meanwhile, and with
 /// [`Error::Corrupt`](crate::Error::Corrupt) when the tip's id is
-/// `u64::MAX` or a frame the current chain lists is missing; nothing is
-/// written then.
+/// `u64::MAX`; nothing is written then.
 pub fn write_checkpoint<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
@@ -653,8 +655,7 @@ fn write_full<B: MemoBackend + ?Sized>(
     let (mut copier, mode) = if two_pass {
         let stored = match probes.summary().filter(|_| !remap) {
             Some(base) => scan_summary(base, &fresh, &contested),
-            None => scan(&source, &fresh, &contested, &mut stats)
-                .map_err(|e| frame_lost(backend, chain, e))?,
+            None => scan(&source, &fresh, &contested, &mut stats)?,
         };
         stats.merged = stored.len();
         let bound = Bound {
@@ -691,9 +692,7 @@ fn write_full<B: MemoBackend + ?Sized>(
         .map(|chain| chain.layers().iter().map(|layer| layer.id()).collect())
         .unwrap_or_default();
     let tip = chain.map(|chain| chain.tip().id());
-    let generation = backend
-        .write_generation_streamed(tip, next.id, &header, &mut copier)
-        .map_err(|e| frame_lost(backend, chain, e))?;
+    let generation = backend.write_generation_streamed(tip, next.id, &header, &mut copier)?;
     stats.corrupt += copier.corrupt;
     stats.oversized += copier.oversized;
     if !two_pass {
@@ -717,21 +716,6 @@ fn write_full<B: MemoBackend + ?Sized>(
         evicted_base,
         mode,
     })
-}
-
-/// `error`, or [`Error::Corrupt`] in place of a [`Error::Busy`] while
-/// `chain` is still current: a frame it lists is missing, so the backend
-/// lost it and a retry would fail the same way.
-fn frame_lost<B: MemoBackend + ?Sized>(backend: &B, chain: Option<&Chain>, error: Error) -> Error {
-    let (Error::Busy, Some(chain)) = (&error, chain) else {
-        return error;
-    };
-    match backend.load_chain(chain.layers()) {
-        Ok(Some(now)) if now.tip().id() == chain.tip().id() => {
-            Error::Corrupt("a frame of the current memo chain is missing")
-        }
-        _ => error,
-    }
 }
 
 /// When a two-pass write evicts: once its entries sum to more than
@@ -931,8 +915,9 @@ impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Source
     }
 }
 
-/// Items read from one layer, the layer's index first, each with its frame.
-type Batch = (usize, Vec<(IndexItem, Vec<u8>)>);
+/// Items read from one layer, the layer's index first, each with its frame
+/// or `None` when the backend no longer has it.
+type Batch = (usize, Vec<(IndexItem, Option<Vec<u8>>)>);
 
 /// The contested `(table, key_hash)` and the keys already carried or fresh
 /// among them.
@@ -977,9 +962,7 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
     }
 
     /// The next batch of `(item, frame)` with the layer they are from, or
-    /// `None` at the end. Fails with [`Error::Busy`] once a layer is gone,
-    /// as when another handle removed the chain, so that no write carries
-    /// only part of it.
+    /// `None` at the end.
     fn next_batch(&mut self) -> Result<Option<Batch>> {
         loop {
             let Some((at, items)) = self.current.as_mut() else {
@@ -1013,12 +996,7 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
                     "a memo backend returned another number of frames than it was asked for",
                 ));
             }
-            let out = batch
-                .into_iter()
-                .zip(frames)
-                .map(|(item, frame)| frame.map(|frame| (item, frame)).ok_or(Error::Busy))
-                .collect::<Result<_>>()?;
-            return Ok(Some((at, out)));
+            return Ok(Some((at, batch.into_iter().zip(frames).collect())));
         }
     }
 
@@ -1097,6 +1075,11 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>
         let source = self.walk.source;
         for (item, frame) in batch {
             let table = self.walk.table(at, &item).expect("walked items survive");
+            let Some(frame) = frame else {
+                self.corrupt += 1;
+                self.walk.hide(table, item.key_hash);
+                continue;
+            };
             let contested = self
                 .dedup
                 .as_ref()
@@ -1199,6 +1182,11 @@ fn scan<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>(
         let layer = &source.layers[at];
         for (item, frame) in batch {
             let table = walk.table(at, &item).expect("walked items survive");
+            let Some(frame) = frame else {
+                stats.corrupt += 1;
+                walk.hide(table, item.key_hash);
+                continue;
+            };
             let stored =
                 decode_stored(&frame, layer, &item, &source.remaps[at], &mut stats.corrupt);
             let entry = match stored {

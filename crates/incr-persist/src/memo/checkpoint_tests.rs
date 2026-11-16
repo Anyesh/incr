@@ -1408,7 +1408,7 @@ fn a_dep_held_at_its_fp_keeps_its_reader_when_its_fresh_rewrite_is_not_kept() {
 }
 
 #[test]
-fn a_frame_gone_mid_stream_fails_the_checkpoint_and_publishes_nothing() {
+fn a_frame_gone_mid_stream_is_skipped_and_the_rest_carried() {
     let tables = vec![desc("a", 1)];
     for evicting in [false, true] {
         let memo = Counting::new(MemoryMemo::without_deltas(), true);
@@ -1420,14 +1420,14 @@ fn a_frame_gone_mid_stream_fails_the_checkpoint_and_publishes_nothing() {
             next.max_bytes = base.generation.entry_bytes();
         }
         memo.reset();
-        let result = write_known(&memo, next, base.chain.layers());
-        assert!(
-            matches!(result, Err(Error::Corrupt(_))),
-            "evicting {evicting}: {result:?}"
-        );
+        let done = write_known(&memo, next, base.chain.layers()).unwrap();
         assert!(memo.reads.load(SeqCst) > 0);
-        let current = memo.load().unwrap().unwrap();
-        assert_eq!(current.id(), base.generation.id());
-        assert_eq!(current.items().len(), 400);
+        assert_eq!(done.stats.corrupt, 1, "evicting {evicting}");
+        *memo.dropping.lock().unwrap() = None;
+        let all = visible(&memo.memo);
+        assert!(all.iter().all(|e| key_hash(&e.key) != gone.key_hash));
+        let kept = done.stats.written + done.stats.evicted + 1;
+        assert_eq!(kept, 410, "evicting {evicting}");
+        assert_eq!(all.len(), done.stats.written, "evicting {evicting}");
     }
 }
