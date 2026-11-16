@@ -103,6 +103,20 @@ impl<C: Cells> Runtime<C> {
             .filter(|info| info.generation == generation)
     }
 
+    /// `handle`'s stamps, or zeros, which no kept payload matches, for a
+    /// handle of another runtime or past this one's slots, which `get`
+    /// refuses or reads as a placeholder.
+    pub(crate) fn handle_stamps<T: Value>(&self, handle: Incr<T>) -> StampPair {
+        if handle.runtime_id() == self.runtime_id && handle.slot() < self.nodes.len() {
+            self.stamp_pair(handle.slot())
+        } else {
+            StampPair {
+                verified_at: 0,
+                changed_at: 0,
+            }
+        }
+    }
+
     pub(crate) fn stamp_pair(&self, slot: u32) -> StampPair {
         let node = self.nodes.get(slot);
         StampPair {
@@ -115,7 +129,8 @@ impl<C: Cells> Runtime<C> {
     /// `stamps`. Called under the inner write lock, which a delete holds
     /// while it bumps the generation.
     fn still_at(&self, capture: &TraceCapture, stamps: StampPair) -> bool {
-        self.nodes.get(capture.slot).generation() == capture.generation
+        capture.slot < self.nodes.len()
+            && self.nodes.get(capture.slot).generation() == capture.generation
             && self.stamp_pair(capture.slot) == stamps
     }
 }

@@ -4046,12 +4046,11 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let disarm = Disarm(self);
-        self.check_handle(handle);
         let before = {
             let mut inner = self.inner.write();
             inner.trace_log.clear();
             inner.trace_root = Some((handle.slot(), Default::default()));
-            self.stamp_pair(handle.slot())
+            self.handle_stamps(handle)
         };
         self.instrument_state.write().trace_times.clear();
 
