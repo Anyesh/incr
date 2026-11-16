@@ -3326,10 +3326,11 @@ impl<C: Cells> Runtime<C> {
                     "incr-core: group verify re-lands member {m} over an empty slot"
                 );
                 node.max_verified_at(verify_rev);
+                let stamps = self.verify_stamps(NodeId(m));
                 let landed = self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty);
                 self.end_reservation_landed(NodeId(m), node, landed);
                 if landed == NodeState::Clean {
-                    self.record_trace(NodeId(m), crate::trace::TraceAction::VerifiedClean);
+                    self.record_verified(NodeId(m), stamps);
                 }
             }
             return GroupEnd::Done(Computed::Done);

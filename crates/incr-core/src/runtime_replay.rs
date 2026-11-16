@@ -927,10 +927,11 @@ impl<C: Cells> Runtime<C> {
                     .verify_rev
                     .min(C::walked(&self.walk, &self.revision)),
             );
+            let stamps = self.verify_stamps(a.id);
             let landed = self.land_single(a.id, node, flags, NodeState::Clean, NodeState::Dirty);
             self.end_reservation_landed(a.id, node, landed);
             if landed == NodeState::Clean {
-                self.record_trace(a.id, crate::trace::TraceAction::VerifiedClean);
+                self.record_verified(a.id, stamps);
             }
             return Landing::Landed(landed);
         }

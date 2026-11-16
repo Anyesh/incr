@@ -2009,7 +2009,24 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     fn record_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
         if self.instrumented() {
-            self.push_trace(id, action);
+            self.push_trace(id, action, None);
+        }
+    }
+
+    /// The stamps a verify left on `id`, read before it lands, while its
+    /// claim keeps other runs off, for [`Self::record_verified`]. `None`
+    /// with tracing and stats off.
+    #[inline(always)]
+    pub(crate) fn verify_stamps(&self, id: NodeId) -> Option<crate::trace::StampPair> {
+        self.instrumented().then(|| self.stamp_pair(id.0))
+    }
+
+    /// Records a verify that landed `id` Clean, with the stamps
+    /// [`Self::verify_stamps`] read before the landing.
+    #[inline(always)]
+    pub(crate) fn record_verified(&self, id: NodeId, stamps: Option<crate::trace::StampPair>) {
+        if self.instrumented() {
+            self.push_trace(id, crate::trace::TraceAction::VerifiedClean, stamps);
         }
     }
 
@@ -2051,7 +2068,12 @@ impl<C: Cells> Runtime<C> {
 
     #[cold]
     #[inline(never)]
-    fn push_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
+    fn push_trace(
+        &self,
+        id: NodeId,
+        action: crate::trace::TraceAction,
+        stamps: Option<crate::trace::StampPair>,
+    ) {
         let action = if !C::SINGLE_THREADED && hold::active() {
             match hold::defer_trace(
                 state::cell_key::<C>(self.nodes.get(id.0).state_cell()),
@@ -2063,10 +2085,17 @@ impl<C: Cells> Runtime<C> {
         } else {
             action
         };
-        self.push_trace_now(id, action);
+        self.push_trace_now(id, action, stamps);
     }
 
-    fn push_trace_now(&self, id: NodeId, action: crate::trace::TraceAction) {
+    /// `stamps` are the root's when read under its claim; `None` reads
+    /// them now, which only a caller that still holds the claim may do.
+    fn push_trace_now(
+        &self,
+        id: NodeId,
+        action: crate::trace::TraceAction,
+        stamps: Option<crate::trace::StampPair>,
+    ) {
         let flags = C::u8_load_relaxed(&self.instrument);
         if flags & crate::instrument::STATS != 0 {
             self.instrument_state
@@ -2079,7 +2108,7 @@ impl<C: Cells> Runtime<C> {
         if flags & crate::instrument::TRACE != 0 {
             let mut inner = self.inner.write();
             if let Some((_, root)) = inner.trace_root.as_mut().filter(|(slot, _)| *slot == id.0) {
-                root.see(&action, self.stamp_pair(id.0));
+                root.see(&action, stamps.unwrap_or_else(|| self.stamp_pair(id.0)));
             }
             inner.trace_log.push(crate::trace::NodeTrace {
                 id,
@@ -6436,11 +6465,12 @@ impl<C: Cells> Runtime<C> {
                         );
                     }
                     node.max_verified_at(verify_rev);
+                    let stamps = self.verify_stamps(id);
                     let landed =
                         self.land_single(id, node, flags, NodeState::Clean, NodeState::Dirty);
                     self.end_reservation_landed(id, node, landed);
                     if landed == NodeState::Clean {
-                        self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
+                        self.record_verified(id, stamps);
                     } else {
                         self.poison_reader(walked, cycle::POISONED);
                     }
