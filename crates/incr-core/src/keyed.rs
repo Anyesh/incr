@@ -1079,18 +1079,18 @@ where
 /// under the write lock, which no commit can interleave with.
 const OPTIMISTIC_REGISTRATIONS: usize = 3;
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 thread_local! {
     static AFTER_OPTIMISTIC_BUILD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 fn set_after_optimistic_build(hook: Option<Box<dyn FnMut()>>) {
     AFTER_OPTIMISTIC_BUILD.with(|slot| *slot.borrow_mut() = hook);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 fn after_optimistic_build() {
     let mut hook = AFTER_OPTIMISTIC_BUILD.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook.as_mut() {
@@ -1706,7 +1706,7 @@ where
                 });
                 (epoch, state)
             };
-            #[cfg(test)]
+            #[cfg(all(test, not(loom)))]
             after_optimistic_build();
             let mut table = self.index.table.write();
             if C::u64_load_relaxed(&self.index.epoch) == epoch {
