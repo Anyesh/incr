@@ -3855,6 +3855,40 @@ fn loom_keyed_get_partition_creates_its_input_against_an_insert() {
     });
 }
 
+/// A writer empties a partition and refills it with another key while a
+/// query reads the partition: the record is dropped and recreated, and the
+/// query still ends on the refilled partition.
+#[test]
+fn loom_keyed_a_partition_emptied_and_refilled_reaches_its_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let keyed = Arc::new(Keyed::new(&rt));
+        let parts = keyed.key_partitions(|key: &u64| key % 2);
+        keyed.upsert(&rt, 2, 10);
+        let reading = Arc::clone(&keyed);
+        let reader = rt.create_query(move |rt: &Rt| {
+            let mut keys = reading.get_partition(rt, &parts, &0);
+            keys.sort_unstable();
+            keys
+        });
+        let writer = {
+            let (rt, keyed) = (Arc::clone(&rt), Arc::clone(&keyed));
+            thread::spawn(move || {
+                keyed.remove(&rt, &2);
+                keyed.upsert(&rt, 4, 20);
+            })
+        };
+        let read = rt.get(reader);
+        assert!(
+            read == vec![2] || read.is_empty() || read == vec![4],
+            "read {read:?}"
+        );
+        writer.join().unwrap();
+        assert_eq!(rt.get(reader), vec![4]);
+        assert_eq!(keyed.partition_records(&parts), 1);
+    });
+}
+
 /// Two writers replace one key's row while a query reads it through
 /// `get_key`: after both, the query reads the row the key holds.
 #[test]

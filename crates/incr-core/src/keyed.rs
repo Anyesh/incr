@@ -236,6 +236,9 @@ enum Slot<P, R> {
     Full(Bucket<P, R>),
 }
 
+/// (partitioning, partition hash) pairs.
+type PartSlots = Vec<(usize, u64)>;
+
 /// The table behind a [`KeyIndex`]: one bucket per key, found by the key's
 /// hash, holding that key's pairs with their ranks. Open addressing with
 /// stored hashes, as `HashedMultiset`: only a lookup runs user code, only
@@ -273,21 +276,23 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     }
 
     /// Applies the plans made against this table, running no user code,
-    /// and returns the (partitioning, partition hash) pairs they touch.
+    /// and returns the (partitioning, partition hash) pairs they touch and
+    /// those left with no record.
     fn apply_parts(
         &mut self,
         plans: Vec<Box<dyn Any + Send>>,
         gone: &mut Vec<P>,
-    ) -> Vec<(usize, u64)> {
+    ) -> (PartSlots, PartSlots) {
         if self.parts.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut touched = Vec::new();
+        let mut emptied = Vec::new();
         for (sink, (at, plan)) in self.parts.iter_mut().zip(plans.into_iter().enumerate()) {
             touched.extend(sink.touched(&*plan).into_iter().map(|hash| (at, hash)));
-            sink.apply(plan, gone);
+            emptied.extend(sink.apply(plan, gone).into_iter().map(|hash| (at, hash)));
         }
-        touched
+        (touched, emptied)
     }
 
     fn heap_bytes(&self) -> usize {
@@ -494,8 +499,9 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
 
 /// A keyed collection's key index: its [`KeyTable`] under a
 /// [`LockKind::KeyIndex`] lock, an epoch that starts at 1 and advances on
-/// every write that changes the table, and the table's pair count and
-/// bytes as of the last such write, readable without the lock.
+/// every write that changes the table and every partitioning registered, and
+/// the table's pair count and bytes as of the last such write, readable
+/// without the lock.
 pub struct KeyIndex<P: 'static, R: 'static, C: Cells> {
     table: OrderedLock<KeyTable<P, R>, C>,
     hasher: RandomState,
@@ -1405,7 +1411,7 @@ where
             let committed = log.apply_batch(batch, false, sink);
             let dropped = table.commit(&mut stage);
             let mut gone = Vec::new();
-            let touched = table.apply_parts(plans, &mut gone);
+            let (touched, emptied) = table.apply_parts(plans, &mut gone);
             let epoch = stage.epoch + 1;
             C::u64_store_release(&index.epoch, epoch);
             index.settle(&table);
@@ -1438,6 +1444,7 @@ where
                 rt.route_queued();
             }
             self.reclaim(rt, &hashes, keep);
+            self.reclaim_partitions(rt, &emptied);
             return outcome;
         }
     }
@@ -1503,6 +1510,42 @@ where
         match keep {
             Some(keep) => keep.keys.extend(keys),
             None => drop(keys),
+        }
+    }
+
+    /// Under `Local`, deletes the input of each partition in `emptied` that
+    /// no query depends on; a later read of the partition creates it again.
+    /// Under `Shared` it frees nothing, since a reader may still hold the
+    /// handle.
+    fn reclaim_partitions(&self, rt: &Runtime<C>, emptied: &[(usize, u64)]) {
+        if !C::SINGLE_THREADED
+            || emptied.is_empty()
+            || C::u64_load_acquire(&self.versions.partition_live) == 0
+        {
+            return;
+        }
+        let candidates: Vec<((usize, u64), Incr<u64>)> = {
+            let inputs = self.versions.partition_inputs.read();
+            emptied
+                .iter()
+                .filter_map(|slot| inputs.get(slot).map(|handle| (*slot, *handle)))
+                .collect()
+        };
+        let mut freed = Vec::new();
+        for (slot, handle) in candidates {
+            match rt.try_delete_node(handle) {
+                Ok(()) | Err(DeleteError::NotAlive) => freed.push(slot),
+                Err(DeleteError::HasDependents) => {}
+            }
+        }
+        if freed.is_empty() {
+            return;
+        }
+        let mut inputs = self.versions.partition_inputs.write();
+        for slot in freed {
+            if inputs.remove(&slot).is_some() {
+                C::u64_fetch_add(&self.versions.partition_live, u64::MAX);
+            }
         }
     }
 
@@ -1739,6 +1782,11 @@ where
     /// such read, so the query reruns when a write inserts or removes a key
     /// of the partition and not for any other change. Outside one it reads
     /// the partition and creates nothing.
+    ///
+    /// A partition record exists only while the partition holds a key. Under
+    /// `Local` a write that empties a partition also deletes its input when
+    /// no query depends on it; under `Shared` the input stays, as version
+    /// inputs do, and a later insert still bumps it.
     pub fn get_partition<Q>(&self, rt: &Runtime<C>, parts: &KeyPartitions<Q>, q: &Q) -> Vec<K>
     where
         Q: Value + Hash + Eq,
@@ -1777,6 +1825,17 @@ where
                 .expect("incr-core: a KeyPartitions belongs to its collection")
                 .keys_of(q)
         })
+    }
+
+    /// How many partition records `parts` holds: one per partition that has
+    /// a key.
+    pub fn partition_records<Q>(&self, parts: &KeyPartitions<Q>) -> usize {
+        self.index.table.read().parts[parts.sink].records()
+    }
+
+    /// How many partition inputs reads created and nothing freed yet.
+    pub fn partition_input_count(&self) -> usize {
+        C::u64_load_acquire(&self.versions.partition_live) as usize
     }
 
     /// Whether a partitioning is registered.
