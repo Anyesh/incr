@@ -461,7 +461,7 @@
     "signature": "(self, /, node)"
    },
    "get_by_id": {
-    "doc": "`get` for the node a `graph_snapshot` entry names by its `\"id\"` and\n`\"generation\"`. Raises `StaleNodeError` if no live node has both:\nthe node was deleted, its slot was reused, or the id is out of\nrange. A cycle that leaves the node without a value gives `None`; a\ncompute that raises re-raises here.",
+    "doc": "`get` for the node a `graph_snapshot` entry names by its `\"id\"` and\n`\"generation\"`, recomputing it as `get` does when it is not Clean.\nRaises `StaleNodeError` if no live node has both:\nthe node was deleted, its slot was reused, or the id is out of\nrange. A cycle that leaves the node without a value gives `None`; a\ncompute that raises re-raises here.",
     "kind": "method_descriptor",
     "signature": "(self, /, id, generation)"
    },
@@ -476,7 +476,7 @@
     "signature": "(self, /, node)"
    },
    "get_traced_by_id": {
-    "doc": "`get_traced` for the node a `graph_snapshot` entry names by its\n`\"id\"` and `\"generation\"`; raises `StaleNodeError` like\n`get_by_id`. A cycle raises `CycleError`, as `get_traced` does.",
+    "doc": "`get_traced` for the node a `graph_snapshot` entry names by its\n`\"id\"` and `\"generation\"`, recomputing what `get_traced` would;\nraises `StaleNodeError` like `get_by_id`. A cycle raises\n`CycleError`, as `get_traced` does.",
     "kind": "method_descriptor",
     "signature": "(self, /, id, generation)"
    },
@@ -500,6 +500,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /, node)"
    },
+   "last_trace_by_id": {
+    "doc": "`(status, trace)` for the node a `graph_snapshot` entry names by its\n`\"id\"` and `\"generation\"`, without running any compute; `status` as\n`peek_by_id` reports it. Only roots of `get_traced` and\n`get_traced_by_id` have a last trace: `trace` is the object the last\nof those calls that recomputed the node returned, labels and values\nas they were then, while the node stays Clean at that value. A\nlater traced read that finds the node clean keeps it; a plain `get`\nthat verifies the node clean, or any change, makes `trace` `None`\nuntil a traced read recomputes the node. Raises `StaleNodeError`\nlike `get_by_id`, and routes queued `group_by` changes first as\n`peek_by_id` does.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, id, generation)"
+   },
    "memory_stats": {
     "doc": "Memory held by this runtime: `{\"bytes\", \"nodes\", \"py_refs\",\n\"by_kind\", \"by_label\"}`. `bytes` estimates what the engine holds from\nsizes and capacities (node slots, values' own slots, closures' captures,\ndependency lists, labels, collection logs and operator state); the\nPython objects themselves are not in it. `py_refs` counts the\nreferences the engine holds to Python objects: node values,\ncollection elements and logged changes, operator state, keyed\nindexes, and every callable handed to it, but not the engine's own\ncopies of a `window`'s windows. `by_kind` splits nodes into \"input\",\n\"query\" and \"collection\" (a collection's version node), and puts all\ncollection and operator state under \"collection\". `by_label` totals\nlabelled nodes by the label up to its first `/`, with a collection's\nstate under the label of its `version_node`; callables are not\nattributed to labels. Walks the whole graph; nothing is counted\nbetween calls.",
     "kind": "method_descriptor",
@@ -519,6 +524,11 @@
     "doc": "Run candidate changes against the live graph and put it back\nexactly on exit; see `Overlay`.",
     "kind": "method_descriptor",
     "signature": "(self, /)"
+   },
+   "peek_by_id": {
+    "doc": "`(status, value)` for the node a `graph_snapshot` entry names by its\n`\"id\"` and `\"generation\"`, without running any compute: `status` as\n`graph_snapshot(values=True)` reports it, and `value` as stored when\nthe node is Clean and holds a value Python can read, else `None`.\nRaises `StaleNodeError` like `get_by_id`. Like every read, it first\nroutes `group_by` changes still queued, which runs their key\nfunctions and can raise their routing error.",
+    "kind": "method_descriptor",
+    "signature": "(self, /, id, generation)"
    },
    "resolve_lookups": {
     "doc": "Set each lookup to its value, from a mapping or an iterable of\n`(key, value)` pairs, creating the ones not asked for yet. Not\natomic: if a key's `__hash__` or `__eq__` raises, the keys before it\nare set.",
