@@ -2,6 +2,107 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.10] - Unreleased
+
+### Added
+
+- **Python: `kc.forget_key(key)` and `kc.version_input_count()` (R14).** `forget_key` frees a key's version input and returns `True` when no query depends on the key and the key holds no row; on Shared it always returns `False`. Inside a compute it raises `RuntimeError`, like keyed writes, and inside an overlay it raises `RuntimeError` too. Both exist on plain and persisted collections in both packages; core gains `KeyedCollection::forget_key` and `version_input_count`, forwarded by `PersistedKeyed`.
+- **Python: `ctx.keys(kc)` reads the key set with a dependency on it (R15).** It returns a list of keys, and the reader reruns only when a write turns a key from absent to present or back; replacing a row does not rerun it. Core gains `KeyedCollection::get_keys` (and `PersistedKeyed::get_keys`) with `membership_input`, `membership_input_or_create` and `has_membership_input`. A memo entry that reads `ctx.keys`, and its dependents, is not saved and reruns after each restore.
+- **Python: `kc.key_partitions(fn)` and `ctx.keys(parts, p)` (R15b).** `fn` maps a key to a hashable partition, and a reader of partition `p` reruns only when a key enters or leaves it. `fn` must be deterministic and total over every key it was given: it runs on the keys held at registration and on each inserted or removed key, never on a row update, and an exception it raises refuses the write with nothing committed (a persisted batch refuses at block exit). The first parameter of `ctx.keys` is now named `source`; positional use is unchanged. Memo entries that read a partition are not saved, as for `ctx.keys`. Core gains `key_partitions`, `get_partition`, `has_partitions`, `check_partitions` and `KeyPartitions`.
+- **Python: `kc.forget_partition(parts, p)` (R15b).** It frees a partition's input when the partition holds no key and no query depends on it, and returns whether it freed; it raises `ValueError` for partitions of another collection, refuses inside a compute or overlay like `forget_key`, and returns `False` on Shared. Core gains `KeyedCollection::forget_partition`, forwarded by `PersistedKeyed`.
+- **Python: read a node by id and generation (R16).** `rt.get_by_id(id, generation)` and `rt.get_traced_by_id(id, generation)` read a node without recomputing it, and `incr.StaleNodeError` / `incr_concurrent.StaleNodeError` (a `LookupError` subclass) report an id whose generation no longer matches. `graph_snapshot` node dicts gain `"generation"`, and with `values=True` they also carry `"status"` (new, dirty, computing, clean, failed, cyclic) and, for Clean nodes of a readable type, `"value"` as stored; `limit` bounds the values read. A node of an unreadable value type raises `TypeError` from `get_by_id` and has no `"value"` key. Core gains `Runtime::erased_handle_at`.
+- **Memo delta checkpoints (R17).** A checkpoint on `FileMemo`, `SqliteMemo` and the Python `MemoryMemo` appends only what changed since the last one (a delta of fresh entries and tombstones) and compacts the chain into a full generation when it reaches 8 deltas or the deltas grow past a quarter of the base. A delta checkpoint no longer walks the base index, and after damage a checkpoint rewrites only what the damage lost. A reader that predates deltas loads the base only, which is staler but never wrong.
+- **Python memo backends: four optional methods (R17).** `read_entries(generation, items)`, `write_generation_streamed(base, generation, header, frames)`, and the pair `load_chain()` and `write_delta(tip, generation, header, entries, tombstones)`, which enable delta chains only together. Each is detected once at open, and a backend with the original five methods behaves as in beta.9. `frames` is a lazy iterator valid only during the call and on the calling thread. A `load_chain(known)` that takes one positional argument gets a frozenset of generation ids the engine already holds and may return `(generation, None, None)` for them, so a reopened store loads the base once. Python `MemoryMemo` implements all of this on both packages, and both conformance tables gain the streamed case and seven delta cases gated on `supports_delta`.
+- **Python: memo checkpoint and stats fields (R17).** `memo.checkpoint()` and `checkpoint_if_due()` dicts gain `delta`, `fresh_written`, `tombstones`, `bytes_appended`, `chain_depth`, `compacted` and `times` (`{snapshot_ns, merge_ns, write_ns}`); existing keys are unchanged. `memo.stats()` gains `chain_depth`, `chain_bytes`, `delta_checkpoints`, `compactions` and `last_bytes_appended` on both packages.
+- **incr-persist: memo delta API (R17).** `DeltaHeader` (format 4, `DELTA_FORMAT`), `Chain`, `Tombstone`, `IndexItem::tombstone`, `Generation::new_delta`, `MemoBackend::{supports_delta, load_chain, write_delta, write_generation_streamed, read_entries}` (all defaulted, so existing backends compile and behave as before), `Error::Unsupported`, `MemoryMemo::without_deltas()`, and the `Checkpointed` fields `chain` and `superseded` (which replaces `replaced`). A memo written in format 3 is read as before and stays byte-identical when written by a backend that does not opt in.
+
+### Changed
+
+- **Intended change: a store call from value code returns `Error::Reentrant` before the store lock, and a contract panic at a Python boundary prints no panic line (R18).** A `Hash`, `Eq`, `Clone` or `Serialize` method that calls the store before its lock is taken now gets `Error::Reentrant` instead of a panic, as do `Memo::checkpoint` and `Memo::checkpoint_if_due`; `Memo::stats`, `set_external`, `take_encode_mismatches` and `get_or_insert` keep the contract panic. At a Python boundary the contract panic (a non-Clean `rt.get`, a keyed read from a key or row method) still raises `RuntimeError` with the same message but writes nothing to stderr, through a panic hook installed once per module that chains to the previous hook.
+- **Intended change: a snapshot keeps a set whose value equals the default (R19).** A set input whose value equals its declared default now survives a checkpoint and a reopen with a different default; before, the checkpoint forgot it and the input fell back to the new default. A delete still clears the value. A release-build checkpoint no longer decodes an input's value, so it cannot fail there with a decode or type error.
+- **Intended change: memo eviction runs only on compaction, down to 0.9 times `max_bytes`, on delta backends (R17).** A store at its cap writes deltas between compactions and may hold up to `max_bytes` plus its chain until the next compaction; backends without deltas still evict to `max_bytes` on every full write. Among entries with equal last use, which one eviction drops first can differ from beta.9 on those backends.
+- **Intended change: a persisted keyed row replace logs one `Record::Replace` (R15).** A keyed upsert that replaces one held row used to log a `Remove` and an `Insert`; Rust log subscribers now see a `Replace`, and a Python backend's append count for such a write is 1 instead of 2. Replay of `Replace` for keyed keys already worked in beta.9.
+- **Intended change: `get_traced_by_id` raises `CycleError` on a cycle (R16).** `get_by_id` returns `None` for the same node, and the trace entries of `get_traced` do not carry a generation.
+- **Intended change: `version_input_count` is a method only (R14).** Python has no per-collection `stats()`, and `memory_stats` is unchanged.
+- **Intended change: `NodeInfo`, `CheckpointStats` and `MemoStats` gained public fields, so a struct literal of any of them no longer compiles.** `NodeInfo` gains `generation` and `state` (R16); `CheckpointStats` gains `delta`, `fresh_written` (a part of `written`), `tombstones`, `bytes_appended`, `chain_depth` and `compacted`; `MemoStats` gains `chain_depth`, `chain_bytes`, `delta_checkpoints`, `compactions` and `last_bytes_appended` (R17). None is `non_exhaustive`; `MemoStats` `entries` and `bytes` are live totals over the chain.
+- **A SQLite memo that holds deltas cannot be opened by an older incr (R17).** The first delta sets `user_version` 2 and adds `memo_generation.parent` in its own transaction; a database that only had full writes stays at version 1 and reads as before. A handle opened by older code before the first delta loads an empty generation and misses, never a wrong value.
+- **`FileMemo` keeps up to 16 generation files open per reader handle (R17)** where beta.9 kept one, and `write_generation` clones each frame once more than beta.9, a constant factor.
+- **A checkpoint skips a chain frame the backend no longer returns and counts it in `CheckpointStats::corrupt` (R17).** Before, the full write stopped there and published every later entry as lost; a permanently lost frame would otherwise fail every later write.
+- **Non-opting memo backends read each carried entry once at the cap (R17).** Dependency probes are batched through `read_entries` and done once per checkpoint on all backends, and a non-opting backend keeps a per-entry summary (about 56 bytes plus heap per entry) so a checkpoint at `max_bytes` needs no second read pass.
+- **Keyed writes pay two flag loads for the new dependencies (R15).** With no `ctx.keys` reader the keyed write path costs about 15 more instructions per write; Clean `get` is unchanged.
+
+### Fixed
+
+- **Shared, two threads: a read whose cycle walk waited on another thread's claim while that thread re-landed the cycle's group could enter the cycle at a different member than any serial order, and return a cycle strategy's value where serial runs fail with the cycle.** The defect was present since beta.8. A woken walk no longer expands a group record another thread landed at the anchor of a group it already expanded, so it runs that group's externals first, as every serial order does; single-thread behavior and Local are unchanged.
+- **`key_partitions` registration finishes in bounded time under any write rate (R15b).** Registration tries three optimistic builds, then builds once under the table write lock, which blocks commits and index readers for O(keys) with `fn` run once per key. Before this fix, which was found in review before any release, it could retry without bound while Shared commits kept moving the epoch.
+- **`forget_key` inside a first-run compute no longer hangs (R14).** It would delete the compute's own unpublished input; it now refuses while a frame is active.
+- **SQLite memo: batched frame reads no longer scan the generation index, and a replaced chain is removed after the memo lock is released (R17).** With 256 rowids in an `IN` list SQLite chose to scan `memo_entry_index` per batch, quadratic in the generation size (46 GB read at 600,000 entries); reads now use `NOT INDEXED` rowid lookups. Superseded generations are deleted in one transaction through the index, whose contiguous writes sync about as fast as beta.9's delete, through the new defaulted `MemoBackend::remove_generations`; a crash between publish and removal leaves the superseded chain whole, and the next checkpoint that writes removes it.
+- **Partitioning by a moving value no longer grows memory per distinct value (R15b).** A partition record exists only while the partition holds a key, and on Local a write that empties a partition deletes its input when no query depends on it; a later read recreates it. Found in review before any release.
+
+### Figures
+
+Release build on a 12-core Linux box shared with other work, so treat them as orders of magnitude.
+
+- **Clean `get` instruction counts (R14, R15, R15b, R16):** 92 on Local and 190 on Shared, exact against beta.9; table hits 150.14 and 216.14, also unchanged.
+- **Keyed write path with no key-set reader (R15, R15b):** Local +0.28% and Shared +0.40% instructions per write (R15), and Local level and Shared +0.7% with no partitions registered (R15b).
+- **R3 end to end (240,000 keys, Local / Shared):** every step within noise of beta.9 (reconcile 2.07 s / 2.78 s, first read of every memo entry 1.18 s / 2.67 s, reopen store and memo 1.31 s / 1.42 s). The explicit final memo checkpoint is faster (0.02 s against 0.82 s on Local) because automatic checkpoints are now deltas.
+- **R17 memo checkpoints, 600,000 entries of 1,000 bytes, 6,000 dirty, one cycle of 8 deltas and a compaction, each pair run back to back against beta.9:**
+
+  | disk | backend | delta median | compaction | amortized | beta.9 full checkpoint |
+  |---|---|---|---|---|---|
+  | NVMe | file | 64 ms | 1.7 s | 0.25 s | 3.5 s |
+  | NVMe | SQLite | 115 ms | 14.9 s | 1.8 s | 19.2 s |
+  | HDD | file | 261 ms | 8.7 s | 1.3 s | 9.5 s |
+  | HDD | SQLite | 646 ms | 55.5 s | 6.8 s | 58.2 s |
+
+  The memo lock is held 31 to 42 ms per checkpoint at 600,000 entries (snapshot and merge); writing and removing generations run off the lock. Peak resident memory (2.49 GB file, 2.54 GB SQLite) matches beta.9, and the ignored RSS tests (a 1% checkpoint on 500,000 entries stays within 5% of RSS before it, on Local and on the Shared auto-checkpoint thread) pass. The same disk varies 3 to 10 times between windows, so only the pairs are comparable.
+
+### Known limitations
+
+- The known limitations listed under 0.2.0-beta.9 still apply.
+
+**Memo deltas and eviction**
+
+- **Disk use can reach about 3 times the live bytes** between compactions (8 deltas at 25% each), and a store at its cap compacts often, since eviction runs only on compaction.
+- **Stored dependents of a tombstoned (oversized) entry restore revalidated.** They rerun once and survive compaction until rewritten or evicted.
+- **A skipped empty delta still counts in `MemoStats::checkpoints`**, and live stats are approximate under key-hash collisions.
+- **A frame a non-opting backend lost is written, not unkept, when a fresh entry depends on it.** Restore treats that dependency as untrusted, so it is a miss, not a wrong value.
+- **The first checkpoint after a handle opens a non-opting store at the cap reads twice**, as does every checkpoint while two handles alternate writes on one such store, and the per-entry summary adds about 34 MB at 600,000 entries.
+- **A full write probes one unbatched `read_entry` per distinct query dependency of the fresh entries**, where beta.9 got them from its whole-base pass.
+- **A remapped stored entry too large to re-encode is dropped but its stored dependents are not**, and in remap mode a generation can exceed `max_bytes` by a few bytes per entry.
+- **`parse_chain` checks the version byte before the checksum**, so a `MEMO_CHAIN` file whose first byte is damaged is a loud error until the file is deleted.
+- **After an outside edit of a SQLite database, `load_chain` can reuse a known delta layer and fail with `Corrupt`** instead of loading an empty generation.
+- **A Python streamed write that stops pulling early publishes a truncated tip.** Reuse is lost and values stay correct, and a `load_chain` without `functools.wraps` that takes `known` is misdetected as taking none, which raises `TypeError` loudly.
+- **A damaged item list in a Python backend's delta layer fails the open** instead of loading that layer as empty, and `MemoryMemo.read_entries` with length 0 asserts.
+
+- **`MemoStats::stale_generations` can over-count on SQLite** when another process removed the same superseded generations first.
+
+**Key-set dependencies**
+
+- **Membership inputs and some partition inputs are never freed.** The membership input lives as long as its collection. On Shared a partition input stays for every partition value ever read in a query, as Shared version inputs do. On Local nothing retries the free of an input a reader held when its partition emptied: a client partitioning by a moving value such as a date calls `kc.forget_partition(parts, p)` for each past value. There is no unregister, and a partition keeps the first row it saw for a key until the key is removed.
+- **A `fn` that raises can poison a persisted store** when it is registered while a write is in flight, runs on keys a repair re-inserts, or runs on a key replayed from another process or a snapshot; a raising `fn` on a reconcile removal does too.
+- **A partitioning registered inside a Python overlay is not undone at overlay exit.**
+- **Each persisted write with partitions costs one `held_pairs` lookup per staged key and runs `fn` twice per flipped key.** A plan dropped outside the kept set on a retry, and the extra epoch bump, also remain.
+- **A key holding two or more pairs can flap membership on a persisted row update**, which is a spurious rerun only; this arises after an overtaken write before repair or with a beta.9 writer live.
+- **`forget_key` is not covered by a Rust-level incr-persist test**, and the `RecomputeFirst` restore case is covered only from Python.
+
+**Reading by id and snapshots**
+
+- **`graph_snapshot(values=True)` inside a query raises `RuntimeError`** (and prints a panic line), and an unbounded one on Shared clones all Clean values in one GIL stretch.
+- **On Shared a node dirtied between the status and value reads shows status clean with no `"value"`.**
+
+**Value code and boundaries**
+
+- **A Python exception raised from a persisted collection's `__hash__` or `__eq__` during `store.insert` still poisons the store**, because it runs under the store lock.
+- **`Error::Reentrant` for value code still reads "store called from inside one of its own calls on this thread".** Panics from a Shared read racing a delete, debug-only assertions, and contract panics on threads without a Python boundary still print.
+- **An input declared and never set is still forgotten by a checkpoint**, as documented on `Store::checkpoint`.
+
+**Replay and tests**
+
+- **Four replay differential seeds fail on beta.9 as well** and are not introduced by this release: `0xb2f6bda27623db30` (Shared two threads, `INCR_MAX_DEPTH=1`: wants `Value(3)`, gets `Value(10000)`), `0xdc1b5e97978e6a87` (Local, byte budget 16384: states and deps differ, values equal), `0x8f9c90a0717e5c2b` (Shared: a failed set differs) and `0xfd7889d830ff0fac` (Local and Shared: `Panic("failed")` against `Panic("stale")`).
+- **The replay differential property tests fail on a random seed in roughly 0.5 to 3% of runs under CPU starvation, at the same rate as beta.9**, through the Shared two-thread race class above; each failing seed found passes or fails the same way on beta.9.
+- **Some timing tests fail under heavy load, as before.** `memo_deadlock::restores_inside_computes_while_a_subscriber_reads_under_the_store_mutex` (10 s watchdog), `attempt::tests::a_waiter_takes_over_*` (timing assertions) and `hold_tests::shared_walk_skips_deps_another_threads_retracted_held_run_installed` (its forced schedule breaks under starvation, with no engine wait) fail occasionally on a loaded machine and pass alone.
+
 ## [0.2.0-beta.9] - 2026-11-15
 
 ### Fixed
