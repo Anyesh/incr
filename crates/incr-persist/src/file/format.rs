@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 #[cfg(not(unix))]
 use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
@@ -81,22 +81,63 @@ pub(super) fn push_frames(out: &mut Vec<u8>, records: &[Record]) -> Result<Vec<u
     let mut offsets = Vec::with_capacity(records.len());
     for (index, record) in records.iter().enumerate() {
         let bytes = record.encode()?;
-        if bytes.len() > MAX_FRAME_LEN {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "record exceeds the 2 GiB frame limit",
-            )));
-        }
-        let mut word = bytes.len() as u32;
-        if index + 1 < records.len() {
-            word |= CONTINUES;
-        }
         offsets.push(out.len() - base);
-        out.extend_from_slice(&word.to_le_bytes());
-        out.extend_from_slice(&frame_crc(word, &bytes).to_le_bytes());
+        out.extend_from_slice(&frame_head(&bytes, index + 1 < records.len())?);
         out.extend_from_slice(&bytes);
     }
     Ok(offsets)
+}
+
+fn frame_head(bytes: &[u8], continues: bool) -> Result<[u8; FRAME_HEADER_LEN]> {
+    if bytes.len() > MAX_FRAME_LEN {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "record exceeds the 2 GiB frame limit",
+        )));
+    }
+    let mut word = bytes.len() as u32;
+    if continues {
+        word |= CONTINUES;
+    }
+    let mut head = [0; FRAME_HEADER_LEN];
+    head[..4].copy_from_slice(&word.to_le_bytes());
+    head[4..].copy_from_slice(&frame_crc(word, bytes).to_le_bytes());
+    Ok(head)
+}
+
+/// Writes `records` to `out` as one run of frames, laid out as
+/// [`push_frames`] lays them. Holds back the latest record, since only the
+/// next one tells whether it is the last, which goes out without
+/// `CONTINUES`.
+pub(super) struct FrameWriter<W: Write> {
+    out: W,
+    held: Option<Vec<u8>>,
+}
+
+impl<W: Write> FrameWriter<W> {
+    pub(super) fn new(out: W) -> Self {
+        Self { out, held: None }
+    }
+
+    pub(super) fn push(&mut self, record: &Record) -> Result<()> {
+        if let Some(held) = self.held.replace(record.encode()?) {
+            self.write(&held, true)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self) -> Result<W> {
+        if let Some(held) = self.held.take() {
+            self.write(&held, false)?;
+        }
+        Ok(self.out)
+    }
+
+    fn write(&mut self, bytes: &[u8], continues: bool) -> Result<()> {
+        self.out.write_all(&frame_head(bytes, continues)?)?;
+        self.out.write_all(bytes)?;
+        Ok(())
+    }
 }
 
 fn frame_crc(word: u32, bytes: &[u8]) -> u32 {
@@ -182,6 +223,30 @@ pub(super) fn write_current(dir: &Path, generation: u64) -> Result<()> {
     write_synced(&tmp, format!("{generation}\n").as_bytes())?;
     fs::rename(&tmp, dir.join(CURRENT))?;
     sync_dir(dir)
+}
+
+/// Creates (or truncates) `path`, writes a snapshot covering `upto` with
+/// each record as it is pulled from `records`, and fsyncs it. Stops at the
+/// first `Err` pulled and returns it, leaving the file incomplete.
+pub(super) fn write_snapshot_synced(
+    path: &Path,
+    upto: u64,
+    records: &mut dyn Iterator<Item = Result<Record>>,
+) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let mut out = BufWriter::new(file);
+    out.write_all(&header(SNAPSHOT_MAGIC, upto))?;
+    let mut frames = FrameWriter::new(out);
+    for record in records {
+        frames.push(&record?)?;
+    }
+    let file = frames.finish()?.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Creates (or truncates) `path`, writes `bytes` and fsyncs, returning the
