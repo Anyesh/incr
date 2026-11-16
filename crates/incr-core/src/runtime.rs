@@ -2022,11 +2022,12 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Records a verify that landed `id` Clean, with the stamps
-    /// [`Self::verify_stamps`] read before the landing.
+    /// [`Self::verify_stamps`] read before the landing; a verify that
+    /// began before tracing or stats were on records nothing.
     #[inline(always)]
     pub(crate) fn record_verified(&self, id: NodeId, stamps: Option<crate::trace::StampPair>) {
-        if self.instrumented() {
-            self.push_trace(id, crate::trace::TraceAction::VerifiedClean, stamps);
+        if let Some(stamps) = stamps {
+            self.push_trace(id, crate::trace::TraceAction::VerifiedClean, Some(stamps));
         }
     }
 
