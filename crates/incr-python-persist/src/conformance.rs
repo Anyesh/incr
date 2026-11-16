@@ -152,6 +152,9 @@ fn store_table<E: PersistExceptions>() -> Vec<Case> {
         append_at_a_stale_position_writes_nothing,
         racing_append_at_one_position_lands_exactly_one,
         append_at_right_after_compacting_to_the_tail_lands,
+        streamed_compaction_matches_compact,
+        failed_streamed_compaction_changes_nothing,
+        default_streamed_compaction_goes_through_compact,
     )
 }
 

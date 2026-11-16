@@ -69,10 +69,8 @@
 //! frames a rewrite carries over from older layers.
 
 use std::marker::PhantomData;
-use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
-use std::thread::{self, ThreadId};
+use std::panic;
+use std::sync::Arc;
 
 use incr_persist::memo::{
     decode_delta_header, decode_header, encode_delta_header, encode_header, Chain, DeltaHeader,
@@ -85,6 +83,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyFrozenSet, PyList, PyString};
 
 use crate::backend::{bad_return, raised};
+use crate::lent::{self, Failure, Lending, Names};
 use crate::PersistExceptions;
 
 /// A memo index item as the protocol passes it: `(table, key_hash, loc, len)`.
@@ -300,7 +299,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                 ),
             );
             let frames = lent.end(py);
-            let frames = frames.get();
+            let frames = &frames.get().lending;
             match frames.failure() {
                 Some(Failure::Error(error)) => return Err(error),
                 Some(Failure::Panic(payload)) => panic::resume_unwind(payload),
@@ -461,42 +460,19 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
     }
 }
 
-type Pulls<'a> = dyn Iterator<Item = Result<EncodedEntry>> + 'a;
+type Pulls<'a> = lent::Pulls<'a, EncodedEntry>;
 
-struct Source(*mut Pulls<'static>);
-
-// The pointer is only dereferenced on the thread that lent it (`Frames`
-// checks), while `Lent` keeps its referent alive.
-unsafe impl Send for Source {}
+const FRAMES: Names = Names {
+    items: "memo frames",
+    call: "write_generation_streamed",
+    source: "memo frame source",
+};
 
 /// The lazy `frames` iterator a streamed write hands its backend: it pulls
 /// the engine's own iterator, and is invalid once the call returns.
 #[pyclass(name = "MemoFrames", module = "incr_python_persist", frozen)]
 pub struct Frames {
-    source: Mutex<Option<Source>>,
-    thread: ThreadId,
-    exhausted: AtomicBool,
-    failure: Mutex<Option<Failure>>,
-}
-
-/// What stopped a pull: an error the engine's iterator returned, or a
-/// panic inside it, resumed once the backend's call has returned.
-enum Failure {
-    Error(Error),
-    Panic(Box<dyn std::any::Any + Send>),
-}
-
-impl Frames {
-    fn exhausted(&self) -> bool {
-        self.exhausted.load(Ordering::Acquire)
-    }
-
-    fn failure(&self) -> Option<Failure> {
-        self.failure
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-    }
+    lending: Lending<EncodedEntry>,
 }
 
 #[pymethods]
@@ -506,56 +482,13 @@ impl Frames {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<(u32, u64, Py<PyBytes>)>> {
-        if thread::current().id() != self.thread {
-            return Err(PyRuntimeError::new_err(
-                "memo frames must be pulled on the thread that called write_generation_streamed",
-            ));
-        }
-        let mut source = match self.source.try_lock() {
-            Ok(source) => source,
-            Err(TryLockError::WouldBlock) => {
-                return Err(PyRuntimeError::new_err("memo frames pulled re-entrantly"))
-            }
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-        };
-        let Some(Source(pulls)) = source.as_mut() else {
-            return Err(PyRuntimeError::new_err(
-                "memo frames are only valid during the write_generation_streamed call",
-            ));
-        };
-        if self.exhausted() {
-            return Ok(None);
-        }
-        // SAFETY: `Lent` keeps the pointee alive and clears this slot
-        // before the call that lent it returns, and the lock excludes a
-        // second pull.
-        let next = panic::catch_unwind(AssertUnwindSafe(|| unsafe { (**pulls).next() }));
-        let next = match next {
-            Ok(next) => next,
-            Err(payload) => {
-                *source = None;
-                *self.failure.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(Failure::Panic(payload));
-                return Err(PyRuntimeError::new_err("memo frame source panicked"));
-            }
-        };
-        match next {
-            None => {
-                self.exhausted.store(true, Ordering::Release);
-                Ok(None)
-            }
-            Some(Ok(entry)) => Ok(Some((
+        Ok(self.lending.pull()?.map(|entry| {
+            (
                 entry.table,
                 entry.key_hash,
                 PyBytes::new(py, &entry.frame).unbind(),
-            ))),
-            Some(Err(error)) => {
-                let message = format!("memo frame source failed: {error}");
-                *self.failure.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(Failure::Error(error));
-                Err(PyRuntimeError::new_err(message))
-            }
-        }
+            )
+        }))
     }
 }
 
@@ -567,20 +500,10 @@ struct Lent {
 
 impl Lent {
     fn new(py: Python<'_>, entries: &mut Pulls<'_>) -> PyResult<Self> {
-        let ptr: *mut Pulls<'_> = entries;
-        // SAFETY: erases the borrow's lifetime; `Frames` never uses the
-        // pointer after `Lent` is gone, which its borrow outlives.
-        let ptr = unsafe { std::mem::transmute::<*mut Pulls<'_>, *mut Pulls<'static>>(ptr) };
-        let frames = Py::new(
-            py,
-            Frames {
-                source: Mutex::new(Some(Source(ptr))),
-                thread: thread::current().id(),
-                exhausted: AtomicBool::new(false),
-                failure: Mutex::new(None),
-            },
-        )?;
-        Ok(Lent { frames })
+        let lending = Lending::new(entries, FRAMES);
+        Ok(Lent {
+            frames: Py::new(py, Frames { lending })?,
+        })
     }
 
     fn end(self, py: Python<'_>) -> Bound<'_, Frames> {
@@ -589,8 +512,7 @@ impl Lent {
     }
 
     fn invalidate(&self, py: Python<'_>) {
-        let frames = self.frames.bind(py).get();
-        *frames.source.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.frames.bind(py).get().lending.invalidate();
     }
 }
 

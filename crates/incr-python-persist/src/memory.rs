@@ -145,6 +145,23 @@ macro_rules! memory_classes {
                     .map_err(|e| persist_error(py, e))
             }
 
+            fn compact_streamed(
+                &self,
+                py: Python<'_>,
+                upto: u64,
+                records: Bound<'_, PyAny>,
+            ) -> PyResult<()> {
+                let mut pulls = records.try_iter()?.map(|record| {
+                    let bytes = record
+                        .and_then(|record| record.extract::<Vec<u8>>())
+                        .map_err($crate::backend::raised::<$exc>)?;
+                    Record::decode(&bytes)
+                });
+                self.inner
+                    .compact_streamed(Position(upto), &mut pulls)
+                    .map_err(|e| persist_error(py, e))
+            }
+
             fn writable(&self) -> bool {
                 self.inner.writable()
             }

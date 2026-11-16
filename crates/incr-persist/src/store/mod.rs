@@ -15,7 +15,7 @@ use crate::value_context::{enter_value_scope, ValueScopeGuard};
 use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, SnapshotId, ValueScope};
 
 use after_lock::{AfterLock, Drained, Holder, HolderMark};
-use binding::{decode, encode, Binding, InputBinding};
+use binding::{decode, encode, Binding, Folded, InputBinding};
 use dep_index::{fp_of, DepFp, DepIndex, Registered};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
@@ -141,8 +141,9 @@ pub enum Origin {
     /// cannot be compared by bytes, or whose snapshot lists them in an order
     /// its own records do not reach, is reported as a `Delete` followed by
     /// its full contents. A writer that declared the collection lists them
-    /// in the order it stores them, so a key with more than one distinct
-    /// element may be reported that way.
+    /// by rank, the fingerprint of each one's encoding, where an insert
+    /// rarely lands last, so a key with more than one distinct element is
+    /// usually reported that way.
     Snapshot,
 }
 
@@ -842,7 +843,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// never set, or reset by [`Store::delete`], is forgotten.
     ///
     /// In debug builds it first fails with [`Error::Bypassed`] if any
-    /// declared input was written through the runtime directly.
+    /// declared input was written through the runtime directly. In every
+    /// build it fails with [`Error::Bypassed`], changing nothing, when a
+    /// collection it is folding changes under it, which only a write
+    /// around the store can do, or a keyed collection's
+    /// `key_partitions` registered meanwhile; a retry succeeds.
     ///
     /// When another writer compacts past this store's position between its
     /// catch-up and its compaction, the backend rejects the stale fold with
@@ -852,6 +857,14 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// tell whether the snapshot was replaced, so it reloads its state from
     /// the backend before returning the error, and is poisoned only if that
     /// reload fails too.
+    ///
+    /// The backend pulls the snapshot through
+    /// [`Backend::compact_streamed`], each record folded as it is pulled. A
+    /// fold error, such as a value that fails to encode, fails the
+    /// checkpoint with that error and changes nothing. A backend that
+    /// returns `Ok` without pulling every record has committed a truncated
+    /// snapshot: the checkpoint fails with [`Error::Corrupt`] and poisons
+    /// the store.
     pub fn checkpoint(&self) -> Result<Position> {
         let mut state = self.state()?;
         self.checkpoint_locked(&mut state)
@@ -879,9 +892,23 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 )?;
             }
             let upto = state.applied;
-            let (folded, forgotten) = self.fold_snapshot(state)?;
-            match self.backend.compact(upto, folded) {
-                Ok(()) => {
+            let mut fold = SnapshotFold::new(state);
+            let result = self.backend.compact_streamed(upto, &mut fold);
+            let pulled = fold.finish(result.is_ok());
+            let result = match (result, pulled) {
+                (Ok(()), Pulled::Whole(forgotten)) => Ok(forgotten),
+                (Err(e), Pulled::Failed) => return Err(e),
+                (Ok(()), Pulled::Truncated | Pulled::Failed) => {
+                    state.poison();
+                    return Err(Error::Corrupt(
+                        "the backend's compact_streamed returned Ok after a failed pull or before \
+                         the last record, so its snapshot may be truncated",
+                    ));
+                }
+                (Err(e), _) => Err(e),
+            };
+            match result {
+                Ok(forgotten) => {
                     for key in forgotten {
                         state.logged.remove(&key);
                     }
@@ -919,37 +946,6 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 }
             }
         }
-    }
-
-    /// The snapshot of everything applied so far, and the keys it forgets:
-    /// those the log knows but that fold to nothing.
-    fn fold_snapshot(&self, state: &State<C>) -> Result<(Vec<Record>, Vec<String>)> {
-        let keys: BTreeSet<&str> = state
-            .logged
-            .keys()
-            .chain(state.bound.keys())
-            .map(String::as_str)
-            .collect();
-        let mut folded = Vec::new();
-        let mut forgotten = Vec::new();
-        for key in keys {
-            let logged = state.logged.get(key);
-            let records = match state.bound.get(key) {
-                Some(&id) => state.bindings[&id].fold(&self.runtime, logged, &state.after)?,
-                None => match logged {
-                    Some(logged) if !logged.at_default() => logged.records(key),
-                    _ => Vec::new(),
-                },
-            };
-            if records.is_empty() {
-                if logged.is_some() {
-                    forgotten.push(key.to_owned());
-                }
-            } else {
-                folded.extend(records);
-            }
-        }
-        Ok((folded, forgotten))
     }
 
     /// Rebuilds the folded log and every bound node from the backend's
@@ -1464,4 +1460,107 @@ fn delete_record<C: Cells>(state: &State<C>, key: &KeyRef<'_>) -> Result<Record>
     Ok(Record::Delete {
         key: state.key_of(key)?,
     })
+}
+
+/// The snapshot of everything a store applied so far, folded key by key in
+/// key order as the backend pulls it, gathering the keys it forgets: those
+/// the log knows but that fold to nothing. Stops after the first `Err`.
+struct SnapshotFold<'a, C: Cells> {
+    state: &'a State<C>,
+    keys: std::collections::btree_set::IntoIter<&'a str>,
+    /// The key being folded, its records, and whether any was pulled.
+    current: Option<(&'a str, Folded<'a>, bool)>,
+    forgotten: Vec<String>,
+    failed: bool,
+}
+
+/// How far a backend pulled a [`SnapshotFold`].
+enum Pulled {
+    /// To the end, with the keys the snapshot forgets.
+    Whole(Vec<String>),
+    /// Not to the end, though nothing failed.
+    Truncated,
+    /// Up to an `Err`.
+    Failed,
+}
+
+impl<'a, C: Cells> SnapshotFold<'a, C> {
+    fn new(state: &'a State<C>) -> Self {
+        let keys: BTreeSet<&str> = state
+            .logged
+            .keys()
+            .chain(state.bound.keys())
+            .map(String::as_str)
+            .collect();
+        Self {
+            state,
+            keys: keys.into_iter(),
+            current: None,
+            forgotten: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// Whether the backend pulled every record. After an `Ok` from the
+    /// backend, pulls once more to tell a whole snapshot from a truncated
+    /// one.
+    fn finish(mut self, committed: bool) -> Pulled {
+        if self.failed {
+            return Pulled::Failed;
+        }
+        if committed && self.next().is_some() {
+            return Pulled::Truncated;
+        }
+        if self.current.is_some() || self.keys.len() > 0 {
+            return Pulled::Truncated;
+        }
+        Pulled::Whole(self.forgotten)
+    }
+
+    fn fold_key(&self, key: &'a str) -> Result<Folded<'a>> {
+        let logged = self.state.logged.get(key);
+        Ok(match self.state.bound.get(key) {
+            Some(&id) => self.state.bindings[&id].fold(logged)?,
+            None => match logged {
+                Some(logged) if !logged.at_default() => Box::new(logged.iter_records(key).map(Ok)),
+                _ => Box::new(std::iter::empty()),
+            },
+        })
+    }
+}
+
+impl<C: Cells> Iterator for SnapshotFold<'_, C> {
+    type Item = Result<Record>;
+
+    fn next(&mut self) -> Option<Result<Record>> {
+        while !self.failed {
+            if let Some((key, records, pulled)) = &mut self.current {
+                match records.next() {
+                    Some(Ok(record)) => {
+                        *pulled = true;
+                        return Some(Ok(record));
+                    }
+                    Some(Err(e)) => {
+                        self.failed = true;
+                        return Some(Err(e));
+                    }
+                    None => {
+                        if !*pulled && self.state.logged.contains_key(*key) {
+                            self.forgotten.push((*key).to_owned());
+                        }
+                        self.current = None;
+                    }
+                }
+            }
+            let key = self.keys.next()?;
+            match self.fold_key(key) {
+                Ok(records) => self.current = Some((key, records, false)),
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        None
+    }
 }

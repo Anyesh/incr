@@ -451,3 +451,115 @@ fn local_apply_removal_returns_the_stored_value() {
 fn shared_apply_removal_returns_the_stored_value() {
     removal_returns_the_stored_value::<Shared>();
 }
+
+fn element_slots_read_each_distinct_element_once<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let c = rt.create_collection::<u32>();
+    for v in [3, 1, 3, 7, 3] {
+        c.insert(&rt, v);
+    }
+    let mut slots = Vec::new();
+    let stamp = c
+        .visit_elements(|slot, _, _| {
+            slots.push(slot);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let mut read: Vec<(u32, usize)> = slots
+        .iter()
+        .map(|&slot| {
+            c.with_element(stamp, slot, |value, count| (*value, count))
+                .expect("the collection has not changed")
+        })
+        .collect();
+    read.sort_unstable();
+    assert_eq!(read, vec![(1, 1), (3, 3), (7, 1)]);
+
+    c.delete(&rt, &7);
+    assert!(slots
+        .iter()
+        .all(|&slot| c.with_element(stamp, slot, |_, _| ()).is_none()));
+}
+
+fn visiting_elements_stops_at_the_first_error<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let c = rt.create_collection::<u32>();
+    for v in 0..10 {
+        c.insert(&rt, v);
+    }
+    let mut seen = 0;
+    let result = c.visit_elements(|_, _, _| {
+        seen += 1;
+        if seen == 3 {
+            Err("stop")
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(result.map(drop), Err("stop"));
+    assert_eq!(seen, 3);
+}
+
+#[test]
+fn local_element_slots_read_each_distinct_element_once() {
+    element_slots_read_each_distinct_element_once::<Local>();
+}
+
+#[test]
+fn shared_element_slots_read_each_distinct_element_once() {
+    element_slots_read_each_distinct_element_once::<Shared>();
+}
+
+#[test]
+fn local_visiting_elements_stops_at_the_first_error() {
+    visiting_elements_stops_at_the_first_error::<Local>();
+}
+
+#[test]
+fn shared_visiting_elements_stops_at_the_first_error() {
+    visiting_elements_stops_at_the_first_error::<Shared>();
+}
+
+fn a_rehash_left_by_a_panicking_write_invalidates_element_slots<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let c = rt.create_collection::<Bomb>();
+    for v in 0..6 {
+        c.insert(&rt, Bomb(v));
+    }
+    let mut slots = Vec::new();
+    let stamp = c
+        .visit_elements(|slot, _, _| {
+            slots.push(slot);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let version = rt.get(c.version_node());
+    let rehashes = c.log.read().elements.rehashes();
+    arm(Call::Eq, 1);
+    let panicked =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.insert(&rt, Bomb(3))));
+    disarm();
+    assert!(panicked.is_err());
+    assert_eq!(
+        rt.get(c.version_node()),
+        version,
+        "the write changed nothing"
+    );
+    assert!(
+        c.log.read().elements.rehashes() > rehashes,
+        "the write rehashed before its Eq panicked"
+    );
+    assert!(slots
+        .iter()
+        .all(|&slot| c.with_element(stamp, slot, |_, _| ()).is_none()));
+}
+
+#[test]
+fn local_a_rehash_left_by_a_panicking_write_invalidates_element_slots() {
+    a_rehash_left_by_a_panicking_write_invalidates_element_slots::<Local>();
+}
+
+#[test]
+fn shared_a_rehash_left_by_a_panicking_write_invalidates_element_slots() {
+    a_rehash_left_by_a_panicking_write_invalidates_element_slots::<Shared>();
+}

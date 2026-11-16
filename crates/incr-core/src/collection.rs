@@ -129,6 +129,18 @@ pub enum Delta<T> {
 /// minutes instead of hours.
 const COMPACT_EVERY: usize = if cfg!(miri) { 128 } else { 1024 };
 
+/// One distinct live element of an [`IncrCollection`], named by its slot
+/// as of one version: see [`IncrCollection::visit_elements`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElementSlot(u32);
+
+/// When the slots [`IncrCollection::visit_elements`] passed were read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElementsStamp {
+    version: u64,
+    rehashes: u64,
+}
+
 /// Delta log + multiset bookkeeping for a single collection.
 ///
 /// `deltas[0]` corresponds to absolute index `base`; consumer cursors
@@ -155,6 +167,13 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             elements: HashedMultiset::new(),
             hasher: RandomState::new(),
             version: 0,
+        }
+    }
+
+    fn stamp(&self) -> ElementsStamp {
+        ElementsStamp {
+            version: self.version,
+            rehashes: self.elements.rehashes(),
         }
     }
 
@@ -949,6 +968,51 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         value_code::check();
         crate::dep_stack::unrecorded_lookup::<C>();
         self.log.read().elements_vec()
+    }
+
+    /// Runs `visit` as value code on each distinct live element, with its
+    /// slot and multiplicity, under the log's read guard, stopping at the
+    /// first `Err`, and returns the stamp the slots are valid under. Reads
+    /// the elements as they stand: unlike [`Self::values`] it brings no
+    /// operator output up to date, and it records no dependency.
+    pub fn visit_elements<E>(
+        &self,
+        mut visit: impl FnMut(ElementSlot, &T, usize) -> Result<(), E>,
+    ) -> Result<ElementsStamp, E> {
+        value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        let log = self.log.read();
+        value_code::run(|| {
+            for (slot, value, count) in log.elements.slots() {
+                let slot =
+                    u32::try_from(slot).expect("incr-core: a multiset holds under 2^32 slots");
+                visit(ElementSlot(slot), value, count)?;
+            }
+            Ok(log.stamp())
+        })
+    }
+
+    /// Runs `f` as value code on the element at a slot
+    /// [`Self::visit_elements`] passed, with its multiplicity, under the
+    /// log's read guard. `None` when the elements changed or moved since
+    /// `stamp`, after which the slot may hold another element or none.
+    /// Records no dependency.
+    pub fn with_element<U>(
+        &self,
+        stamp: ElementsStamp,
+        slot: ElementSlot,
+        f: impl FnOnce(&T, usize) -> U,
+    ) -> Option<U> {
+        value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        let log = self.log.read();
+        if log.stamp() != stamp {
+            return None;
+        }
+        let at = slot.0 as usize;
+        Some(value_code::run(|| {
+            f(log.elements.stored(at), log.elements.count(at))
+        }))
     }
 
     /// Current elements, with multiset duplicates expanded. Forces

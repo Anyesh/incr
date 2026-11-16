@@ -665,6 +665,50 @@ fn settled_stats_are_read_without_the_lock<C: Cells>() {
     assert_eq!((stats.elements, stats.bytes), (pairs, bytes));
 }
 
+fn pair_handles_read_every_held_pair_in_rank_order<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = populated(&rt);
+    apply(
+        &rt,
+        &kc,
+        vec![
+            PairOp::Insert((k(4), r(40)), 9),
+            PairOp::Insert((k(5), r(50)), 2),
+            PairOp::Insert((k(5), r(51)), 7),
+        ],
+    );
+    let (epoch, handles) = kc.pair_handles();
+    assert_eq!(epoch, kc.epoch());
+    let read: Vec<(Quad, u8)> = handles
+        .iter()
+        .map(|&h| {
+            kc.with_pair(epoch, h, |pair, rank| (quad(pair), rank))
+                .expect("the index has not changed")
+        })
+        .collect();
+    let ranks: Vec<u8> = read.iter().map(|(_, rank)| *rank).collect();
+    assert_eq!(ranks, sorted(ranks.clone()), "handles come in rank order");
+    let held = kc.index.table.read().all_pairs();
+    let held: Vec<(Quad, u8)> = held
+        .iter()
+        .map(|(pair, rank)| (quad(pair), *rank))
+        .collect();
+    assert_eq!(sorted(read), sorted(held));
+}
+
+fn a_pair_handle_reads_nothing_once_the_index_changes<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kc = populated(&rt);
+    let (epoch, handles) = kc.pair_handles();
+    kc.upsert(&rt, k(9), r(90));
+    assert!(handles
+        .iter()
+        .all(|&h| kc.with_pair(epoch, h, |_, _| ()).is_none()));
+    let (epoch, handles) = kc.pair_handles();
+    assert_eq!(handles.len(), 5);
+    assert!(kc.with_pair(epoch, handles[0], |_, _| ()).is_some());
+}
+
 macro_rules! for_both {
     ($($name:ident),* $(,)?) => {
         mod local {
@@ -700,6 +744,8 @@ for_both!(
     keys_and_items_are_snapshots_and_len_counts_keys,
     settled_stats_are_read_without_the_lock,
     model_matches,
+    pair_handles_read_every_held_pair_in_rank_order,
+    a_pair_handle_reads_nothing_once_the_index_changes,
 );
 
 type Plain<C> = KeyedCollection<u8, u8, C, (u8, u8), u8>;

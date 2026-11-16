@@ -877,6 +877,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /, upto, folded)"
    },
+   "compact_streamed": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, upto, records)"
+   },
    "load_snapshot": {
     "doc": null,
     "kind": "method_descriptor",

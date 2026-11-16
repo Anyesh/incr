@@ -83,6 +83,9 @@ macro_rules! backend_conformance {
             append_at_a_stale_position_writes_nothing,
             racing_append_at_one_position_lands_exactly_one,
             append_at_right_after_compacting_to_the_tail_lands,
+            streamed_compaction_matches_compact,
+            failed_streamed_compaction_changes_nothing,
+            default_streamed_compaction_goes_through_compact,
         );
     };
     (@cases $harness:expr; $($case:ident),+ $(,)?) => {
@@ -867,4 +870,201 @@ pub fn append_at_right_after_compacting_to_the_tail_lands<H: Harness>(mut h: H) 
     let append_at = conditional(&reopened).expect("a reopened handle has it");
     let next = append_at.append_at(last, &[set("a", 5)]).unwrap();
     assert_eq!(next, Position(last.0 + 1));
+}
+
+/// A collection's worth of records, some large enough to span any chunking
+/// a backend streams through.
+fn streamed_snapshot() -> Vec<Record> {
+    let mut records = vec![
+        Record::Declare {
+            key: "c".into(),
+            kind: Kind::Collection,
+            default: Vec::new(),
+        },
+        declare("a"),
+        set("a", 7),
+    ];
+    for i in 0..2_000u32 {
+        let mut element = i.to_le_bytes().to_vec();
+        element.resize(100, i as u8);
+        records.push(Record::Insert {
+            key: "c".into(),
+            element,
+        });
+    }
+    for i in 0..3u8 {
+        records.push(Record::Insert {
+            key: "c".into(),
+            element: vec![i; 700 * 1024],
+        });
+    }
+    records
+}
+
+/// The state a compaction is judged by: the snapshot, its id and the log
+/// after it.
+type Compacted = (
+    Option<(Position, Vec<Record>)>,
+    Option<SnapshotId>,
+    Vec<(Position, Record)>,
+);
+
+fn compacted_state<B: Backend>(backend: &B) -> Compacted {
+    let snapshot = backend.load_snapshot().unwrap();
+    let after = snapshot.as_ref().map_or(Position::ZERO, |(at, _)| *at);
+    (
+        snapshot,
+        backend.snapshot_id().unwrap(),
+        read_all(backend, after),
+    )
+}
+
+/// Appends a history, compacts it once with `compact`, appends more, and
+/// returns the position a second compaction covers.
+fn compaction_history<B: Backend>(backend: &B) -> Position {
+    let first = backend.append(&[declare("a"), set("a", 1)]).unwrap();
+    backend
+        .compact(first, vec![declare("a"), set("a", 1)])
+        .unwrap();
+    let upto = backend.append(&[set("a", 7), set("b", 1)]).unwrap();
+    backend.append(&[set("a", 8)]).unwrap();
+    upto
+}
+
+/// Calls a backend's `compact_streamed`, or that of a wrapper around it.
+type StreamedCompact<'f, B> =
+    &'f dyn Fn(&B, Position, &mut dyn Iterator<Item = crate::Result<Record>>) -> crate::Result<()>;
+
+fn check_streamed_matches_compact<H: Harness>(
+    h: &mut H,
+    streamed: StreamedCompact<'_, H::Backend>,
+) {
+    let folded = streamed_snapshot();
+    let compacted = {
+        let log = h.new_log();
+        let backend = h.open(&log);
+        let upto = compaction_history(&backend);
+        backend.compact(upto, folded.clone()).unwrap();
+        compacted_state(&backend)
+    };
+    let log = h.new_log();
+    {
+        let backend = h.open(&log);
+        let upto = compaction_history(&backend);
+        streamed(&backend, upto, &mut folded.iter().cloned().map(Ok)).unwrap();
+        assert_eq!(
+            compacted_state(&backend),
+            compacted,
+            "a streamed compaction must leave what compact leaves"
+        );
+        backend.sync(Position(u64::MAX)).unwrap();
+    }
+    assert_eq!(
+        compacted_state(&h.open(&log)),
+        compacted,
+        "a reopen must see the streamed compaction"
+    );
+}
+
+fn check_failed_stream_changes_nothing<H: Harness>(
+    h: &mut H,
+    streamed: StreamedCompact<'_, H::Backend>,
+) {
+    let folded = streamed_snapshot();
+    let log = h.new_log();
+    let backend = h.open(&log);
+    let fail_after = |upto: Position, pulled: usize| {
+        let before = compacted_state(&backend);
+        let mut records = folded
+            .iter()
+            .take(pulled)
+            .cloned()
+            .map(Ok)
+            .chain(std::iter::once(Err(Error::Corrupt("pulled failure"))));
+        let result = streamed(&backend, upto, &mut records);
+        assert!(
+            matches!(result, Err(Error::Corrupt("pulled failure"))),
+            "an Err pulled after {pulled} records must fail the call with it, got {result:?}"
+        );
+        assert_eq!(
+            compacted_state(&backend),
+            before,
+            "a failed streamed compaction must change nothing"
+        );
+    };
+    let first = backend.append(&[declare("a"), set("a", 1)]).unwrap();
+    for pulled in [0, 1, folded.len()] {
+        fail_after(first, pulled);
+    }
+    backend
+        .compact(first, vec![declare("a"), set("a", 1)])
+        .unwrap();
+    let upto = backend.append(&[set("a", 9)]).unwrap();
+    for pulled in [0, 1, folded.len()] {
+        fail_after(upto, pulled);
+    }
+}
+
+/// Streaming the same records as `compact` takes leaves the same
+/// snapshot, snapshot id and log, here and after a reopen.
+pub fn streamed_compaction_matches_compact<H: Harness>(mut h: H) {
+    check_streamed_matches_compact(&mut h, &|backend, upto, records| {
+        backend.compact_streamed(upto, records)
+    });
+}
+
+/// An `Err` pulled from the records, first, mid-stream or after the last
+/// one, fails the call with that error and changes nothing, on a log never
+/// compacted and on one with a snapshot.
+pub fn failed_streamed_compaction_changes_nothing<H: Harness>(mut h: H) {
+    check_failed_stream_changes_nothing(&mut h, &|backend, upto, records| {
+        backend.compact_streamed(upto, records)
+    });
+}
+
+/// A backend that does not override `compact_streamed` gets the default,
+/// which meets the same contract through `compact`.
+pub fn default_streamed_compaction_goes_through_compact<H: Harness>(mut h: H) {
+    let unstreamed: StreamedCompact<'_, H::Backend> =
+        &|backend, upto, records| Unstreamed(backend).compact_streamed(upto, records);
+    check_streamed_matches_compact(&mut h, unstreamed);
+    check_failed_stream_changes_nothing(&mut h, unstreamed);
+}
+
+/// A backend without its own `compact_streamed`, so the trait's default
+/// runs.
+struct Unstreamed<'a, B>(&'a B);
+
+impl<B: Backend> Backend for Unstreamed<'_, B> {
+    fn append(&self, records: &[Record]) -> crate::Result<Position> {
+        self.0.append(records)
+    }
+
+    fn sync(&self, upto: Position) -> crate::Result<()> {
+        self.0.sync(upto)
+    }
+
+    fn read_from(
+        &self,
+        after: Position,
+        out: &mut Vec<(Position, Record)>,
+    ) -> crate::Result<ReadOutcome> {
+        self.0.read_from(after, out)
+    }
+
+    fn load_snapshot(&self) -> crate::Result<Option<(Position, Vec<Record>)>> {
+        self.0.load_snapshot()
+    }
+
+    fn snapshot_id(&self) -> crate::Result<Option<SnapshotId>> {
+        self.0.snapshot_id()
+    }
+
+    fn compact(&self, upto: Position, folded: Vec<Record>) -> crate::Result<()> {
+        self.0.compact(upto, folded)
+    }
+
+    fn writable(&self) -> bool {
+        self.0.writable()
+    }
 }

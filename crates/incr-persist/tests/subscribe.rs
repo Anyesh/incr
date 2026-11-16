@@ -292,8 +292,8 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
 
 /// A multi-element collection the reader never declared, caught up across
 /// a compaction, reports the exact `Remove`/`Insert` diff whatever hash seed
-/// each store draws: the writer hands its elements to the folded log in byte
-/// order. Each fresh store draws new hash keys, so the rounds cover several.
+/// each store draws: the writer hands its elements to the folded log in rank
+/// order, the same in every process. Each fresh store draws new hash keys, so the rounds cover several.
 #[test]
 fn an_undeclared_collection_catches_up_as_the_exact_diff() {
     for _ in 0..32 {
@@ -362,16 +362,11 @@ fn undeclared_catch_up(order: impl IntoIterator<Item = u32>, undeclared: bool) -
 // same 64 elements in the same order only by chance.
 #[test]
 fn an_undeclared_catch_up_reports_the_same_changes_however_the_writer_hashes() {
-    let expected = [
-        Record::Remove {
-            key: "raw".into(),
-            element: enc(&63u32),
-        },
-        Record::Insert {
-            key: "raw".into(),
-            element: enc(&64u32),
-        },
-    ];
+    let expected = undeclared_catch_up(0..64, false);
+    assert!(expected.contains(&Record::Insert {
+        key: "raw".into(),
+        element: enc(&64u32),
+    }));
     for undeclared in [false, true] {
         assert_eq!(undeclared_catch_up(0..64, undeclared), expected);
         assert_eq!(undeclared_catch_up((0..64).rev(), undeclared), expected);

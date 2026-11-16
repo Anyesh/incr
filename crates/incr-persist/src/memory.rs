@@ -121,7 +121,18 @@ impl Backend for MemoryBackend {
     }
 
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()> {
+        self.compact_streamed(upto, &mut folded.into_iter().map(Ok))
+    }
+
+    /// Pulls every record without the log's lock, so a panicking pull
+    /// leaves the lock unpoisoned, then publishes under it.
+    fn compact_streamed(
+        &self,
+        upto: Position,
+        records: &mut dyn Iterator<Item = Result<Record>>,
+    ) -> Result<()> {
         self.require_writable()?;
+        let folded = records.collect::<Result<Vec<_>>>()?;
         let mut log = self.lock();
         let snapshot_at = log.snapshot.as_ref().map_or(Position::ZERO, |(at, _)| *at);
         if upto < snapshot_at || upto > log.tail {

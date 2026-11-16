@@ -136,6 +136,9 @@ pub(crate) struct HashedMultiset<T> {
     table: Table<T>,
     len: usize,
     growth_left: usize,
+    /// How many times entries moved, which a write whose user `Eq` panics
+    /// after reserving can do without changing any element.
+    rehashes: u64,
 }
 
 /// Where one change lands, as found by [`HashedMultiset::locate`]. Valid
@@ -171,6 +174,7 @@ impl<T> HashedMultiset<T> {
             table: Table::empty(),
             len: 0,
             growth_left: 0,
+            rehashes: 0,
         }
     }
 
@@ -189,14 +193,27 @@ impl<T> HashedMultiset<T> {
 
     /// Distinct elements with their multiplicities, in table order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&T, usize)> {
+        self.slots().map(|(_, value, count)| (value, count))
+    }
+
+    /// How many times entries moved; slots from [`Self::slots`] name the
+    /// same entries while this and the elements stay unchanged.
+    pub(crate) fn rehashes(&self) -> u64 {
+        self.rehashes
+    }
+
+    /// [`Self::iter`] with each element's slot, which [`Self::stored`] and
+    /// [`Self::count`] take until the multiset next changes or rehashes.
+    pub(crate) fn slots(&self) -> impl Iterator<Item = (usize, &T, usize)> {
         self.table
             .ctrl()
             .iter()
             .zip(self.table.entries())
-            .filter(|(c, _)| **c & FULL != 0)
+            .enumerate()
+            .filter(|(_, (c, _))| **c & FULL != 0)
             // SAFETY: the slot is full, so its entry is initialised.
-            .map(|(_, e)| unsafe { e.assume_init_ref() })
-            .map(|e| (&e.value, e.count))
+            .map(|(i, (_, e))| (i, unsafe { e.assume_init_ref() }))
+            .map(|(i, e)| (i, &e.value, e.count))
     }
 
     /// Ensure `additional` more distinct elements can be inserted without
@@ -251,6 +268,7 @@ impl<T> HashedMultiset<T> {
             entries[j].write(entry);
         }
         self.table = table;
+        self.rehashes += 1;
         self.growth_left = load_limit(capacity) - self.len;
     }
 

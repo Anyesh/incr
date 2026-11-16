@@ -274,6 +274,41 @@ impl Backend for SqliteBackend {
         tx.commit().map_err(sql)
     }
 
+    /// Stages each record as it is pulled inside the write transaction,
+    /// then copies the staged frames into the snapshot row, so the snapshot
+    /// never sits whole in memory. An `Err` pulled rolls the transaction
+    /// back.
+    fn compact_streamed(
+        &self,
+        upto: Position,
+        records: &mut dyn Iterator<Item = Result<Record>>,
+    ) -> Result<()> {
+        self.require_writable()?;
+        let mut inner = self.lock();
+        let tx = inner.begin_write()?;
+        let snapshot_at = snapshot_position(&tx)?.unwrap_or(Position::ZERO);
+        let tail = tail(&tx)?;
+        if upto < snapshot_at || upto > tail {
+            return Err(Error::InvalidCompaction {
+                upto,
+                snapshot_at,
+                tail,
+            });
+        }
+        let len = stage_snapshot(&tx, records)?;
+        let upto_sql = sql_position(upto);
+        tx.execute("DELETE FROM log WHERE pos <= ?1", [upto_sql])
+            .map_err(sql)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO snapshot (id, pos, generation, recs) \
+             VALUES (0, ?1, ifnull((SELECT generation FROM snapshot), 0) + 1, zeroblob(?2))",
+            params![upto_sql, len],
+        )
+        .map_err(sql)?;
+        copy_staged_snapshot(&tx)?;
+        tx.commit().map_err(sql)
+    }
+
     fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {
         Some(self)
     }
@@ -560,11 +595,75 @@ fn push_records_after(
 fn encode_snapshot(records: &[Record]) -> Result<Vec<u8>> {
     let mut recs = Vec::new();
     for record in records {
-        let encoded = record.encode()?;
-        recs.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
-        recs.extend_from_slice(&encoded);
+        push_snapshot_frame(&mut recs, record)?;
     }
     Ok(recs)
+}
+
+fn push_snapshot_frame(recs: &mut Vec<u8>, record: &Record) -> Result<()> {
+    let encoded = record.encode()?;
+    recs.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+    recs.extend_from_slice(&encoded);
+    Ok(())
+}
+
+/// How many bytes of snapshot frames [`stage_snapshot`] gathers per row.
+const STAGED_CHUNK: usize = 1 << 20;
+
+/// Frames each record pulled from `records` as `encode_snapshot` does, in
+/// rows of a temp table created inside `tx`, and returns the frames' total
+/// length. The temp table spills to a temp file, so the frames never sit
+/// whole in memory.
+fn stage_snapshot(
+    tx: &Transaction<'_>,
+    records: &mut dyn Iterator<Item = Result<Record>>,
+) -> Result<i64> {
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp.snapshot_staging; \
+         CREATE TEMP TABLE snapshot_staging (seq INTEGER PRIMARY KEY, bytes BLOB NOT NULL);",
+    )
+    .map_err(sql)?;
+    let mut insert = tx
+        .prepare("INSERT INTO temp.snapshot_staging (bytes) VALUES (?1)")
+        .map_err(sql)?;
+    let mut chunk = Vec::with_capacity(STAGED_CHUNK);
+    let mut len = 0usize;
+    for record in records {
+        push_snapshot_frame(&mut chunk, &record?)?;
+        if chunk.len() >= STAGED_CHUNK {
+            insert.execute([&chunk]).map_err(sql)?;
+            len += chunk.len();
+            chunk.clear();
+        }
+    }
+    if !chunk.is_empty() {
+        insert.execute([&chunk]).map_err(sql)?;
+        len += chunk.len();
+    }
+    i64::try_from(len).map_err(|_| Error::Backend("snapshot exceeds i64::MAX bytes".into()))
+}
+
+/// Copies the frames [`stage_snapshot`] gathered into the snapshot row's
+/// `recs`, which must hold a zeroblob of their length, then drops the
+/// temp table.
+fn copy_staged_snapshot(tx: &Transaction<'_>) -> Result<()> {
+    {
+        let mut blob = tx
+            .blob_open(rusqlite::MAIN_DB, c"snapshot", c"recs", 0, false)
+            .map_err(sql)?;
+        let mut rows = tx
+            .prepare("SELECT bytes FROM temp.snapshot_staging ORDER BY seq")
+            .map_err(sql)?;
+        let mut rows = rows.query([]).map_err(sql)?;
+        let mut at = 0;
+        while let Some(row) = rows.next().map_err(sql)? {
+            let bytes: Vec<u8> = row.get(0).map_err(sql)?;
+            blob.write_all_at(&bytes, at).map_err(sql)?;
+            at += bytes.len();
+        }
+    }
+    tx.execute_batch("DROP TABLE temp.snapshot_staging")
+        .map_err(sql)
 }
 
 fn decode_snapshot(mut recs: &[u8]) -> Result<Vec<Record>> {

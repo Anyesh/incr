@@ -253,7 +253,9 @@ fn a_crash_after_any_compaction_step_leaves_the_old_or_new_state_whole() {
                 .unwrap();
             writer.append(&[set("a", 3), set("a", 4)]).unwrap();
             let before = contents(&writer);
-            writer.compact_steps(upto, folded.clone(), step).unwrap();
+            writer
+                .compact_steps(upto, &mut folded.clone().into_iter().map(Ok), step)
+                .unwrap();
             before
         };
         let after = (

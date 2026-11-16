@@ -8,7 +8,7 @@ use incr_core::{PairOp, Runtime};
 use serde::{Deserialize, Serialize};
 
 use super::collection::fp_of_elements;
-use super::dep_index::{DepFp, DepIndex};
+use super::dep_index::{fp_of, DepFp, DepIndex};
 use super::{Options, PendingWrite, PersistedKeyed, Store};
 use crate::memo::{BuildId, Memo, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo};
 use crate::{
@@ -37,6 +37,7 @@ macro_rules! local_and_shared {
 }
 
 local_and_shared!(
+    a_snapshot_lists_elements_in_rank_order,
     records_match_the_reference_encoding,
     foreign_insert_remove_and_replace_reach_the_index_via_refresh,
     a_write_staged_before_a_caught_up_foreign_write_repairs_to_one_pair,
@@ -1484,4 +1485,54 @@ fn row_drops_in_a_refused_keyed_write_run_after_the_store_lock<C: Cells>() {
     let (all, under) = PROBED.get();
     assert!(all > 0, "the refused writes dropped no row");
     assert_eq!(under, 0, "{under} of {all} row drops ran under a lock");
+}
+
+/// A snapshot lists a keyed collection's pairs by rank, the fingerprint of
+/// the bytes each was applied from, with pairs an unlogged write left
+/// unranked placed by the fingerprint of their encoding; and a plain
+/// collection's elements by the high half of that fingerprint, then bytes.
+fn a_snapshot_lists_elements_in_rank_order<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let kc = keyed(&store);
+    for k in 0..40 {
+        store.upsert(&kc, k, format!("row{k}")).unwrap();
+    }
+    let rt = store.runtime();
+    let scope = store.unlogged_scope().unwrap();
+    let overlay = scope.keyed(&kc).unwrap();
+    for k in [3, 17, 29, 38] {
+        overlay.remove(rt, &k);
+        overlay.upsert(rt, k, format!("row{k}"));
+    }
+    scope.close().unwrap();
+    assert_eq!(overlay.read_rank(&17), Some(incr_core::UNIDENTIFYING_RANK));
+    let plain = store.collection::<String>("plain").unwrap();
+    for v in ["b", "a", "c", "a", "dd", "e", "a", "ff"] {
+        plain.insert(&store, s(v)).unwrap();
+    }
+    store.checkpoint().unwrap();
+
+    let (_, snapshot) = log.load_snapshot().unwrap().expect("a snapshot");
+    let elements = |of: &str| -> Vec<Vec<u8>> {
+        snapshot
+            .iter()
+            .filter_map(|record| match record {
+                Record::Insert { key, element } if key == of => Some(element.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let pairs = elements("k");
+    assert_eq!(pairs.len(), 40);
+    assert!(pairs.iter().map(|e| fp_of(e)).is_sorted(), "keyed by rank");
+    let values = elements("plain");
+    assert_eq!(values.len(), 8);
+    assert!(
+        values
+            .iter()
+            .map(|e| ((fp_of(e) >> 64) as u64, e))
+            .is_sorted(),
+        "plain by fingerprint, then bytes"
+    );
 }

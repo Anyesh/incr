@@ -108,7 +108,14 @@ class DictBackend:
         return self._writable
 
 
+class DictStreamingBackend(DictBackend):
+    def compact_streamed(self, upto, records):
+        self.compact(upto, list(records))
+
+
 class DictLogFactory:
+    backend_type = DictBackend
+
     def __init__(self, persist=persist):
         self.persist = persist
 
@@ -116,10 +123,10 @@ class DictLogFactory:
         return DictLogState()
 
     def open(self, log):
-        return DictBackend(log, persist=self.persist)
+        return self.backend_type(log, persist=self.persist)
 
     def open_read_only(self, log):
-        return DictBackend(log, writable=False, persist=self.persist)
+        return self.backend_type(log, writable=False, persist=self.persist)
 
     def multi_writer(self):
         return True
@@ -596,7 +603,15 @@ class SqliteMemoFactory:
         return True
 
 
-STORE_FLAVORS = {"dict": DictLogFactory, "sqlite3": SqliteLogFactory}
+class DictStreamingLogFactory(DictLogFactory):
+    backend_type = DictStreamingBackend
+
+
+STORE_FLAVORS = {
+    "dict": DictLogFactory,
+    "dict-streamed": DictStreamingLogFactory,
+    "sqlite3": SqliteLogFactory,
+}
 MEMO_FLAVORS = {
     "dict": DictMemoFactory,
     "dict-delta": DictDeltaMemoFactory,

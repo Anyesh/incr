@@ -109,22 +109,27 @@ impl LoggedKey {
     /// `Set`, then one `Insert` per live element occurrence followed by the
     /// raw tail. Folding them back reproduces this state.
     pub fn records(&self, key: &str) -> Vec<Record> {
-        let mut out = Vec::new();
-        if let Some(Declared { kind, default }) = &self.declared {
-            out.push(Record::Declare {
+        self.iter_records(key).collect()
+    }
+
+    /// [`Self::records`], made one at a time.
+    pub fn iter_records<'a>(&'a self, key: &'a str) -> impl Iterator<Item = Record> + 'a {
+        let declare = self
+            .declared
+            .as_ref()
+            .map(|Declared { kind, default }| Record::Declare {
                 key: key.to_owned(),
                 kind: *kind,
                 default: default.clone(),
             });
-        }
-        if let Some(value) = &self.value {
-            out.push(Record::Set {
-                key: key.to_owned(),
-                value: value.clone(),
-            });
-        }
-        self.elements.records(key, &mut out);
-        out
+        let set = self.value.as_ref().map(|value| Record::Set {
+            key: key.to_owned(),
+            value: value.clone(),
+        });
+        declare
+            .into_iter()
+            .chain(set)
+            .chain(self.elements.iter_records(key))
     }
 }
 
@@ -160,13 +165,18 @@ impl Elements {
     /// Pushes one `Insert` per live element occurrence, then the raw tail,
     /// the records that fold back to these elements from none.
     fn records(&self, key: &str, out: &mut Vec<Record>) {
-        for (element, count) in self.live() {
-            out.extend((0..count).map(|_| Record::Insert {
+        out.extend(self.iter_records(key));
+    }
+
+    /// [`Self::records`], made one at a time.
+    fn iter_records<'a>(&'a self, key: &'a str) -> impl Iterator<Item = Record> + 'a {
+        let live = self.live().flat_map(move |(element, count)| {
+            (0..count).map(move |_| Record::Insert {
                 key: key.to_owned(),
                 element: element.to_vec(),
-            }));
-        }
-        out.extend(self.tail.iter().map(|op| match op {
+            })
+        });
+        live.chain(self.tail.iter().map(move |op| match op {
             ElementOp::Insert(element) => Record::Insert {
                 key: key.to_owned(),
                 element: element.clone(),
@@ -175,7 +185,7 @@ impl Elements {
                 key: key.to_owned(),
                 element: element.clone(),
             },
-        }));
+        }))
     }
 
     /// Pushes a `Remove` per occurrence `new` lacks, latest inserted first,

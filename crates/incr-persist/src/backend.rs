@@ -124,6 +124,30 @@ pub trait Backend: Send + Sync {
     /// exactly one; a failed one leaves it unchanged.
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()>;
 
+    /// [`compact`](Self::compact) with the folded records pulled one at a
+    /// time, so a backend can write each as it comes instead of holding
+    /// them all. Same contract, plus two rules:
+    ///
+    /// - An `Err` pulled from `records` fails the call with that error and
+    ///   leaves the snapshot, its id and the log unchanged.
+    /// - An implementation pulls until `records` returns `None` before it
+    ///   commits. One that returns `Ok` with records left has committed a
+    ///   truncated snapshot: a store reports that as
+    ///   [`Error::Corrupt`](crate::Error::Corrupt) and poisons itself
+    ///   rather than load it back.
+    ///
+    /// A store's `records` runs value code, which may panic, but never
+    /// calls back into the backend. The default collects every record,
+    /// then calls `compact`.
+    fn compact_streamed(
+        &self,
+        upto: Position,
+        records: &mut dyn Iterator<Item = Result<Record>>,
+    ) -> Result<()> {
+        let folded = records.collect::<Result<Vec<_>>>()?;
+        self.compact(upto, folded)
+    }
+
     /// `false` for a read-only open, on which `append` and `compact` fail.
     fn writable(&self) -> bool;
 

@@ -1,15 +1,15 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::flock::Flock;
 use crate::{Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use format::{
     decode_frames, header, journal_path, parse_header, push_frames, read_current, read_header,
-    remove_stale, scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current, HEADER_LEN,
-    JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
+    remove_stale, scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current,
+    write_snapshot_synced, HEADER_LEN, JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
 };
 pub(crate) use format::{sync_dir, write_synced};
 
@@ -43,6 +43,9 @@ const COMPACTION_STEPS: u8 = 5;
 pub struct FileBackend {
     dir: PathBuf,
     state: Mutex<State>,
+    // Serializes compactions on this handle, which write their snapshot
+    // without holding `state` so that appends go on meanwhile.
+    compacting: Mutex<()>,
     // Held for the handle's lifetime so that no second writer can open the
     // log; dropping it releases the lock. `None` for read-only handles.
     lock: Option<Flock>,
@@ -225,6 +228,7 @@ impl FileBackend {
                 synced,
                 failed: false,
             }),
+            compacting: Mutex::new(()),
             lock: Some(Flock(lock)),
         })
     }
@@ -255,6 +259,7 @@ impl FileBackend {
                 synced: 0,
                 failed: false,
             }),
+            compacting: Mutex::new(()),
             lock: None,
         })
     }
@@ -299,27 +304,45 @@ impl FileBackend {
     /// 3. write `journal.N+1` with the records above `upto` and fsync it;
     /// 4. point `CURRENT` at `N+1` by atomic rename and fsync the directory;
     /// 5. switch this handle over and delete the old pair, best-effort.
-    fn compact_steps(&self, upto: Position, folded: Vec<Record>, stop_after: u8) -> Result<()> {
-        let mut guard = self.writer_state()?;
-        let state = &mut *guard;
-        let (snapshot_at, tail) = (state.journal.snapshot_at(), state.journal.tail());
-        if upto.0 < snapshot_at || upto.0 > tail {
-            return Err(Error::InvalidCompaction {
-                upto,
-                snapshot_at: Position(snapshot_at),
-                tail: Position(tail),
-            });
-        }
+    fn compact_steps(
+        &self,
+        upto: Position,
+        records: &mut dyn Iterator<Item = Result<Record>>,
+        stop_after: u8,
+    ) -> Result<()> {
+        let _compacting = self
+            .compacting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let next = {
+            let state = self.writer_state()?;
+            let (snapshot_at, tail) = (state.journal.snapshot_at(), state.journal.tail());
+            if upto.0 < snapshot_at || upto.0 > tail {
+                return Err(Error::InvalidCompaction {
+                    upto,
+                    snapshot_at: Position(snapshot_at),
+                    tail: Position(tail),
+                });
+            }
+            state.generation + 1
+        };
         let dir = &self.dir;
-        let next = state.generation + 1;
 
-        let mut snapshot = header(SNAPSHOT_MAGIC, upto.0).to_vec();
-        push_frames(&mut snapshot, &folded)?;
+        // Without the state lock, appends land meanwhile. They land above
+        // the tail checked above, so `upto` stays valid, and only this
+        // handle compacts, which `compacting` serializes, so `next` does too.
         let tmp = snapshot_tmp_path(dir, next);
-        write_synced(&tmp, &snapshot)?;
+        if let Err(e) = write_snapshot_synced(&tmp, upto.0, records) {
+            // Ignored on purpose: a leftover temp file is removed by the
+            // next compaction or writable open.
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
         if stop_after == 1 {
             return Ok(());
         }
+        let mut guard = self.writer_state()?;
+        let state = &mut *guard;
 
         fs::rename(&tmp, snapshot_path(dir, next))?;
         if stop_after == 2 {
@@ -487,7 +510,17 @@ impl Backend for FileBackend {
     }
 
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()> {
-        self.compact_steps(upto, folded, COMPACTION_STEPS)
+        self.compact_steps(upto, &mut folded.into_iter().map(Ok), COMPACTION_STEPS)
+    }
+
+    /// Writes each record to the temp snapshot as it is pulled, holding no
+    /// lock appends take.
+    fn compact_streamed(
+        &self,
+        upto: Position,
+        records: &mut dyn Iterator<Item = Result<Record>>,
+    ) -> Result<()> {
+        self.compact_steps(upto, records, COMPACTION_STEPS)
     }
 
     fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {

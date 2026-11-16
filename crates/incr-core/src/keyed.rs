@@ -497,6 +497,14 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     }
 }
 
+/// One held pair of a [`KeyedCollection`], named by where its key index
+/// keeps it as of one epoch: see [`KeyedCollection::pair_handles`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairHandle {
+    slot: u32,
+    at: u32,
+}
+
 /// A keyed collection's key index: its [`KeyTable`] under a
 /// [`LockKind::KeyIndex`] lock, an epoch that starts at 1 and advances on
 /// every write that changes the table and every partitioning registered, and
@@ -2053,6 +2061,45 @@ where
                 None => Vec::new(),
             },
         )
+    }
+
+    /// The index epoch and a handle on every held pair, in rank order,
+    /// pairs of one rank in no particular order. Runs no user code and
+    /// records no dependency.
+    pub fn pair_handles(&self) -> (u64, Vec<PairHandle>) {
+        refuse_value_code();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        let table = self.index.table.read();
+        let mut handles = Vec::with_capacity(table.pairs);
+        for (slot, bucket) in table.buckets() {
+            let slot = u32::try_from(slot).expect("incr-core: a key table holds under 2^32 slots");
+            handles.extend((0..bucket.pairs().len()).map(|at| PairHandle {
+                slot,
+                at: at as u32,
+            }));
+        }
+        handles.sort_unstable_by_key(|h| table.bucket(h.slot as usize).pairs()[h.at as usize].1);
+        (self.index.epoch(), handles)
+    }
+
+    /// Runs `f` as value code on the pair a handle from
+    /// [`Self::pair_handles`] names, with its rank, under the index's read
+    /// guard. `None` when the index changed since `epoch`, after which the
+    /// handle may name another pair or none. Records no dependency.
+    pub fn with_pair<T>(
+        &self,
+        epoch: u64,
+        handle: PairHandle,
+        f: impl FnOnce(&P, R) -> T,
+    ) -> Option<T> {
+        refuse_value_code();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        let table = self.index.table.read();
+        if self.index.epoch() != epoch {
+            return None;
+        }
+        let (pair, rank) = &table.bucket(handle.slot as usize).pairs()[handle.at as usize];
+        Some(value_code::run(|| f(pair, *rank)))
     }
 
     /// A copy of every pair held, with its rank, in no particular order.
