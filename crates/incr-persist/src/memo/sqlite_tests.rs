@@ -281,6 +281,7 @@ fn buffered_loss_rolls_back_to_an_earlier_whole_generation() {
         .unwrap();
     memo.write_generation(Some(GenId(1)), GenId(2), &header(2), &encoded(5))
         .unwrap();
+    memo.remove_generation(GenId(1)).unwrap();
 
     let copy = db.dir.path().join("crashed.sqlite");
     std::fs::copy(&db.path, &copy).unwrap();
@@ -293,27 +294,6 @@ fn buffered_loss_rolls_back_to_an_earlier_whole_generation() {
         let frame = after.read_entry(loaded.id(), &item).unwrap().unwrap();
         assert_eq!(frame, written.frame);
     }
-}
-
-#[test]
-fn a_buffered_removal_ends_with_a_checkpoint_that_leaves_the_new_generation_whole() {
-    let db = db();
-    let options = SqliteMemoOptions {
-        durability: SqliteDurability::Buffered,
-        ..SqliteMemoOptions::default()
-    };
-    let memo = SqliteMemo::open_with(&db.path, options).unwrap();
-    memo.write_generation(None, GenId(1), &header(1), &encoded(3))
-        .unwrap();
-    memo.write_generation(Some(GenId(1)), GenId(2), &header(2), &encoded(5))
-        .unwrap();
-    memo.remove_generation(GenId(1)).unwrap();
-
-    let copy = db.dir.path().join("crashed.sqlite");
-    std::fs::copy(&db.path, &copy).unwrap();
-    let after = SqliteMemo::open(&copy).unwrap();
-    assert_eq!(after.load().unwrap().unwrap().id(), GenId(2));
-    assert_eq!(row_count(&after), 5);
 }
 
 #[test]
@@ -687,7 +667,7 @@ fn a_streamed_full_write_from_the_tip_replaces_the_chain() {
 }
 
 #[test]
-fn a_batched_frame_read_and_a_generation_delete_go_by_rowid_not_through_the_index() {
+fn a_batched_frame_read_goes_by_rowid_and_a_generation_delete_goes_through_the_index() {
     let dir = tempfile::tempdir().unwrap();
     let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
     memo.write_generation(None, GenId(1), &header(1), &encoded(255))
@@ -707,15 +687,15 @@ fn a_batched_frame_read_and_a_generation_delete_go_by_rowid_not_through_the_inde
     );
 
     let mut plan = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", delete_range_sql(2)))
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", delete_generations_sql(2)))
         .unwrap();
     let details: Vec<String> = plan
-        .query_map([1, 255, 1, 2], |row| row.get(3))
+        .query_map([1, 2], |row| row.get(3))
         .unwrap()
         .collect::<std::result::Result<_, _>>()
         .unwrap();
     assert!(
-        details.iter().all(|d| d.contains("INTEGER PRIMARY KEY")),
+        details.iter().all(|d| d.contains("memo_entry_index")),
         "{details:?}"
     );
 }
@@ -737,11 +717,11 @@ fn superseded_chain(memo: &SqliteMemo) -> [GenId; 2] {
 }
 
 #[test]
-fn several_superseded_generations_are_removed_in_rowid_ranges_and_the_current_one_stays() {
+fn several_superseded_generations_are_removed_together_and_the_current_one_stays() {
     let dir = tempfile::tempdir().unwrap();
     let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
     let old = superseded_chain(&memo);
-    remove_in_chunks(&mut lock(&memo.writer), &old, 16, None).unwrap();
+    remove_in_one(&mut lock(&memo.writer), &old).unwrap();
     assert_eq!(row_count(&memo), 100);
     assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
     assert!(memo.remove_generations(&[GenId(3)]).is_err());
@@ -749,54 +729,16 @@ fn several_superseded_generations_are_removed_in_rowid_ranges_and_the_current_on
 }
 
 #[test]
-fn a_removal_stopped_between_ranges_is_finished_by_the_next_open() {
+fn a_chain_left_by_a_crash_before_its_removal_is_finished_by_the_next_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("memo.db");
     {
         let memo = SqliteMemo::open(&path).unwrap();
-        let old = superseded_chain(&memo);
-        let stopped = remove_in_chunks(&mut lock(&memo.writer), &old, 16, Some(2));
-        assert!(stopped.is_err());
-        let left = row_count(&memo);
-        assert!(100 < left && left < 300, "{left} rows");
-        assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
+        superseded_chain(&memo);
+        assert_eq!(row_count(&memo), 300);
     }
     let memo = SqliteMemo::open(&path).unwrap();
     drop(memo.lock_checkpoint().unwrap());
     assert_eq!(row_count(&memo), 100);
     assert_eq!(memo.load().unwrap().unwrap().id(), GenId(3));
-}
-
-fn pragma_int(conn: &Connection, name: &str) -> i64 {
-    conn.pragma_query_value(None, name, |row| row.get(0))
-        .unwrap()
-}
-
-#[test]
-fn a_removal_commits_without_syncing_or_checkpointing_and_leaves_the_connection_as_it_was() {
-    let dir = tempfile::tempdir().unwrap();
-    let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
-    let mut conn = lock(&memo.writer);
-    let (sync, auto) = (
-        pragma_int(&conn, "synchronous"),
-        pragma_int(&conn, "wal_autocheckpoint"),
-    );
-    assert_eq!(sync, 2, "Full durability is FULL");
-    let saved = relax_for_removal(&conn).unwrap();
-    assert_eq!(pragma_int(&conn, "synchronous"), 1);
-    assert_eq!(pragma_int(&conn, "wal_autocheckpoint"), 0);
-    restore_after_removal(&mut conn, saved).unwrap();
-    assert_eq!(pragma_int(&conn, "synchronous"), sync);
-    assert_eq!(pragma_int(&conn, "wal_autocheckpoint"), auto);
-}
-
-#[test]
-fn a_removal_that_stops_early_still_restores_the_connection() {
-    let dir = tempfile::tempdir().unwrap();
-    let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
-    let old = superseded_chain(&memo);
-    let mut conn = lock(&memo.writer);
-    assert!(remove_in_chunks(&mut conn, &old, 16, Some(1)).is_err());
-    assert_eq!(pragma_int(&conn, "synchronous"), 2);
-    assert_eq!(pragma_int(&conn, "wal_autocheckpoint"), 1000);
 }

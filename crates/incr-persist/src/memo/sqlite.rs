@@ -318,7 +318,7 @@ impl MemoBackend for SqliteMemo {
     }
 
     fn remove_generations(&self, generations: &[GenId]) -> Result<()> {
-        remove_in_chunks(&mut lock(&self.writer), generations, REMOVE_SPAN, None)
+        remove_in_one(&mut lock(&self.writer), generations)
     }
 }
 
@@ -433,7 +433,7 @@ impl SqliteMemo {
             return Ok(());
         }
         let ids = leftovers(&conn)?;
-        remove_in_chunks(&mut conn, &ids, REMOVE_SPAN, None)
+        remove_in_one(&mut conn, &ids)
     }
 }
 
@@ -453,136 +453,34 @@ fn leftovers(conn: &Connection) -> Result<Vec<GenId>> {
     Ok(ids)
 }
 
-/// Rowids one removal transaction covers. Removing a whole chain in one
-/// commit rewrites every page of it through the WAL and one checkpoint,
-/// which on a 600k-entry store took minutes.
-const REMOVE_SPAN: i64 = 1 << 15;
-
-/// The connection settings a removal changes.
-struct Saved {
-    synchronous: i64,
-    autocheckpoint: i64,
-}
-
-/// Stops the connection syncing at each commit and checkpointing on its
-/// own, so that a removal's many page rewrites reach the disk in one
-/// ordered checkpoint instead of one scattered fsync per range. Only a
-/// removal runs this way: the rows it deletes are already outside the
-/// chain, so a commit lost to a crash leaves them for the next open to
-/// remove, and `NORMAL` keeps the file consistent.
-fn relax_for_removal(conn: &Connection) -> Result<Saved> {
-    let saved = Saved {
-        synchronous: conn
-            .pragma_query_value(None, "synchronous", |row| row.get(0))
-            .map_err(sql)?,
-        autocheckpoint: conn
-            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
-            .map_err(sql)?,
-    };
-    if saved.synchronous > 1 {
-        conn.pragma_update(None, "synchronous", 1).map_err(sql)?;
-    }
-    conn.pragma_update(None, "wal_autocheckpoint", 0)
-        .map_err(sql)?;
-    Ok(saved)
-}
-
-fn restore_after_removal(conn: &mut Connection, saved: Saved) -> Result<()> {
-    conn.pragma_update(None, "synchronous", saved.synchronous)
-        .map_err(sql)?;
-    conn.pragma_update(None, "wal_autocheckpoint", saved.autocheckpoint)
-        .map_err(sql)
-}
-
-/// Removes the generations' rows a rowid range at a time, each range its
-/// own transaction, and their `memo_generation` rows last, then
-/// checkpoints the WAL once. A stop between ranges leaves generations
-/// outside the chain, which [`SqliteMemo::remove_leftovers`] finishes at
-/// the next [`lock_checkpoint`](MemoBackend::lock_checkpoint). With
-/// `stop_after`, fails once that many ranges are removed.
-fn remove_in_chunks(
-    conn: &mut Connection,
-    generations: &[GenId],
-    span: i64,
-    stop_after: Option<usize>,
-) -> Result<()> {
-    if generations.is_empty() {
-        return Ok(());
-    }
-    let saved = relax_for_removal(conn)?;
-    let removed = remove_ranges(conn, generations, span, stop_after);
-    let restored = restore_after_removal(conn, saved);
-    removed?;
-    restored?;
-    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
-        .map_err(sql)
-}
-
-fn remove_ranges(
-    conn: &mut Connection,
-    generations: &[GenId],
-    span: i64,
-    stop_after: Option<usize>,
-) -> Result<()> {
+/// Removes the generations' rows and their `memo_generation` rows in one
+/// transaction, so a crash leaves them whole for
+/// [`SqliteMemo::remove_leftovers`] to finish at the next
+/// [`lock_checkpoint`](MemoBackend::lock_checkpoint).
+fn remove_in_one(conn: &mut Connection, generations: &[GenId]) -> Result<()> {
     if generations.is_empty() {
         return Ok(());
     }
     let marks = vec!["?"; generations.len()].join(",");
     let ids = || generations.iter().map(|g| to_sql(g.0));
-    let rows = {
-        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
-            Err(e) if is_busy(&e) => return Err(Error::Busy),
-            begun => begun.map_err(sql)?,
-        };
-        if let Some(live) = chain_ids(&tx)?.iter().find(|id| generations.contains(id)) {
-            return Err(Error::Backend(
-                format!(
-                    "memo generation {} is in the current chain and cannot be removed",
-                    live.0
-                )
-                .into(),
-            ));
-        }
-        let rows: (Option<i64>, Option<i64>) = tx
-            .query_row(
-                &format!("SELECT min(loc), max(loc) FROM memo_entry WHERE generation IN ({marks})"),
-                params_from_iter(ids()),
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(sql)?;
-        tx.commit().map_err(sql)?;
-        rows
-    };
-    if let (Some(first), Some(last)) = rows {
-        let delete = delete_range_sql(generations.len());
-        let mut done = 0;
-        let mut from = first;
-        while from <= last {
-            if stop_after == Some(done) {
-                return Err(Error::Backend("memo removal stopped".into()));
-            }
-            let to = from.saturating_add(span - 1);
-            let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
-                Err(e) if is_busy(&e) => return Err(Error::Busy),
-                begun => begun.map_err(sql)?,
-            };
-            tx.execute(
-                &delete,
-                params_from_iter([from, to].into_iter().chain(ids())),
-            )
-            .map_err(sql)?;
-            tx.commit().map_err(sql)?;
-            done += 1;
-            from = to.saturating_add(1);
-            if to == i64::MAX {
-                break;
-            }
-        }
-    }
     let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
         Err(e) if is_busy(&e) => return Err(Error::Busy),
         begun => begun.map_err(sql)?,
     };
+    if let Some(live) = chain_ids(&tx)?.iter().find(|id| generations.contains(id)) {
+        return Err(Error::Backend(
+            format!(
+                "memo generation {} is in the current chain and cannot be removed",
+                live.0
+            )
+            .into(),
+        ));
+    }
+    tx.execute(
+        &delete_generations_sql(generations.len()),
+        params_from_iter(ids()),
+    )
+    .map_err(sql)?;
     tx.execute(
         &format!("DELETE FROM memo_generation WHERE id IN ({marks})"),
         params_from_iter(ids()),
@@ -807,13 +705,14 @@ fn from_sql(value: i64) -> u64 {
     value as u64
 }
 
-/// Deletes by rowid range, which goes in rowid order; through
-/// `memo_entry_index` the rows go in key-hash order, each a random page.
-fn delete_range_sql(generations: usize) -> String {
+/// Deletes through `memo_entry_index`, which touches every page of the
+/// chain, so the checkpoint writes them contiguously. A rowid-ordered
+/// delete frees emptied pages without writing them and leaves a scatter of
+/// half-emptied ones, whose single `fsync` took 50 to 145 s on a spinning
+/// disk against 9 s for this order.
+fn delete_generations_sql(generations: usize) -> String {
     let marks = vec!["?"; generations].join(",");
-    format!(
-        "DELETE FROM memo_entry NOT INDEXED WHERE loc BETWEEN ? AND ? AND generation IN ({marks})"
-    )
+    format!("DELETE FROM memo_entry WHERE generation IN ({marks})")
 }
 
 /// Fetches rows by rowid. Without `NOT INDEXED`, a long `IN` list makes
