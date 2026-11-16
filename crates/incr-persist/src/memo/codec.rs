@@ -189,9 +189,31 @@ pub fn encode_entry(entry: &Entry, tag: u64) -> Result<Vec<u8>> {
 /// that differs from `frame.len()`, another tag or an undecodable body is
 /// an error.
 pub fn decode_entry(frame: &[u8], tag: u64) -> Result<Entry> {
-    let body = body(frame)?;
-    match body.split_first_chunk() {
-        Some((found, entry)) if u64::from_le_bytes(*found) == tag => decode_body(entry),
+    decode_body(entry_body(frame, tag)?)
+}
+
+/// An [`Entry`] decoded with its key and value borrowed from the frame.
+#[derive(Deserialize)]
+pub(crate) struct EntryView<'a> {
+    pub(crate) table: u32,
+    #[serde(borrow)]
+    pub(crate) key: &'a [u8],
+    #[serde(borrow)]
+    pub(crate) value: &'a [u8],
+    pub(crate) deps: Vec<StoredDep>,
+    pub(crate) last_used: u64,
+}
+
+/// [`decode_entry`] without copying the key and value.
+pub(crate) fn decode_view(frame: &[u8], tag: u64) -> Result<EntryView<'_>> {
+    decode_body(entry_body(frame, tag)?)
+}
+
+/// The entry bytes of `frame` after its crc and its tag, which must be
+/// `tag`, are checked.
+fn entry_body(frame: &[u8], tag: u64) -> Result<&[u8]> {
+    match body(frame)?.split_first_chunk() {
+        Some((found, entry)) if u64::from_le_bytes(*found) == tag => Ok(entry),
         _ => Err(Error::Corrupt(
             "memo entry frame belongs to another generation",
         )),
@@ -330,7 +352,7 @@ fn body(frame: &[u8]) -> Result<&[u8]> {
     Ok(body)
 }
 
-fn decode_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T> {
+fn decode_body<'de, T: Deserialize<'de>>(body: &'de [u8]) -> Result<T> {
     let (value, rest) = postcard::take_from_bytes(body).map_err(Error::Decode)?;
     if !rest.is_empty() {
         return Err(Error::Corrupt("memo frame has trailing bytes"));

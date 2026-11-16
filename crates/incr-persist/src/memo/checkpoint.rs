@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::layers::{self, Live, Probe};
+use super::summary::{Row, Summary, Summing};
 use super::{
     decode_entry, fingerprint, key_hash, retag_frame, Chain, DeltaHeader, EncodedEntry, Entry,
     GenHeader, GenId, Generation, IndexItem, MemoBackend, StoredDep, TableDesc, Tombstone,
@@ -198,17 +200,51 @@ fn write_chain<B: MemoBackend + ?Sized>(
         seq: next_seq.unwrap_or(1),
         started,
     };
+    let mut probes = Probes::new(mergeable.and_then(|chain| known_summary(chain, known)));
     let input = match mergeable
         .filter(|chain| backend.supports_delta() && chain.depth() < MAX_CHAIN_DEPTH)
     {
-        Some(chain) => match write_delta(backend, chain, input, &next, &encode)? {
+        Some(chain) => match write_delta(backend, chain, input, &next, &encode, &mut probes)? {
             Ok(done) => return Ok(done),
             Err(input) => input,
         },
         None => input,
     };
     let merged = mergeable.is_some();
-    write_full(backend, chain.as_ref(), merged, input, &next, encode)
+    write_full(
+        backend,
+        chain.as_ref(),
+        merged,
+        input,
+        &next,
+        encode,
+        &mut probes,
+    )
+}
+
+/// The summary a `known` layer keeps of `chain`, when the chain is one
+/// full generation equal to that layer.
+fn known_summary<'k>(chain: &Chain, known: &'k [Arc<Generation>]) -> Option<Summarized<'k>> {
+    let [base] = chain.layers() else {
+        return None;
+    };
+    let generation = known.iter().find(|layer| layer.id() == base.id())?;
+    let summary = generation.summary()?;
+    let same = Arc::ptr_eq(generation, base)
+        || (generation.base().is_none()
+            && generation.header() == base.header()
+            && generation.items() == base.items());
+    same.then_some(Summarized {
+        generation,
+        summary,
+    })
+}
+
+/// A full generation and the summary this process kept of it.
+#[derive(Clone, Copy)]
+struct Summarized<'k> {
+    generation: &'k Generation,
+    summary: &'k Summary,
 }
 
 /// The id and sequence number the checkpoint writes under.
@@ -226,6 +262,7 @@ fn write_delta<B: MemoBackend + ?Sized>(
     input: CheckpointInput,
     next: &Next,
     encode: &impl Fn(&Entry, u64) -> Result<EncodedEntry>,
+    probes: &mut Probes,
 ) -> Result<std::result::Result<Checkpointed, CheckpointInput>> {
     let base = chain.base();
     let base_bytes = base.entry_bytes();
@@ -250,15 +287,13 @@ fn write_delta<B: MemoBackend + ?Sized>(
         chain_depth: chain.depth() + 1,
         ..CheckpointStats::default()
     };
-    let held = held_in_chain(
+    let unkept = probes.unkept(
         backend,
         chain.layers(),
         &input.fresh,
         |table| to_base.get(table as usize).copied(),
-        |_| true,
+        None,
     )?;
-    let unkept = unkept(&input.fresh, &held);
-    drop(held);
     let mut fates = vec![Fate::Written; input.fresh.len()];
     let mut kept = Vec::new();
     let mut origin = Vec::new();
@@ -373,41 +408,141 @@ fn renumber(entry: &mut Entry, to_base: &[u32]) {
     }
 }
 
-/// The fps of the stored entries the fresh entries' query deps name, read
-/// through `layers` newest first. Deps are keyed in the live catalog;
-/// `to_chain` maps a live table to the chain's, and only entries `keep`
-/// accepts count.
-fn held_in_chain<'a, B: MemoBackend + ?Sized>(
-    backend: &B,
-    layers: &[Arc<Generation>],
-    fresh: &'a [Entry],
-    to_chain: impl Fn(u32) -> Option<u32>,
-    keep: impl Fn(&Entry) -> bool,
-) -> Result<Held<'a>> {
-    let mut fps = HashMap::new();
-    let mut missing = HashSet::new();
-    for entry in fresh {
-        for (dep, _) in query_deps(entry) {
-            if fps.contains_key(&dep) || missing.contains(&dep) {
-                continue;
-            }
-            let Some(table) = to_chain(dep.0) else {
-                continue;
-            };
-            let probe = layers::probe(layers, table, dep.1, |id, item| {
-                backend.read_entry(id, item)
-            })?;
-            match probe {
-                Probe::Found(stored) if keep(&stored) => {
-                    fps.insert(dep, fingerprint(&stored.value));
-                }
-                _ => {
-                    missing.insert(dep);
-                }
-            }
+/// What a checkpoint learned of the stored entries its fresh entries'
+/// query deps name: per live table and key, the stored entry's value fp
+/// and query-dep tables, or `None` when the chain does not hold it. Deps
+/// are looked up in the summary this process kept of the base when it has
+/// one, and probed through the chain in batches otherwise.
+struct Probes<'k> {
+    summary: Option<Summarized<'k>>,
+    found: HashMap<u32, HashMap<Vec<u8>, Option<Hit>>>,
+}
+
+struct Hit {
+    fp: u128,
+    /// In the chain's catalog.
+    dep_tables: Vec<u32>,
+}
+
+impl<'k> Probes<'k> {
+    fn new(summary: Option<Summarized<'k>>) -> Self {
+        Probes {
+            summary,
+            found: HashMap::new(),
         }
     }
-    Ok(Held { fps })
+
+    fn get(&self, (table, key): Identity) -> Option<&Option<Hit>> {
+        self.found.get(&table)?.get(key)
+    }
+
+    /// [`unkept`] for `fresh` against the stored entries of `layers`, whose
+    /// catalog `to_chain` maps a live table into. With `remap`, a stored
+    /// entry counts only when every query-dep table it names survives
+    /// `remap`. A dep that names a fresh entry is probed only once that
+    /// entry turns out unkept, since a kept one satisfies the dep anyway.
+    fn unkept<B: MemoBackend + ?Sized>(
+        &mut self,
+        backend: &B,
+        layers: &[Arc<Generation>],
+        fresh: &[Entry],
+        to_chain: impl Fn(u32) -> Option<u32>,
+        remap: Option<&[Option<u32>]>,
+    ) -> Result<Vec<bool>> {
+        let at: HashMap<Identity, usize> = fresh
+            .iter()
+            .enumerate()
+            .map(|(i, e)| ((e.table, e.key.as_slice()), i))
+            .collect();
+        let deps = || fresh.iter().flat_map(query_deps).map(|(dep, _)| dep);
+        let stored: Vec<Identity> = deps().filter(|dep| !at.contains_key(dep)).collect();
+        self.probe(backend, layers, &stored, &to_chain)?;
+        let out = unkept(fresh, &self.held(remap));
+        let rescue: Vec<Identity> = deps()
+            .filter(|dep| at.get(dep).is_some_and(|&j| out[j]) && self.get(*dep).is_none())
+            .collect();
+        if rescue.is_empty() {
+            return Ok(out);
+        }
+        self.probe(backend, layers, &rescue, &to_chain)?;
+        Ok(unkept(fresh, &self.held(remap)))
+    }
+
+    fn probe<B: MemoBackend + ?Sized>(
+        &mut self,
+        backend: &B,
+        layers: &[Arc<Generation>],
+        wanted: &[Identity],
+        to_chain: &impl Fn(u32) -> Option<u32>,
+    ) -> Result<()> {
+        let mut pending: Vec<(u32, &[u8])> = Vec::new();
+        let mut keys: Vec<(u32, &[u8])> = Vec::new();
+        for &(table, key) in wanted {
+            let known = self.found.entry(table).or_default();
+            if known.contains_key(key) {
+                continue;
+            }
+            let hit = match (to_chain(table), self.summary) {
+                (None, _) => None,
+                (Some(at), Some(base)) => {
+                    base.summary.find(base.generation, at, key).map(Hit::of_row)
+                }
+                (Some(at), None) => {
+                    pending.push((table, key));
+                    keys.push((at, key));
+                    None
+                }
+            };
+            known.insert(key.to_vec(), hit);
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let found = &mut self.found;
+        layers::probe_many(
+            layers,
+            &keys,
+            STREAM_BATCH,
+            |id, items| backend.read_entries(id, items),
+            |i, probe| {
+                if let Probe::Found(entry) = probe {
+                    let (table, key) = pending[i];
+                    let hit = found
+                        .get_mut(&table)
+                        .and_then(|keys| keys.get_mut(key))
+                        .expect("a pending dep was recorded");
+                    *hit = Some(Hit::of(&entry));
+                }
+            },
+        )
+    }
+
+    fn held<'p>(&'p self, remap: Option<&'p [Option<u32>]>) -> Held<'p> {
+        Held {
+            probes: Some(self),
+            remap,
+        }
+    }
+
+    fn summary(&self) -> Option<Summarized<'k>> {
+        self.summary
+    }
+}
+
+impl Hit {
+    fn of(entry: &Entry) -> Self {
+        Hit {
+            fp: fingerprint(&entry.value),
+            dep_tables: query_deps(entry).map(|((table, _), _)| table).collect(),
+        }
+    }
+
+    fn of_row(row: &Row) -> Self {
+        Hit {
+            fp: row.fp,
+            dep_tables: row.deps.iter().map(|&(table, _)| table).collect(),
+        }
+    }
 }
 
 /// How a full write carried the chain's entries.
@@ -420,7 +555,8 @@ pub(crate) enum Mode {
     Copy { remap: bool },
     /// A pass that keeps only each visible entry's metadata, to evict or
     /// to drop the dependents of an oversized fresh entry, then a streamed
-    /// pass over the entries that stay.
+    /// pass over the entries that stay. The first pass reads nothing when
+    /// this process kept a summary of the base.
     TwoPass { remap: bool },
 }
 
@@ -433,7 +569,8 @@ pub(crate) const STREAM_BATCH: usize = 256;
 /// frames into the write a batch at a time. Eviction runs when the result
 /// would exceed `max_bytes`, down to 0.9 of it on a backend with deltas so
 /// that the next checkpoints have room for deltas, and down to `max_bytes`
-/// on one without.
+/// on one without. On a backend without deltas the new generation keeps a
+/// summary of its entries for the next full write.
 fn write_full<B: MemoBackend + ?Sized>(
     backend: &B,
     chain: Option<&Chain>,
@@ -441,6 +578,7 @@ fn write_full<B: MemoBackend + ?Sized>(
     input: CheckpointInput,
     next: &Next,
     encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
+    probes: &mut Probes,
 ) -> Result<Checkpointed> {
     let seq = next.seq;
     let mut stats = CheckpointStats::default();
@@ -457,18 +595,16 @@ fn write_full<B: MemoBackend + ?Sized>(
         .iter()
         .any(|remap| (0..).zip(remap).any(|(i, &to)| to != Some(i)));
 
-    let held = match layers.first() {
-        Some(base) => held_in_chain(
+    let unkept = match layers.first() {
+        Some(base) => probes.unkept(
             backend,
             layers,
             &input.fresh,
             |table| base.header().table_index(&tables[table as usize]),
-            |stored| decodes_into(stored, &remaps[0]),
+            Some(&remaps[0]),
         )?,
-        None => Held::none(),
+        None => unkept(&input.fresh, &Held::none()),
     };
-    let unkept = unkept(&input.fresh, &held);
-    drop(held);
     let mut fates = vec![Fate::Written; input.fresh.len()];
     let mut fresh = Vec::with_capacity(input.fresh.len());
     let mut origin = Vec::with_capacity(input.fresh.len());
@@ -512,8 +648,12 @@ fn write_full<B: MemoBackend + ?Sized>(
         encode: &encode,
     };
     let mut evicted_base = Vec::new();
+    let summing = (!backend.supports_delta()).then(Summing::default);
     let (mut copier, mode) = if two_pass {
-        let stored = scan(&source, &fresh, &contested, &mut stats)?;
+        let stored = match probes.summary().filter(|_| !remap) {
+            Some(base) => scan_summary(base, &fresh, &contested),
+            None => scan(&source, &fresh, &contested, &mut stats)?,
+        };
         stats.merged = stored.len();
         let bound = Bound {
             max_bytes: input.max_bytes,
@@ -529,7 +669,8 @@ fn write_full<B: MemoBackend + ?Sized>(
         evicted_base = chosen.evicted_base;
         let kept = chosen.fresh;
         let walk = Walk::new(&source, Some(picked));
-        (Copier::new(walk, kept, None), Mode::TwoPass { remap })
+        let copy = Copier::new(walk, kept, None, summing);
+        (copy, Mode::TwoPass { remap })
     } else {
         let kept = frames.into_iter().flatten().collect();
         let walk = Walk::new(&source, None);
@@ -537,7 +678,7 @@ fn write_full<B: MemoBackend + ?Sized>(
             .iter()
             .map(|entry| (entry.table, entry.key.clone()))
             .collect();
-        let copy = Copier::new(walk, kept, Some((contested, seen)));
+        let copy = Copier::new(walk, kept, Some((contested, seen)), summing);
         (copy, Mode::Copy { remap })
     };
     drop(fresh);
@@ -558,6 +699,9 @@ fn write_full<B: MemoBackend + ?Sized>(
     stats.fresh_written = fates.iter().filter(|&&f| f == Fate::Written).count();
     stats.bytes_appended = generation.entry_bytes();
     stats.compacted = superseded.len() > 1;
+    if let Some(summary) = copier.summing.take().and_then(|s| s.finish(&generation)) {
+        generation.set_summary(summary);
+    }
     stats.times.write = merged_at.elapsed();
     let generation = Arc::new(generation);
     Ok(Checkpointed {
@@ -581,11 +725,11 @@ struct Bound {
 
 /// What a two-pass write carries once oversized entries' dependents and
 /// evicted entries are gone.
-struct Chosen {
+struct Chosen<'s> {
     /// The fitting fresh frames that stay.
     fresh: Vec<EncodedEntry>,
     /// The chain entries that stay, in scan order.
-    stored: Vec<Meta>,
+    stored: Vec<Meta<'s>>,
     /// The `(table, key)` of every chain entry evicted.
     evicted_base: Vec<(u32, Vec<u8>)>,
 }
@@ -594,15 +738,15 @@ struct Chosen {
 /// then evicts within `bound`, recording each fresh entry's fate.
 /// `frames[i]` is fresh entry `i`'s frame, `None` when it was too large,
 /// and `origin[i]` its index in the checkpoint's input.
-fn choose(
+fn choose<'s>(
     fresh: &[Entry],
     frames: Vec<Option<EncodedEntry>>,
-    stored: Vec<Meta>,
+    stored: Vec<Meta<'s>>,
     bound: Bound,
     origin: &[usize],
     fates: &mut [Fate],
     stats: &mut CheckpointStats,
-) -> Chosen {
+) -> Chosen<'s> {
     let nodes: Vec<Node> = fresh
         .iter()
         .zip(&frames)
@@ -649,21 +793,14 @@ fn choose(
         }
         if evicted {
             stats.evicted += 1;
-            chosen.evicted_base.push((meta.table, meta.key));
+            chosen
+                .evicted_base
+                .push((meta.table, meta.row.key.to_vec()));
         } else {
             chosen.stored.push(meta);
         }
     }
     chosen
-}
-
-/// Whether every query dep of the stored `entry` names a table that
-/// survives `remap`, so a full write would carry it.
-fn decodes_into(entry: &Entry, remap: &[Option<u32>]) -> bool {
-    entry.deps.iter().all(|dep| match dep {
-        StoredDep::Query { table, .. } => remap.get(*table as usize).copied().flatten().is_some(),
-        _ => true,
-    })
 }
 
 /// The `(table, key_hash)`, in the new catalog, of every fresh entry and
@@ -899,12 +1036,14 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E> Walk<'s, 'a, B, E> {
 /// The frames of a full write: the fresh ones, then the chain's, pulled a
 /// batch at a time. With `dedup`, the chain's entries are chosen as they
 /// come, as a newest-first probe sees them; without it the walk reads only
-/// entries a scan picked.
+/// entries a scan picked. With `summing`, every frame it hands out is
+/// summarized.
 struct Copier<'s, 'a, B: ?Sized, E> {
     walk: Walk<'s, 'a, B, E>,
     fresh: std::vec::IntoIter<EncodedEntry>,
     pending: VecDeque<EncodedEntry>,
     dedup: Option<Dedup>,
+    summing: Option<Summing>,
     carried: usize,
     corrupt: usize,
     oversized: usize,
@@ -913,12 +1052,18 @@ struct Copier<'s, 'a, B: ?Sized, E> {
 impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>
     Copier<'s, 'a, B, E>
 {
-    fn new(walk: Walk<'s, 'a, B, E>, fresh: Vec<EncodedEntry>, dedup: Option<Dedup>) -> Self {
+    fn new(
+        walk: Walk<'s, 'a, B, E>,
+        fresh: Vec<EncodedEntry>,
+        dedup: Option<Dedup>,
+        summing: Option<Summing>,
+    ) -> Self {
         Copier {
             walk,
             fresh: fresh.into_iter(),
             pending: VecDeque::new(),
             dedup,
+            summing,
             carried: 0,
             corrupt: 0,
             oversized: 0,
@@ -961,14 +1106,8 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>
         }
         Ok(true)
     }
-}
 
-impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Iterator
-    for Copier<'_, '_, B, E>
-{
-    type Item = Result<EncodedEntry>;
-
-    fn next(&mut self) -> Option<Result<EncodedEntry>> {
+    fn pull(&mut self) -> Option<Result<EncodedEntry>> {
         if let Some(frame) = self.fresh.next() {
             return Some(Ok(frame));
         }
@@ -985,27 +1124,39 @@ impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Iterat
     }
 }
 
+impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Iterator
+    for Copier<'_, '_, B, E>
+{
+    type Item = Result<EncodedEntry>;
+
+    fn next(&mut self) -> Option<Result<EncodedEntry>> {
+        let next = self.pull();
+        if let (Some(summing), Some(Ok(frame))) = (self.summing.as_mut(), &next) {
+            summing.add(frame, self.walk.source.tag);
+        }
+        next
+    }
+}
+
 /// A chain entry a two-pass write may carry: where its frame is and what
 /// eviction needs, without its value.
-struct Meta {
+struct Meta<'s> {
     layer: usize,
     item: IndexItem,
     /// In the new catalog, as are the deps' tables.
     table: u32,
-    key: Vec<u8>,
-    deps: Vec<(u32, Vec<u8>)>,
-    last_used: u64,
+    row: Cow<'s, Row>,
     /// Its frame's length in the new generation.
     size: u64,
 }
 
-impl Meta {
+impl Meta<'_> {
     fn node(&self) -> Node<'_> {
         Node {
             table: self.table,
-            key: &self.key,
-            deps: self.deps.iter().map(|(t, k)| (*t, k.as_slice())).collect(),
-            last_used: self.last_used,
+            key: &self.row.key,
+            deps: self.row.deps.iter().map(|(t, k)| (*t, &**k)).collect(),
+            last_used: self.row.last_used,
             size: self.size,
         }
     }
@@ -1018,7 +1169,7 @@ fn scan<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>(
     fresh: &[Entry],
     contested: &HashSet<(u32, u64)>,
     stats: &mut CheckpointStats,
-) -> Result<Vec<Meta>> {
+) -> Result<Vec<Meta<'static>>> {
     let mut seen: HashSet<(u32, Vec<u8>)> = fresh
         .iter()
         .map(|entry| (entry.table, entry.key.clone()))
@@ -1059,16 +1210,51 @@ fn scan<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>(
                 layer: at,
                 item,
                 table: entry.table,
-                deps: query_deps(&entry)
-                    .map(|((t, k), _)| (t, k.to_vec()))
-                    .collect(),
-                key: entry.key,
-                last_used: entry.last_used,
+                row: Cow::Owned(Row::new(
+                    &entry.key,
+                    &entry.value,
+                    &entry.deps,
+                    entry.last_used,
+                )),
                 size,
             });
         }
     }
     Ok(out)
+}
+
+/// [`scan`] of a chain that is the one generation `base` summarizes, with
+/// no table moving: reads nothing, and takes the entries in the order a
+/// scan walks them, by `loc`.
+fn scan_summary<'s>(
+    base: Summarized<'s>,
+    fresh: &[Entry],
+    contested: &HashSet<(u32, u64)>,
+) -> Vec<Meta<'s>> {
+    let items = base.generation.items();
+    let rows = base.summary.rows();
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_unstable_by_key(|&i| items[i].loc);
+    let mut seen: HashSet<Identity> = fresh
+        .iter()
+        .map(|entry| (entry.table, entry.key.as_slice()))
+        .collect();
+    let mut out = Vec::with_capacity(items.len());
+    for i in order {
+        let (item, row) = (items[i], &rows[i]);
+        if contested.contains(&(item.table, item.key_hash)) && !seen.insert((item.table, &row.key))
+        {
+            continue;
+        }
+        out.push(Meta {
+            layer: 0,
+            item,
+            table: item.table,
+            row: Cow::Borrowed(row),
+            size: u64::from(item.len),
+        });
+    }
+    out
 }
 
 /// An entry as eviction and the oversized-dependents rule see it.
@@ -1121,27 +1307,38 @@ fn query_deps(entry: &Entry) -> impl Iterator<Item = (Identity<'_>, u128)> {
 
 /// The stored entries a fresh entry's query dep may name instead of a
 /// fresh one: only at the fp of the stored value, which is what a restore
-/// compares, so a dep whose rewrite was not kept does not count.
-struct Held<'a> {
-    fps: HashMap<Identity<'a>, u128>,
+/// compares, so a dep whose rewrite was not kept does not count. With
+/// `remap`, only stored entries whose query-dep tables all survive it.
+struct Held<'p> {
+    probes: Option<&'p Probes<'p>>,
+    remap: Option<&'p [Option<u32>]>,
 }
 
-impl<'a> Held<'a> {
+impl Held<'_> {
     fn none() -> Self {
         Held {
-            fps: HashMap::new(),
+            probes: None,
+            remap: None,
         }
     }
 
-    fn holds(&self, dep: Identity<'a>, fp: u128) -> bool {
-        self.fps.get(&dep) == Some(&fp)
+    fn holds(&self, dep: Identity, fp: u128) -> bool {
+        let Some(Some(hit)) = self.probes.and_then(|probes| probes.get(dep)) else {
+            return false;
+        };
+        hit.fp == fp
+            && self.remap.is_none_or(|remap| {
+                hit.dep_tables
+                    .iter()
+                    .all(|&table| remap.get(table as usize).copied().flatten().is_some())
+            })
     }
 }
 
 /// The reverse query-dep edges among `entries`, and which entries read a
 /// query that is not among them. A dep in `held` is satisfied without an
 /// edge.
-fn query_edges<'a>(entries: &'a [Entry], held: &Held<'a>) -> (Vec<Vec<usize>>, Vec<bool>) {
+fn query_edges(entries: &[Entry], held: &Held) -> (Vec<Vec<usize>>, Vec<bool>) {
     let at: HashMap<Identity, usize> = entries
         .iter()
         .enumerate()
@@ -1191,7 +1388,7 @@ fn mark_with_dependents(
 /// `entries`, a query that neither `entries` nor `held` has. A dep `held`
 /// has is kept whatever becomes of its fresh rewrite. Linear in entries
 /// plus edges.
-fn unkept<'a>(entries: &'a [Entry], held: &Held<'a>) -> Vec<bool> {
+fn unkept(entries: &[Entry], held: &Held) -> Vec<bool> {
     let (dependents, dangling) = query_edges(entries, held);
     let mut out = vec![false; entries.len()];
     for (i, _) in dangling.iter().enumerate().filter(|(_, &d)| d) {

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use super::{decode_entry, key_hash, Entry, GenId, Generation, IndexItem};
-use crate::Result;
+use crate::{Error, Result};
 
 /// What a newest-first probe for one key found.
 pub(crate) enum Probe {
@@ -34,25 +34,121 @@ pub(crate) fn probe(
         let run = layer.find(table, hash);
         let mut corrupt = false;
         for item in run.iter().filter(|item| !item.is_tombstone()) {
-            let Some(frame) = read(layer.id(), item)? else {
-                return Ok(Probe::Gone);
-            };
-            match decode_entry(&frame, layer.frame_tag()) {
-                Ok(entry) if entry.table == table && entry.key == key => {
-                    return Ok(Probe::Found(entry))
-                }
-                Ok(_) => {}
-                Err(_) => corrupt = true,
+            match judge(read(layer.id(), item)?, layer, table, key) {
+                Frame::Decides(probe) => return Ok(probe),
+                Frame::Other => {}
+                Frame::Corrupt => corrupt = true,
             }
         }
-        if corrupt {
-            return Ok(Probe::Corrupt);
-        }
-        if run.iter().any(IndexItem::is_tombstone) {
-            return Ok(Probe::Missing);
+        if let Some(probe) = after_run(run, corrupt) {
+            return Ok(probe);
         }
     }
     Ok(Probe::Missing)
+}
+
+/// [`probe`] for each of `keys`, reading the frames each layer needs
+/// through `read`, at most `batch` per call, and handing each key's result
+/// to `found` once, with the key's index in `keys`. Fails with
+/// [`Error::Corrupt`] when `read` returns another number of frames than
+/// it was asked for.
+pub(crate) fn probe_many(
+    layers: &[Arc<Generation>],
+    keys: &[(u32, &[u8])],
+    batch: usize,
+    mut read: impl FnMut(GenId, &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>>,
+    mut found: impl FnMut(usize, Probe),
+) -> Result<()> {
+    let hashes: Vec<u64> = keys.iter().map(|(_, key)| key_hash(key)).collect();
+    let mut open: Vec<usize> = (0..keys.len()).collect();
+    let mut decided = vec![false; keys.len()];
+    let mut corrupt = vec![false; keys.len()];
+    for layer in layers.iter().rev() {
+        if open.is_empty() {
+            break;
+        }
+        let wanted: Vec<(usize, IndexItem)> = open
+            .iter()
+            .flat_map(|&i| {
+                let run = layer.find(keys[i].0, hashes[i]);
+                run.iter()
+                    .filter(|item| !item.is_tombstone())
+                    .map(move |item| (i, *item))
+            })
+            .collect();
+        for chunk in wanted.chunks(batch.max(1)) {
+            let items: Vec<IndexItem> = chunk.iter().map(|&(_, item)| item).collect();
+            let frames = read(layer.id(), &items)?;
+            if frames.len() != items.len() {
+                return Err(Error::Corrupt(
+                    "a memo backend returned another number of frames than it was asked for",
+                ));
+            }
+            for (&(i, _), frame) in chunk.iter().zip(frames) {
+                if decided[i] {
+                    continue;
+                }
+                match judge(frame, layer, keys[i].0, keys[i].1) {
+                    Frame::Decides(probe) => {
+                        decided[i] = true;
+                        found(i, probe);
+                    }
+                    Frame::Other => {}
+                    Frame::Corrupt => corrupt[i] = true,
+                }
+            }
+        }
+        open.retain(|&i| {
+            if decided[i] {
+                return false;
+            }
+            match after_run(layer.find(keys[i].0, hashes[i]), corrupt[i]) {
+                Some(probe) => {
+                    found(i, probe);
+                    false
+                }
+                None => true,
+            }
+        });
+    }
+    for i in open {
+        found(i, Probe::Missing);
+    }
+    Ok(())
+}
+
+/// What one frame of a probed run says about the key probed for.
+enum Frame {
+    /// Found, or the layer is gone: the probe ends here.
+    Decides(Probe),
+    /// Another key with the same hash.
+    Other,
+    Corrupt,
+}
+
+fn judge(frame: Option<Vec<u8>>, layer: &Generation, table: u32, key: &[u8]) -> Frame {
+    let Some(frame) = frame else {
+        return Frame::Decides(Probe::Gone);
+    };
+    match decode_entry(&frame, layer.frame_tag()) {
+        Ok(entry) if entry.table == table && entry.key == key => {
+            Frame::Decides(Probe::Found(entry))
+        }
+        Ok(_) => Frame::Other,
+        Err(_) => Frame::Corrupt,
+    }
+}
+
+/// How a probe ends at a layer whose run for the key, `run`, decided
+/// nothing frame by frame: corrupt, a tombstone's miss, or `None` to go on
+/// to the older layers.
+fn after_run(run: &[IndexItem], corrupt: bool) -> Option<Probe> {
+    if corrupt {
+        return Some(Probe::Corrupt);
+    }
+    run.iter()
+        .any(IndexItem::is_tombstone)
+        .then_some(Probe::Missing)
 }
 
 /// Whether some layer may hold an entry of `table` whose key hashes to

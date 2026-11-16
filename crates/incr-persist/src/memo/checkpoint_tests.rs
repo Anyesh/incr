@@ -1316,6 +1316,97 @@ impl MemoBackend for Counting {
     }
 }
 
+fn on_wide_fp(table: u32, n: u32, value: u8) -> StoredDep {
+    StoredDep::Query {
+        table,
+        key: n.to_le_bytes().to_vec(),
+        fp: fingerprint(&[value; 16]),
+    }
+}
+
+#[test]
+fn a_backend_without_deltas_at_its_cap_reads_each_base_entry_once_per_checkpoint() {
+    let tables = vec![desc("a", 1)];
+    let memo = Counting::new(MemoryMemo::without_deltas(), false);
+    let reference = MemoryMemo::without_deltas();
+    let first = wide_input(tables.clone(), 0..400, 1);
+    let base = write_checkpoint(&memo, first.clone()).unwrap();
+    write_checkpoint(&reference, first).unwrap();
+    let max_bytes = base.generation.entry_bytes();
+    let mut chain = base.chain;
+    for round in 0..6_u32 {
+        let keys = 1000 + 10 * round..1010 + 10 * round;
+        let mut next = wide_input(tables.clone(), keys.clone(), 2 + round as u8);
+        let mut reader = wide(0, 2000 + round, 9);
+        reader.deps = vec![
+            on_wide_fp(0, 399 - round, 1),
+            on_wide_fp(0, keys.start, 2 + round as u8),
+        ];
+        next.fresh.push(reader);
+        next.max_bytes = max_bytes;
+        let base_entries = chain.base().entry_count() as usize;
+        memo.reset();
+        let done = write_known(&memo, next.clone(), chain.layers()).unwrap();
+        let reads = memo.reads.load(SeqCst);
+        assert!(
+            reads <= base_entries,
+            "round {round}: {reads} reads for {base_entries} base entries"
+        );
+        assert!(matches!(done.mode, Mode::TwoPass { .. }), "round {round}");
+        assert!(done.stats.evicted > 0, "round {round}");
+        assert!(done.generation.entry_bytes() <= max_bytes, "round {round}");
+        assert!(
+            done.fates.iter().all(|&f| f == Fate::Written),
+            "round {round}"
+        );
+        write_checkpoint(&reference, next).unwrap();
+        assert_eq!(visible(&memo.memo), visible(&reference), "round {round}");
+        chain = done.chain;
+    }
+}
+
+#[test]
+fn dep_probes_are_one_batch_without_fresh_deps_and_a_rejected_delta_reuses_them() {
+    let tables = vec![desc("a", 1)];
+    for rejected in [false, true] {
+        let memo = Counting::new(MemoryMemo::new(), true);
+        write_checkpoint(&memo, wide_input(tables.clone(), 0..400, 1)).unwrap();
+        let deps_each = if rejected { 10 } else { 2 };
+        let mut next = wide_input(tables.clone(), 1000..1001, 2);
+        for i in 0..30_u32 {
+            let mut reader = wide(0, 1100 + i, 3);
+            reader.deps = (0..deps_each)
+                .map(|j| on_wide_fp(0, (i + j) % 40, 1))
+                .chain([on_wide_fp(0, 1000, 2)])
+                .collect();
+            next.fresh.push(reader);
+        }
+        memo.reset();
+        let done = write_checkpoint(&memo, next).unwrap();
+        assert_eq!(done.stats.delta, !rejected);
+        assert!(done.fates.iter().all(|&f| f == Fate::Written));
+        let distinct = if rejected { 39 } else { 31 };
+        assert_eq!(memo.single_probes.load(SeqCst), 0, "rejected {rejected}");
+        assert_eq!(memo.probe_calls.load(SeqCst), 1, "rejected {rejected}");
+        assert_eq!(memo.probed.load(SeqCst), distinct, "rejected {rejected}");
+    }
+}
+
+#[test]
+fn a_dep_held_at_its_fp_keeps_its_reader_when_its_fresh_rewrite_is_not_kept() {
+    for memo in [MemoryMemo::new(), MemoryMemo::without_deltas()] {
+        let tables = vec![desc("a", 1)];
+        write_checkpoint(&memo, input(tables.clone(), vec![entry(0, 1, 10, vec![])])).unwrap();
+        let fresh = vec![
+            entry(0, 1, 11, vec![on(0, 9)]),
+            entry(0, 2, 20, vec![on_fp(0, 1, 10)]),
+        ];
+        let done = write_checkpoint(&memo, input(tables, fresh)).unwrap();
+        assert_eq!(done.fates, [Fate::Unkept, Fate::Written]);
+        assert_eq!(ids(&visible(&memo)), [(0, 1, 10, 1), (0, 2, 20, 2)]);
+    }
+}
+
 #[test]
 fn a_frame_gone_mid_stream_fails_the_checkpoint_and_publishes_nothing() {
     let tables = vec![desc("a", 1)];

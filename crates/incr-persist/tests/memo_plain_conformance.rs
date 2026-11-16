@@ -1,15 +1,19 @@
 //! A backend that implements only the required `MemoBackend` methods gets
 //! the provided defaults: no deltas, and full checkpoints as before.
 
-use incr_persist::memo::{
-    conformance::MemoHarness, write_checkpoint, CheckpointInput, CheckpointStats, CheckpointTimes,
-    DeltaHeader, EncodedEntry, Entry, GenHeader, GenId, Generation, IndexItem, MemoBackend,
-    MemoryMemo, StoredDep, TableDesc,
-};
-use incr_persist::{Error, Result};
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::Arc;
 
+use incr_persist::memo::{
+    conformance::MemoHarness, write_checkpoint, BuildId, CheckpointInput, CheckpointStats,
+    CheckpointTimes, DeltaHeader, EncodedEntry, Entry, GenHeader, GenId, Generation, IndexItem,
+    MemoBackend, MemoBuilder, MemoOptions, MemoryMemo, StoredDep, TableDesc,
+};
+use incr_persist::{Error, MemoryBackend, Options, Result, Shared, Store};
+
+/// The required methods only, counting the frames `read_entry` returns.
 #[derive(Clone, Default)]
-struct PlainMemo(MemoryMemo);
+struct PlainMemo(MemoryMemo, Arc<AtomicUsize>);
 
 impl MemoBackend for PlainMemo {
     type Guard = <MemoryMemo as MemoBackend>::Guard;
@@ -23,6 +27,7 @@ impl MemoBackend for PlainMemo {
     }
 
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
+        self.1.fetch_add(1, SeqCst);
         self.0.read_entry(generation, item)
     }
 
@@ -171,4 +176,46 @@ fn full_checkpoints_match_a_memory_store_without_deltas() {
             memory.remove_generation(old).unwrap();
         }
     }
+}
+
+#[test]
+fn a_memo_at_its_cap_reads_each_stored_entry_at_most_once_per_checkpoint() {
+    let plain = PlainMemo::default();
+    let store =
+        Arc::new(Store::<Shared, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let x = store.input("x", 1_u64).unwrap().handle();
+    let max_bytes = 16 << 10;
+    let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(7)).max_bytes(max_bytes));
+    let t = builder.table::<u32, u64>("t", 1);
+    let u = builder.table::<u32, u64>("u", 1);
+    builder.define(t, move |ctx, &k| ctx.rt().get(x) + u64::from(k));
+    builder.define(u, move |ctx, &k| ctx.get(t, k) + 1);
+    let memo = builder.open(&store, plain.clone()).unwrap();
+    let read = |table, k| memo.runtime().get(memo.get_or_insert(table, k));
+    let mut evicting = 0;
+    for round in 0..200_u32 {
+        let keys = 10 * round..10 * round + 10;
+        for k in keys.clone() {
+            read(t, k);
+            if round > 0 {
+                read(u, k - 10);
+            }
+        }
+        let stored = memo.stats().entries as usize;
+        plain.1.store(0, SeqCst);
+        let done = memo.checkpoint().unwrap();
+        let reads = plain.1.load(SeqCst);
+        assert!(
+            reads <= stored,
+            "round {round}: {reads} reads for {stored} stored entries"
+        );
+        assert!(memo.stats().bytes <= max_bytes, "round {round}");
+        if done.evicted > 0 {
+            evicting += 1;
+            if evicting == 5 {
+                return;
+            }
+        }
+    }
+    panic!("the memo never reached its cap");
 }
