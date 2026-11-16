@@ -458,13 +458,67 @@ fn leftovers(conn: &Connection) -> Result<Vec<GenId>> {
 /// which on a 600k-entry store took minutes.
 const REMOVE_SPAN: i64 = 1 << 15;
 
+/// The connection settings a removal changes.
+struct Saved {
+    synchronous: i64,
+    autocheckpoint: i64,
+}
+
+/// Stops the connection syncing at each commit and checkpointing on its
+/// own, so that a removal's many page rewrites reach the disk in one
+/// ordered checkpoint instead of one scattered fsync per range. Only a
+/// removal runs this way: the rows it deletes are already outside the
+/// chain, so a commit lost to a crash leaves them for the next open to
+/// remove, and `NORMAL` keeps the file consistent.
+fn relax_for_removal(conn: &Connection) -> Result<Saved> {
+    let saved = Saved {
+        synchronous: conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .map_err(sql)?,
+        autocheckpoint: conn
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .map_err(sql)?,
+    };
+    if saved.synchronous > 1 {
+        conn.pragma_update(None, "synchronous", 1).map_err(sql)?;
+    }
+    conn.pragma_update(None, "wal_autocheckpoint", 0)
+        .map_err(sql)?;
+    Ok(saved)
+}
+
+fn restore_after_removal(conn: &mut Connection, saved: Saved) -> Result<()> {
+    conn.pragma_update(None, "synchronous", saved.synchronous)
+        .map_err(sql)?;
+    conn.pragma_update(None, "wal_autocheckpoint", saved.autocheckpoint)
+        .map_err(sql)
+}
+
 /// Removes the generations' rows a rowid range at a time, each range its
-/// own transaction followed by a passive WAL checkpoint, and their
-/// `memo_generation` rows last. A stop between ranges leaves generations
+/// own transaction, and their `memo_generation` rows last, then
+/// checkpoints the WAL once. A stop between ranges leaves generations
 /// outside the chain, which [`SqliteMemo::remove_leftovers`] finishes at
 /// the next [`lock_checkpoint`](MemoBackend::lock_checkpoint). With
 /// `stop_after`, fails once that many ranges are removed.
 fn remove_in_chunks(
+    conn: &mut Connection,
+    generations: &[GenId],
+    span: i64,
+    stop_after: Option<usize>,
+) -> Result<()> {
+    if generations.is_empty() {
+        return Ok(());
+    }
+    let saved = relax_for_removal(conn)?;
+    let removed = remove_ranges(conn, generations, span, stop_after);
+    let restored = restore_after_removal(conn, saved);
+    removed?;
+    restored?;
+    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+        .map_err(sql)
+}
+
+fn remove_ranges(
     conn: &mut Connection,
     generations: &[GenId],
     span: i64,
@@ -518,10 +572,6 @@ fn remove_in_chunks(
             )
             .map_err(sql)?;
             tx.commit().map_err(sql)?;
-            if to < last {
-                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
-                    .map_err(sql)?;
-            }
             done += 1;
             from = to.saturating_add(1);
             if to == i64::MAX {
