@@ -222,11 +222,8 @@ impl MemoBackend for SqliteMemo {
         let tx = conn.transaction().map_err(sql)?;
         let mut frames: HashMap<u64, Vec<u8>> = HashMap::with_capacity(items.len());
         for chunk in items.chunks(READ_BATCH) {
-            let marks = vec!["?"; chunk.len()].join(",");
             let mut select = tx
-                .prepare_cached(&format!(
-                    "SELECT loc, frame FROM memo_entry WHERE generation = ?1 AND loc IN ({marks})"
-                ))
+                .prepare_cached(&read_entries_sql(chunk.len()))
                 .map_err(sql)?;
             let args = std::iter::once(to_sql(generation.0))
                 .chain(chunk.iter().map(|item| to_sql(item.loc)));
@@ -473,11 +470,17 @@ fn leftovers(conn: &Connection) -> Result<Vec<GenId>> {
 }
 
 fn delete_generation(conn: &Connection, generation: GenId) -> Result<()> {
-    conn.execute(
-        "DELETE FROM memo_entry WHERE generation = ?1",
-        [to_sql(generation.0)],
-    )
-    .map_err(sql)?;
+    let span: (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT min(loc), max(loc) FROM memo_entry WHERE generation = ?1",
+            [to_sql(generation.0)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql)?;
+    if let (Some(first), Some(last)) = span {
+        conn.execute(DELETE_ENTRIES, params![first, last, to_sql(generation.0)])
+            .map_err(sql)?;
+    }
     conn.execute(
         "DELETE FROM memo_generation WHERE id = ?1",
         [to_sql(generation.0)],
@@ -700,6 +703,23 @@ fn to_sql(value: u64) -> i64 {
 
 fn from_sql(value: i64) -> u64 {
     value as u64
+}
+
+/// Deletes a generation's rows in rowid order. Through
+/// `memo_entry_index` the rows go in key-hash order, each a random page
+/// of the table. A generation's rows were inserted by one transaction, so
+/// they sit between its smallest and largest `loc`.
+const DELETE_ENTRIES: &str = "DELETE FROM memo_entry NOT INDEXED \
+     WHERE loc BETWEEN ?1 AND ?2 AND generation = ?3";
+
+/// Fetches rows by rowid. Without `NOT INDEXED`, a long `IN` list makes
+/// SQLite scan the whole generation through `memo_entry_index` for every
+/// batch, which is quadratic in the generation's entries.
+fn read_entries_sql(locs: usize) -> String {
+    let marks = vec!["?"; locs].join(",");
+    format!(
+        "SELECT loc, frame FROM memo_entry NOT INDEXED WHERE generation = ?1 AND loc IN ({marks})"
+    )
 }
 
 #[cfg(test)]

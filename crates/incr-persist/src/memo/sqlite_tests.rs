@@ -665,3 +665,37 @@ fn a_streamed_full_write_from_the_tip_replaces_the_chain() {
         .unwrap();
     assert_eq!(ids, 1);
 }
+
+#[test]
+fn a_batched_frame_read_and_a_generation_delete_go_by_rowid_not_through_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = SqliteMemo::open(dir.path().join("memo.db")).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(255))
+        .unwrap();
+    let conn = lock(&memo.reader);
+    let sql = format!("EXPLAIN QUERY PLAN {}", read_entries_sql(READ_BATCH));
+    let mut plan = conn.prepare(&sql).unwrap();
+    let args = (0..=READ_BATCH as i64).map(|n| n.max(1));
+    let details: Vec<String> = plan
+        .query_map(rusqlite::params_from_iter(args), |row| row.get(3))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(
+        details.iter().all(|d| d.contains("INTEGER PRIMARY KEY")),
+        "{details:?}"
+    );
+
+    let mut plan = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {DELETE_ENTRIES}"))
+        .unwrap();
+    let details: Vec<String> = plan
+        .query_map([1, 255, 1], |row| row.get(3))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(
+        details.iter().all(|d| d.contains("INTEGER PRIMARY KEY")),
+        "{details:?}"
+    );
+}

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::Mutex;
 
 use super::*;
 use crate::memo::{decode_entry, encode_entry, fingerprint, MemoryMemo, StoredDep, TableDesc};
@@ -769,6 +770,8 @@ struct Streaming {
     writing: AtomicBool,
     read: AtomicUsize,
     ahead: AtomicUsize,
+    last_loc: Mutex<HashMap<u64, u64>>,
+    backwards: AtomicUsize,
 }
 
 impl Streaming {
@@ -797,6 +800,17 @@ impl MemoBackend for Streaming {
 
     fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
         self.count(items.len());
+        if self.writing.load(SeqCst) {
+            let mut last = self.last_loc.lock().unwrap();
+            for item in items {
+                if last
+                    .insert(generation.0, item.loc)
+                    .is_some_and(|prev| prev > item.loc)
+                {
+                    self.backwards.fetch_add(1, SeqCst);
+                }
+            }
+        }
         self.memo.read_entries(generation, items)
     }
 
@@ -818,6 +832,8 @@ impl MemoBackend for Streaming {
         entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
     ) -> Result<Generation> {
         self.read.store(0, SeqCst);
+        self.backwards.store(0, SeqCst);
+        self.last_loc.lock().unwrap().clear();
         self.writing.store(true, SeqCst);
         let mut pulled = Vec::new();
         for entry in entries {
@@ -884,6 +900,11 @@ fn a_compaction_reads_the_chain_in_batches_as_the_write_pulls() {
             memo.ahead.load(SeqCst) <= STREAM_BATCH + fresh.len(),
             "{} frames read ahead of the write",
             memo.ahead.load(SeqCst)
+        );
+        assert_eq!(
+            memo.backwards.load(SeqCst),
+            0,
+            "frames read out of location order within a layer"
         );
     }
 }
