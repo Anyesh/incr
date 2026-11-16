@@ -216,7 +216,7 @@ pub fn keep_traced<C: Cells>(
     Ok(out)
 }
 
-/// The rendered trace [`trace_payload`] kept.
+/// The rendered trace [`keep_traced`] kept.
 pub fn kept_trace(py: Python<'_>, payload: Option<TracePayload>) -> Option<Py<PyAny>> {
     payload?
         .downcast_ref::<Py<PyAny>>()
