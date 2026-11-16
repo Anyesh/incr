@@ -6,8 +6,12 @@
 use pyo3::prelude::*;
 
 use incr_core::persist_hooks::{inspect_many, Deferred};
-use incr_core::{Cells, ErasedIncr, Incr, NodeId, NodeInfo, NodeState, PropagationTrace, Runtime};
+use incr_core::{
+    Cells, ErasedIncr, Incr, NodeId, NodeInfo, NodeState, PropagationTrace, Runtime, TraceCapture,
+    TracePayload,
+};
 
+use crate::snapshot::status;
 use crate::{PyValue, StaleNodeError};
 
 /// A node whose value type Python can read: a `PyValue`, or the `u64` and
@@ -41,20 +45,23 @@ impl TypedNode {
         }
     }
 
-    /// [`Runtime::get_traced`] for any of the readable types.
-    pub fn get_traced<C: Cells>(self, rt: &Runtime<C>) -> (Py<PyAny>, PropagationTrace) {
+    /// [`Runtime::get_traced_retaining`] for any of the readable types.
+    pub fn get_traced_retaining<C: Cells>(
+        self,
+        rt: &Runtime<C>,
+    ) -> (Py<PyAny>, PropagationTrace, TraceCapture) {
         match self {
             Self::Py(node) => {
-                let (value, trace) = rt.get_traced(node);
-                (value.0, trace)
+                let (value, trace, capture) = rt.get_traced_retaining(node);
+                (value.0, trace, capture)
             }
             Self::Count(node) => {
-                let (value, trace) = rt.get_traced(node);
-                (count_to_py(value), trace)
+                let (value, trace, capture) = rt.get_traced_retaining(node);
+                (count_to_py(value), trace, capture)
             }
             Self::Pair(node) => {
-                let (value, trace) = rt.get_traced(node);
-                (pair_to_py(value), trace)
+                let (value, trace, capture) = rt.get_traced_retaining(node);
+                (pair_to_py(value), trace, capture)
             }
         }
     }
@@ -158,4 +165,60 @@ fn read_plain<C: Cells, T: incr_core::Value>(
         .into_iter()
         .map(|seen| seen.map(|seen| seen.value))
         .collect()
+}
+
+/// The status `graph_snapshot(values=True)` reports for the node at `id`
+/// and `generation`, and its value when it is Clean and readable. Nothing
+/// recomputes.
+pub fn peek<C: Cells>(
+    rt: &Runtime<C>,
+    id: u32,
+    generation: u32,
+    hold_values: impl FnOnce(&mut dyn FnMut()),
+) -> Result<(&'static str, Option<Py<PyAny>>), ByIdError> {
+    let info = rt
+        .node_info(NodeId(id), generation)
+        .ok_or(ByIdError::Stale { id, generation })?;
+    let value = snapshot_values(rt, std::slice::from_ref(&info), hold_values)
+        .pop()
+        .flatten();
+    Ok((status(info.state), value))
+}
+
+/// The status of the node at `id` and `generation`, as [`peek`] reports
+/// it, and the trace a binding kept for it. Nothing recomputes.
+pub fn last_trace<C: Cells>(
+    rt: &Runtime<C>,
+    id: u32,
+    generation: u32,
+) -> Result<(&'static str, Option<TracePayload>), ByIdError> {
+    let found = rt
+        .last_trace(NodeId(id), generation)
+        .ok_or(ByIdError::Stale { id, generation })?;
+    Ok((status(found.state), found.payload))
+}
+
+/// The `(value, trace)` a traced read returns, from `render`, with the
+/// trace kept for [`last_trace`]. Takes the GIL for `render` and keeps
+/// the trace after releasing it, so a Shared binding drops a payload it
+/// replaces without the GIL, as its engine calls drop values.
+pub fn keep_traced<C: Cells>(
+    rt: &Runtime<C>,
+    capture: TraceCapture,
+    render: impl FnOnce(Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)>,
+) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+    let (out, payload) = Python::attach(|py| {
+        let out = render(py)?;
+        let payload: TracePayload = std::sync::Arc::new(out.1.clone_ref(py));
+        Ok::<_, PyErr>((out, payload))
+    })?;
+    rt.retain_trace(capture, payload);
+    Ok(out)
+}
+
+/// The rendered trace [`trace_payload`] kept.
+pub fn kept_trace(py: Python<'_>, payload: Option<TracePayload>) -> Option<Py<PyAny>> {
+    payload?
+        .downcast_ref::<Py<PyAny>>()
+        .map(|trace| trace.clone_ref(py))
 }

@@ -54,7 +54,7 @@ use persist::PyPersistedKeyed;
 use state::{LocalState, PyCallable, RtState};
 
 use incr_python_persist::ready;
-use incr_python_protocol::by_id::{resolve, snapshot_values, TypedNode};
+use incr_python_protocol::by_id::{keep_traced, resolve, snapshot_values, TypedNode};
 use incr_python_protocol::inspect::trace_header;
 use incr_python_protocol::notready::{
     lookup_failed, PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
@@ -1996,17 +1996,19 @@ impl PyRuntime {
     }
 
     fn get_traced(&self, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        let (val, trace, nodes): (PyValue, PropagationTrace, Vec<TracedNode>) =
-            self.engine_read(|rt| {
-                let (val, trace) = rt.get_traced(node.inner);
-                let nodes = traced_nodes(rt, &trace);
-                (val, trace, nodes)
-            })?;
-        Python::attach(|py| traced_to_py(py, ready::unwrapped(py, val.0), &trace, nodes))
+        self.engine_read(|rt| {
+            let (val, trace, capture): (PyValue, PropagationTrace, _) =
+                rt.get_traced_retaining(node.inner);
+            let nodes = traced_nodes(rt, &trace);
+            keep_traced(rt, capture, |py| {
+                traced_to_py(py, ready::unwrapped(py, val.0), &trace, nodes)
+            })
+        })?
     }
 
     /// `get` for the node a `graph_snapshot` entry names by its `"id"` and
-    /// `"generation"`. Raises `StaleNodeError` if no live node has both:
+    /// `"generation"`, recomputing it as `get` does when it is not Clean.
+    /// Raises `StaleNodeError` if no live node has both:
     /// the node was deleted, its slot was reused, or the id is out of
     /// range. A cycle that leaves the node without a value gives `None`; a
     /// compute that raises re-raises here.
@@ -2017,16 +2019,47 @@ impl PyRuntime {
     }
 
     /// `get_traced` for the node a `graph_snapshot` entry names by its
-    /// `"id"` and `"generation"`; raises `StaleNodeError` like
-    /// `get_by_id`. A cycle raises `CycleError`, as `get_traced` does.
+    /// `"id"` and `"generation"`, recomputing what `get_traced` would;
+    /// raises `StaleNodeError` like `get_by_id`. A cycle raises
+    /// `CycleError`, as `get_traced` does.
     fn get_traced_by_id(&self, id: u32, generation: u32) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        let (val, trace, nodes) = self.engine_read(|rt| {
-            let node = resolve(rt, id, generation)?;
-            let (val, trace) = node.get_traced(rt);
+        self.engine_read(|rt| {
+            let (val, trace, capture) = resolve(rt, id, generation)?.get_traced_retaining(rt);
             let nodes = traced_nodes(rt, &trace);
-            Ok::<_, incr_python_protocol::by_id::ByIdError>((val, trace, nodes))
-        })??;
-        Python::attach(|py| traced_to_py(py, ready::unwrapped(py, val), &trace, nodes))
+            Ok::<_, incr_python_protocol::by_id::ByIdError>(keep_traced(rt, capture, |py| {
+                traced_to_py(py, ready::unwrapped(py, val), &trace, nodes)
+            }))
+        })??
+    }
+
+    /// `(status, value)` for the node a `graph_snapshot` entry names by its
+    /// `"id"` and `"generation"`, without running any compute: `status` as
+    /// `graph_snapshot(values=True)` reports it, and `value` as stored when
+    /// the node is Clean and holds a value Python can read, else `None`.
+    /// Raises `StaleNodeError` like `get_by_id`.
+    fn peek_by_id(&self, id: u32, generation: u32) -> PyResult<(&'static str, Option<Py<PyAny>>)> {
+        Ok(self.engine_read(|rt| incr_python_protocol::by_id::peek(rt, id, generation, |f| f()))??)
+    }
+
+    /// `(status, trace)` for the node a `graph_snapshot` entry names by its
+    /// `"id"` and `"generation"`, without running any compute; `status` as
+    /// `peek_by_id` reports it. Only roots of `get_traced` and
+    /// `get_traced_by_id` have a last trace: `trace` is the object the last
+    /// of those calls that recomputed the node returned, labels and values
+    /// as they were then, while the node stays Clean at that value. A
+    /// later traced read that finds the node clean keeps it; a plain `get`
+    /// that verifies the node clean, or any change, makes `trace` `None`
+    /// until a traced read recomputes the node. Raises `StaleNodeError`
+    /// like `get_by_id`.
+    fn last_trace_by_id(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        generation: u32,
+    ) -> PyResult<(&'static str, Option<Py<PyAny>>)> {
+        let (status, payload) =
+            self.engine_read(|rt| incr_python_protocol::by_id::last_trace(rt, id, generation))??;
+        Ok((status, incr_python_protocol::by_id::kept_trace(py, payload)))
     }
 
     /// The graph as a list of `{"id", "kind", "label", "dependencies",
