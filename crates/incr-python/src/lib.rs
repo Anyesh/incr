@@ -2036,7 +2036,9 @@ impl PyRuntime {
     /// `"id"` and `"generation"`, without running any compute: `status` as
     /// `graph_snapshot(values=True)` reports it, and `value` as stored when
     /// the node is Clean and holds a value Python can read, else `None`.
-    /// Raises `StaleNodeError` like `get_by_id`.
+    /// Raises `StaleNodeError` like `get_by_id`. Like every read, it first
+    /// routes `group_by` changes still queued, which runs their key
+    /// functions and can raise their routing error.
     fn peek_by_id(&self, id: u32, generation: u32) -> PyResult<(&'static str, Option<Py<PyAny>>)> {
         Ok(self.engine_read(|rt| incr_python_protocol::by_id::peek(rt, id, generation, |f| f()))??)
     }
@@ -2050,7 +2052,8 @@ impl PyRuntime {
     /// later traced read that finds the node clean keeps it; a plain `get`
     /// that verifies the node clean, or any change, makes `trace` `None`
     /// until a traced read recomputes the node. Raises `StaleNodeError`
-    /// like `get_by_id`.
+    /// like `get_by_id`, and routes queued `group_by` changes first as
+    /// `peek_by_id` does.
     fn last_trace_by_id(
         &self,
         py: Python<'_>,
