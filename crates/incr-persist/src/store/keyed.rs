@@ -667,8 +667,10 @@ trait Stage<C: Cells> {
     fn stale(&self) -> bool;
 
     /// Runs the partition functions registered now on each key the stage
-    /// inserts or removes, so one registered after the stage began raises
-    /// before the store lock is taken.
+    /// writes or removes, whether or not it still looks like an insert or
+    /// a remove, since the keys held may have moved since the stage began:
+    /// a function registered after the stage began raises before the store
+    /// lock is taken.
     fn check_partitions(&self);
 
     /// The records that make the staged changes: per key, a `Remove` of
@@ -902,10 +904,8 @@ where
                 Next::Row(pair) => Some(pair),
                 Next::Gone => None,
             };
-            if staged.held.is_empty() != next.is_none() {
-                if let Some(pair) = next.or(staged.held.first().map(|(pair, _)| pair)) {
-                    self.keyed.keyed.check_partitions(pair);
-                }
+            if let Some(pair) = next.or(staged.held.first().map(|(pair, _)| pair)) {
+                self.keyed.keyed.check_partitions(pair);
             }
         }
     }

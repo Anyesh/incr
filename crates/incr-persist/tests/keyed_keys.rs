@@ -190,3 +190,25 @@ fn a_partitioning_registered_after_a_write_was_staged_still_refuses_it() {
     store.upsert(&rows, 3, "c".into()).unwrap();
     assert_eq!(rows.keys().len(), 2);
 }
+
+#[test]
+fn a_late_partitioning_checks_a_staged_replacement_whose_key_was_removed_meanwhile() {
+    let log = MemoryBackend::new();
+    let store = Store::<Shared, _>::open(log.clone(), Options::default()).unwrap();
+    let rows: Rows = store.keyed_collection("rows").unwrap();
+    store.upsert(&rows, 9, "a".into()).unwrap();
+    let mut pending = incr_persist::PendingWrite::new();
+    pending.upsert(&rows, 9, "z".into());
+    store.remove(&rows, &9).unwrap();
+    rows.key_partitions(|k: &u32| {
+        assert_ne!(*k, 9, "no partition for 9");
+        k % 2
+    });
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.write_pending(pending)
+    }));
+    assert!(refused.is_err());
+    assert!(rows.keys().is_empty());
+    store.upsert(&rows, 3, "c".into()).unwrap();
+    assert_eq!(rows.keys().len(), 1);
+}
