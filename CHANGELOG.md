@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`LICENSE` opens with the copyright notice** ("Copyright (C) 2026 Anish Shrestha") above the unchanged AGPL-3.0 text.
+
 ## [0.2.0-beta.12] - 2026-11-17
 
 ### Changed
