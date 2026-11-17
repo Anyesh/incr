@@ -1,0 +1,14 @@
+incr
+Copyright (C) 2026 Anish Shrestha
+
+Versions of incr released after 0.2.0-beta.11 are licensed under the GNU
+Affero General Public License, version 3 only (AGPL-3.0-only); the full text
+is in the LICENSE file. A commercial licence is also available from the
+copyright holder for use without AGPL-3.0's obligations; see
+LICENSE-COMMERCIAL.md in the source repository, or write to
+sir.anishshrestha@gmail.com.
+
+Versions 0.2.0-beta.11 and earlier, including every release published to
+crates.io and PyPI up to and including 0.2.0-beta.11 (0.2.0b11 on PyPI), were
+released under the Apache License, Version 2.0, and remain available under
+that licence to anyone who has them.
