@@ -4,6 +4,7 @@ members = ["crates/incr-bench", "crates/incr-compute", "crates/incr-concurrent",
 
 [workspace.package]
 version = "0.2.0-beta.11"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 incr-core = { version = "=0.2.0-beta.11", path = "crates/incr-core" }

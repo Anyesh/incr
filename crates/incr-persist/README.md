@@ -39,4 +39,4 @@ assert_eq!(rt.get(total), 300);
 
 ## License
 
-Apache-2.0
+AGPL-3.0-only (see `LICENSE`). A commercial licence for use without AGPL-3.0's obligations is available from the copyright holder, Anish Shrestha (sir.anishshrestha@gmail.com). Versions 0.2.0-beta.11 and earlier were released under Apache-2.0 and remain available under it (see `NOTICE`).

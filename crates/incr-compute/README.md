@@ -80,3 +80,7 @@ User types stored in the runtime must implement `Value`, which is `Clone + Parti
 ## Python
 
 `pip install --pre incr-compute` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr import Runtime`).
+
+## License
+
+AGPL-3.0-only (see `LICENSE`). A commercial licence for use without AGPL-3.0's obligations is available from the copyright holder, Anish Shrestha (sir.anishshrestha@gmail.com). Versions 0.2.0-beta.11 and earlier were released under Apache-2.0 and remain available under it (see `NOTICE`).

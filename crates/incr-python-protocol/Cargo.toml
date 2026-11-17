@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 rust-version = "1.88"
 description = "The exception and unwind protocol shared by incr's Python bindings"
-license = "Apache-2.0"
+license.workspace = true
 publish = false
 
 [lib]
