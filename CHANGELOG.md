@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Licence: AGPL-3.0-only, with a commercial licence available.** Every crate and Python package is now licensed under AGPL-3.0-only, and the copyright holder, Anish Shrestha, offers a commercial licence for use without AGPL-3.0's obligations (`LICENSE-COMMERCIAL.md`). 0.2.0-beta.11 and earlier stay Apache-2.0 for anyone who has them (`NOTICE`). Contributions need a signed contributor licence agreement (`CONTRIBUTING.md`). Wheels now carry `LICENSE` and `NOTICE`.
+
 ## [0.2.0-beta.11] - 2026-11-17
 
 ### Added

@@ -99,3 +99,7 @@ Use `incr-concurrent` when you need to share a computation graph across threads.
 ## Python
 
 `pip install --pre incr-concurrent` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr_concurrent import Runtime`); its classes are shareable across Python threads and the GIL is released around computing calls.
+
+## License
+
+AGPL-3.0-only (see `LICENSE`). A commercial licence for use without AGPL-3.0's obligations is available from the copyright holder, Anish Shrestha (sir.anishshrestha@gmail.com). Versions 0.2.0-beta.11 and earlier were released under Apache-2.0 and remain available under it (see `NOTICE`).

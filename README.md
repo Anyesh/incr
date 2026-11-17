@@ -229,4 +229,4 @@ None of the existing systems combine function DAGs with incremental collections 
 
 ## License
 
-Apache-2.0
+incr is licensed under [AGPL-3.0-only](LICENSE), and a commercial licence is available from the copyright holder, Anish Shrestha, for use without AGPL-3.0's obligations; see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md). Versions 0.2.0-beta.11 and earlier were released under Apache-2.0 and remain available under it ([NOTICE](NOTICE)). Contributions need a signed contributor licence agreement; see [CONTRIBUTING.md](CONTRIBUTING.md).

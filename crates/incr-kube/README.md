@@ -70,3 +70,7 @@ let ns_pods = by_namespace.get_group(&rt, "default").values(&rt);
 ## When to use
 
 Use this for a query your reconciler runs often, over a predicate that's selective (a small fraction of the cache matches). If you're reading the whole cache anyway, or reading rarely, `kube-rs`'s own `Store` is simpler and has no second cache to keep in sync.
+
+## License
+
+AGPL-3.0-only (see `LICENSE`). A commercial licence for use without AGPL-3.0's obligations is available from the copyright holder, Anish Shrestha (sir.anishshrestha@gmail.com). Versions 0.2.0-beta.11 and earlier were released under Apache-2.0 and remain available under it (see `NOTICE`).
