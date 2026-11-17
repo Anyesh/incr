@@ -16,7 +16,7 @@ doc = false
 conformance = ["incr-python-persist/conformance"]
 
 [dependencies]
-incr_concurrent = { package = "incr-concurrent", version = "=0.2.0-beta.11", path = "../incr-concurrent" }
+incr_concurrent = { package = "incr-concurrent", version = "=0.2.0-beta.12", path = "../incr-concurrent" }
 incr-python-persist = { path = "../incr-python-persist" }
 incr-python-protocol = { path = "../incr-python-protocol" }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
