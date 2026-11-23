@@ -1106,7 +1106,11 @@ where
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         {
             let yielder = rt.yielder();
-            let seeded: Vec<U> = yielder.collect(bootstrap.into_iter().filter_map(&image));
+            let seeded: Vec<U> = bootstrap
+                .into_iter()
+                .inspect(|_| yielder.tick())
+                .filter_map(&image)
+                .collect();
             let mut out = output_log.write();
             let yielder = rt.yielder_under_lock();
             for v in seeded {
@@ -1143,15 +1147,15 @@ where
             };
             let to = from + pending.len() as u64;
 
-            let staged: Vec<Staged<U>> = with_ticks!(rt.hook(), |ticks| ticks.collect(
-                pending
-                    .into_iter()
-                    .filter_map(|d| match d {
-                        Delta::Insert(v) => image(v).map(Delta::Insert),
-                        Delta::Delete(v) => image(v).map(Delta::Delete),
-                    })
-                    .map(|d| Staged::delta(&out_hasher, d)),
-            ));
+            let staged: Vec<Staged<U>> = with_ticks!(rt.hook(), |ticks| pending
+                .into_iter()
+                .inspect(|_| ticks.tick())
+                .filter_map(|d| match d {
+                    Delta::Insert(v) => image(v).map(Delta::Insert),
+                    Delta::Delete(v) => image(v).map(Delta::Delete),
+                })
+                .map(|d| Staged::delta(&out_hasher, d))
+                .collect());
 
             let mut out = output_log_for_query.write();
             with_ticks!(rt.hook_under_lock(), |ticks| rebuild.guard(|| {

@@ -114,6 +114,7 @@ impl<'a> Yielder<'a> {
 
     /// A [`Yielder`] of this thread's ambient hook (`with_ambient_hook`);
     /// one that never ticks without the `yield-hook` feature.
+    #[inline]
     pub fn ambient() -> Yielder<'static> {
         #[cfg(feature = "yield-hook")]
         let hook = AMBIENT.with(|ambient| ambient.borrow().clone().map(HookRef::Owned));
@@ -136,7 +137,8 @@ impl<'a> Yielder<'a> {
         self.hook.is_some()
     }
 
-    /// Collects `iter` with a tick per item. Without a hook it is a plain
+    /// Collects `iter` with a tick per item it yields, so a filtering
+    /// caller ticks its source instead. Without a hook it is a plain
     /// `collect`, which keeps an exact-size source's single allocation.
     #[inline]
     pub fn collect<I: Iterator, B: FromIterator<I::Item>>(&self, iter: I) -> B {
@@ -144,15 +146,6 @@ impl<'a> Yielder<'a> {
             return iter.collect();
         }
         iter.inspect(|_| self.tick()).collect()
-    }
-
-    /// Counts `iter` with a tick per item, as [`Self::collect`] collects.
-    #[inline]
-    pub fn count<I: Iterator>(&self, iter: I) -> usize {
-        if self.hook.is_none() {
-            return iter.count();
-        }
-        iter.inspect(|_| self.tick()).count()
     }
 
     /// `n` ticks at once, for a loop that steps a batch at a time.
@@ -183,7 +176,6 @@ pub trait Ticks {
     fn yield_now(&self);
     fn is_active(&self) -> bool;
     fn collect<I: Iterator, B: FromIterator<I::Item>>(&self, iter: I) -> B;
-    fn count<I: Iterator>(&self, iter: I) -> usize;
 }
 
 #[derive(Clone, Copy)]
@@ -233,11 +225,6 @@ impl Ticks for NoTicks {
     fn collect<I: Iterator, B: FromIterator<I::Item>>(&self, iter: I) -> B {
         iter.collect()
     }
-
-    #[inline(always)]
-    fn count<I: Iterator>(&self, iter: I) -> usize {
-        iter.count()
-    }
 }
 
 impl<T: Ticks> Ticks for &T {
@@ -259,11 +246,6 @@ impl<T: Ticks> Ticks for &T {
     #[inline(always)]
     fn collect<I: Iterator, B: FromIterator<I::Item>>(&self, iter: I) -> B {
         T::collect(self, iter)
-    }
-
-    #[inline(always)]
-    fn count<I: Iterator>(&self, iter: I) -> usize {
-        T::count(self, iter)
     }
 }
 
@@ -288,11 +270,6 @@ impl Ticks for Yielder<'_> {
     #[inline(always)]
     fn collect<I: Iterator, B: FromIterator<I::Item>>(&self, iter: I) -> B {
         Yielder::collect(self, iter)
-    }
-
-    #[inline(always)]
-    fn count<I: Iterator>(&self, iter: I) -> usize {
-        Yielder::count(self, iter)
     }
 }
 

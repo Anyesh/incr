@@ -455,10 +455,11 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
         yielder: &impl Ticks,
     ) -> Vec<(P, R)> {
         let KeyStage { keys, fresh, .. } = stage;
-        let added = yielder.count(
-            keys.iter()
-                .filter(|k| k.slot.is_none() && !k.now.is_empty()),
-        );
+        let added = keys
+            .iter()
+            .inspect(|_| yielder.tick())
+            .filter(|k| k.slot.is_none() && !k.now.is_empty())
+            .count();
         if let Some(moved) = self.reserve(added) {
             for slot in keys.iter_mut().filter_map(|k| k.slot.as_mut()) {
                 yielder.tick();
@@ -748,8 +749,12 @@ where
 
     /// Stages the removal of every held key nothing staged so far names.
     fn remove_the_rest(&mut self, table: &KeyTable<P, R>, yielder: &impl Ticks) {
-        let named: HashSet<usize, FxBuildHasher> =
-            yielder.collect(self.keys.iter().filter_map(|k| k.slot));
+        let named: HashSet<usize, FxBuildHasher> = self
+            .keys
+            .iter()
+            .inspect(|_| yielder.tick())
+            .filter_map(|k| k.slot)
+            .collect();
         for (slot, b) in table.buckets() {
             yielder.tick();
             if !named.contains(&slot) {
