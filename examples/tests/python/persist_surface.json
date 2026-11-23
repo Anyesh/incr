@@ -510,6 +510,11 @@
     "kind": "method_descriptor",
     "signature": "(self, /)"
    },
+   "memory_walker": {
+    "doc": "`memory_stats()` in parts, for a caller that must keep its thread\nresponsive: `walker.step(budget_seconds)` walks for about that long\nand returns True once the walk has ended, then `walker.result()`\nreturns the dict. On a runtime that does not change between steps\nthe result equals `memory_stats()`; changes made between steps can\nmake the figures mix moments.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
    "node_count": {
     "doc": null,
     "kind": "method_descriptor",
