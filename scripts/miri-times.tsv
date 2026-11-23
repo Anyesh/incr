@@ -1444,3 +1444,11 @@
 0	kept_trace::tests::a_kept_trace_reads_back_what_it_was_built_from
 0	kept_trace::tests::kept_refs_drop_once_with_the_last_clone_on_any_thread
 0	kept_trace::tests::totals_follow_insert_replace_and_remove
+14	capture::tests::plain_capture_equals_the_elements_at_begin
+18	capture::tests::keyed_capture_equals_the_pairs_at_begin
+16	capture::tests::plain_capture_survives_both_rehashes_mid_scan
+2	capture::tests::ending_a_capture_removes_it_and_its_rows
+1	capture::tests::a_shared_collection_refuses_a_capture
+0	hashed_multiset::tests::a_write_that_skips_the_settling_lookup_panics_under_a_capture
+0	keyed::tests::a_key_table_write_that_skips_the_stage_clone_panics_under_a_capture
+62	keyed::tests::keyed_capture_survives_both_rehashes_mid_scan

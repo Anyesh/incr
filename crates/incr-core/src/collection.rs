@@ -48,7 +48,9 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as MemOrdering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
+use crate::capture::{CaptureStep, CAPTURE_UNIT};
 use crate::cells::Cells;
 use crate::handle::{ErasedIncr, Incr};
 use crate::hashed_multiset::HashedMultiset;
@@ -287,7 +289,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         on_rep: &mut R,
     ) -> Committed<T> {
         let found = value_code::run(|| {
-            let found = self.elements.find(staged.hash, &staged.value);
+            let found = self.elements.find_settling(staged.hash, &staged.value);
             if let (true, Some(i)) = (R::ACTIVE, found) {
                 on_rep.on_rep(RepSide::Removed, self.elements.stored(i));
             }
@@ -1014,6 +1016,67 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         Some(value_code::run(|| {
             f(log.elements.stored(at), log.elements.count(at))
         }))
+    }
+
+    /// Starts a capture of every distinct element with its multiplicity
+    /// as of now, which [`Self::capture_step`] hands over while writes go
+    /// on: a write first clones each element it changes into the capture.
+    ///
+    /// Panics under a `Shared` runtime, from value code, and if a capture
+    /// is installed already.
+    pub fn begin_capture(&self) {
+        assert!(
+            C::SINGLE_THREADED,
+            "incr-core: a capture needs a Local runtime"
+        );
+        value_code::check();
+        self.log.write().elements.begin_capture();
+    }
+
+    /// Copies elements into the capture for about `budget` (at least one
+    /// unit of table slots, as value code under the read guard) and hands
+    /// over what the capture took since the last step, as (element,
+    /// multiplicity). Once `done`, the capture is removed; without one
+    /// installed, returns an empty finished step.
+    pub fn capture_step(&self, budget: Duration) -> CaptureStep<(T, usize)> {
+        self.capture_step_by(budget, CAPTURE_UNIT)
+    }
+
+    pub(crate) fn capture_step_by(&self, budget: Duration, unit: usize) -> CaptureStep<(T, usize)> {
+        value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        let start = Instant::now();
+        let scanned = {
+            let log = self.log.read();
+            value_code::run(|| {
+                log.elements
+                    .capture_scan(unit, start, budget)
+                    .map(|scan| (log.stamp(), scan))
+            })
+        };
+        let mut log = self.log.write();
+        let (step, stale) = match scanned {
+            Some((stamp, (end, run))) if log.stamp() == stamp => {
+                (log.elements.capture_advance(end, run), Vec::new())
+            }
+            Some((_, (_, run))) => (log.elements.capture_drain(), run),
+            None => (log.elements.capture_drain(), Vec::new()),
+        };
+        drop(log);
+        drop(stale);
+        step
+    }
+
+    /// Removes the capture, if one is installed, and drops what it took.
+    pub fn end_capture(&self) {
+        value_code::check();
+        let rows = self.log.write().elements.end_capture();
+        drop(rows);
+    }
+
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn capture_installed(&self) -> bool {
+        self.log.read().elements.capture_installed()
     }
 
     /// Current elements, with multiset duplicates expanded. Forces
