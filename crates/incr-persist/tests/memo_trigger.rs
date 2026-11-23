@@ -258,7 +258,12 @@ fn entries_due_during_a_checkpoint_are_saved_without_another_compute() {
     backend.wait_for_first_write();
     w.read(3);
     w.read(4);
-    assert_eq!(w.memo.stats().unsaved_entries, 2);
+    // 3 when key 2 was still computing at the woken checkpoint's snapshot,
+    // which then carries it.
+    let unsaved = w.memo.stats().unsaved_entries;
+    assert!((2..=3).contains(&unsaved), "{unsaved} unsaved entries");
     backend.release();
     w.wait_for_checkpoints(2);
+    let stats = w.memo.stats();
+    assert_eq!((stats.entries, stats.unsaved_entries), (4, 0));
 }
