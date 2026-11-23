@@ -1147,15 +1147,24 @@ where
             };
             let to = from + pending.len() as u64;
 
-            let staged: Vec<Staged<U>> = with_ticks!(rt.hook(), |ticks| pending
-                .into_iter()
-                .inspect(|_| ticks.tick())
-                .filter_map(|d| match d {
-                    Delta::Insert(v) => image(v).map(Delta::Insert),
-                    Delta::Delete(v) => image(v).map(Delta::Delete),
-                })
-                .map(|d| Staged::delta(&out_hasher, d))
-                .collect());
+            let delta_image = |d| match d {
+                Delta::Insert(v) => image(v).map(Delta::Insert),
+                Delta::Delete(v) => image(v).map(Delta::Delete),
+            };
+            let staged: Vec<Staged<U>> = with_ticks!(rt.hook(), |ticks| if ticks.is_active() {
+                pending
+                    .into_iter()
+                    .inspect(|_| ticks.tick())
+                    .filter_map(delta_image)
+                    .map(|d| Staged::delta(&out_hasher, d))
+                    .collect()
+            } else {
+                pending
+                    .into_iter()
+                    .filter_map(delta_image)
+                    .map(|d| Staged::delta(&out_hasher, d))
+                    .collect()
+            });
 
             let mut out = output_log_for_query.write();
             with_ticks!(rt.hook_under_lock(), |ticks| rebuild.guard(|| {
