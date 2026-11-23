@@ -196,6 +196,16 @@ impl HeldWrite {
     }
 }
 
+/// Releases the held write when dropped, so a failed assert cannot leave
+/// the checkpoint thread waiting while the memo's drop joins it.
+struct ReleaseOnDrop(HeldWrite);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl MemoBackend for HeldWrite {
     type Guard = <MemoryMemo as MemoBackend>::Guard;
 
@@ -242,6 +252,7 @@ impl MemoBackend for HeldWrite {
 fn entries_due_during_a_checkpoint_are_saved_without_another_compute() {
     let backend = HeldWrite::default();
     let w = World::<Shared>::open_on(options().checkpoint_after_entries(2), backend.clone());
+    let _release = ReleaseOnDrop(backend.clone());
     w.read(1);
     w.read(2);
     backend.wait_for_first_write();
