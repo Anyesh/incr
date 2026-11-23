@@ -98,7 +98,8 @@ pub use keyed::{
 };
 pub use locks::{LocalLock, Lock};
 pub use memory::{
-    Held, MemoryStats, NodeKind, NodeMemory, StateKind, StateMemory, StateStats, ValueType,
+    Held, Labels, MemoryStats, MemoryVisitor, MemoryWalker, NodeKind, NodeMemory, StateKind,
+    StateMemory, StateStats, ValueType, WalkEnd,
 };
 pub use node::{NodeData, NodeId};
 pub use runtime::{
