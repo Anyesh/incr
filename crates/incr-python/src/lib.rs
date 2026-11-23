@@ -42,11 +42,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 
 use incr_compute::{
-    Change, DeleteError, ErasedIncr, Incr, IncrCollection, NodeId, NodeTable, PropagationTrace,
-    Runtime, SortedCollection,
+    Change, DeleteError, ErasedIncr, Incr, IncrCollection, NodeTable, PropagationTrace, Runtime,
+    SortedCollection,
 };
+use incr_core::{KeptTrace, PairOp, StateStats, StepValue, TraceCapture};
 use incr_core::{Local, RoutingFailed};
-use incr_core::{PairOp, StateStats};
 use incr_python_persist::classes::KeyedSource;
 use incr_python_persist::classes::{key_counts, keyed_rows_refusal, reconcile_pairs, KeyCounts};
 use overlay::{Born, Undo};
@@ -55,7 +55,7 @@ use state::{LocalState, PyCallable, RtState};
 
 use incr_python_persist::ready;
 use incr_python_protocol::by_id::{keep_traced, resolve, snapshot_values, TypedNode};
-use incr_python_protocol::inspect::trace_header;
+use incr_python_protocol::inspect::{kept_value, trace_dict};
 use incr_python_protocol::notready::{
     lookup_failed, PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
@@ -141,39 +141,34 @@ fn raise_routing(failure: RoutingFailed) -> ! {
     raise_into_engine(Python::attach(|py| routing_error(py, failure)))
 }
 
-type TracedNode = (Option<String>, Option<Py<PyAny>>);
-
-fn traced_nodes(rt: &Runtime, trace: &PropagationTrace) -> Vec<TracedNode> {
-    trace
-        .node_traces
-        .iter()
-        .map(|nt| (rt.label(nt.id.0), traced_value(rt, nt.id)))
-        .collect()
-}
-
+/// The trace dict of `get_traced` and `last_trace_by_id`, each step with
+/// its node's label as of now (none once the step's node is deleted, even
+/// if its slot was reused) and its kept value.
 fn traced_to_py(
     py: Python<'_>,
-    value: Py<PyAny>,
-    trace: &PropagationTrace,
-    nodes: Vec<TracedNode>,
-) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-    let trace_dict = trace_header(py, trace)?;
-    let node_traces = pyo3::types::PyList::empty(py);
-    for (nt, (label, value)) in trace.node_traces.iter().zip(nodes) {
-        let d = incr_python_protocol::inspect::trace_entry(py, nt)?;
-        d.set_item("label", label)?;
-        d.set_item("value", value)?;
-        node_traces.append(d)?;
-    }
-    trace_dict.set_item("node_traces", node_traces)?;
-    Ok((value, trace_dict.into_any().unbind()))
+    rt: &Runtime,
+    target: u32,
+    kept: &KeptTrace,
+) -> PyResult<Py<PyAny>> {
+    let d = trace_dict(py, target, kept, |entry, step| {
+        let label = rt
+            .erased_handle_at(step.id, step.generation)
+            .and_then(|_| rt.label(step.id.0));
+        entry.set_item("label", label)?;
+        entry.set_item("value", kept_value(py, &step.value))
+    })?;
+    Ok(d.into_any().unbind())
 }
 
-/// The memoized value of a node a trace just left Clean, so the read
-/// recomputes nothing. `None` for a dead slot, a cycle, or a value type
-/// other than `PyValue`, `u64` and `(u64, u64)`.
-fn traced_value(rt: &Runtime, id: NodeId) -> Option<Py<PyAny>> {
-    TypedNode::of(rt, rt.erased_handle(id)?)?.try_value(rt)
+/// [`Runtime::kept_trace`] with each step's memoized value: a trace just
+/// left the steps Clean, so nothing recomputes. No value for a dead slot,
+/// a cycle, or a value type other than `PyValue`, `u64` and `(u64, u64)`.
+fn kept_trace(rt: &Runtime, capture: &TraceCapture, trace: &PropagationTrace) -> KeptTrace {
+    rt.kept_trace(capture, trace, |step| {
+        rt.erased_handle(step.id)
+            .and_then(|handle| TypedNode::of(rt, handle))
+            .map_or(StepValue::None, |node| node.kept_value(rt))
+    })
 }
 
 fn delete_error(e: DeleteError, key: impl Into<Py<PyAny>>) -> PyErr {
@@ -1999,9 +1994,10 @@ impl PyRuntime {
         self.engine_read(|rt| {
             let (val, trace, capture): (PyValue, PropagationTrace, _) =
                 rt.get_traced_retaining(node.inner);
-            let nodes = traced_nodes(rt, &trace);
-            keep_traced(rt, capture, |py| {
-                traced_to_py(py, ready::unwrapped(py, val.0), &trace, nodes)
+            let kept = kept_trace(rt, &capture, &trace);
+            keep_traced(rt, capture, kept, |py, kept| {
+                let trace = traced_to_py(py, rt, trace.target.0, kept)?;
+                Ok((ready::unwrapped(py, val.0), trace))
             })
         })?
     }
@@ -2025,10 +2021,16 @@ impl PyRuntime {
     fn get_traced_by_id(&self, id: u32, generation: u32) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         self.engine_read(|rt| {
             let (val, trace, capture) = resolve(rt, id, generation)?.get_traced_retaining(rt);
-            let nodes = traced_nodes(rt, &trace);
-            Ok::<_, incr_python_protocol::by_id::ByIdError>(keep_traced(rt, capture, |py| {
-                traced_to_py(py, ready::unwrapped(py, val), &trace, nodes)
-            }))
+            let kept = kept_trace(rt, &capture, &trace);
+            Ok::<_, incr_python_protocol::by_id::ByIdError>(keep_traced(
+                rt,
+                capture,
+                kept,
+                |py, kept| {
+                    let trace = traced_to_py(py, rt, trace.target.0, kept)?;
+                    Ok((ready::unwrapped(py, val), trace))
+                },
+            ))
         })??
     }
 
@@ -2046,23 +2048,27 @@ impl PyRuntime {
     /// `(status, trace)` for the node a `graph_snapshot` entry names by its
     /// `"id"` and `"generation"`, without running any compute; `status` as
     /// `peek_by_id` reports it. Only roots of `get_traced` and
-    /// `get_traced_by_id` have a last trace: `trace` is the object the last
-    /// of those calls that recomputed the node returned, labels and values
-    /// as they were then, while the node stays Clean at that value. A
-    /// later traced read that finds the node clean keeps it; a plain `get`
-    /// that verifies the node clean, or any change, makes `trace` `None`
-    /// until a traced read recomputes the node. Raises `StaleNodeError`
-    /// like `get_by_id`, and routes queued `group_by` changes first as
-    /// `peek_by_id` does.
+    /// `get_traced_by_id` have a last trace: `trace` is a new dict equal to
+    /// what the last of those calls that recomputed the node returned,
+    /// with values as they were then and labels as they are now (none for
+    /// a step node deleted since), while the node stays Clean at that
+    /// value. A later traced read that finds the node clean keeps it; a
+    /// plain `get` that verifies the node clean, or any change, makes
+    /// `trace` `None` until a traced read recomputes the node. Raises
+    /// `StaleNodeError` like `get_by_id`, and routes queued `group_by`
+    /// changes first as `peek_by_id` does.
     fn last_trace_by_id(
         &self,
-        py: Python<'_>,
         id: u32,
         generation: u32,
     ) -> PyResult<(&'static str, Option<Py<PyAny>>)> {
-        let (status, payload) =
-            self.engine_read(|rt| incr_python_protocol::by_id::last_trace(rt, id, generation))??;
-        Ok((status, incr_python_protocol::by_id::kept_trace(py, payload)))
+        self.engine_read(|rt| {
+            let (status, kept) = incr_python_protocol::by_id::last_trace(rt, id, generation)?;
+            let trace = kept
+                .map(|kept| Python::attach(|py| traced_to_py(py, rt, id, &kept)))
+                .transpose()?;
+            Ok::<_, PyErr>((status, trace))
+        })?
     }
 
     /// The graph as a list of `{"id", "kind", "label", "dependencies",
@@ -2124,7 +2130,7 @@ impl PyRuntime {
     }
 
     /// Memory held by this runtime: `{"bytes", "nodes", "py_refs",
-    /// "by_kind", "by_label"}`. `bytes` estimates what the engine holds from
+    /// "by_kind", "by_label", "kept_traces"}`. `bytes` estimates what the engine holds from
     /// sizes and capacities (node slots, values' own slots, closures' captures,
     /// dependency lists, labels, collection logs and operator state); the
     /// Python objects themselves are not in it. `py_refs` counts the
@@ -2136,8 +2142,11 @@ impl PyRuntime {
     /// collection and operator state under "collection". `by_label` totals
     /// labelled nodes by the label up to its first `/`, with a collection's
     /// state under the label of its `version_node`; callables are not
-    /// attributed to labels. Walks the whole graph; nothing is counted
-    /// between calls.
+    /// attributed to labels. `kept_traces` is `{"count", "bytes",
+    /// "py_refs"}` for the traces `last_trace_by_id` reads: their own
+    /// allocations and the table holding them, and the node values they
+    /// reference; the other figures leave them out. Walks the whole graph,
+    /// except for `kept_traces`, which is a running total.
     fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let stats = self.engine_read(|rt| rt.memory_stats())?;
         let bridges = self

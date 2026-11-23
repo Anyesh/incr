@@ -4,8 +4,14 @@ All notable changes to this project are documented here. Format roughly follows 
 
 ## [Unreleased]
 
+### Added
+
+- **Python: `memory_stats()["kept_traces"]` (R23).** `{"count", "bytes", "py_refs"}` for the traces `last_trace_by_id` reads, kept as running totals; the top-level `bytes` and `py_refs` still leave them out. incr-core gains `Runtime::kept_trace_memory` and `MemoryStats::kept_traces`.
+
 ### Changed
 
+- **A kept trace is compact (R23).** A `get_traced` root keeps one allocation per trace (ids, generations, actions, timings, dependencies and a reference to each step's value) instead of the rendered dict: 224 bytes for a five-step trace with eight dependency ids, plus a 16-byte table entry. At 270,967 traced roots of five steps (Local, release wheel, Linux glibc), RssAnon rises 273 bytes per root over plain `get`, against 5,275 bytes on beta.12. A trace's block is 48 bytes plus 20 per step, 8 per kept value (16 for a pair) and 4 per dependency id, rounded up to 8, so five-step traces stay under 300 bytes per root up to about twelve dependency ids. incr-core's `retain_trace` takes a `KeptTrace` built by `Runtime::kept_trace`, and `LastTrace::trace` replaces `LastTrace::payload` and `TracePayload`.
+- **Intended change: `last_trace_by_id` returns a new dict per call (R23).** It equals what `get_traced` returned but is not the same object, so mutating either no longer shows in later reads. On the Local wheel each step's `label` is read when `last_trace_by_id` runs: a label set after the traced read shows, and a step whose node was deleted since shows `None`.
 - **`LICENSE` opens with the copyright notice** ("Copyright (C) 2026 Anish Shrestha") above the unchanged AGPL-3.0 text.
 
 ## [0.2.0-beta.12] - 2026-11-17
@@ -49,7 +55,7 @@ Store checkpoint, 600,000 rows of about 100 bytes, Local runtime, release, this 
 - SQLite holds its write transaction while the fold encodes every row, where beta.10 encoded before beginning it, so other writer processes wait longer and can hit `busy_timeout` on a large store with a slow codec. It also stages the snapshot in a TEMP table, writing its bytes twice; peak memory stays flat.
 - A `key_partitions` registration on a Shared runtime while another thread checkpoints fails the checkpoint with a false `Error::Bypassed`; nothing changes and a retry succeeds.
 - A backend that commits after a failed pull and then raises is indistinguishable from one that abandoned the write; the store neither resyncs nor poisons, and a later catch-up adopts the truncated snapshot. Such a backend violates the documented contract.
-- Only roots of `get_traced`/`get_traced_by_id` keep a last trace. A plain `get` that verifies the node clean makes `last_trace_by_id` return `None` until the next traced recompute, and on Shared a traced call that races another thread's run of the root keeps nothing. The kept trace is the same object `get_traced` returned, so mutating it changes later reads.
+- Only roots of `get_traced`/`get_traced_by_id` keep a last trace. A plain `get` that verifies the node clean makes `last_trace_by_id` return `None` until the next traced recompute, and on Shared a traced call that races another thread's run of the root keeps nothing. The kept trace is the same object `get_traced` returned, so mutating it changes later reads (beta.13 returns a new dict per call).
 - On the Local wheel `peek_by_id` and `last_trace_by_id` first route queued `group_by` changes, as every read does, which runs key functions and can raise a routing error.
 
 ## [0.2.0-beta.10] - 2026-11-17

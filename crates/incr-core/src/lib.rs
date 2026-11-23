@@ -40,6 +40,7 @@ pub mod handle;
 mod hashed_multiset;
 mod hold;
 mod instrument;
+mod kept_trace;
 pub mod keyed;
 pub mod lock_order;
 pub mod locks;
@@ -90,6 +91,7 @@ pub use fx::{FxBuildHasher, FxHasher};
 pub use generic_arena::GenericArena;
 pub use grid_table::{GridKey, GridTable};
 pub use handle::{ErasedIncr, Incr, RuntimeId};
+pub use kept_trace::{KeptRef, KeptStep, KeptTrace, KeptTraceMemory, KeptValue, StepValue};
 pub use keyed::{
     find_element, same_element, ElementRank, KeyCounts, KeyIndex, KeyPartitions, KeyTable,
     KeyedChange, KeyedCollection, KeyedSpent, Pair, PairHandle, PairOp, UNIDENTIFYING_RANK,
@@ -109,7 +111,7 @@ pub use table::{NodeTable, TableKey};
 pub use trace::{
     label_group, BoundedSnapshot, ComputeCounts, Direction, GraphQuery, GraphSummary, GroupEdge,
     GroupKind, GroupSummary, LastTrace, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace,
-    TraceAction, TraceCapture, TracePayload,
+    TraceAction, TraceCapture,
 };
 pub use value::Value;
 #[doc(hidden)]

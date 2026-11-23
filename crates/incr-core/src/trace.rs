@@ -191,11 +191,6 @@ pub struct PropagationTrace {
     pub elapsed_ns: u64,
 }
 
-/// What a binding keeps for a `get_traced` root, rendered from its trace;
-/// [`crate::Runtime::retain_trace`] stores it and
-/// [`crate::Runtime::last_trace`] hands it back.
-pub type TracePayload = std::sync::Arc<dyn std::any::Any + Send + Sync>;
-
 /// A node's `verified_at` (memo bit masked) and `changed_at`. Zero in
 /// either names no landing a trace could describe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,8 +232,8 @@ pub struct TraceCapture {
     pub(crate) root: RootEntries,
 }
 
-/// What a store does with a capture: keep a new payload at these stamps,
-/// move the kept payload to them, or leave everything as it is.
+/// What a store does with a capture: keep a new trace at these stamps,
+/// move the kept trace to them, or leave everything as it is.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Retain {
     Keep(StampPair),
@@ -265,18 +260,11 @@ impl TraceCapture {
     }
 }
 
-/// A root's kept payload and the stamps it describes.
-pub(crate) struct RetainedTrace {
-    pub(crate) generation: u32,
-    pub(crate) stamps: StampPair,
-    pub(crate) payload: TracePayload,
-}
-
 /// [`crate::Runtime::last_trace`]'s answer for a live node.
 pub struct LastTrace {
     /// The node's state when read.
     pub state: crate::state::NodeState,
-    /// The kept payload, when the node is Clean at the stamps it was kept
+    /// The kept trace, when the node is Clean at the stamps it was kept
     /// with.
-    pub payload: Option<TracePayload>,
+    pub trace: Option<crate::kept_trace::KeptTrace>,
 }

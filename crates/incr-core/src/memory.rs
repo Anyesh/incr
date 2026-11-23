@@ -164,6 +164,9 @@ pub struct MemoryStats {
     pub free_slots: usize,
     /// The bytes those slots keep.
     pub free_bytes: usize,
+    /// The traces kept for `get_traced` roots, which [`Self::bytes`]
+    /// leaves out.
+    pub kept_traces: crate::kept_trace::KeptTraceMemory,
 }
 
 impl MemoryStats {
@@ -340,6 +343,7 @@ impl<C: Cells> Runtime<C> {
             });
         }
         let free_slots = len - nodes.len();
+        let kept_traces = inner.last_traces.memory();
         drop(inner);
         MemoryStats {
             nodes,
@@ -347,6 +351,7 @@ impl<C: Cells> Runtime<C> {
             value_types,
             free_slots,
             free_bytes: free_slots * fixed,
+            kept_traces,
         }
     }
 
