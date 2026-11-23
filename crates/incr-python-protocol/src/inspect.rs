@@ -1,4 +1,4 @@
-//! The Python face of `get_traced` entries and compute stats, shared by
+//! The Python face of `get_traced` traces and compute stats, shared by
 //! both bindings, and the label grouping they and `memory_stats` use.
 
 use std::collections::HashMap;
@@ -7,30 +7,50 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 pub use incr_core::label_group;
-use incr_core::{ComputeCounts, GraphSummary, GroupKind, NodeTrace, PropagationTrace, TraceAction};
+use incr_core::{
+    ComputeCounts, GraphSummary, GroupKind, KeptStep, KeptTrace, KeptValue, TraceAction,
+};
 
-/// A trace's `target`, counts and `elapsed_ns`, for the caller to add its
-/// `node_traces` to.
-pub fn trace_header<'py>(
+/// A kept trace as `get_traced` returns it: `target`, the counts,
+/// `elapsed_ns` and `node_traces`, one [`trace_entry`] per step, to which
+/// `extra` adds what a binding shows beyond them.
+pub fn trace_dict<'py>(
     py: Python<'py>,
-    trace: &PropagationTrace,
+    target: u32,
+    trace: &KeptTrace,
+    mut extra: impl FnMut(&Bound<'py, PyDict>, &KeptStep<'_>) -> PyResult<()>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new(py);
-    d.set_item("target", trace.target.0)?;
-    d.set_item("total_nodes", trace.total_nodes)?;
-    d.set_item("nodes_recomputed", trace.nodes_recomputed)?;
-    d.set_item("nodes_cutoff", trace.nodes_cutoff)?;
-    d.set_item("elapsed_ns", trace.elapsed_ns)?;
+    let d = trace_header(py, target, trace)?;
+    let node_traces = PyList::empty(py);
+    for step in trace.steps() {
+        let entry = trace_entry(py, &step)?;
+        extra(&entry, &step)?;
+        node_traces.append(entry)?;
+    }
+    d.set_item("node_traces", node_traces)?;
     Ok(d)
 }
 
-/// A trace entry's `id`, `action`, `dependencies` and `elapsed_ns`.
-pub fn trace_entry<'py>(py: Python<'py>, entry: &NodeTrace) -> PyResult<Bound<'py, PyDict>> {
+fn trace_header<'py>(
+    py: Python<'py>,
+    target: u32,
+    trace: &KeptTrace,
+) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
-    d.set_item("id", entry.id.0)?;
+    d.set_item("target", target)?;
+    d.set_item("total_nodes", trace.total_nodes())?;
+    d.set_item("nodes_recomputed", trace.nodes_recomputed())?;
+    d.set_item("nodes_cutoff", trace.nodes_cutoff())?;
+    d.set_item("elapsed_ns", trace.elapsed_ns())?;
+    Ok(d)
+}
+
+fn trace_entry<'py>(py: Python<'py>, step: &KeptStep<'_>) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("id", step.id.0)?;
     d.set_item(
         "action",
-        match entry.action {
+        match step.action {
             TraceAction::VerifiedClean => "verified_clean",
             TraceAction::Recomputed {
                 value_changed: true,
@@ -40,12 +60,20 @@ pub fn trace_entry<'py>(py: Python<'py>, entry: &NodeTrace) -> PyResult<Bound<'p
             } => "recomputed_cutoff",
         },
     )?;
-    d.set_item(
-        "dependencies",
-        entry.dependencies.iter().map(|d| d.0).collect::<Vec<_>>(),
-    )?;
-    d.set_item("elapsed_ns", entry.elapsed_ns)?;
+    d.set_item("dependencies", step.dependencies)?;
+    d.set_item("elapsed_ns", step.elapsed_ns)?;
     Ok(d)
+}
+
+/// A step's kept value as Python sees it: a reference as kept, a count as
+/// an `int`, a pair as a tuple.
+pub fn kept_value(py: Python<'_>, value: &KeptValue<'_>) -> Py<PyAny> {
+    match value {
+        KeptValue::None => py.None(),
+        KeptValue::Count(n) => n.into_pyobject(py).unwrap().into_any().unbind(),
+        KeptValue::Pair(a, b) => (*a, *b).into_pyobject(py).unwrap().into_any().unbind(),
+        KeptValue::Ref(r) => r.get::<Py<PyAny>>().clone_ref(py),
+    }
 }
 
 /// `{group: {"recomputed", "cutoff", "verified", "elapsed_ns"}}`, with

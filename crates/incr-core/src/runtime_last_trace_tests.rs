@@ -1,5 +1,5 @@
-//! A `get_traced` root keeps the payload its wheel rendered from the trace
-//! while the root stays Clean at the stamps that trace left it with.
+//! A `get_traced` root keeps the compact form of its trace while the root
+//! stays Clean at the stamps that trace left it with.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -7,24 +7,49 @@ use std::sync::Arc;
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::handle::Incr;
+use crate::kept_trace::{KeptTrace, KeptValue, StepValue};
 use crate::node::NodeId;
 use crate::state::NodeState;
-use crate::trace::{Retain, RootEntries, StampPair, TraceAction, TraceCapture};
+use crate::trace::{PropagationTrace, Retain, RootEntries, StampPair, TraceAction, TraceCapture};
 use crate::value::Value;
 
+type Tag = Box<&'static str>;
+
+/// Keeps `trace` with `held` as its first step's value.
+fn keep<C: Cells, V: Send + Sync + 'static>(
+    rt: &Runtime<C>,
+    trace: &PropagationTrace,
+    capture: TraceCapture,
+    held: V,
+) {
+    let mut held = Some(held);
+    let kept = rt.kept_trace(&capture, trace, |_, _| {
+        held.take().map_or(StepValue::None, StepValue::Ref)
+    });
+    rt.retain_trace(capture, kept);
+}
+
 fn traced<C: Cells, T: Value>(rt: &Runtime<C>, q: Incr<T>, tag: &'static str) -> T {
-    let (value, _, capture) = rt.get_traced_retaining(q);
-    rt.retain_trace(capture, Arc::new(tag));
+    let (value, trace, capture) = rt.get_traced_retaining(q);
+    keep(rt, &trace, capture, Tag::new(tag));
     value
+}
+
+fn kept<C: Cells, T: Value>(rt: &Runtime<C>, q: Incr<T>) -> Option<KeptTrace> {
+    rt.last_trace(NodeId(q.slot()), q.generation())
+        .expect("a live node has a last-trace answer")
+        .trace
 }
 
 fn last<C: Cells, T: Value>(rt: &Runtime<C>, q: Incr<T>) -> (NodeState, Option<&'static str>) {
     let found = rt
         .last_trace(NodeId(q.slot()), q.generation())
         .expect("a live node has a last-trace answer");
-    let tag = found.payload.map(|p| {
-        *p.downcast_ref::<&'static str>()
-            .expect("the payload's type")
+    let tag = found.trace.and_then(|kept| {
+        kept.steps().find_map(|step| match step.value {
+            KeptValue::Ref(held) => Some(**held.get::<Tag>()),
+            _ => None,
+        })
     });
     (found.state, tag)
 }
@@ -73,7 +98,7 @@ fn traced_read_of_a_clean_root_leaves_the_trace<C: Cells>() {
     traced(&rt, q, "first");
     let (_, trace, capture) = rt.get_traced_retaining(q);
     assert!(trace.node_traces.iter().all(|t| t.id.0 != q.slot()));
-    rt.retain_trace(capture, Arc::new("second"));
+    keep(&rt, &trace, capture, Tag::new("second"));
     assert_eq!(last(&rt, q), (NodeState::Clean, Some("first")));
 }
 
@@ -91,7 +116,7 @@ fn traced_verify_clean_restamps_the_trace<C: Cells>() {
         .map(|t| t.action.clone())
         .collect();
     assert_eq!(root, vec![TraceAction::VerifiedClean]);
-    rt.retain_trace(capture, Arc::new("second"));
+    keep(&rt, &trace, capture, Tag::new("second"));
     assert_eq!(last(&rt, q), (NodeState::Clean, Some("first")));
 }
 
@@ -141,8 +166,13 @@ fn delete_drops_the_payload_and_a_reused_slot_starts_empty<C: Cells>() {
     let rt: Runtime<C> = Runtime::new();
     let (_, q, _) = counted(&rt);
     let dropped = Arc::new(AtomicUsize::new(0));
-    let (_, _, capture) = rt.get_traced_retaining(q);
-    rt.retain_trace(capture, Arc::new(CountDrop(Arc::clone(&dropped))));
+    let (_, trace, capture) = rt.get_traced_retaining(q);
+    keep(
+        &rt,
+        &trace,
+        capture,
+        Arc::new(CountDrop(Arc::clone(&dropped))),
+    );
     rt.delete_node(q);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     assert!(rt.last_trace(NodeId(q.slot()), q.generation()).is_none());
@@ -184,11 +214,11 @@ fn payloads_drop_outside_the_lock<C: Cells>(rt: &Runtime<C>) {
             dropped: Arc::clone(&dropped),
         })
     };
-    let (_, _, capture) = rt.get_traced_retaining(q);
-    rt.retain_trace(capture, touch());
+    let (_, trace, capture) = rt.get_traced_retaining(q);
+    keep(rt, &trace, capture, touch());
     rt.set(a, 2);
-    let (_, _, capture) = rt.get_traced_retaining(q);
-    rt.retain_trace(capture, touch());
+    let (_, trace, capture) = rt.get_traced_retaining(q);
+    keep(rt, &trace, capture, touch());
     assert_eq!(dropped.load(Ordering::SeqCst), 1, "the replaced payload");
     rt.delete_node(q);
     assert_eq!(
@@ -196,6 +226,39 @@ fn payloads_drop_outside_the_lock<C: Cells>(rt: &Runtime<C>) {
         2,
         "the deleted root's payload"
     );
+}
+
+fn kept_totals_follow_keep_replace_and_delete<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    assert_eq!(rt.kept_trace_memory(), Default::default());
+    let (a, q, _) = counted(&rt);
+    let (_, p, _) = counted(&rt);
+    traced(&rt, q, "q");
+    traced(&rt, p, "p");
+    let two = rt.kept_trace_memory();
+    let body = kept(&rt, q).expect("q's trace").heap_bytes();
+    let table = two.bytes - 2 * body;
+    assert_eq!((two.count, two.refs), (2, 2));
+    assert_eq!(
+        table,
+        crate::memory::table_bytes::<(u32, KeptTrace)>(rt.inner.read().last_traces.capacity())
+    );
+    assert!(table > 0);
+
+    rt.set(a, 3);
+    traced(&rt, q, "replaced");
+    assert_eq!(
+        rt.kept_trace_memory(),
+        two,
+        "a replacement of the same shape"
+    );
+
+    rt.delete_node(q);
+    let one = rt.kept_trace_memory();
+    assert_eq!((one.count, one.bytes, one.refs), (1, table + body, 1));
+    rt.delete_node(p);
+    let none = rt.kept_trace_memory();
+    assert_eq!((none.count, none.bytes, none.refs), (0, table, 0));
 }
 
 fn node_info_reads_one_node_by_id<C: Cells>() {
@@ -283,9 +346,10 @@ fn a_capture_from_another_runtime_is_refused<C: Cells>() {
         traced.create_input(0_i64);
     }
     let other: Runtime<C> = Runtime::new();
-    let (_, _, capture) = traced.get_traced_retaining(q);
+    let (_, trace, capture) = traced.get_traced_retaining(q);
+    let foreign = traced.kept_trace(&capture, &trace, |_, _| StepValue::<Tag>::None);
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        other.retain_trace(capture, Arc::new("foreign"));
+        other.retain_trace(capture, foreign);
     }));
     let payload = refused.expect_err("a foreign capture was accepted");
     let message = payload
@@ -295,6 +359,38 @@ fn a_capture_from_another_runtime_is_refused<C: Cells>() {
         .unwrap_or_default();
     assert!(message.contains("another runtime"), "got: {message}");
     assert_eq!(other.inner.read().last_traces.capacity(), 0);
+}
+
+fn a_trace_for_another_capture_or_shared_is_refused<C: Cells>() {
+    let rt: Runtime<C> = Runtime::new();
+    let (a, q, _) = counted(&rt);
+    let (_, p, _) = counted(&rt);
+    rt.delete_node(p);
+    let (_, trace, first) = rt.get_traced_retaining(q);
+    let kept = rt.kept_trace(&first, &trace, |_, _| StepValue::<Tag>::None);
+    let clone = kept.clone();
+    let shared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.retain_trace(first, kept);
+    }));
+    assert!(panic_text(shared.expect_err("a shared trace was kept")).contains("shared"));
+    drop(clone);
+
+    let reused = rt.create_query(move |r: &Runtime<C>| r.get(a) + 1);
+    assert_eq!(
+        (reused.slot(), reused.generation()),
+        (p.slot(), p.generation() + 1)
+    );
+    let (_, trace, other) = rt.get_traced_retaining(q);
+    let (_, _, wrong) = rt.get_traced_retaining(reused);
+    let kept = rt.kept_trace(&other, &trace, |_, _| StepValue::<Tag>::None);
+    let foreign = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.retain_trace(wrong, kept);
+    }));
+    assert!(
+        panic_text(foreign.expect_err("a trace of another capture was kept"))
+            .contains("another capture")
+    );
+    assert_eq!(rt.kept_trace_memory().count, 0);
 }
 
 fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -337,6 +433,8 @@ fn cases<C: Cells>() {
     plain_get_traced_and_get_store_nothing::<C>();
     delete_drops_the_payload_and_a_reused_slot_starts_empty::<C>();
     node_info_reads_one_node_by_id::<C>();
+    kept_totals_follow_keep_replace_and_delete::<C>();
+    a_trace_for_another_capture_or_shared_is_refused::<C>();
     a_capture_from_another_runtime_is_refused::<C>();
     only_this_runtimes_handles_arm_a_trace_root::<C>();
 }

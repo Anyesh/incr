@@ -180,9 +180,9 @@ pub(crate) struct Inner<C: Cells> {
     /// The slot of the root the armed `get_traced` reads, and its entries
     /// in `trace_log`.
     pub(crate) trace_root: Option<(u32, crate::trace::RootEntries)>,
-    /// Kept trace payloads of `get_traced` roots by slot; empty until a
-    /// binding keeps one.
-    pub(crate) last_traces: HashMap<u32, crate::trace::RetainedTrace>,
+    /// Kept traces of `get_traced` roots by slot; empty until a binding
+    /// keeps one.
+    pub(crate) last_traces: crate::kept_trace::KeptTraces,
     /// Node slots released by delete_node, awaiting recycling.
     pub(crate) free_nodes: Vec<u32>,
     pub(crate) observers: Observers<C>,
@@ -293,7 +293,7 @@ impl<C: Cells> Inner<C> {
             labels: HashMap::new(),
             trace_log: Vec::new(),
             trace_root: None,
-            last_traces: HashMap::new(),
+            last_traces: Default::default(),
             free_nodes: Vec::new(),
             observers: Observers::new(),
             owned: HashMap::new(),
@@ -3312,11 +3312,7 @@ impl<C: Cells> Runtime<C> {
         } else {
             inner.labels.remove(&slot)
         };
-        let trace = if inner.last_traces.is_empty() {
-            None
-        } else {
-            inner.last_traces.remove(&slot).map(|kept| kept.payload)
-        };
+        let trace = inner.last_traces.remove(slot);
         if C::u8_load_relaxed(&self.instrument_used) != 0 {
             self.instrument_state.write().release(slot, label);
         }

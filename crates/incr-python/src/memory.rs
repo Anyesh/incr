@@ -122,5 +122,10 @@ pub(crate) fn stats_dict<'py>(
     )?;
     d.set_item("by_kind", kinds)?;
     d.set_item("by_label", labels)?;
+    let kept = PyDict::new(py);
+    kept.set_item("count", stats.kept_traces.count)?;
+    kept.set_item("bytes", stats.kept_traces.bytes)?;
+    kept.set_item("py_refs", stats.kept_traces.refs)?;
+    d.set_item("kept_traces", kept)?;
     Ok(d)
 }

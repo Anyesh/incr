@@ -1428,8 +1428,13 @@
 3	keyed::tests::rows_local::forget_partition_inside_a_compute_is_refused
 3	keyed::tests::rows_shared::forget_partition_inside_a_compute_is_refused
 1	collection::tests::shared_snapshot_values_records_no_dependency
-4	runtime::last_trace_tests::local_last_trace_cases
-7	runtime::last_trace_tests::shared_last_trace_cases
+6	runtime::last_trace_tests::local_last_trace_cases
+11	runtime::last_trace_tests::shared_last_trace_cases
 1	runtime::last_trace_tests::local_last_trace_payloads_drop_outside_the_lock
 1	runtime::last_trace_tests::shared_last_trace_payloads_drop_outside_the_lock
 0	runtime::last_trace_tests::a_capture_keeps_only_what_its_root_entries_vouch_for
+0	kept_trace::tests::a_five_step_trace_with_seven_dependencies_is_one_216_byte_block
+0	kept_trace::tests::a_kept_ref_read_as_another_type_panics
+0	kept_trace::tests::a_kept_trace_reads_back_what_it_was_built_from
+0	kept_trace::tests::kept_refs_drop_once_with_the_last_clone_on_any_thread
+0	kept_trace::tests::totals_follow_insert_replace_and_remove

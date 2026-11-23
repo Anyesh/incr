@@ -7,8 +7,8 @@ use pyo3::prelude::*;
 
 use incr_core::persist_hooks::{inspect_many, Deferred};
 use incr_core::{
-    Cells, ErasedIncr, Incr, NodeId, NodeInfo, NodeState, PropagationTrace, Runtime, TraceCapture,
-    TracePayload,
+    Cells, ErasedIncr, Incr, KeptTrace, NodeId, NodeInfo, NodeState, PropagationTrace, Runtime,
+    StepValue, TraceCapture,
 };
 
 use crate::snapshot::status;
@@ -43,6 +43,17 @@ impl TypedNode {
             Self::Count(node) => rt.try_get(node).ok().map(count_to_py),
             Self::Pair(node) => rt.try_get(node).ok().map(pair_to_py),
         }
+    }
+
+    /// [`Self::try_value`] in the form a kept trace stores it: a count or
+    /// pair natively, a Python value by reference.
+    pub fn kept_value<C: Cells>(self, rt: &Runtime<C>) -> StepValue<Py<PyAny>> {
+        let value = match self {
+            Self::Py(node) => rt.try_get(node).ok().map(|v| StepValue::Ref(v.0)),
+            Self::Count(node) => rt.try_get(node).ok().map(StepValue::Count),
+            Self::Pair(node) => rt.try_get(node).ok().map(|(a, b)| StepValue::Pair(a, b)),
+        };
+        value.unwrap_or(StepValue::None)
     }
 
     /// [`Runtime::get_traced_retaining`] for any of the readable types.
@@ -191,34 +202,24 @@ pub fn last_trace<C: Cells>(
     rt: &Runtime<C>,
     id: u32,
     generation: u32,
-) -> Result<(&'static str, Option<TracePayload>), ByIdError> {
+) -> Result<(&'static str, Option<KeptTrace>), ByIdError> {
     let found = rt
         .last_trace(NodeId(id), generation)
         .ok_or(ByIdError::Stale { id, generation })?;
-    Ok((status(found.state), found.payload))
+    Ok((status(found.state), found.trace))
 }
 
-/// The `(value, trace)` a traced read returns, from `render`, with the
-/// trace kept for [`last_trace`]. Takes the GIL for `render` and keeps
-/// the trace after releasing it, so a Shared binding drops a payload it
-/// replaces without the GIL, as its engine calls drop values.
+/// The `(value, trace)` a traced read returns, from `render`, with `kept`
+/// kept for [`last_trace`]. Takes the GIL for `render` and keeps the trace
+/// after releasing it, so a Shared binding drops a trace it replaces
+/// without the GIL, as its engine calls drop values.
 pub fn keep_traced<C: Cells>(
     rt: &Runtime<C>,
     capture: TraceCapture,
-    render: impl FnOnce(Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)>,
+    kept: KeptTrace,
+    render: impl FnOnce(Python<'_>, &KeptTrace) -> PyResult<(Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-    let (out, payload) = Python::attach(|py| {
-        let out = render(py)?;
-        let payload: TracePayload = std::sync::Arc::new(out.1.clone_ref(py));
-        Ok::<_, PyErr>((out, payload))
-    })?;
-    rt.retain_trace(capture, payload);
+    let out = Python::attach(|py| render(py, &kept))?;
+    rt.retain_trace(capture, kept);
     Ok(out)
-}
-
-/// The rendered trace [`keep_traced`] kept.
-pub fn kept_trace(py: Python<'_>, payload: Option<TracePayload>) -> Option<Py<PyAny>> {
-    payload?
-        .downcast_ref::<Py<PyAny>>()
-        .map(|trace| trace.clone_ref(py))
 }

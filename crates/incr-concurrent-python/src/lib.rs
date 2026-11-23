@@ -43,11 +43,11 @@ use engine::{
     DeleteError, ErasedIncr, Incr, IncrCollection, NodeTable, PropagationTrace, Runtime,
     SortedCollection,
 };
-use incr_python_persist::incr_core::StateStats;
+use incr_python_persist::incr_core::{KeptTrace, StateStats, StepValue, TraceCapture};
 use incr_python_persist::ready;
 use incr_python_persist::state::RtState;
 use incr_python_protocol::by_id::{keep_traced, resolve, snapshot_values};
-use incr_python_protocol::inspect::trace_header;
+use incr_python_protocol::inspect::trace_dict;
 use incr_python_protocol::notready::{
     PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
 };
@@ -114,18 +114,16 @@ fn hold_gil(f: &mut dyn FnMut()) {
     Python::attach(|_| f());
 }
 
-fn traced_to_py(
-    py: Python<'_>,
-    value: Py<PyAny>,
-    trace: &PropagationTrace,
-) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-    let trace_dict = trace_header(py, trace)?;
-    let node_traces = pyo3::types::PyList::empty(py);
-    for nt in &trace.node_traces {
-        node_traces.append(incr_python_protocol::inspect::trace_entry(py, nt)?)?;
-    }
-    trace_dict.set_item("node_traces", node_traces)?;
-    Ok((value, trace_dict.into_any().unbind()))
+/// The trace dict of `get_traced` and `last_trace_by_id`, which shows no
+/// labels or values.
+fn traced_to_py(py: Python<'_>, target: u32, kept: &KeptTrace) -> PyResult<Py<PyAny>> {
+    Ok(trace_dict(py, target, kept, |_, _| Ok(()))?
+        .into_any()
+        .unbind())
+}
+
+fn kept_trace(rt: &Runtime, capture: &TraceCapture, trace: &PropagationTrace) -> KeptTrace {
+    rt.kept_trace(capture, trace, |_, _| StepValue::<()>::None)
 }
 
 /// The closure the engine runs for a Python query: `py_func` called with
@@ -1214,8 +1212,10 @@ impl PyRuntime {
         engine_call(py, &self.inner, || {
             let (val, trace, capture): (PyValue, PropagationTrace, _) =
                 self.inner.get_traced_retaining(node.inner);
-            keep_traced(&self.inner, capture, |py| {
-                traced_to_py(py, ready::unwrapped(py, val.0), &trace)
+            let kept = kept_trace(&self.inner, &capture, &trace);
+            keep_traced(&self.inner, capture, kept, |py, kept| {
+                let trace = traced_to_py(py, trace.target.0, kept)?;
+                Ok((ready::unwrapped(py, val.0), trace))
             })
         })?
     }
@@ -1246,10 +1246,15 @@ impl PyRuntime {
         engine_call(py, &self.inner, || {
             let (val, trace, capture) =
                 resolve(&self.inner, id, generation)?.get_traced_retaining(&self.inner);
+            let kept = kept_trace(&self.inner, &capture, &trace);
             Ok::<_, incr_python_protocol::by_id::ByIdError>(keep_traced(
                 &self.inner,
                 capture,
-                |py| traced_to_py(py, ready::unwrapped(py, val), &trace),
+                kept,
+                |py, kept| {
+                    let trace = traced_to_py(py, trace.target.0, kept)?;
+                    Ok((ready::unwrapped(py, val), trace))
+                },
             ))
         })??
     }
@@ -1273,9 +1278,9 @@ impl PyRuntime {
     /// `(status, trace)` for the node a `graph_snapshot` entry names by its
     /// `"id"` and `"generation"`, without running any compute; `status` as
     /// `peek_by_id` reports it. Only roots of `get_traced` and
-    /// `get_traced_by_id` have a last trace: `trace` is the object the last
-    /// of those calls that recomputed the node returned, while the node
-    /// stays Clean at that value. A later traced read that finds the node
+    /// `get_traced_by_id` have a last trace: `trace` is a new dict equal to
+    /// what the last of those calls that recomputed the node returned,
+    /// while the node stays Clean at that value. A later traced read that finds the node
     /// clean keeps it; a plain `get` that verifies the node clean, or any
     /// change, makes `trace` `None` until a traced read recomputes the
     /// node. Raises `StaleNodeError` like `get_by_id`.
@@ -1285,10 +1290,11 @@ impl PyRuntime {
         id: u32,
         generation: u32,
     ) -> PyResult<(&'static str, Option<Py<PyAny>>)> {
-        let (status, payload) = engine_call(py, &self.inner, || {
+        let (status, kept) = engine_call(py, &self.inner, || {
             incr_python_protocol::by_id::last_trace(&self.inner, id, generation)
         })??;
-        Ok((status, incr_python_protocol::by_id::kept_trace(py, payload)))
+        let trace = kept.map(|kept| traced_to_py(py, id, &kept)).transpose()?;
+        Ok((status, trace))
     }
 
     /// The graph as a list of `{"id", "kind", "label", "dependencies",

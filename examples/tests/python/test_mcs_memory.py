@@ -20,7 +20,8 @@ def chain(rt, length):
 def test_stats_have_the_documented_shape():
     stats = Runtime().memory_stats()
 
-    assert set(stats) == {"bytes", "nodes", "py_refs", "by_kind", "by_label"}
+    assert set(stats) == {"bytes", "nodes", "py_refs", "by_kind", "by_label", "kept_traces"}
+    assert stats["kept_traces"] == {"count": 0, "bytes": 0, "py_refs": 0}
     assert set(stats["by_kind"]) == {"input", "query", "collection"}
     for entry in stats["by_kind"].values():
         assert set(entry) == ENTRY

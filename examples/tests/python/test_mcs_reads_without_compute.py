@@ -66,12 +66,12 @@ def test_a_clean_node_gives_the_trace_that_produced_its_value(mod):
     assert value == 11
     status, kept = rt.last_trace_by_id(*named(rt, q))
     assert status == "clean"
-    assert kept is trace
+    assert kept == trace
 
     rt.set(a, 2)
     value, trace = rt.get_traced_by_id(*named(rt, q))
     assert value == 10
-    assert rt.last_trace_by_id(*named(rt, q))[1] is trace
+    assert rt.last_trace_by_id(*named(rt, q))[1] == trace
 
 
 def test_a_traced_verify_keeps_the_trace_and_a_plain_one_hides_it(mod):
@@ -83,7 +83,7 @@ def test_a_traced_verify_keeps_the_trace_and_a_plain_one_hides_it(mod):
         "verified_clean"
     ]
     assert rt.last_trace_by_id(*named(rt, q)) == ("clean", first)
-    assert rt.last_trace_by_id(*named(rt, q))[1] is first
+    assert rt.last_trace_by_id(*named(rt, q))[1] == first
 
     rt.set(a, 5)
     assert rt.get(q) == 11
