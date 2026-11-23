@@ -530,6 +530,11 @@ impl Backend for FileBackend {
     fn writable(&self) -> bool {
         self.lock.is_some()
     }
+
+    /// Only compactions take the lock a compaction holds while it pulls.
+    fn concurrent_compaction(&self) -> bool {
+        true
+    }
 }
 
 impl ConditionalAppend for FileBackend {

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use incr_persist::conformance::Harness;
-use incr_persist::FileBackend;
+use incr_persist::{Backend, FileBackend};
 use tempfile::TempDir;
 
 #[derive(Default)]
@@ -34,3 +34,10 @@ impl Harness for FileHarness {
 }
 
 incr_persist::backend_conformance!(FileHarness::default());
+
+#[test]
+fn the_file_backend_declares_concurrent_compaction() {
+    let mut harness = FileHarness::default();
+    let log = harness.new_log();
+    assert!(harness.open(&log).concurrent_compaction());
+}

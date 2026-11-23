@@ -168,6 +168,14 @@ pub enum Error {
     #[error("the backend has no conditional append, which a staged batch needs")]
     ConditionalAppendUnsupported,
 
+    /// A checkpoint that runs on a worker thread was asked of a backend
+    /// whose `concurrent_compaction` is `false`, which does not promise that
+    /// its compaction can run beside the caller's other calls.
+    #[error(
+        "the backend does not declare concurrent compaction, which a background checkpoint needs"
+    )]
+    ConcurrentCompactionUnsupported,
+
     /// A checkpoint running on a worker thread was cancelled or abandoned;
     /// the backend is handed this in place of the next record.
     #[error("the checkpoint was cancelled")]
