@@ -5,11 +5,14 @@
 use criterion::{BatchSize, Bencher};
 use incr_core::{
     Cells, ErasedIncr, Incr, IncrCollection, KeyedCollection, QueryOpts, Replay, Runtime, Shared,
+    YieldHook,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::hint::black_box;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::Instant;
 
 /// One measured operation. `setup` builds what a single `run` consumes;
 /// criterion times only `run` and drops its output untimed, which is
@@ -23,6 +26,24 @@ pub trait Workload {
         Self: 'a;
     fn setup(&self) -> Self::Input;
     fn run(&self, input: Self::Input) -> Self::Output<'_>;
+}
+
+/// A runtime for a workload. With `INCR_BENCH_YIELD_HOOK` set it has the
+/// Python binding's yield hook short of the GIL release, so that a run
+/// measures what an installed hook costs where it never yields.
+pub fn bench_runtime<C: Cells>() -> Runtime<C> {
+    let mut rt = Runtime::new();
+    if std::env::var_os("INCR_BENCH_YIELD_HOOK").is_some() {
+        let start = Instant::now();
+        let last = AtomicU64::new(0);
+        rt.set_yield_hook(Some(YieldHook::new(move || {
+            let now = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if now.saturating_sub(last.load(Ordering::Relaxed)) >= 100_000_000 {
+                last.store(now, Ordering::Relaxed);
+            }
+        })));
+    }
+    rt
 }
 
 pub fn steady<W: Workload<Input = ()>>(b: &mut Bencher, w: &W) {
@@ -56,7 +77,7 @@ pub struct Chain<C: Cells> {
 
 impl<C: Cells> Chain<C> {
     pub fn new(n: usize) -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let input = rt.create_input(1_i64);
         let mut prev = input;
         for _ in 0..n {
@@ -94,7 +115,7 @@ pub struct Diamond<C: Cells> {
 
 impl<C: Cells> Diamond<C> {
     pub fn new() -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let input = rt.create_input(1_i64);
         let a = rt.create_query(move |rt| rt.get(input).wrapping_add(10));
         let b = rt.create_query(move |rt| rt.get(input).wrapping_add(100));
@@ -130,7 +151,7 @@ pub struct EarlyCutoff<C: Cells> {
 
 impl<C: Cells> EarlyCutoff<C> {
     pub fn new() -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let input = rt.create_input(200_i64);
         let clamped = rt.create_query(move |rt| rt.get(input).min(100));
         let after = rt.create_query(move |rt| rt.get(clamped).wrapping_add(1));
@@ -168,7 +189,7 @@ pub struct InsertThenRead<C: Cells> {
 
 impl<C: Cells> InsertThenRead<C> {
     pub fn pipeline(size: usize) -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let col: IncrCollection<i64, C> = rt.create_collection();
         let evens = col.filter(&rt, |x| x % 2 == 0);
         let doubled = evens.map(&rt, |x| x * 2);
@@ -177,7 +198,7 @@ impl<C: Cells> InsertThenRead<C> {
     }
 
     pub fn simple_count(size: usize) -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let col: IncrCollection<i64, C> = rt.create_collection();
         let count = col.count(&rt);
         Self::populate(rt, col, count, size)
@@ -261,7 +282,7 @@ pub struct GetClean<C: Cells> {
 
 impl<C: Cells> GetClean<C> {
     pub fn new() -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let input = rt.create_input(1_i64);
         let query = rt.create_query(move |rt| rt.get(input).wrapping_add(1));
         let _ = rt.get(query);
@@ -293,7 +314,7 @@ impl GetContended {
     pub const READS: usize = 10_000;
 
     pub fn new() -> Self {
-        let rt: Runtime<Shared> = Runtime::new();
+        let rt: Runtime<Shared> = bench_runtime();
         let input = rt.create_input(1_i64);
         let query = rt.create_query(move |rt| rt.get(input).wrapping_add(1));
         let _ = rt.get(query);
@@ -334,7 +355,7 @@ pub struct Fanout<C: Cells> {
 impl<C: Cells> Fanout<C> {
     pub fn new(width: i64) -> Self {
         Self {
-            rt: Runtime::new(),
+            rt: bench_runtime(),
             width,
         }
     }
@@ -374,7 +395,9 @@ pub struct DeleteSingle<C: Cells> {
 
 impl<C: Cells> DeleteSingle<C> {
     pub fn new() -> Self {
-        Self { rt: Runtime::new() }
+        Self {
+            rt: bench_runtime(),
+        }
     }
 }
 
@@ -401,7 +424,9 @@ impl<C: Cells> DeleteCascade<C> {
     pub const LEN: usize = 100;
 
     pub fn new() -> Self {
-        Self { rt: Runtime::new() }
+        Self {
+            rt: bench_runtime(),
+        }
     }
 }
 
@@ -436,7 +461,9 @@ impl<C: Cells> DeleteOwnedTree<C> {
     pub const GROUPS: i64 = 100;
 
     pub fn new() -> Self {
-        Self { rt: Runtime::new() }
+        Self {
+            rt: bench_runtime(),
+        }
     }
 }
 
@@ -479,7 +506,7 @@ impl<C: Cells> TableHit<C> {
 
 impl<C: Cells, S: std::hash::BuildHasher> TableHit<C, S> {
     pub fn with_hasher(hasher: S) -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let table = rt.create_table_with_hasher::<u64, i64, S>(hasher);
         for k in 0..TABLE_KEYS {
             table.get_or_insert_input(&rt, k, || k as i64);
@@ -520,7 +547,7 @@ pub struct TableMiss<C: Cells> {
 
 impl<C: Cells> TableMiss<C> {
     pub fn new() -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let table = rt.create_table::<u64, i64>();
         Self {
             rt,
@@ -579,7 +606,7 @@ pub struct KeyedWrite<C: Cells> {
 
 impl<C: Cells> KeyedWrite<C> {
     pub fn new() -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let keyed = KeyedCollection::new(&rt);
         for k in 0..1000 {
             keyed.upsert(&rt, k, k);
@@ -620,7 +647,7 @@ pub struct ChildrenRerun<C: Cells> {
 
 impl<C: Cells> ChildrenRerun<C> {
     pub fn new(n: u64) -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let x = rt.create_input(0_u64);
         let creator = rt.create_query(move |rt| {
             let v = rt.get(x);
@@ -663,7 +690,7 @@ pub struct ChildrenChurn<C: Cells> {
 
 impl<C: Cells> ChildrenChurn<C> {
     pub fn new() -> Self {
-        let rt: Runtime<C> = Runtime::new();
+        let rt: Runtime<C> = bench_runtime();
         let x = rt.create_input(0_u64);
         let creator = rt.create_query(move |rt| {
             let v = rt.get(x);
@@ -719,11 +746,11 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> ForeignRead<T> {
         make: fn(i64) -> T,
         len: fn(&T) -> i64,
     ) -> Self {
-        let rt: Runtime<Shared> = Runtime::new();
+        let rt: Runtime<Shared> = bench_runtime();
         if !budgeted {
             rt.set_max_frames(u32::MAX);
         }
-        let other: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+        let other: Arc<Runtime<Shared>> = Arc::new(bench_runtime());
         let source = other.create_input(make(0));
         let read: Vec<Incr<T>> = (0..reads)
             .map(|_| other.create_query(move |rt| rt.get(source)))
