@@ -19,6 +19,8 @@ use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
 use std::slice;
 
+use crate::yield_hook::Yielder;
+
 const EMPTY: u8 = 0;
 const TOMBSTONE: u8 = 1;
 const FULL: u8 = 0x80;
@@ -220,15 +222,20 @@ impl<T> HashedMultiset<T> {
     /// a rehash. Runs no user code. Returns whether it rehashed, which
     /// moves entries and so invalidates every located index.
     pub(crate) fn reserve(&mut self, additional: usize) -> bool {
+        self.reserve_ticking(additional, &Yielder::none())
+    }
+
+    /// [`Self::reserve`], ticking `yielder` per entry a rehash moves.
+    pub(crate) fn reserve_ticking(&mut self, additional: usize, yielder: &Yielder<'_>) -> bool {
         let rehash = additional > self.growth_left;
         if rehash {
-            self.rehash(additional);
+            self.rehash(additional, yielder);
         }
         rehash
     }
 
     #[cold]
-    fn rehash(&mut self, additional: usize) {
+    fn rehash(&mut self, additional: usize, yielder: &Yielder<'_>) {
         let need = self
             .len
             .checked_add(additional)
@@ -256,6 +263,7 @@ impl<T> HashedMultiset<T> {
             if *old_c & FULL == 0 {
                 continue;
             }
+            yielder.tick();
             // SAFETY: the slot is full. Marking it empty right away hands
             // ownership to the new table, so the old one never drops it.
             let entry = unsafe { old_e.assume_init_read() };

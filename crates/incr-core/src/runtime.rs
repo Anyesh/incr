@@ -1676,6 +1676,7 @@ pub struct Runtime<C: Cells> {
     watching: C::U32,
     router_lists: routing_impl::RouterLists<C>,
     routing_owing: routing_impl::Owing<C>,
+    pub(crate) yield_hook: Option<crate::yield_hook::YieldHook>,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1880,6 +1881,7 @@ impl<C: Cells> Runtime<C> {
             watching: C::new_u32(0),
             router_lists: routing_impl::RouterLists::new(runtime_id),
             routing_owing: routing_impl::Owing::new(),
+            yield_hook: None,
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -4790,7 +4792,10 @@ impl<C: Cells> Runtime<C> {
 
         let mut expanded_new: Option<HashSet<NodeId>> = None;
         let past = self.failed_past.load(std::sync::atomic::Ordering::Relaxed);
+        // Other threads wait on a set's walk, which runs no user code.
+        let yielder = self.yielder_under_lock();
         while let Some(id) = queue.pop() {
+            yielder.tick();
             let (node, flags) = self.nodes.get_with_flags(id.0);
             loop {
                 // This thread's own set flips its held landings through
@@ -5069,6 +5074,7 @@ impl<C: Cells> Runtime<C> {
         let mut unchecked = None;
         #[cfg(test)]
         let mut revisited: Vec<NodeId> = Vec::new();
+        let yielder = self.yielder();
 
         while let Some(Entry {
             id: cur,
@@ -5076,6 +5082,7 @@ impl<C: Cells> Runtime<C> {
             generation,
         }) = walk.work.pop()
         {
+            yielder.tick();
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
                 // A root another thread landed Failed computes as one found
@@ -6040,6 +6047,7 @@ impl<C: Cells> Runtime<C> {
         planned: Option<Planned>,
         seen: Seen,
     ) -> Computed {
+        self.maybe_yield();
         let mut bag = Deferred::new();
         let computed =
             self.compute_attempts::<MODE>(id, visit, gen, walked, planned, seen, &mut bag);

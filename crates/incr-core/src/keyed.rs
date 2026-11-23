@@ -37,6 +37,7 @@ use crate::persist_hooks::RepSink;
 use crate::runtime::{DeleteError, Runtime};
 use crate::value::Value;
 use crate::value_code;
+use crate::yield_hook::Yielder;
 
 mod parts;
 use parts::{Flip, PartSink, PartState};
@@ -446,19 +447,26 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     /// `stage` must have been staged against this table as it is now.
     /// Returns the pairs it let go, for the caller to drop once user
     /// `Drop` may run.
-    fn commit<K, V>(&mut self, stage: &mut KeyStage<K, V, P, R>) -> Vec<(P, R)> {
+    fn commit<K, V>(
+        &mut self,
+        stage: &mut KeyStage<K, V, P, R>,
+        yielder: &Yielder<'_>,
+    ) -> Vec<(P, R)> {
         let KeyStage { keys, fresh, .. } = stage;
         let added = keys
             .iter()
+            .inspect(|_| yielder.tick())
             .filter(|k| k.slot.is_none() && !k.now.is_empty())
             .count();
         if let Some(moved) = self.reserve(added) {
             for slot in keys.iter_mut().filter_map(|k| k.slot.as_mut()) {
+                yielder.tick();
                 *slot = moved[*slot];
             }
         }
         let mut dropped = Vec::new();
         for k in keys.iter().filter(|k| !k.untouched()) {
+            yielder.tick();
             let mut held: Vec<Option<(P, R)>> = match k.slot {
                 Some(s) => few_into_vec(self.replace(s, Few::None))
                     .into_iter()
@@ -667,6 +675,13 @@ where
         })
     }
 
+    /// Makes room for `keys` more staged keys, so staging them grows no
+    /// table in one long step.
+    fn reserve(&mut self, keys: usize) {
+        self.keys.reserve(keys);
+        self.by_hash.reserve(keys);
+    }
+
     fn locate(&mut self, table: &KeyTable<P, R>, hash: u64, key: &K) -> usize {
         if let Some(at) = self.staged(hash, key) {
             return at;
@@ -731,10 +746,15 @@ where
     }
 
     /// Stages the removal of every held key nothing staged so far names.
-    fn remove_the_rest(&mut self, table: &KeyTable<P, R>) {
-        let named: HashSet<usize, FxBuildHasher> =
-            self.keys.iter().filter_map(|k| k.slot).collect();
+    fn remove_the_rest(&mut self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) {
+        let named: HashSet<usize, FxBuildHasher> = self
+            .keys
+            .iter()
+            .inspect(|_| yielder.tick())
+            .filter_map(|k| k.slot)
+            .collect();
         for (slot, b) in table.buckets() {
+            yielder.tick();
             if !named.contains(&slot) {
                 self.push(StagedKey {
                     hash: b.hash,
@@ -750,8 +770,9 @@ where
     /// Ends the staging of `upsert`, `remove` and `reconcile`: a key whose
     /// staged row equals its held one keeps its held pairs, and each key
     /// is counted by its held and staged rows.
-    fn settle_keys(&mut self, table: &KeyTable<P, R>) {
+    fn settle_keys(&mut self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) {
         for at in 0..self.keys.len() {
+            yielder.tick();
             let before = self.held_read(table, at);
             if let (Some(held), &[Src::New(j)]) = (before, self.keys[at].now.as_slice()) {
                 let held_row = self.pair(table, at, held).0.row();
@@ -818,11 +839,12 @@ where
 
     /// Journals what `upsert`, `remove` and `reconcile` staged, when
     /// journalling: per key, each held pair it lets go, then each new one.
-    fn journal_staged(&mut self, table: &KeyTable<P, R>) {
+    fn journal_staged(&mut self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) {
         let Some(mut journal) = self.journal.take() else {
             return;
         };
         for (at, k) in self.keys.iter().enumerate() {
+            yielder.tick();
             if k.untouched() {
                 continue;
             }
@@ -843,9 +865,10 @@ where
     }
 
     /// The keys that go from holding no pair to holding one or back.
-    fn flips<'a>(&'a self, table: &'a KeyTable<P, R>) -> Vec<Flip<'a, P>> {
+    fn flips<'a>(&'a self, table: &'a KeyTable<P, R>, yielder: &Yielder<'_>) -> Vec<Flip<'a, P>> {
         let mut flips = Vec::new();
         for (at, k) in self.keys.iter().enumerate() {
+            yielder.tick();
             let inserted = !k.now.is_empty();
             if (k.held > 0) == inserted {
                 continue;
@@ -874,9 +897,10 @@ where
 
     /// The changes to the pair collection: each held pair a key lets go,
     /// then each new pair it takes.
-    fn log_changes(&self, table: &KeyTable<P, R>) -> Vec<Change<P>> {
+    fn log_changes(&self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) -> Vec<Change<P>> {
         let mut changes = Vec::new();
         for (at, k) in self.keys.iter().enumerate() {
+            yielder.tick();
             if k.untouched() {
                 continue;
             }
@@ -1145,6 +1169,27 @@ pub struct KeyedSpent<K, V, P, R = ()> {
     _row: PhantomData<fn() -> V>,
 }
 
+/// Drops element by element, ticking this thread's ambient hook
+/// ([`crate::with_ambient_hook`]), since a write can let go of every pair.
+impl<K, V, P, R> Drop for KeyedSpent<K, V, P, R> {
+    fn drop(&mut self) {
+        let yielder = Yielder::ambient();
+        drop_ticking(mem::take(&mut self.ops), &yielder);
+        drop_ticking(mem::take(&mut self.keys), &yielder);
+        drop_ticking(mem::take(&mut self.batches), &yielder);
+        drop_ticking(mem::take(&mut self.unused), &yielder);
+        drop_ticking(mem::take(&mut self.displaced), &yielder);
+        drop_ticking(mem::take(&mut self.pairs), &yielder);
+    }
+}
+
+fn drop_ticking<T>(items: Vec<T>, yielder: &Yielder<'_>) {
+    for item in items {
+        yielder.tick();
+        drop(item);
+    }
+}
+
 impl<K, V, P, R> Default for KeyedSpent<K, V, P, R> {
     fn default() -> Self {
         Self {
@@ -1160,7 +1205,7 @@ impl<K, V, P, R> Default for KeyedSpent<K, V, P, R> {
 }
 
 type StageOps<'s, K, V, P, R> =
-    dyn Fn(&mut KeyStage<K, V, P, R>, &KeyTable<P, R>, &RandomState) + 's;
+    dyn Fn(&mut KeyStage<K, V, P, R>, &KeyTable<P, R>, &RandomState, &Yielder<'_>) + 's;
 
 impl<K, V, C, P, R> KeyedCollection<K, V, C, P, R>
 where
@@ -1225,9 +1270,9 @@ where
         row: V,
         journal: Option<&mut Vec<PairOp<P, R>>>,
     ) -> KeyedChange<K> {
-        self.write_journaled(rt, journal, &|stage, table, hasher| {
+        self.write_journaled(rt, journal, &|stage, table, hasher, yielder| {
             stage.upsert(table, hasher, &key, &row);
-            stage.settle_keys(table);
+            stage.settle_keys(table, yielder);
         })
     }
 
@@ -1243,9 +1288,9 @@ where
         key: &K,
         journal: Option<&mut Vec<PairOp<P, R>>>,
     ) -> KeyedChange<K> {
-        self.write_journaled(rt, journal, &|stage, table, hasher| {
+        self.write_journaled(rt, journal, &|stage, table, hasher, yielder| {
             stage.remove(table, hasher, key);
-            stage.settle_keys(table);
+            stage.settle_keys(table, yielder);
         })
     }
 
@@ -1268,12 +1313,14 @@ where
         journal: Option<&mut Vec<PairOp<P, R>>>,
     ) -> KeyedChange<K> {
         let rows: Vec<(K, V)> = rows.into_iter().collect();
-        self.write_journaled(rt, journal, &|stage, table, hasher| {
+        self.write_journaled(rt, journal, &|stage, table, hasher, yielder| {
+            stage.reserve(rows.len());
             for (key, row) in &rows {
+                yielder.tick();
                 stage.upsert(table, hasher, key, row);
             }
-            stage.remove_the_rest(table);
-            stage.settle_keys(table);
+            stage.remove_the_rest(table, yielder);
+            stage.settle_keys(table, yielder);
         })
     }
 
@@ -1283,11 +1330,15 @@ where
         journal: Option<&mut Vec<PairOp<P, R>>>,
         stage_ops: &StageOps<'_, K, V, P, R>,
     ) -> KeyedChange<K> {
-        let (change, steps) =
-            self.write(rt, &mut (), journal.is_some(), &|stage, table, hasher| {
-                stage_ops(stage, table, hasher);
-                stage.journal_staged(table);
-            });
+        let (change, steps) = self.write(
+            rt,
+            &mut (),
+            journal.is_some(),
+            &|stage, table, hasher, yielder| {
+                stage_ops(stage, table, hasher, yielder);
+                stage.journal_staged(table, yielder);
+            },
+        );
         if let Some(journal) = journal {
             journal.extend(steps);
         }
@@ -1307,11 +1358,17 @@ where
         journal: Option<&mut Vec<PairOp<P, R>>>,
     ) -> KeyedChange<K> {
         let ops: Vec<PairOp<P, R>> = ops.into_iter().collect();
-        let (change, steps) = self.write(rt, sink, journal.is_some(), &|stage, table, hasher| {
-            for op in &ops {
-                stage.apply(table, hasher, op);
-            }
-        });
+        let (change, steps) = self.write(
+            rt,
+            sink,
+            journal.is_some(),
+            &|stage, table, hasher, yielder| {
+                for op in &ops {
+                    yielder.tick();
+                    stage.apply(table, hasher, op);
+                }
+            },
+        );
         if let Some(journal) = journal {
             journal.extend(steps);
         }
@@ -1337,8 +1394,9 @@ where
             rt,
             sink,
             journal.is_some(),
-            &|stage, table, hasher| {
+            &|stage, table, hasher, yielder| {
                 for op in &ops {
+                    yielder.tick();
                     stage.apply(table, hasher, op);
                 }
             },
@@ -1381,18 +1439,19 @@ where
              discards would leave rows ahead of their readers' versions",
         );
         let index = &*self.index;
+        let yielder = rt.yielder_under_lock();
         loop {
             let mut stage = KeyStage::new(journal);
             let (changes, plans) = {
                 let table = index.table.read();
                 stage.epoch = C::u64_load_relaxed(&index.epoch);
                 value_code::run(|| {
-                    stage_ops(&mut stage, &table, &index.hasher);
-                    let changes = stage.log_changes(&table);
+                    stage_ops(&mut stage, &table, &index.hasher, &yielder);
+                    let changes = stage.log_changes(&table, &yielder);
                     let plans = if table.parts.is_empty() {
                         Vec::new()
                     } else {
-                        table.plan_parts(&stage.flips(&table))
+                        table.plan_parts(&stage.flips(&table, &yielder))
                     };
                     (changes, plans)
                 })
@@ -1404,7 +1463,7 @@ where
                 }
                 return outcome;
             }
-            let batch = self.pairs.stage_batch(changes);
+            let batch = self.pairs.stage_batch(changes, &rt.yielder());
             let mut log = self.pairs.log.write();
             let mut table = index.table.write();
             if C::u64_load_relaxed(&index.epoch) != stage.epoch {
@@ -1416,18 +1475,21 @@ where
                 }
                 continue;
             }
-            let committed = log.apply_batch(batch, false, sink);
-            let dropped = table.commit(&mut stage);
+            let committed = log.apply_batch(batch, false, sink, &yielder);
+            let dropped = table.commit(&mut stage, &yielder);
             let mut gone = Vec::new();
             let (touched, emptied) = table.apply_parts(plans, &mut gone);
+
             let epoch = stage.epoch + 1;
             C::u64_store_release(&index.epoch, epoch);
             index.settle(&table);
             drop(table);
             drop(log);
+
             let hashes = mem::take(&mut stage.changed_hashes);
             let membership = self.versions.any_listed() && stage.membership_changed();
             let queued = self.bump(rt, &hashes, membership, &touched);
+
             let outcome = stage.outcome(epoch);
             match keep.as_deref_mut() {
                 Some(keep) => {
@@ -1452,6 +1514,7 @@ where
                 rt.route_queued();
             }
             self.reclaim(rt, &hashes, keep);
+
             self.reclaim_partitions(rt, &emptied);
             return outcome;
         }
@@ -2070,15 +2133,19 @@ where
         refuse_value_code();
         crate::dep_stack::unrecorded_lookup::<C>();
         let table = self.index.table.read();
-        let mut handles = Vec::with_capacity(table.pairs);
+        let mut ranked = Vec::with_capacity(table.pairs);
         for (slot, bucket) in table.buckets() {
             let slot = u32::try_from(slot).expect("incr-core: a key table holds under 2^32 slots");
-            handles.extend((0..bucket.pairs().len()).map(|at| PairHandle {
-                slot,
-                at: at as u32,
+            ranked.extend(bucket.pairs().iter().enumerate().map(|(at, pair)| {
+                let handle = PairHandle {
+                    slot,
+                    at: at as u32,
+                };
+                (pair.1, handle)
             }));
         }
-        handles.sort_unstable_by_key(|h| table.bucket(h.slot as usize).pairs()[h.at as usize].1);
+        ranked.sort_unstable_by_key(|&(rank, _)| rank);
+        let handles = ranked.into_iter().map(|(_, handle)| handle).collect();
         (self.index.epoch(), handles)
     }
 

@@ -1104,9 +1104,16 @@ where
         // starts past everything the snapshot covered.
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         {
-            let seeded: Vec<U> = bootstrap.into_iter().filter_map(&image).collect();
+            let yielder = rt.yielder();
+            let seeded: Vec<U> = bootstrap
+                .into_iter()
+                .inspect(|_| yielder.tick())
+                .filter_map(&image)
+                .collect();
             let mut out = output_log.write();
+            let yielder = rt.yielder_under_lock();
             for v in seeded {
+                yielder.tick();
                 out.insert(v);
             }
         }
@@ -1139,8 +1146,10 @@ where
             };
             let to = from + pending.len() as u64;
 
+            let yielder = rt.yielder();
             let staged: Vec<Staged<U>> = pending
                 .into_iter()
+                .inspect(|_| yielder.tick())
                 .filter_map(|d| match d {
                     Delta::Insert(v) => image(v).map(Delta::Insert),
                     Delta::Delete(v) => image(v).map(Delta::Delete),
@@ -1149,8 +1158,10 @@ where
                 .collect();
 
             let mut out = output_log_for_query.write();
+            let yielder = rt.yielder_under_lock();
             rebuild.guard(|| {
                 for change in staged {
+                    yielder.tick();
                     out.apply_kept(change, &mut keep);
                 }
             });
@@ -1185,7 +1196,9 @@ where
             let from = cursor.load(MemOrdering::Acquire);
             if from < up.end() {
                 let mut delta = 0_i64;
+                let yielder = rt.yielder_under_lock();
                 for d in up.pending_from(from) {
+                    yielder.tick();
                     match d {
                         Delta::Insert(_) => delta += 1,
                         Delta::Delete(_) => delta -= 1,
