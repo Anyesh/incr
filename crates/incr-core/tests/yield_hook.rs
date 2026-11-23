@@ -107,6 +107,31 @@ fn a_collection_extend_and_its_count_call_the_hook() {
 }
 
 #[test]
+fn a_filter_rejecting_every_delta_calls_the_hook() {
+    let c = Counted::<Local>::new();
+    let col = c.rt.create_collection::<u64>();
+    let none = col.filter(&c.rt, |_| false).count(&c.rt);
+    c.rt.get(none);
+    col.extend(&c.rt, 0..N);
+    let (calls, value) = c.calls_during(|rt| rt.get(none));
+    assert_eq!(value, 0);
+    assert!(calls >= BATCHES, "{calls} calls filtering {N} deltas");
+}
+
+#[test]
+fn a_count_partition_matching_nothing_calls_the_hook() {
+    let c = Counted::<Local>::new();
+    let col = c.rt.create_collection::<u64>();
+    col.extend(&c.rt, 0..N);
+    let (calls, split) = c.calls_during(|rt| {
+        let split = col.count_partition(rt, |_| false);
+        rt.get(split)
+    });
+    assert_eq!(split, (0, N));
+    assert!(calls >= BATCHES, "{calls} calls counting {N} elements");
+}
+
+#[test]
 fn a_keyed_reconcile_calls_the_hook() {
     let c = Counted::<Local>::new();
     let keyed: KeyedCollection<u64, u64, Local> = KeyedCollection::new(&c.rt);
