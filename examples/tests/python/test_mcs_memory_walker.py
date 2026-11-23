@@ -191,7 +191,7 @@ gaps.append(time.perf_counter() - t)
 print(json.dumps({
     "nodes": whole["nodes"],
     "memory_stats_s": whole_s,
-    "steps": len(gaps),
+    "steps": len(gaps) - 2,
     "create_s": gaps[0],
     "max_step_s": max(gaps),
     "equal": result == whole,
