@@ -37,7 +37,9 @@ use crate::persist_hooks::RepSink;
 use crate::runtime::{DeleteError, Runtime};
 use crate::value::Value;
 use crate::value_code;
-use crate::yield_hook::Yielder;
+use crate::yield_hook::{with_ticks, NoTicks, Ticks, Yielder};
+#[cfg(feature = "yield-hook")]
+use crate::yield_hook::{YieldHook, YIELD_EVERY};
 
 mod parts;
 use parts::{Flip, PartSink, PartState};
@@ -450,14 +452,13 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     fn commit<K, V>(
         &mut self,
         stage: &mut KeyStage<K, V, P, R>,
-        yielder: &Yielder<'_>,
+        yielder: &impl Ticks,
     ) -> Vec<(P, R)> {
         let KeyStage { keys, fresh, .. } = stage;
-        let added = keys
-            .iter()
-            .inspect(|_| yielder.tick())
-            .filter(|k| k.slot.is_none() && !k.now.is_empty())
-            .count();
+        let added = yielder.count(
+            keys.iter()
+                .filter(|k| k.slot.is_none() && !k.now.is_empty()),
+        );
         if let Some(moved) = self.reserve(added) {
             for slot in keys.iter_mut().filter_map(|k| k.slot.as_mut()) {
                 yielder.tick();
@@ -746,13 +747,9 @@ where
     }
 
     /// Stages the removal of every held key nothing staged so far names.
-    fn remove_the_rest(&mut self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) {
-        let named: HashSet<usize, FxBuildHasher> = self
-            .keys
-            .iter()
-            .inspect(|_| yielder.tick())
-            .filter_map(|k| k.slot)
-            .collect();
+    fn remove_the_rest(&mut self, table: &KeyTable<P, R>, yielder: &impl Ticks) {
+        let named: HashSet<usize, FxBuildHasher> =
+            yielder.collect(self.keys.iter().filter_map(|k| k.slot));
         for (slot, b) in table.buckets() {
             yielder.tick();
             if !named.contains(&slot) {
@@ -770,7 +767,7 @@ where
     /// Ends the staging of `upsert`, `remove` and `reconcile`: a key whose
     /// staged row equals its held one keeps its held pairs, and each key
     /// is counted by its held and staged rows.
-    fn settle_keys(&mut self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) {
+    fn settle_keys(&mut self, table: &KeyTable<P, R>, yielder: &impl Ticks) {
         for at in 0..self.keys.len() {
             yielder.tick();
             let before = self.held_read(table, at);
@@ -839,7 +836,7 @@ where
 
     /// Journals what `upsert`, `remove` and `reconcile` staged, when
     /// journalling: per key, each held pair it lets go, then each new one.
-    fn journal_staged(&mut self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) {
+    fn journal_staged(&mut self, table: &KeyTable<P, R>, yielder: &impl Ticks) {
         let Some(mut journal) = self.journal.take() else {
             return;
         };
@@ -865,7 +862,7 @@ where
     }
 
     /// The keys that go from holding no pair to holding one or back.
-    fn flips<'a>(&'a self, table: &'a KeyTable<P, R>, yielder: &Yielder<'_>) -> Vec<Flip<'a, P>> {
+    fn flips<'a>(&'a self, table: &'a KeyTable<P, R>, yielder: &impl Ticks) -> Vec<Flip<'a, P>> {
         let mut flips = Vec::new();
         for (at, k) in self.keys.iter().enumerate() {
             yielder.tick();
@@ -897,7 +894,7 @@ where
 
     /// The changes to the pair collection: each held pair a key lets go,
     /// then each new pair it takes.
-    fn log_changes(&self, table: &KeyTable<P, R>, yielder: &Yielder<'_>) -> Vec<Change<P>> {
+    fn log_changes(&self, table: &KeyTable<P, R>, yielder: &impl Ticks) -> Vec<Change<P>> {
         let mut changes = Vec::new();
         for (at, k) in self.keys.iter().enumerate() {
             yielder.tick();
@@ -1170,9 +1167,19 @@ pub struct KeyedSpent<K, V, P, R = ()> {
 }
 
 /// Drops element by element, ticking this thread's ambient hook
-/// ([`crate::with_ambient_hook`]), since a write can let go of every pair.
+/// (`with_ambient_hook`), since a write can let go of every pair.
+#[cfg(feature = "yield-hook")]
 impl<K, V, P, R> Drop for KeyedSpent<K, V, P, R> {
     fn drop(&mut self) {
+        let len = self.ops.len()
+            + self.keys.len()
+            + self.batches.len()
+            + self.unused.len()
+            + self.displaced.len()
+            + self.pairs.len();
+        if len < YIELD_EVERY as usize {
+            return;
+        }
         let yielder = Yielder::ambient();
         drop_ticking(mem::take(&mut self.ops), &yielder);
         drop_ticking(mem::take(&mut self.keys), &yielder);
@@ -1183,7 +1190,8 @@ impl<K, V, P, R> Drop for KeyedSpent<K, V, P, R> {
     }
 }
 
-fn drop_ticking<T>(items: Vec<T>, yielder: &Yielder<'_>) {
+#[cfg(feature = "yield-hook")]
+fn drop_ticking<T>(items: Vec<T>, yielder: &impl Ticks) {
     for item in items {
         yielder.tick();
         drop(item);
@@ -1430,7 +1438,39 @@ where
         sink: &mut S,
         journal: bool,
         stage_ops: &StageOps<'_, K, V, P, R>,
+        keep: Option<&mut KeyedSpent<K, V, P, R>>,
+    ) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
+        #[cfg(feature = "yield-hook")]
+        if let Some(hook) = rt.hook_under_lock() {
+            return self.write_yielding(rt, sink, journal, stage_ops, keep, hook);
+        }
+        self.write_ticking(rt, sink, journal, stage_ops, keep, NoTicks)
+    }
+
+    /// Out of line, so that the unhooked write inlines as if this one did
+    /// not exist.
+    #[cfg(feature = "yield-hook")]
+    #[inline(never)]
+    fn write_yielding<S: RepSink<P>>(
+        &self,
+        rt: &Runtime<C>,
+        sink: &mut S,
+        journal: bool,
+        stage_ops: &StageOps<'_, K, V, P, R>,
+        keep: Option<&mut KeyedSpent<K, V, P, R>>,
+        hook: &YieldHook,
+    ) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
+        self.write_ticking(rt, sink, journal, stage_ops, keep, Yielder::of(Some(hook)))
+    }
+
+    fn write_ticking<S: RepSink<P>>(
+        &self,
+        rt: &Runtime<C>,
+        sink: &mut S,
+        journal: bool,
+        stage_ops: &StageOps<'_, K, V, P, R>,
         mut keep: Option<&mut KeyedSpent<K, V, P, R>>,
+        ticks: impl Ticks,
     ) -> (KeyedChange<K>, Vec<PairOp<P, R>>) {
         refuse_value_code();
         assert!(
@@ -1447,11 +1487,11 @@ where
                 stage.epoch = C::u64_load_relaxed(&index.epoch);
                 value_code::run(|| {
                     stage_ops(&mut stage, &table, &index.hasher, &yielder);
-                    let changes = stage.log_changes(&table, &yielder);
+                    let changes = stage.log_changes(&table, &ticks);
                     let plans = if table.parts.is_empty() {
                         Vec::new()
                     } else {
-                        table.plan_parts(&stage.flips(&table, &yielder))
+                        table.plan_parts(&stage.flips(&table, &ticks))
                     };
                     (changes, plans)
                 })
@@ -1463,7 +1503,7 @@ where
                 }
                 return outcome;
             }
-            let batch = self.pairs.stage_batch(changes, &rt.yielder());
+            let batch = with_ticks!(rt.hook(), |ticks| self.pairs.stage_batch(changes, ticks));
             let mut log = self.pairs.log.write();
             let mut table = index.table.write();
             if C::u64_load_relaxed(&index.epoch) != stage.epoch {
@@ -1475,8 +1515,8 @@ where
                 }
                 continue;
             }
-            let committed = log.apply_batch(batch, false, sink, &yielder);
-            let dropped = table.commit(&mut stage, &yielder);
+            let committed = log.apply_batch(batch, false, sink, &ticks);
+            let dropped = table.commit(&mut stage, &ticks);
             let mut gone = Vec::new();
             let (touched, emptied) = table.apply_parts(plans, &mut gone);
 

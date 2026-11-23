@@ -26,13 +26,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         let yielder = rt.yielder();
-        let matching = value_code::run(|| {
-            bootstrap
-                .iter()
-                .inspect(|_| yielder.tick())
-                .filter(|v| pred(v))
-                .count()
-        });
+        let matching = value_code::run(|| yielder.count(bootstrap.iter().filter(|v| pred(v))));
         let running = [
             AtomicI64::new(matching as i64),
             AtomicI64::new((bootstrap.len() - matching) as i64),

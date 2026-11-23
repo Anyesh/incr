@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
+#[cfg(feature = "yield-hook")]
+use incr_core::YieldHook;
 use incr_core::{
-    in_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value,
-    YieldHook, Yielder,
+    in_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value, Yielder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -96,7 +97,8 @@ pub struct Options {
     /// outside a store call enters it with [`Store::enter_value_scope`].
     pub value_scope: Option<ValueScope>,
     /// The hook of the store's runtime, which restores, checkpoints and
-    /// catch-ups also call ([`Runtime::set_yield_hook`]).
+    /// catch-ups also call (`Runtime::set_yield_hook`).
+    #[cfg(feature = "yield-hook")]
     pub yield_hook: Option<YieldHook>,
 }
 
@@ -473,7 +475,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// Replay only folds records; a key's runtime node is created when this
     /// process declares it with [`Store::input`].
     pub fn open(backend: B, options: Options) -> Result<Self> {
+        #[cfg_attr(not(feature = "yield-hook"), allow(unused_mut))]
         let mut runtime = Runtime::new();
+        #[cfg(feature = "yield-hook")]
         runtime.set_yield_hook(options.yield_hook.clone());
         let store = Store {
             runtime,
@@ -1028,6 +1032,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// engine runs as value code under the mutex gets the error too, and a
     /// call from value code returns [`Error::Reentrant`] instead of
     /// panicking.
+    fn drained(&self) -> Drained<'_> {
+        let drained = Drained::new(self.options.value_scope.as_ref());
+        #[cfg(feature = "yield-hook")]
+        let drained = drained.ticking(self.runtime.yield_hook());
+        drained
+    }
+
     fn state(&self) -> Result<Locked<'_, C>> {
         if self.holder.is_current() {
             return Err(Error::Reentrant);
@@ -1053,7 +1064,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             guard,
             _routing: routing,
             _scope: self.enter_value_scope(),
-            drained: Drained::new(self.options.value_scope.as_ref(), self.runtime.yield_hook()),
+            drained: self.drained(),
         })
     }
 

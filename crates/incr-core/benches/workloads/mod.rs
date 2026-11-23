@@ -5,14 +5,11 @@
 use criterion::{BatchSize, Bencher};
 use incr_core::{
     Cells, ErasedIncr, Incr, IncrCollection, KeyedCollection, QueryOpts, Replay, Runtime, Shared,
-    YieldHook,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
 
 /// One measured operation. `setup` builds what a single `run` consumes;
 /// criterion times only `run` and drops its output untimed, which is
@@ -28,22 +25,33 @@ pub trait Workload {
     fn run(&self, input: Self::Input) -> Self::Output<'_>;
 }
 
-/// A runtime for a workload. With `INCR_BENCH_YIELD_HOOK` set it has the
-/// Python binding's yield hook short of the GIL release, so that a run
-/// measures what an installed hook costs where it never yields.
+/// A runtime for a workload. Built with the `yield-hook` feature and run
+/// with `INCR_BENCH_YIELD_HOOK` set, it has the Python binding's yield hook
+/// short of the GIL release, so that a run measures what an installed hook
+/// costs where it never yields.
 pub fn bench_runtime<C: Cells>() -> Runtime<C> {
+    #[cfg_attr(not(feature = "yield-hook"), allow(unused_mut))]
     let mut rt = Runtime::new();
+    #[cfg(feature = "yield-hook")]
     if std::env::var_os("INCR_BENCH_YIELD_HOOK").is_some() {
-        let start = Instant::now();
-        let last = AtomicU64::new(0);
-        rt.set_yield_hook(Some(YieldHook::new(move || {
-            let now = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            if now.saturating_sub(last.load(Ordering::Relaxed)) >= 100_000_000 {
-                last.store(now, Ordering::Relaxed);
-            }
-        })));
+        rt.set_yield_hook(Some(clock_hook()));
     }
     rt
+}
+
+#[cfg(feature = "yield-hook")]
+fn clock_hook() -> incr_core::YieldHook {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let last = AtomicU64::new(0);
+    incr_core::YieldHook::new(move || {
+        let now = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if now.saturating_sub(last.load(Ordering::Relaxed)) >= 100_000_000 {
+            last.store(now, Ordering::Relaxed);
+        }
+    })
 }
 
 pub fn steady<W: Workload<Input = ()>>(b: &mut Bencher, w: &W) {

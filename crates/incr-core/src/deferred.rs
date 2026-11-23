@@ -49,7 +49,7 @@ use crate::dep_stack::DepStack;
 use crate::node::RetiredDeps;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::runtime::{ComputeFn, ObserverEntry, Runtime};
-use crate::yield_hook::Yielder;
+use crate::yield_hook::{with_ticks, Ticks, YieldHook};
 
 /// A type-erased spill item; dropping it is the deferred step.
 pub(crate) type ErasedDrop = Box<dyn Any>;
@@ -197,7 +197,7 @@ impl<C: Cells> Deferred<C> {
 
     #[inline(always)]
     fn drain_items_now(mut self, rt: &Runtime<C>) {
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.drop_items(&rt.yielder()))) {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.drop_items(rt.hook()))) {
             self.unwind(rt, payload);
         }
         self.forget_empty();
@@ -206,16 +206,13 @@ impl<C: Cells> Deferred<C> {
     /// Drops every item, each leaving the bag only as it drops, and
     /// leaves the bag empty. The spill is reversed so items pop in push
     /// order; [`Self::unwind`] restores the order of what a panic left.
-    fn drop_items(&mut self, yielder: &Yielder<'_>) {
+    fn drop_items(&mut self, hook: Option<&YieldHook>) {
         if let Some(token) = self.dep_list.take() {
             retire_dep_list::<C>(token);
         }
         if let Some(spill) = self.spill.as_mut() {
             spill.reverse();
-            while let Some(item) = spill.pop() {
-                yielder.tick();
-                drop(item);
-            }
+            with_ticks!(hook, |ticks| drop_popping(spill, ticks));
             self.spill = None;
         }
     }
@@ -334,7 +331,7 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
             self.node.drop_parts();
             if self.dep_list.is_some() || self.members.is_some() {
-                self.drop_rest(&rt.yielder());
+                self.drop_rest(rt.hook());
             }
         })) {
             self.unwind(rt, payload);
@@ -365,16 +362,13 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
     /// the bag only as it drops, and leaves the bag's rest empty. The
     /// members are reversed so they pop in push order; [`Self::unwind`]
     /// restores the order of what a panic left.
-    fn drop_rest(&mut self, yielder: &Yielder<'_>) {
+    fn drop_rest(&mut self, hook: Option<&YieldHook>) {
         if let Some(token) = self.dep_list.take() {
             retire_dep_list::<C>(token);
         }
         if let Some(members) = self.members.as_mut() {
             members.reverse();
-            while let Some(member) = members.pop() {
-                yielder.tick();
-                drop(member);
-            }
+            with_ticks!(hook, |ticks| drop_popping(members, ticks));
             self.members = None;
         }
     }
@@ -508,4 +502,12 @@ pub(crate) fn isolate(step: impl FnOnce()) {
         }
     }
     cycle_state::set_unwind_kind(kind);
+}
+
+/// Pops and drops every item, so that each leaves `items` only as it drops.
+fn drop_popping<T>(items: &mut Vec<T>, ticks: &impl Ticks) {
+    while let Some(item) = items.pop() {
+        ticks.tick();
+        drop(item);
+    }
 }

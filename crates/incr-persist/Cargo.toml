@@ -12,6 +12,7 @@ categories = ["algorithms", "database"]
 [features]
 backend-tests = []
 sqlite = ["dep:rusqlite"]
+yield-hook = ["incr-core/yield-hook"]
 
 [dependencies]
 incr-core.workspace = true
@@ -30,6 +31,10 @@ incr-core = { workspace = true, features = ["test-hooks"] }
 proptest = "1.11"
 tempfile = "3.27"
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[[test]]
+name = "yield_hook"
+required-features = ["yield-hook"]
 
 [[bench]]
 name = "throughput"

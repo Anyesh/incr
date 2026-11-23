@@ -9,6 +9,10 @@ repository = "https://github.com/Anyesh/incr"
 keywords = ["incremental", "computation", "reactive", "dataflow"]
 categories = ["algorithms", "data-structures"]
 
+[features]
+# The yield hook (`Runtime::set_yield_hook`, `YieldHook`).
+yield-hook = ["incr-core/yield-hook"]
+
 [dependencies]
 incr-core.workspace = true
 

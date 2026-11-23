@@ -19,7 +19,7 @@ use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
 use std::slice;
 
-use crate::yield_hook::Yielder;
+use crate::yield_hook::{NoTicks, Ticks};
 
 const EMPTY: u8 = 0;
 const TOMBSTONE: u8 = 1;
@@ -222,11 +222,11 @@ impl<T> HashedMultiset<T> {
     /// a rehash. Runs no user code. Returns whether it rehashed, which
     /// moves entries and so invalidates every located index.
     pub(crate) fn reserve(&mut self, additional: usize) -> bool {
-        self.reserve_ticking(additional, &Yielder::none())
+        self.reserve_ticking(additional, &NoTicks)
     }
 
     /// [`Self::reserve`], ticking `yielder` per entry a rehash moves.
-    pub(crate) fn reserve_ticking(&mut self, additional: usize, yielder: &Yielder<'_>) -> bool {
+    pub(crate) fn reserve_ticking(&mut self, additional: usize, yielder: &impl Ticks) -> bool {
         let rehash = additional > self.growth_left;
         if rehash {
             self.rehash(additional, yielder);
@@ -235,7 +235,7 @@ impl<T> HashedMultiset<T> {
     }
 
     #[cold]
-    fn rehash(&mut self, additional: usize, yielder: &Yielder<'_>) {
+    fn rehash(&mut self, additional: usize, yielder: &impl Ticks) {
         let need = self
             .len
             .checked_add(additional)

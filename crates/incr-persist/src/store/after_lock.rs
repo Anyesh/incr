@@ -2,6 +2,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(feature = "yield-hook")]
 use incr_core::{with_ambient_hook, YieldHook};
 
 use crate::value_context::hold;
@@ -61,16 +62,24 @@ pub(super) struct Drained<'a> {
     scope: Option<&'a ValueScope>,
     /// The ambient hook the drops tick, which runs no user code under a
     /// lock: the values drop after the store mutex is released.
+    #[cfg(feature = "yield-hook")]
     yield_hook: Option<&'a YieldHook>,
 }
 
 impl<'a> Drained<'a> {
-    pub(super) fn new(scope: Option<&'a ValueScope>, yield_hook: Option<&'a YieldHook>) -> Self {
+    pub(super) fn new(scope: Option<&'a ValueScope>) -> Self {
         Drained {
             values: Vec::new(),
             scope,
-            yield_hook,
+            #[cfg(feature = "yield-hook")]
+            yield_hook: None,
         }
+    }
+
+    #[cfg(feature = "yield-hook")]
+    pub(super) fn ticking(mut self, yield_hook: Option<&'a YieldHook>) -> Self {
+        self.yield_hook = yield_hook;
+        self
     }
 
     pub(super) fn take_from(&mut self, bag: &AfterLock) {
@@ -85,7 +94,10 @@ impl Drop for Drained<'_> {
             return;
         }
         let values = std::mem::take(&mut self.values);
+        #[cfg(feature = "yield-hook")]
         with_ambient_hook(self.yield_hook, || hold(self.scope, || drop(values)));
+        #[cfg(not(feature = "yield-hook"))]
+        hold(self.scope, || drop(values));
     }
 }
 

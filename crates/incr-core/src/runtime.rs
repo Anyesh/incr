@@ -60,6 +60,9 @@ use crate::value::Value;
 use crate::value_code;
 use crate::value_slot::{Compared, Displaced};
 use crate::waits;
+use crate::yield_hook::{NoTicks, Ticks};
+#[cfg(feature = "yield-hook")]
+use crate::yield_hook::{YieldHook, Yielder};
 
 /// Compute closure: takes a borrow of the runtime, the node's slot and
 /// the frame's control block, which says whether this is a recompute
@@ -1676,6 +1679,7 @@ pub struct Runtime<C: Cells> {
     watching: C::U32,
     router_lists: routing_impl::RouterLists<C>,
     routing_owing: routing_impl::Owing<C>,
+    #[cfg(feature = "yield-hook")]
     pub(crate) yield_hook: Option<crate::yield_hook::YieldHook>,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
@@ -1881,6 +1885,7 @@ impl<C: Cells> Runtime<C> {
             watching: C::new_u32(0),
             router_lists: routing_impl::RouterLists::new(runtime_id),
             routing_owing: routing_impl::Owing::new(),
+            #[cfg(feature = "yield-hook")]
             yield_hook: None,
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
@@ -4767,6 +4772,34 @@ impl<C: Cells> Runtime<C> {
     /// Sets `routers` if it queued a `group_by` router for routing, which
     /// the walk takes by reference so its loop keeps no register for it.
     fn mark_dependents_dirty(&self, start: NodeId, start_flags: &C::U8, routers: &mut bool) {
+        #[cfg(feature = "yield-hook")]
+        if let Some(hook) = self.hook_under_lock() {
+            return self.mark_dependents_yielding(start, start_flags, routers, hook);
+        }
+        self.mark_dependents_ticking(start, start_flags, routers, NoTicks)
+    }
+
+    /// Out of line, so that the unhooked walk inlines as if this one did
+    /// not exist.
+    #[cfg(feature = "yield-hook")]
+    #[inline(never)]
+    fn mark_dependents_yielding(
+        &self,
+        start: NodeId,
+        start_flags: &C::U8,
+        routers: &mut bool,
+        hook: &YieldHook,
+    ) {
+        self.mark_dependents_ticking(start, start_flags, routers, Yielder::of(Some(hook)))
+    }
+
+    fn mark_dependents_ticking(
+        &self,
+        start: NodeId,
+        start_flags: &C::U8,
+        routers: &mut bool,
+        ticks: impl Ticks,
+    ) {
         let mut queue: Vec<NodeId> = Vec::new();
         {
             let inner = self.inner.read();
@@ -4792,10 +4825,10 @@ impl<C: Cells> Runtime<C> {
 
         let mut expanded_new: Option<HashSet<NodeId>> = None;
         let past = self.failed_past.load(std::sync::atomic::Ordering::Relaxed);
-        // Other threads wait on a set's walk, which runs no user code.
-        let yielder = self.yielder_under_lock();
+        // Other threads wait on a set's walk, which runs no user code, so
+        // the caller ticks only with single-threaded cells.
         while let Some(id) = queue.pop() {
-            yielder.tick();
+            ticks.tick();
             let (node, flags) = self.nodes.get_with_flags(id.0);
             loop {
                 // This thread's own set flips its held landings through
@@ -5032,6 +5065,37 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         restarts: u32,
     ) -> Computed {
+        #[cfg(feature = "yield-hook")]
+        if let Some(hook) = self.hook() {
+            return self.clean_walk_yielding::<MODE>(id, gen, word, observed, restarts, hook);
+        }
+        self.clean_walk_ticking::<MODE>(id, gen, word, observed, restarts, NoTicks)
+    }
+
+    /// Out of line, as [`Self::mark_dependents_yielding`] is.
+    #[cfg(feature = "yield-hook")]
+    #[inline(never)]
+    fn clean_walk_yielding<const MODE: u8>(
+        &self,
+        id: NodeId,
+        gen: u32,
+        word: u64,
+        observed: NodeState,
+        restarts: u32,
+        hook: &YieldHook,
+    ) -> Computed {
+        self.clean_walk_ticking::<MODE>(id, gen, word, observed, restarts, Yielder::of(Some(hook)))
+    }
+
+    fn clean_walk_ticking<const MODE: u8>(
+        &self,
+        id: NodeId,
+        gen: u32,
+        word: u64,
+        observed: NodeState,
+        restarts: u32,
+        ticks: impl Ticks,
+    ) -> Computed {
         let observed = self.seen(self.nodes.get(id.0).state_cell(), observed);
         // A read whose walk a doom stopped goes on with it even if its root
         // has been memoized since, as the unbounded run's walk goes on.
@@ -5074,7 +5138,6 @@ impl<C: Cells> Runtime<C> {
         let mut unchecked = None;
         #[cfg(test)]
         let mut revisited: Vec<NodeId> = Vec::new();
-        let yielder = self.yielder();
 
         while let Some(Entry {
             id: cur,
@@ -5082,7 +5145,7 @@ impl<C: Cells> Runtime<C> {
             generation,
         }) = walk.work.pop()
         {
-            yielder.tick();
+            ticks.tick();
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
                 // A root another thread landed Failed computes as one found
@@ -5134,6 +5197,7 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     Seen::Dirty
                 };
+                ticks.yield_now();
                 let mut computed = self.compute_one::<MODE>(
                     cur,
                     visit,
@@ -5996,6 +6060,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
+        self.maybe_yield();
         let mut computed =
             self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false, None, Seen::Unwalked);
         if computed == Computed::Discarded {
@@ -6047,7 +6112,6 @@ impl<C: Cells> Runtime<C> {
         planned: Option<Planned>,
         seen: Seen,
     ) -> Computed {
-        self.maybe_yield();
         let mut bag = Deferred::new();
         let computed =
             self.compute_attempts::<MODE>(id, visit, gen, walked, planned, seen, &mut bag);

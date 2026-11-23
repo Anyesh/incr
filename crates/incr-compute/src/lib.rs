@@ -28,6 +28,8 @@ use incr_core::Local;
 
 #[doc(hidden)]
 pub use incr_core::persist_hooks;
+#[cfg(feature = "yield-hook")]
+pub use incr_core::YieldHook;
 #[doc(hidden)]
 pub use incr_core::{
     active_frame_doomed, check_value_code, engine_unwind, engine_unwind_in_progress,
