@@ -16,6 +16,8 @@ mod backend;
 pub mod conformance;
 mod error;
 mod file;
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+mod flight;
 mod flock;
 pub mod memo;
 mod memory;
@@ -28,6 +30,7 @@ mod value_context;
 pub use backend::{Backend, ConditionalAppend, Position, ReadOutcome, SnapshotId};
 pub use error::{Error, Result};
 pub use file::FileBackend;
+pub use flight::join_checkpoint_workers;
 pub use incr_core::{Cells, Local, Shared};
 pub use memory::MemoryBackend;
 pub use record::{Kind, Record};

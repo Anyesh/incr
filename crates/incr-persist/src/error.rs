@@ -168,6 +168,11 @@ pub enum Error {
     #[error("the backend has no conditional append, which a staged batch needs")]
     ConditionalAppendUnsupported,
 
+    /// A checkpoint running on a worker thread was cancelled or abandoned;
+    /// the backend is handed this in place of the next record.
+    #[error("the checkpoint was cancelled")]
+    Cancelled,
+
     /// `BuildId::CurrentExe` could not read the running executable.
     #[error("cannot fingerprint the running executable for the memo build id")]
     BuildIdUnavailable(#[source] std::io::Error),
