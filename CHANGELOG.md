@@ -7,6 +7,7 @@ All notable changes to this project are documented here. Format roughly follows 
 ### Added
 
 - **Python: `memory_stats()["kept_traces"]` (R23).** `{"count", "bytes", "py_refs"}` for the traces `last_trace_by_id` reads, kept as running totals; the top-level `bytes` and `py_refs` still leave them out. incr-core gains `Runtime::kept_trace_memory` and `MemoryStats::kept_traces`.
+- **Python: `rt.memory_walker()` takes the `memory_stats()` walk in steps (R26).** `walker.step(budget_seconds)` walks for about that long and returns True once done, and `walker.result()` returns the `memory_stats()` dict (it raises before then). `memory_stats()` is the same walk taken in one step, so the figures share one rule. At 1,665,899 nodes (270,967 five-step traced roots, 2.6M keyed rows in 47 families, 240,000 rows grouped by 5,000 keys; Local release wheel) `memory_stats()` takes 0.40 to 0.60 s and every `step(0.05)` returns within 51 ms. Each step measures at least one registered state or one batch of 4,096 node slots, the longest of which took 5.4 ms there. A walk reads the registered states and node slots that existed when it began, each as it is when reached, so on a runtime that changes between steps the figures can mix moments; on one that does not, the result equals `memory_stats()`. incr-core gains `Runtime::memory_walker`, `MemoryWalker`, `MemoryVisitor`, `Labels` and `WalkEnd`; `NodeMemory` takes its label type as a parameter (`String` by default), and the memory figure types implement `PartialEq`.
 
 ### Changed
 
