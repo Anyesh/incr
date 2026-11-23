@@ -99,6 +99,15 @@ impl<C: MemoCells> CoreRef<C> {
         park(Park::BeforeSeed);
         let (handle, seeded) = t.seed(self, rt, key, &entry.value, &deps, reuse, &base, bag);
         record(state, t.index, handle.erase(), entry, &base, seeded);
+        let yielder = rt.yielder_under_lock();
+        for visit in walk.visits.drain(..) {
+            yielder.tick();
+            drop(visit);
+        }
+        for id in walk.ids.drain() {
+            yielder.tick();
+            drop(id);
+        }
         handle
     }
 }
@@ -181,6 +190,10 @@ enum Mark {
     Done,
 }
 
+/// Ticks per step of [`Walk::run`], which can cost a hundred times one
+/// iteration of a plain loop.
+const STEP_TICKS: usize = 64;
+
 struct Walk<'a, C: MemoCells> {
     core: &'a CoreRef<C>,
     rt: &'a Runtime<C>,
@@ -223,9 +236,14 @@ impl<C: MemoCells> Walk<'_, C> {
                 return false;
             }
         };
+        let rt = self.rt;
+        let yielder = rt.yielder_under_lock();
+        self.visits.reserve(entry.deps.len());
+        self.ids.reserve(entry.deps.len());
         let children = entry
             .deps
             .iter()
+            .inspect(|_| yielder.tick())
             .filter_map(|dep| match dep {
                 StoredDep::Query { table, key, .. } => Some((*table, key)),
                 _ => None,
@@ -246,7 +264,11 @@ impl<C: MemoCells> Walk<'_, C> {
     fn run(&mut self, state: &mut MemoState, root: usize, base: &SeedBase, bag: &mut Deferred<C>) {
         self.visits[root].mark = Some(Mark::OnStack);
         let mut stack = vec![(root, 0_usize)];
+        let rt = self.rt;
+        let yielder = rt.yielder_under_lock();
         while let Some(&(id, next)) = stack.last() {
+            // A step can read and seed an entry through the backend.
+            yielder.tick_by(STEP_TICKS);
             let Some(&child) = self.visits[id].children.get(next) else {
                 stack.pop();
                 if id != root {
@@ -366,7 +388,9 @@ impl<C: MemoCells> Walk<'_, C> {
         let mut deps = Vec::with_capacity(entry.deps.len());
         let mut unchanged = true;
         let mut children = visit.children.iter();
+        let yielder = self.rt.yielder_under_lock();
         for dep in &entry.deps {
+            yielder.tick();
             match dep {
                 StoredDep::External { name, .. } => {
                     self.core.external(self.rt, name);
@@ -391,6 +415,7 @@ impl<C: MemoCells> Walk<'_, C> {
         }
         let map = self.core.deps.read();
         for dep in &entry.deps {
+            yielder.tick();
             match dep {
                 StoredDep::Query { fp, .. } => {
                     let child = (*children.next()?)?;

@@ -611,7 +611,7 @@
     "signature": "(self, /, node)"
    }
   },
-  "signature": "()"
+  "signature": "(*, gil_yield_ms=100)"
  },
  "incr.RuntimeRef": {
   "bases": [
@@ -1066,9 +1066,9 @@
     "signature": "(self, /, name, version, key_codec, codec, func, *, label=None)"
    },
    "open": {
-    "doc": "Opens a store over `backend`, replaying its log. `build_id`, an int\nor a str, names the code that computes memoized values; incr hashes\na str to an id. `durability` is `\"sync\"` (a write is durable when it\nreturns) or `\"buffered\"`. With `auto_checkpoint_records=n`, a\nwrite first checkpoints once `n` records were applied since the last\nsnapshot; a failed checkpoint fails that write and leaves the log\nunchanged.",
+    "doc": "Opens a store over `backend`, replaying its log. `build_id`, an int\nor a str, names the code that computes memoized values; incr hashes\na str to an id. `durability` is `\"sync\"` (a write is durable when it\nreturns) or `\"buffered\"`. With `auto_checkpoint_records=n`, a\nwrite first checkpoints once `n` records were applied since the last\nsnapshot; a failed checkpoint fails that write and leaves the log\nunchanged. `gil_yield_ms` is the store runtime's, as in `Runtime()`,\nand covers this replay too.",
     "kind": "staticmethod",
-    "signature": "(backend, *, build_id, durability='sync', auto_checkpoint_records=None)"
+    "signature": "(backend, *, build_id, durability='sync', auto_checkpoint_records=None, gil_yield_ms=100)"
    },
    "open_memo": {
     "doc": "Opens the memo over `backend`, an object that implements the memo\nbackend protocol (see `incr.persist.MemoryMemo`), and loads its\ncurrent generation. Entries written under another `build_id`, or by\na table of another name, version or type, are ignored.\n\nA checkpoint evicts the oldest entries down to `max_bytes` of\nencoded entries (512 MiB by default). With\n`checkpoint_after_entries=n` a checkpoint is due once `n` entries\ncomputed since the last one are unsaved: on a Local runtime each\nlogged store write and batch commit runs a due checkpoint after it\nlands, and a read never does (call `memo.checkpoint_if_due()` after\na read-only rebuild); a Shared memo's checkpoint thread runs it. A\ntriggered checkpoint that fails does not raise from the write that\nran it, which has landed: `memo.stats()` counts it under\n`auto_checkpoint_errors` with its text under\n`last_auto_checkpoint_error`, and it stays due, retried by the first\nwrite after a new entry computes. `Busy` leaves it due for the\nnext write.",

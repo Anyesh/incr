@@ -38,6 +38,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::panic;
 
+use incr_core::{YieldHook, Yielder};
 use incr_persist::{
     Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId,
 };
@@ -121,6 +122,8 @@ pub struct PyBackend<E> {
     backend: Py<PyAny>,
     has_append_at: bool,
     streams: bool,
+    /// The store runtime's hook, ticked per record converted.
+    yield_hook: Option<YieldHook>,
     exceptions: PhantomData<fn() -> E>,
 }
 
@@ -134,8 +137,17 @@ impl<E: PersistExceptions> PyBackend<E> {
             backend,
             has_append_at,
             streams,
+            yield_hook: None,
             exceptions: PhantomData,
         })
+    }
+
+    pub fn with_yield_hook(self, yield_hook: Option<YieldHook>) -> Self {
+        PyBackend { yield_hook, ..self }
+    }
+
+    fn yielder(&self) -> Yielder<'_> {
+        Yielder::of(self.yield_hook.as_ref())
     }
 
     fn call<'py, A: pyo3::call::PyCallArgs<'py>>(
@@ -144,19 +156,23 @@ impl<E: PersistExceptions> PyBackend<E> {
         method: &Bound<'py, PyString>,
         args: A,
     ) -> Result<Bound<'py, PyAny>> {
-        self.backend
-            .bind(py)
-            .call_method1(method, args)
-            .map_err(raised::<E>)
+        incr_core::with_ambient_hook(self.yield_hook.as_ref(), || {
+            self.backend
+                .bind(py)
+                .call_method1(method, args)
+                .map_err(raised::<E>)
+        })
     }
 }
 
 fn encoded<'py, E: PersistExceptions>(
     py: Python<'py>,
     records: &[Record],
+    yielder: &Yielder<'_>,
 ) -> Result<Bound<'py, PyList>> {
     let items = records
         .iter()
+        .inspect(|_| yielder.tick())
         .map(|record| Ok(PyBytes::new(py, &record.encode()?)))
         .collect::<Result<Vec<_>>>()?;
     PyList::new(py, items).map_err(raised::<E>)
@@ -169,10 +185,14 @@ fn decoded<E: PersistExceptions>(object: &Bound<'_, PyAny>) -> Result<Record> {
     Record::decode(bytes.as_bytes())
 }
 
-fn decoded_all<E: PersistExceptions>(object: &Bound<'_, PyAny>) -> Result<Vec<Record>> {
+fn decoded_all<E: PersistExceptions>(
+    object: &Bound<'_, PyAny>,
+    yielder: &Yielder<'_>,
+) -> Result<Vec<Record>> {
     object
         .try_iter()
         .map_err(raised::<E>)?
+        .inspect(|_| yielder.tick())
         .map(|item| decoded::<E>(&item.map_err(raised::<E>)?))
         .collect()
 }
@@ -187,7 +207,7 @@ fn position<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Resu
 impl<E: PersistExceptions> Backend for PyBackend<E> {
     fn append(&self, records: &[Record]) -> Result<Position> {
         Python::attach(|py| {
-            let list = encoded::<E>(py, records)?;
+            let list = encoded::<E>(py, records, &self.yielder())?;
             position::<E>(&self.call(py, intern!(py, "append"), (list,))?, "append")
         })
     }
@@ -205,7 +225,9 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
                 }
             }
             let mut found = Vec::new();
+            let yielder = self.yielder();
             for item in result.try_iter().map_err(raised::<E>)? {
+                yielder.tick();
                 let pair = item.map_err(raised::<E>)?;
                 let pair = pair
                     .downcast::<PyTuple>()
@@ -236,7 +258,7 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
             let at = position::<E>(&pair.get_item(0).map_err(raised::<E>)?, "load_snapshot")?;
             Ok(Some((
                 at,
-                decoded_all::<E>(&pair.get_item(1).map_err(raised::<E>)?)?,
+                decoded_all::<E>(&pair.get_item(1).map_err(raised::<E>)?, &self.yielder())?,
             )))
         })
     }
@@ -259,7 +281,7 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
 
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()> {
         Python::attach(|py| {
-            let list = encoded::<E>(py, &folded)?;
+            let list = encoded::<E>(py, &folded, &self.yielder())?;
             self.call(py, intern!(py, "compact"), (upto.0, list))
                 .map(drop)
         })
@@ -311,7 +333,7 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
 impl<E: PersistExceptions> ConditionalAppend for PyBackend<E> {
     fn append_at(&self, after: Position, records: &[Record]) -> Result<Position> {
         Python::attach(|py| {
-            let list = encoded::<E>(py, records)?;
+            let list = encoded::<E>(py, records, &self.yielder())?;
             let landed = self
                 .backend
                 .bind(py)

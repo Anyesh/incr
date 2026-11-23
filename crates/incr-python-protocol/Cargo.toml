@@ -14,6 +14,6 @@ doc = false
 persist = ["dep:serde"]
 
 [dependencies]
-incr-core.workspace = true
+incr-core = { workspace = true, features = ["yield-hook"] }
 pyo3 = "0.26"
 serde = { version = "1.0.229", default-features = false, optional = true }

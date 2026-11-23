@@ -448,6 +448,7 @@ where
         let builder = self.builder_from_decls(py, options.memo_options(core), &make);
         let builder = carry::<B, _>(builder);
         let opened = core.write(py, move |store, _| {
+            let adapter = adapter.with_yield_hook(store.runtime().yield_hook().cloned());
             builder.into_inner().open(store, adapter).map(carry::<B, _>)
         });
         match opened {

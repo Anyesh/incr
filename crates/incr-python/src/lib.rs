@@ -55,6 +55,7 @@ use state::{LocalState, PyCallable, RtState};
 
 use incr_python_persist::ready;
 use incr_python_protocol::by_id::{keep_traced, resolve, snapshot_values, TypedNode};
+use incr_python_protocol::gil_yield::{gil_yield_hook, DEFAULT_GIL_YIELD_MS};
 use incr_python_protocol::inspect::{kept_value, trace_dict};
 use incr_python_protocol::notready::{
     lookup_failed, PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
@@ -1713,14 +1714,24 @@ impl PyRuntime {
 
 #[pymethods]
 impl PyRuntime {
+    /// `gil_yield_ms`: during an engine call's native work (computes,
+    /// walks, batch writes, restores, checkpoints), hand the GIL to waiting
+    /// threads once this many ms (at least 1) have passed since the last
+    /// hand-over; `None` never hands it over.
     #[new]
-    fn new() -> Self {
-        PyRuntime {
-            holder: Holder::Owned(Box::new(Runtime::new())),
+    #[pyo3(
+        signature = (*, gil_yield_ms=Some(DEFAULT_GIL_YIELD_MS)),
+        text_signature = "(*, gil_yield_ms=100)"
+    )]
+    fn new(gil_yield_ms: Option<u64>) -> PyResult<Self> {
+        let mut runtime = Box::new(Runtime::new());
+        runtime.set_yield_hook(gil_yield_hook(gil_yield_ms)?);
+        Ok(PyRuntime {
+            holder: Holder::Owned(runtime),
             version_bridges: RefCell::new(HashMap::new()),
             keyed_labels: RefCell::new(Vec::new()),
             state: RtState::default(),
-        }
+        })
     }
 
     /// Drop the engine and everything it holds: values, closures and the

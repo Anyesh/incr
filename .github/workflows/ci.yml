@@ -39,6 +39,17 @@ jobs:
           INCR_MAX_DEPTH: "1"
           INCR_TEST_ALL_REPLAYABLE: "1"
 
+  # The crates' own test runs leave yield-hook off, which skips its tests.
+  test-yield-hook:
+    name: Test (yield-hook)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash .github/scripts/annotated-test.sh 1500 "Test (yield-hook)" cargo test --release -p incr-core -p incr-persist --features incr-persist/sqlite,incr-core/yield-hook,incr-persist/yield-hook
+
   # The release job above never runs the debug-only lock-order check, so
   # this covers every crate's tests in debug. The Python crates are
   # extension-module cdylibs tested by the Python job, and incr-wasm-tests
@@ -381,6 +392,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The Python crates turn yield-hook on for the whole workspace build.
+      - run: cargo clippy -p incr-core -p incr-persist -p incr-compute -p incr-concurrent --all-targets --features incr-persist/sqlite -- -D warnings
 
   doc:
     name: Docs

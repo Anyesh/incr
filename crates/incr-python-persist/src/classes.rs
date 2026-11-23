@@ -252,9 +252,11 @@ pub fn reconcile_pairs(rows: &Bound<'_, PyAny>) -> PyResult<Vec<(PyKey, PyValue)
     } else {
         rows.clone()
     };
+    let yielder = incr_core::Yielder::ambient();
     pairs
         .try_iter()?
         .map(|pair| {
+            yielder.tick();
             let (key, row): (Py<PyAny>, Py<PyAny>) = pair?.extract()?;
             Ok((PyKey(key), PyValue(row)))
         })

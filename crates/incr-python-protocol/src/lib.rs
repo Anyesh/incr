@@ -23,6 +23,7 @@ use incr_core::{
 };
 
 pub mod by_id;
+pub mod gil_yield;
 pub mod inspect;
 pub mod notready;
 #[cfg(feature = "persist")]

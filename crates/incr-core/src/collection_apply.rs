@@ -7,6 +7,7 @@ use crate::persist_hooks::{RepSide, RepSink};
 use crate::runtime::Runtime;
 use crate::value::Value;
 use crate::value_code;
+use crate::yield_hook::{with_ticks, Ticks};
 
 /// One change of a batch given to [`IncrCollection::apply`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,19 +64,25 @@ impl<T> Staged<T> {
 }
 
 impl<T: Hash + Eq + Clone> StagedBatch<T> {
-    fn new(hasher: &RandomState, changes: impl IntoIterator<Item = Change<T>>) -> Self {
-        let changes: Vec<Staged<T>> = changes
-            .into_iter()
-            .map(|change| match change {
+    fn new(
+        hasher: &RandomState,
+        changes: impl IntoIterator<Item = Change<T>>,
+        yielder: &impl Ticks,
+    ) -> Self {
+        let changes: Vec<Staged<T>> =
+            yielder.collect(changes.into_iter().map(|change| match change {
                 Change::Insert(value) => Staged::Insert(StagedInsert::new(hasher, value)),
                 Change::Delete(value) => Staged::Delete(StagedDelete::owned(hasher, value)),
-            })
-            .collect();
+            }));
         let mut group_of = Vec::with_capacity(changes.len());
         let mut groups = Vec::new();
         let mut seen = HashedMultiset::new();
+        if yielder.is_active() {
+            seen.reserve(changes.len());
+        }
         value_code::run(|| {
             for (i, change) in changes.iter().enumerate() {
+                yielder.tick();
                 let (hash, value) = change.key();
                 let member = Member {
                     value,
@@ -131,8 +138,9 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         batch: StagedBatch<T>,
         report: bool,
         sink: &mut S,
+        yielder: &impl Ticks,
     ) -> CommittedBatch<T> {
-        let mut plan = value_code::run(|| self.plan_batch(&batch, report, sink));
+        let mut plan = value_code::run(|| self.plan_batch(&batch, report, sink, yielder));
         let mut applied = Vec::new();
         let mut unused = Vec::new();
         let start = self.deltas.len();
@@ -141,6 +149,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         // rehashes, and filling a free slot or emptying a full one never
         // moves another entry.
         for (change, group) in batch.changes.into_iter().zip(batch.group_of) {
+            yielder.tick();
             let planned = &mut plan[group];
             match change {
                 Staged::Insert(s) if planned.inserts > 0 => {
@@ -198,20 +207,17 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         batch: &StagedBatch<T>,
         report: bool,
         sink: &mut S,
+        yielder: &impl Ticks,
     ) -> Vec<Planned<T>> {
         let find = |elements: &HashedMultiset<T>, group: &Group| {
             elements.find(group.hash, batch.changes[group.first].key().1)
         };
-        let mut plan: Vec<Planned<T>> = batch
-            .groups
-            .iter()
-            .map(|group| Planned {
-                at: find(&self.elements, group),
-                inserts: 0,
-                deletes: 0,
-                copies: Vec::new(),
-            })
-            .collect();
+        let mut plan: Vec<Planned<T>> = yielder.collect(batch.groups.iter().map(|group| Planned {
+            at: find(&self.elements, group),
+            inserts: 0,
+            deletes: 0,
+            copies: Vec::new(),
+        }));
         let mut have: Vec<usize> = plan
             .iter()
             .map(|p| p.at.map_or(0, |at| self.elements.count(at)))
@@ -219,6 +225,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         let start = have.clone();
         let mut first_insert: Vec<Option<usize>> = vec![None; plan.len()];
         for (i, (change, &group)) in batch.changes.iter().zip(&batch.group_of).enumerate() {
+            yielder.tick();
             match change {
                 Staged::Insert(_) => {
                     have[group] += 1;
@@ -228,6 +235,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             }
         }
         for (p, (&before, &after)) in plan.iter_mut().zip(start.iter().zip(&have)) {
+            yielder.tick();
             p.inserts = after.saturating_sub(before);
             p.deletes = before.saturating_sub(after);
         }
@@ -235,8 +243,9 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             .iter()
             .filter(|p| p.at.is_none() && p.inserts > 0)
             .count();
-        if self.elements.reserve(absent) {
+        if self.elements.reserve_ticking(absent, yielder) {
             for (p, group) in plan.iter_mut().zip(&batch.groups) {
+                yielder.tick();
                 if p.at.is_some() {
                     p.at = find(&self.elements, group);
                 }
@@ -244,6 +253,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         }
         if S::ACTIVE {
             for (g, p) in plan.iter().enumerate() {
+                yielder.tick();
                 let added = match (p.at, first_insert[g]) {
                     (Some(at), _) => Some(self.elements.stored(at)),
                     (None, Some(i)) => Some(batch.changes[i].key().1),
@@ -261,6 +271,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         }
         if report {
             for (g, p) in plan.iter_mut().enumerate() {
+                yielder.tick();
                 p.copies = match p.at {
                     None if p.inserts > 0 => first_insert[g]
                         .and_then(|i| batch.changes[i].inserted_copy())
@@ -316,8 +327,13 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         changes: impl IntoIterator<Item = Change<T>>,
         report: bool,
     ) -> Vec<Change<T>> {
-        let batch = self.stage_batch(changes);
-        let committed = self.log.write().apply_batch(batch, report, &mut ());
+        let batch = with_ticks!(rt.hook(), |ticks| self.stage_batch(changes, ticks));
+        let committed = with_ticks!(rt.hook_under_lock(), |ticks| self.log.write().apply_batch(
+            batch,
+            report,
+            &mut (),
+            ticks
+        ));
         self.publish_batch(rt, committed, || {})
     }
 
@@ -326,10 +342,11 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     pub(crate) fn stage_batch(
         &self,
         changes: impl IntoIterator<Item = Change<T>>,
+        yielder: &impl Ticks,
     ) -> StagedBatch<T> {
         self.check_mutable();
         value_code::check();
-        StagedBatch::new(&self.hasher, changes)
+        StagedBatch::new(&self.hasher, changes, yielder)
     }
 
     /// Sets the version for a batch committed under a log guard the caller

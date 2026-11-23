@@ -122,6 +122,8 @@ incr-compute = "0.2.0-beta.12"      # single-threaded
 incr-concurrent = "0.2.0-beta.12"   # multi-threaded (Send + Sync)
 ```
 
+The yield hook that lets long native work call back into its host (`Runtime::set_yield_hook`, `incr_persist::Options::yield_hook`) is behind the `yield-hook` feature of `incr-compute`, `incr-concurrent`, `incr-core` and `incr-persist`; without it no loop checks for a hook.
+
 **Python (`incr-compute`, Local runtime) for a live service:**
 
 ```python
@@ -153,7 +155,7 @@ value, status = rt.get_with_status(total)                  # 14, Incomplete(14, 
 - **Operator view:** `rt.compute_stats()` (after `rt.enable_compute_stats(True)`) counts recomputed, cut-off and verified nodes and their time per label group, `rt.graph_summary()` returns the label groups with node counts and the edges between them, and `rt.graph_snapshot(roots=, direction=, depth=, label_prefix=, limit=)` returns a bounded part of the graph. `get_traced` entries also carry `dependencies` and `elapsed_ns`.
 - **Inspection and cleanup:** `rt.memory_stats()` returns bytes and Python references by kind and label (`rt.memory_walker()` takes the same walk in steps of a given number of seconds), `rt.get_traced(node)` entries carry `label` and `value`, `rt.try_delete_node(node)` raises `HasDependentsError` instead of deleting dependents, and `rt.close()` releases everything the runtime holds.
 - **Persistence:** `incr.persist.Store.open(backend, build_id=...)` persists inputs, collections and keyed collections with your codecs on any Python object that implements the backend methods (`MemoryBackend` is built in); `store.batch()` appends all its writes at once, so a progress input set in the batch lands with the rows it covers, and `store.batch(apply="on_write")` applies writes as they are made, so reads inside the block see them, and still appends once at exit (`b.retry()` after a failed append); `store.open_memo(backend, max_bytes=, checkpoint_after_entries=)` restores memoized values after a restart, checkpoints by itself once that many entries are unsaved, and reports `memo.stats()`; `Store.open(..., auto_checkpoint_records=n)` does the same for the log (`store.stats()`). Your own backends can be checked with `incr.persist.conformance.run_log_backend(factory)` and `run_memo_backend(factory)`. Overlays work on a persisted graph and leave the log untouched. See `examples/python/mcs_live_e2e.py` for a run on a sqlite3 backend, and `examples/tests/python/test_mcs_*.py` for each feature.
-- **Not provided:** the GIL is held during propagation (releasing it measured slower for the writer once another Python thread runs), so keep writes short with bulk `extend` and `reconcile`.
+- **Other threads during long calls:** a long `get`, write, restore or checkpoint hands the GIL to waiting Python threads once `gil_yield_ms` (default 100) has passed since the last hand-over: `Runtime(gil_yield_ms=...)`, `Store.open(..., gil_yield_ms=...)`, `None` to never hand it over.
 
 **Running the tests:**
 

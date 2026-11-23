@@ -74,6 +74,7 @@ mod value_code;
 pub mod value_slot;
 mod waits;
 pub mod walk_ring;
+mod yield_hook;
 
 pub use arena::PrimitiveArena;
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
@@ -120,6 +121,10 @@ pub use value_code::{
     check_value_code, in_value_code, is_contract_panic_message, with_value_code, CONTRACT_MESSAGE,
 };
 pub use value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
+#[cfg(feature = "yield-hook")]
+pub use yield_hook::{with_ambient_hook, YieldHook};
+#[doc(hidden)]
+pub use yield_hook::{Yielder, YIELD_EVERY};
 
 #[cfg(test)]
 #[path = "../tests/common/child.rs"]

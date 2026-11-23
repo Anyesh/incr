@@ -10,6 +10,7 @@ use super::{
     GenHeader, GenId, Generation, IndexItem, MemoBackend, StoredDep, TableDesc, Tombstone,
 };
 use crate::{Error, Result};
+use incr_core::Yielder;
 
 /// The most deltas a chain holds; the checkpoint that would add one more
 /// rewrites the chain as a full generation.
@@ -300,7 +301,9 @@ fn write_delta<B: MemoBackend + ?Sized>(
     let mut fates = vec![Fate::Written; input.fresh.len()];
     let mut kept = Vec::new();
     let mut origin = Vec::new();
+    let yielder = Yielder::ambient();
     for (i, (entry, drop)) in input.fresh.iter().zip(unkept).enumerate() {
+        yielder.tick();
         if drop {
             stats.unkept += 1;
             fates[i] = Fate::Unkept;
@@ -329,6 +332,7 @@ fn write_delta<B: MemoBackend + ?Sized>(
     let mut written = Vec::with_capacity(frames.len());
     let mut tombstones = Vec::new();
     for ((entry, i), frame) in kept.iter().zip(origin).zip(frames) {
+        yielder.tick();
         match frame {
             Some(frame) => written.push(frame),
             None => {
@@ -611,7 +615,9 @@ fn write_full<B: MemoBackend + ?Sized>(
     let mut fates = vec![Fate::Written; input.fresh.len()];
     let mut fresh = Vec::with_capacity(input.fresh.len());
     let mut origin = Vec::with_capacity(input.fresh.len());
+    let yielder = Yielder::ambient();
     for (i, (mut entry, drop)) in input.fresh.into_iter().zip(unkept).enumerate() {
+        yielder.tick();
         if drop {
             stats.unkept += 1;
             fates[i] = Fate::Unkept;
@@ -679,6 +685,7 @@ fn write_full<B: MemoBackend + ?Sized>(
         let walk = Walk::new(&source, None);
         let seen = fresh
             .iter()
+            .inspect(|_| yielder.tick())
             .map(|entry| (entry.table, entry.key.clone()))
             .collect();
         let copy = Copier::new(walk, kept, Some((contested, seen)), summing);
@@ -1044,6 +1051,7 @@ struct Copier<'s, 'a, B: ?Sized, E> {
     carried: usize,
     corrupt: usize,
     oversized: usize,
+    yielder: Yielder<'static>,
 }
 
 impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>>
@@ -1064,6 +1072,7 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>
             carried: 0,
             corrupt: 0,
             oversized: 0,
+            yielder: Yielder::ambient(),
         }
     }
 
@@ -1074,6 +1083,7 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>
         };
         let source = self.walk.source;
         for (item, frame) in batch {
+            self.yielder.tick();
             let table = self.walk.table(at, &item).expect("walked items survive");
             let Some(frame) = frame else {
                 self.corrupt += 1;
@@ -1119,7 +1129,9 @@ impl<'s, 'a, B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>
             }
             match self.fill() {
                 Ok(true) => {}
-                Ok(false) => return None,
+                Ok(false) => {
+                    return None;
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1132,6 +1144,7 @@ impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Iterat
     type Item = Result<EncodedEntry>;
 
     fn next(&mut self) -> Option<Result<EncodedEntry>> {
+        self.yielder.tick();
         let next = self.pull();
         if let (Some(summing), Some(Ok(frame))) = (self.summing.as_mut(), &next) {
             summing.add(frame, self.walk.source.tag);
@@ -1341,8 +1354,10 @@ impl Held<'_> {
 /// query that is not among them. A dep in `held` is satisfied without an
 /// edge.
 fn query_edges(entries: &[Entry], held: &Held) -> (Vec<Vec<usize>>, Vec<bool>) {
+    let yielder = Yielder::ambient();
     let at: HashMap<Identity, usize> = entries
         .iter()
+        .inspect(|_| yielder.tick())
         .enumerate()
         .map(|(i, e)| ((e.table, e.key.as_slice()), i))
         .collect();
@@ -1350,6 +1365,7 @@ fn query_edges(entries: &[Entry], held: &Held) -> (Vec<Vec<usize>>, Vec<bool>) {
     let mut dangling = vec![false; entries.len()];
     for (i, entry) in entries.iter().enumerate() {
         for (dep, fp) in query_deps(entry) {
+            yielder.tick();
             if held.holds(dep, fp) {
                 continue;
             }
@@ -1465,8 +1481,10 @@ fn encode_fitting(
     encode: impl Fn(&Entry) -> Result<EncodedEntry>,
     oversized: &mut usize,
 ) -> Result<Vec<Option<EncodedEntry>>> {
+    let yielder = Yielder::ambient();
     let mut encoded = entries
         .iter()
+        .inspect(|_| yielder.tick())
         .map(|entry| match encode(entry) {
             Err(Error::FrameTooLarge { .. }) => Ok(None),
             other => other.map(Some),

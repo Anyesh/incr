@@ -25,7 +25,14 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
-        let matching = value_code::run(|| bootstrap.iter().filter(|v| pred(v)).count());
+        let yielder = rt.yielder();
+        let matching = value_code::run(|| {
+            bootstrap
+                .iter()
+                .inspect(|_| yielder.tick())
+                .filter(|v| pred(v))
+                .count()
+        });
         let running = [
             AtomicI64::new(matching as i64),
             AtomicI64::new((bootstrap.len() - matching) as i64),
@@ -38,8 +45,10 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
             let from = cursor.load(MemOrdering::Acquire);
             if from < up.end() {
                 let mut delta = [0_i64; 2];
+                let yielder = rt.yielder_under_lock();
                 value_code::run(|| {
                     for d in up.pending_from(from) {
+                        yielder.tick();
                         match d {
                             Delta::Insert(v) => delta[usize::from(!pred(v))] += 1,
                             Delta::Delete(v) => delta[usize::from(!pred(v))] -= 1,

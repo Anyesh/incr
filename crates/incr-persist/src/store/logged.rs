@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::{Kind, Record};
+use incr_core::Yielder;
 
 /// The first live `Declare` of a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +135,18 @@ impl LoggedKey {
 }
 
 impl Elements {
+    /// Drops the elements one at a time, ticking `yielder` per element.
+    pub(crate) fn drop_ticking(self, yielder: &Yielder<'_>) {
+        for element in self.live {
+            yielder.tick();
+            drop(element);
+        }
+        for op in self.tail {
+            yielder.tick();
+            drop(op);
+        }
+    }
+
     /// The multiset of `elements`, one occurrence per item.
     pub fn from_encoded(elements: impl IntoIterator<Item = Vec<u8>>) -> Self {
         let mut out = Elements::default();

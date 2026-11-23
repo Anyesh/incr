@@ -3,13 +3,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::mem;
 use std::sync::{Arc, Weak};
 
 use incr_core::persist_hooks::Deferred;
 use incr_core::{
     find_element, with_value_code, Cells, DeleteError, ElementRank, ErasedIncr, Incr,
     IncrCollection, KeyCounts, KeyIndex, KeyPartitions, KeyedChange, KeyedCollection, KeyedSpent,
-    Pair, PairHandle, PairOp, Runtime, Shared, Value,
+    Pair, PairHandle, PairOp, Runtime, Shared, Value, Yielder,
 };
 
 use super::after_lock::AfterLock;
@@ -858,7 +859,9 @@ where
     }
 
     fn reconcile(&mut self, rows: impl IntoIterator<Item = (K, V)>) {
+        let yielder = Yielder::ambient();
         for (key, row) in rows {
+            yielder.tick();
             self.upsert(key, row);
         }
         self.complete = true;
@@ -868,6 +871,7 @@ where
         let mut at: HashMap<K, usize> = HashMap::new();
         with_value_code(|| {
             for ranked in held {
+                yielder.tick();
                 let key = ranked.0.key();
                 if self.by_key.contains_key(&key) {
                     done.push((key, Some(ranked)));
@@ -885,15 +889,22 @@ where
                 }
             }
         });
-        drop((done, at));
+        for item in done {
+            yielder.tick();
+            drop(item);
+        }
+        drop(at);
         for (key, held) in rest {
+            yielder.tick();
             self.push(key, held, Next::Gone);
         }
     }
 
     fn counts(&self) -> KeyCounts {
         let mut counts = KeyCounts::default();
+        let yielder = Yielder::ambient();
         for staged in &self.keys {
+            yielder.tick();
             match (staged.held_read(), &staged.next) {
                 (_, Next::Held) | (None, Next::Gone) => {}
                 (None, Next::Row(_)) => counts.inserted += 1,
@@ -939,7 +950,9 @@ where
     fn records(&mut self, state: &State<C>) -> Result<Vec<Record>> {
         let key = self.key(state)?;
         let mut out = Vec::new();
+        let yielder = Yielder::ambient();
         for staged in &self.keys {
+            yielder.tick();
             let next = match &staged.next {
                 Next::Held => continue,
                 Next::Row(pair) => Some(pair),
@@ -973,7 +986,9 @@ where
     fn repairs(&mut self, state: &State<C>) -> Result<Vec<Record>> {
         let key = self.key(state)?;
         let mut fixes = Vec::new();
+        let yielder = Yielder::ambient();
         for staged in &self.keys {
+            yielder.tick();
             let checked = match staged.next {
                 Next::Held => self.complete && !staged.held.is_empty(),
                 Next::Gone => !staged.held.is_empty(),
@@ -1092,9 +1107,14 @@ fn decode_ranked<P: PersistValue>(key: &str, bytes: &[u8]) -> Result<Ranked<P>> 
 
 /// The ops that rebuild `elements` from nothing: an insert per live
 /// occurrence in the order first inserted, then the raw tail.
-fn element_ops<P: PersistValue>(key: &str, elements: &Elements) -> Result<Vec<PairOp<P, u128>>> {
+fn element_ops<P: PersistValue>(
+    key: &str,
+    elements: &Elements,
+    yielder: &Yielder<'_>,
+) -> Result<Vec<PairOp<P, u128>>> {
     let mut ops = Vec::new();
     for (bytes, n) in elements.live() {
+        yielder.tick();
         let (pair, rank) = decode_ranked::<P>(key, bytes)?;
         for _ in 1..n {
             ops.push(PairOp::Insert(with_value_code(|| pair.clone()), rank));
@@ -1102,6 +1122,7 @@ fn element_ops<P: PersistValue>(key: &str, elements: &Elements) -> Result<Vec<Pa
         ops.push(PairOp::Insert(pair, rank));
     }
     for op in elements.tail() {
+        yielder.tick();
         ops.push(match op {
             ElementOp::Insert(bytes) => {
                 let (pair, rank) = decode_ranked(key, bytes)?;
@@ -1125,10 +1146,15 @@ fn keep_changed<K: Send + 'static>(bag: &AfterLock, change: KeyedChange<K>) {
 
 /// The ranked multiset `ops` build from nothing, a removal taking the
 /// held pair [`find_element`] names, as the index's own replay does.
-fn fold_ops<P: Eq + Send + 'static>(ops: Vec<PairOp<P, u128>>, bag: &AfterLock) -> Vec<Ranked<P>> {
+fn fold_ops<P: Eq + Send + 'static>(
+    ops: Vec<PairOp<P, u128>>,
+    bag: &AfterLock,
+    yielder: &Yielder<'_>,
+) -> Vec<Ranked<P>> {
     let mut held: Vec<Ranked<P>> = Vec::new();
     with_value_code(|| {
         for op in ops {
+            yielder.tick();
             match op {
                 PairOp::Insert(pair, rank) => held.push((pair, rank)),
                 PairOp::Remove(pair, rank) => {
@@ -1412,8 +1438,13 @@ where
     ) -> Result<()> {
         let target = match logged {
             Some(logged) => {
-                let target = fold_ops(element_ops(&self.key, &logged.elements)?, bag);
-                logged.elements = Elements::default();
+                let yielder = rt.yielder_under_lock();
+                let target = fold_ops(
+                    element_ops(&self.key, &logged.elements, &yielder)?,
+                    bag,
+                    &yielder,
+                );
+                mem::take(&mut logged.elements).drop_ticking(&yielder);
                 target
             }
             None => Vec::new(),
@@ -1442,7 +1473,11 @@ where
         Ok(None)
     }
 
-    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>> {
+    fn fold<'a>(
+        &'a self,
+        logged: Option<&'a LoggedKey>,
+        yielder: &Yielder<'_>,
+    ) -> Result<Folded<'a>> {
         let (epoch, handles) = self.keyed.pair_handles();
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
         if handles.is_empty() && !has_value {
@@ -1451,6 +1486,7 @@ where
         let mut logged_pairs = handles.into_iter().peekable();
         let mut unlogged = Vec::new();
         while let Some(&handle) = logged_pairs.peek() {
+            yielder.tick();
             let element = self.keyed.with_pair(epoch, handle, |pair, rank| {
                 (rank == UNLOGGED_RANK).then(|| encode(&self.key, pair))
             });
@@ -1515,11 +1551,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.declare(state, key, Kind::Collection, || Ok(Vec::new()))?;
         let logged = state.logged.get_mut(key);
         let ops = match &logged {
-            Some(logged) => element_ops::<P>(key, &logged.elements)?,
+            Some(logged) => {
+                element_ops::<P>(key, &logged.elements, &self.runtime.yielder_under_lock())?
+            }
             None => Vec::new(),
         };
         if let Some(logged) = logged {
-            logged.elements = Elements::default();
+            mem::take(&mut logged.elements).drop_ticking(&self.runtime.yielder_under_lock());
         }
         let keyed = KeyedCollection::new(&self.runtime);
         let rows = Arc::new(KeyedRows {
@@ -1556,6 +1594,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         guard.disarm();
         drop(hold);
         keep_changed(&state.after, change);
+
         let keyed = binding.keyed.clone();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedKeyed { id, keyed })

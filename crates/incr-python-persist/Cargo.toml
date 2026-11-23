@@ -14,7 +14,7 @@ doc = false
 conformance = ["incr-persist/backend-tests"]
 
 [dependencies]
-incr-core.workspace = true
-incr-persist = { path = "../incr-persist" }
+incr-core = { workspace = true, features = ["yield-hook"] }
+incr-persist = { path = "../incr-persist", features = ["yield-hook"] }
 incr-python-protocol = { path = "../incr-python-protocol", features = ["persist"] }
 pyo3 = "0.26"

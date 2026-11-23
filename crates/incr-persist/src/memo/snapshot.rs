@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use incr_core::persist_hooks::{changed_at_erased, Deferred};
-use incr_core::{in_value_code, ErasedIncr, Runtime};
+use incr_core::{in_value_code, ErasedIncr, Runtime, Yielder};
 
 use super::checkpoint::Fate;
 use super::dirty::Record;
@@ -99,15 +99,28 @@ impl<C: MemoCells> CoreRef<C> {
         let mut dead = Vec::new();
         let (snaps, clean, moved) = {
             let mut state = self.lock_memo();
+            let yielder = rt.yielder_under_lock();
             // Dead nodes never match a live handle, so pruning them can
             // wait until the map has doubled: linear time per prune,
             // amortized over the inserts since the last one.
             if state.seed_info.len() >= 2 * state.pruned_at.max(1024) {
-                state.seed_info.retain(|&handle, _| rt.is_alive(handle));
-                state.seed_keys.retain(|&handle, _| rt.is_alive(handle));
+                state.seed_info.retain(|&handle, _| {
+                    yielder.tick();
+                    rt.is_alive(handle)
+                });
+                state.seed_keys.retain(|&handle, _| {
+                    yielder.tick();
+                    rt.is_alive(handle)
+                });
                 state.pruned_at = state.seed_info.len();
             }
-            let dirty = self.dirty.attempt(|handle| rt.is_alive(handle), &mut dead);
+            let dirty = self.dirty.attempt(
+                |handle| {
+                    yielder.tick();
+                    rt.is_alive(handle)
+                },
+                &mut dead,
+            );
             attempt.started = true;
             // The read hold excludes every mapped write, and each finishes
             // its walk inside its own hold, so a Clean entry over mapped
@@ -119,6 +132,7 @@ impl<C: MemoCells> CoreRef<C> {
             for same in by_table.chunk_by(|a, b| a.table == b.table) {
                 let table = &self.tables[same[0].table as usize];
                 for batch in same.chunks(VALUE_BATCH) {
+                    yielder.tick_by(batch.len());
                     table.inspect_dirty(rt, &map, self.id, batch, &mut snaps, &mut bag);
                 }
             }
@@ -127,17 +141,28 @@ impl<C: MemoCells> CoreRef<C> {
             // over its new value; dropping it drops them as unmapped.
             let (mut snaps, moved): (Vec<_>, Vec<_>) = snaps
                 .into_iter()
+                .inspect(|_| yielder.tick())
                 .partition(|snap| changed_at_erased(rt, snap.handle) == Some(snap.stamp));
             {
-                let taken: HashSet<ErasedIncr> = snaps.iter().map(|snap| snap.handle).collect();
+                let taken: HashSet<ErasedIncr> = snaps
+                    .iter()
+                    .inspect(|_| yielder.tick())
+                    .map(|snap| snap.handle)
+                    .collect();
                 for record in &dirty {
+                    yielder.tick();
                     if !taken.contains(&record.handle) {
                         self.dirty.carry(record);
                     }
                 }
             }
-            let dirty: HashSet<ErasedIncr> = dirty.iter().map(|record| record.handle).collect();
+            let dirty: HashSet<ErasedIncr> = dirty
+                .iter()
+                .inspect(|_| yielder.tick())
+                .map(|record| record.handle)
+                .collect();
             for snap in &mut snaps {
+                yielder.tick();
                 snap.seeded = state
                     .seed_info
                     .get(&snap.handle)
@@ -150,6 +175,7 @@ impl<C: MemoCells> CoreRef<C> {
             let mut clean: HashMap<ErasedIncr, Clean> = HashMap::new();
             for snap in &snaps {
                 for dep in &snap.deps {
+                    yielder.tick();
                     let LiveDep::Query(handle) = *dep else {
                         continue;
                     };
@@ -186,9 +212,20 @@ impl<C: MemoCells> CoreRef<C> {
             let entry = index.read(&*self.backend, table, key).ok()??;
             (fingerprint(&entry.value) == fp).then_some(entry.value)
         };
-        let found = fresh(snaps, &clean, self.scope.as_ref(), &stored, &mut mismatches);
+        let found = fresh(
+            snaps,
+            &clean,
+            self.scope.as_ref(),
+            &stored,
+            &mut mismatches,
+            &rt.yielder_under_lock(),
+        );
         drop(index);
-        drop(clean);
+        let yielder = rt.yielder_under_lock();
+        for dep in clean {
+            yielder.tick();
+            drop(dep);
+        }
         let snapshot = started.elapsed();
         if found.entries.is_empty() {
             attempt.saved = true;
@@ -207,15 +244,17 @@ impl<C: MemoCells> CoreRef<C> {
             return Ok(stats);
         }
         let known = self.index().layers.clone();
-        let done = self.backend.checkpoint(
-            CheckpointInput {
-                build: self.build,
-                tables: self.catalog.clone(),
-                fresh: found.entries,
-                max_bytes: self.max_bytes,
-            },
-            &known,
-        );
+        let done = rt.with_ambient_under_lock(|| {
+            self.backend.checkpoint(
+                CheckpointInput {
+                    build: self.build,
+                    tables: self.catalog.clone(),
+                    fresh: found.entries,
+                    max_bytes: self.max_bytes,
+                },
+                &known,
+            )
+        });
         drop(known);
         let mut state = self.lock_memo();
         for mismatch in mismatches {
@@ -225,6 +264,7 @@ impl<C: MemoCells> CoreRef<C> {
         attempt.saved = true;
         done.stats.times.snapshot = snapshot;
         self.swap_index(IndexGen::new(done.chain, self.build, &self.catalog));
+
         state.stats.checkpoints += 1;
         state.stats.delta_checkpoints += u64::from(done.stats.delta);
         state.stats.compactions += u64::from(done.stats.compacted);
@@ -233,7 +273,11 @@ impl<C: MemoCells> CoreRef<C> {
         let mut saved = Vec::new();
         {
             let dirty = &self.dirty;
+            let yielder = rt.yielder_under_lock();
+            state.seed_info.reserve(done.fates.len());
+            state.seed_keys.reserve(done.fates.len());
             for (fate, origin) in done.fates.iter().zip(&found.origin) {
+                yielder.tick();
                 match fate {
                     Fate::Written => {
                         saved.extend(dirty.saved(origin.handle, origin.mark));
@@ -337,6 +381,7 @@ fn fresh(
     scope: Option<&ValueScope>,
     stored: &StoredAt<'_>,
     mismatches: &mut Vec<EncodeMismatch>,
+    yielder: &Yielder<'_>,
 ) -> Found {
     let mut note = |r: Result<Vec<u8>, EncodeMismatch>| match r {
         Ok(bytes) => Some(bytes),
@@ -347,6 +392,7 @@ fn fresh(
     };
     let mut encoded: Vec<Option<(Vec<u8>, Vec<u8>)>> = Vec::with_capacity(snaps.len());
     for batch in snaps.chunks(VALUE_BATCH) {
+        yielder.tick_by(batch.len());
         hold(scope, || {
             encoded.extend(batch.iter().map(|snap| {
                 #[cfg(test)]
@@ -359,6 +405,7 @@ fn fresh(
     }
     // Outside the holds: `stored` reads the backend, which takes its lock.
     for (snap, bytes) in snaps.iter().zip(&mut encoded) {
+        yielder.tick();
         let (Some(fp), Some((key, value))) = (snap.seeded, bytes) else {
             continue;
         };
@@ -371,12 +418,14 @@ fn fresh(
     let mut by_handle: HashMap<ErasedIncr, (u32, Vec<u8>, u128)> = snaps
         .iter()
         .zip(&encoded)
+        .inspect(|_| yielder.tick())
         .filter_map(|(snap, bytes)| {
             let (key, value) = bytes.as_ref()?;
             Some((snap.handle, (snap.table, key.clone(), fingerprint(value))))
         })
         .collect();
     for (&handle, dep) in clean {
+        yielder.tick();
         by_handle.insert(handle, (dep.table, dep.key.clone(), dep.fp));
     }
     let mut found = Found {
@@ -384,7 +433,8 @@ fn fresh(
         origin: Vec::new(),
         unsaveable: 0,
     };
-    for (snap, bytes) in snaps.iter().zip(encoded) {
+    for (snap, bytes) in snaps.into_iter().zip(encoded) {
+        yielder.tick();
         let Some((key, value)) = bytes.filter(|_| !snap.in_group) else {
             found.unsaveable += 1;
             continue;
@@ -392,6 +442,7 @@ fn fresh(
         let deps: Option<Vec<StoredDep>> = snap
             .deps
             .iter()
+            .inspect(|_| yielder.tick())
             .map(|dep| match dep {
                 LiveDep::Stored(stored) => Some(stored.clone()),
                 LiveDep::Query(handle) => {

@@ -4390,6 +4390,7 @@ impl<C: Cells> Runtime<C> {
                     // One call site, so the compute inlines once into this
                     // frame, which every panic of a replayed run unwinds
                     // through.
+                    self.maybe_yield();
                     self.compute_one::<VIRT>(
                         id,
                         visit,

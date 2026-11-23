@@ -7,7 +7,7 @@ use std::sync::Arc;
 use incr_core::persist_hooks::{self, Deferred, Displaced, RepSide, RepSink};
 use incr_core::{
     with_value_code, Cells, ElementSlot, ElementsStamp, ErasedIncr, Incr, IncrCollection, Runtime,
-    Value,
+    Value, Yielder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -262,7 +262,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.declare(state, key, Kind::Collection, || Ok(Vec::new()))?;
         let logged = state.logged.get_mut(key);
         let elements = match &logged {
-            Some(logged) => decode_elements::<T>(key, &logged.elements, &state.after)?,
+            Some(logged) => decode_elements::<T>(
+                key,
+                &logged.elements,
+                &state.after,
+                &self.runtime.yielder_under_lock(),
+            )?,
             None => HashMap::new(),
         };
         if let Some(logged) = logged {
@@ -497,9 +502,10 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
     /// so every process lists the same elements in the same order. Keeps
     /// 16 bytes per element rather than its encoding, which the caller
     /// makes again as it yields.
-    fn ranked_slots(&self) -> Result<(ElementsStamp, Vec<ElementSlot>)> {
+    fn ranked_slots(&self, yielder: &Yielder<'_>) -> Result<(ElementsStamp, Vec<ElementSlot>)> {
         let mut slots = Vec::new();
         let stamp = self.collection.visit_elements(|slot, value, _| {
+            yielder.tick();
             let element = encode(&self.key, value)?;
             slots.push(((fp_of(&element) >> 64) as u64, slot));
             Ok::<(), Error>(())
@@ -507,6 +513,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         slots.sort_unstable_by_key(|&(fp, _)| fp);
         let mut at = 0;
         while at < slots.len() {
+            yielder.tick();
             let run = slots[at..]
                 .iter()
                 .take_while(|&&(fp, _)| fp == slots[at].0)
@@ -623,9 +630,11 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         spent: &mut Spent<T>,
     ) -> Option<DepFp> {
         let mut guard = PanicGuard::new(map, &self.key);
+        let yielder = rt.yielder_under_lock();
         for (value, &have) in &plan.current {
             let want = plan.kept(value, &plan.target);
             for _ in want..have {
+                yielder.tick();
                 persist_hooks::collection_delete(
                     rt,
                     &self.collection,
@@ -638,6 +647,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         for (value, &want) in &plan.target {
             let have = plan.kept(value, &plan.current);
             for _ in have..want {
+                yielder.tick();
                 let value = with_value_code(|| value.clone());
                 persist_hooks::collection_insert(
                     rt,
@@ -739,7 +749,8 @@ where
     ) -> Result<()> {
         let target = match logged {
             Some(logged) => {
-                let target = decode_elements(&self.key, &logged.elements, bag)?;
+                let target =
+                    decode_elements(&self.key, &logged.elements, bag, &rt.yielder_under_lock())?;
                 logged.elements = Elements::default();
                 target
             }
@@ -769,8 +780,12 @@ where
         Ok(None)
     }
 
-    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>> {
-        let (stamp, slots) = self.ranked_slots()?;
+    fn fold<'a>(
+        &'a self,
+        logged: Option<&'a LoggedKey>,
+        yielder: &Yielder<'_>,
+    ) -> Result<Folded<'a>> {
+        let (stamp, slots) = self.ranked_slots(yielder)?;
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
         if slots.is_empty() && !has_value {
             return Ok(Box::new(std::iter::empty()));
@@ -851,13 +866,16 @@ fn decode_elements<T: Hash + Eq + DeserializeOwned + Send + 'static>(
     key: &str,
     elements: &Elements,
     bag: &AfterLock,
+    yielder: &Yielder<'_>,
 ) -> Result<HashMap<T, usize>> {
     let mut counts = HashMap::new();
     with_value_code(|| -> Result<()> {
         for (bytes, n) in elements.live() {
+            yielder.tick();
             add(&mut counts, decode(key, bytes)?, n, bag);
         }
         for op in elements.tail() {
+            yielder.tick();
             match op {
                 ElementOp::Insert(bytes) => add(&mut counts, decode(key, bytes)?, 1, bag),
                 ElementOp::Remove(bytes) => {

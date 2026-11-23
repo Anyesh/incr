@@ -59,6 +59,7 @@ use crate::persist_hooks::{RepSide, RepSink};
 use crate::runtime::{ParkPoint, Runtime};
 use crate::value::Value;
 use crate::value_code;
+use crate::yield_hook::{with_ticks, Ticks};
 
 #[path = "collection_apply.rs"]
 mod apply;
@@ -1104,9 +1105,16 @@ where
         // starts past everything the snapshot covered.
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         {
-            let seeded: Vec<U> = bootstrap.into_iter().filter_map(&image).collect();
+            let yielder = rt.yielder();
+            let seeded: Vec<U> = bootstrap
+                .into_iter()
+                .inspect(|_| yielder.tick())
+                .filter_map(&image)
+                .collect();
             let mut out = output_log.write();
+            let yielder = rt.yielder_under_lock();
             for v in seeded {
+                yielder.tick();
                 out.insert(v);
             }
         }
@@ -1139,21 +1147,32 @@ where
             };
             let to = from + pending.len() as u64;
 
-            let staged: Vec<Staged<U>> = pending
-                .into_iter()
-                .filter_map(|d| match d {
-                    Delta::Insert(v) => image(v).map(Delta::Insert),
-                    Delta::Delete(v) => image(v).map(Delta::Delete),
-                })
-                .map(|d| Staged::delta(&out_hasher, d))
-                .collect();
+            let delta_image = |d| match d {
+                Delta::Insert(v) => image(v).map(Delta::Insert),
+                Delta::Delete(v) => image(v).map(Delta::Delete),
+            };
+            let staged: Vec<Staged<U>> = with_ticks!(rt.hook(), |ticks| if ticks.is_active() {
+                pending
+                    .into_iter()
+                    .inspect(|_| ticks.tick())
+                    .filter_map(delta_image)
+                    .map(|d| Staged::delta(&out_hasher, d))
+                    .collect()
+            } else {
+                pending
+                    .into_iter()
+                    .filter_map(delta_image)
+                    .map(|d| Staged::delta(&out_hasher, d))
+                    .collect()
+            });
 
             let mut out = output_log_for_query.write();
-            rebuild.guard(|| {
+            with_ticks!(rt.hook_under_lock(), |ticks| rebuild.guard(|| {
                 for change in staged {
+                    ticks.tick();
                     out.apply_kept(change, &mut keep);
                 }
-            });
+            }));
             cursor.store(to, MemOrdering::Release);
             let version = out.version;
             drop(out);
@@ -1184,13 +1203,17 @@ where
             let up = upstream_log.read();
             let from = cursor.load(MemOrdering::Acquire);
             if from < up.end() {
-                let mut delta = 0_i64;
-                for d in up.pending_from(from) {
-                    match d {
-                        Delta::Insert(_) => delta += 1,
-                        Delta::Delete(_) => delta -= 1,
+                let delta = with_ticks!(rt.hook_under_lock(), |ticks| {
+                    let mut delta = 0_i64;
+                    for d in up.pending_from(from) {
+                        ticks.tick();
+                        match d {
+                            Delta::Insert(_) => delta += 1,
+                            Delta::Delete(_) => delta -= 1,
+                        }
                     }
-                }
+                    delta
+                });
                 running_for_query.fetch_add(delta, MemOrdering::Relaxed);
                 cursor.store(up.end(), MemOrdering::Release);
             }

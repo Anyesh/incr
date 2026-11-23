@@ -17,8 +17,8 @@ conformance = ["incr-persist/backend-tests", "incr-python-persist/conformance"]
 
 [dependencies]
 incr_compute = { package = "incr-compute", version = "=0.2.0-beta.12", path = "../incr-compute" }
-incr-core.workspace = true
-incr-persist = { path = "../incr-persist" }
+incr-core = { workspace = true, features = ["yield-hook"] }
+incr-persist = { path = "../incr-persist", features = ["yield-hook"] }
 incr-python-persist = { path = "../incr-python-persist" }
 incr-python-protocol = { path = "../incr-python-protocol", features = ["persist"] }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }

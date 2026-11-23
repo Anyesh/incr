@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
+#[cfg(feature = "yield-hook")]
+use incr_core::YieldHook;
 use incr_core::{
-    in_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value,
+    in_value_code, with_value_code, Cells, DeleteError, Incr, RoutingHold, Runtime, Value, Yielder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -94,6 +96,10 @@ pub struct Options {
     /// store runs, on any thread, see it. Value code the caller runs
     /// outside a store call enters it with [`Store::enter_value_scope`].
     pub value_scope: Option<ValueScope>,
+    /// The hook of the store's runtime, which restores, checkpoints and
+    /// catch-ups also call (`Runtime::set_yield_hook`).
+    #[cfg(feature = "yield-hook")]
+    pub yield_hook: Option<YieldHook>,
 }
 
 /// What [`Store::stats`] reports.
@@ -469,8 +475,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// Replay only folds records; a key's runtime node is created when this
     /// process declares it with [`Store::input`].
     pub fn open(backend: B, options: Options) -> Result<Self> {
+        #[cfg_attr(not(feature = "yield-hook"), allow(unused_mut))]
+        let mut runtime = Runtime::new();
+        #[cfg(feature = "yield-hook")]
+        runtime.set_yield_hook(options.yield_hook.clone());
         let store = Store {
-            runtime: Runtime::new(),
+            runtime,
             backend,
             options,
             state: Mutex::new(State {
@@ -892,7 +902,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 )?;
             }
             let upto = state.applied;
-            let mut fold = SnapshotFold::new(state);
+            let mut fold = SnapshotFold::new(state, self.runtime.yielder_under_lock());
+
             let result = self.backend.compact_streamed(upto, &mut fold);
             let pulled = fold.finish(result.is_ok());
             let result = match (result, pulled) {
@@ -1021,6 +1032,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// engine runs as value code under the mutex gets the error too, and a
     /// call from value code returns [`Error::Reentrant`] instead of
     /// panicking.
+    fn drained(&self) -> Drained<'_> {
+        let drained = Drained::new(self.options.value_scope.as_ref());
+        #[cfg(feature = "yield-hook")]
+        let drained = drained.ticking(self.runtime.yield_hook());
+        drained
+    }
+
     fn state(&self) -> Result<Locked<'_, C>> {
         if self.holder.is_current() {
             return Err(Error::Reentrant);
@@ -1046,7 +1064,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             guard,
             _routing: routing,
             _scope: self.enter_value_scope(),
-            drained: Drained::new(self.options.value_scope.as_ref()),
+            drained: self.drained(),
         })
     }
 
@@ -1139,7 +1157,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if state.applied.0 + len != last.0 {
             return self.catch_up(state, Some(first..=last));
         }
+        let yielder = self.runtime.yielder_under_lock();
         for (position, record) in (first.0..).map(Position).zip(records) {
+            yielder.tick();
             self.apply_at(state, position, record, Origin::Local)?;
         }
         Ok(())
@@ -1161,6 +1181,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.reconcile_snapshot(state)?;
         let start = state.applied;
         let mut read = Vec::new();
+        let yielder = self.runtime.yielder_under_lock();
         loop {
             read.clear();
             match self.backend.read_from(state.applied, &mut read)? {
@@ -1168,6 +1189,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 ReadOutcome::Records => {
                     let progressed = !read.is_empty();
                     for (position, record) in read.drain(..) {
+                        yielder.tick();
                         let origin = match &own {
                             Some(run) if run.contains(&position) => Origin::Local,
                             _ => Origin::Foreign,
@@ -1342,7 +1364,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         records: impl IntoIterator<Item = Record>,
     ) -> Result<()> {
         let mut logged = LoggedKeys::new();
+        let yielder = self.runtime.yielder_under_lock();
         for record in records {
+            yielder.tick();
             fold(&mut logged, record);
         }
         let notify = !state.subscribers.is_empty();
@@ -1359,6 +1383,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         };
         let mut changes = Vec::new();
         for key in &keys {
+            yielder.tick();
             let sink = notify.then_some(&mut changes);
             if let Err(e) = self.replace_key(state, key, logged.get_mut(key), sink) {
                 state.poison();
@@ -1472,6 +1497,7 @@ struct SnapshotFold<'a, C: Cells> {
     current: Option<(&'a str, Folded<'a>, bool)>,
     forgotten: Vec<String>,
     failed: bool,
+    yielder: Yielder<'a>,
 }
 
 /// How far a backend pulled a [`SnapshotFold`].
@@ -1485,7 +1511,7 @@ enum Pulled {
 }
 
 impl<'a, C: Cells> SnapshotFold<'a, C> {
-    fn new(state: &'a State<C>) -> Self {
+    fn new(state: &'a State<C>, yielder: Yielder<'a>) -> Self {
         let keys: BTreeSet<&str> = state
             .logged
             .keys()
@@ -1498,6 +1524,7 @@ impl<'a, C: Cells> SnapshotFold<'a, C> {
             current: None,
             forgotten: Vec::new(),
             failed: false,
+            yielder,
         }
     }
 
@@ -1520,7 +1547,7 @@ impl<'a, C: Cells> SnapshotFold<'a, C> {
     fn fold_key(&self, key: &'a str) -> Result<Folded<'a>> {
         let logged = self.state.logged.get(key);
         Ok(match self.state.bound.get(key) {
-            Some(&id) => self.state.bindings[&id].fold(logged)?,
+            Some(&id) => self.state.bindings[&id].fold(logged, &self.yielder)?,
             None => match logged {
                 Some(logged) if !logged.at_default() => Box::new(logged.iter_records(key).map(Ok)),
                 _ => Box::new(std::iter::empty()),
@@ -1533,6 +1560,7 @@ impl<C: Cells> Iterator for SnapshotFold<'_, C> {
     type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Result<Record>> {
+        self.yielder.tick();
         while !self.failed {
             if let Some((key, records, pulled)) = &mut self.current {
                 match records.next() {
