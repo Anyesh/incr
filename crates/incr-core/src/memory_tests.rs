@@ -2,10 +2,13 @@
 
 use std::any::TypeId;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::IncrCollection;
-use crate::memory::{Held, MemoryStats, NodeKind, StateKind, StateMemory, StateStats};
+use crate::memory::{
+    Held, MemoryStats, MemoryWalker, NodeKind, StateKind, StateMemory, StateStats,
+};
 use crate::runtime::Runtime;
 
 macro_rules! both {
@@ -36,6 +39,9 @@ both!(
     memory_stats_prune_dead_weaks,
     memory_stats_registry_stays_bounded_without_walks,
     memory_stats_report_registered_external_state,
+    memory_walker_steps_add_up_to_memory_stats,
+    memory_walker_reads_a_reused_slot_as_it_is_when_reached,
+    memory_walker_skips_state_dropped_mid_walk,
 );
 
 fn kind_count(stats: &MemoryStats, kind: NodeKind) -> usize {
@@ -258,4 +264,106 @@ fn shared_memory_stats_survives_concurrent_collection_creation() {
             });
         }
     });
+}
+
+fn walk_out<C: Cells>(
+    rt: &Runtime<C>,
+    walker: &mut MemoryWalker,
+    walked: &mut MemoryStats,
+) -> usize {
+    let mut steps = 1;
+    while !walker.step(rt, walked, Some(Instant::now())) {
+        steps += 1;
+    }
+    steps
+}
+
+fn memory_walker_steps_add_up_to_memory_stats<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let inputs: Vec<_> = (0..30_u64).map(|i| rt.create_input(i)).collect();
+    let queries: Vec<_> = inputs
+        .iter()
+        .map(|&i| rt.create_query(move |rt| rt.get(i) * 2))
+        .collect();
+    for (n, &q) in queries.iter().enumerate() {
+        rt.get(q);
+        rt.set_label(q.slot(), format!("pay{}/{n}", n % 3));
+    }
+    let col: IncrCollection<u64, C> = rt.create_collection();
+    col.extend(&rt, 0..50_u64);
+    let total = col.aggregate(&rt, 0_u64, |v| *v, |a, b| a + b);
+    let grouped = col.group_by(&rt, |v| v % 5);
+    rt.get(total);
+    rt.get(grouped.version_node());
+    rt.set_label(col.version_node().slot(), "shifts/rows".to_string());
+    rt.delete_node(queries[7]);
+
+    let mut walker = rt.memory_walker();
+    walker.set_batch(4);
+    let mut walked = MemoryStats::default();
+    let steps = walk_out(&rt, &mut walker, &mut walked);
+    let whole = rt.memory_stats();
+    assert_eq!(walked, whole);
+    assert!(
+        steps > whole.states.len() + whole.nodes.len() / 4,
+        "the walk ran in {steps} steps, not one unit per step"
+    );
+    assert!(walker.is_finished());
+    assert!(walker.step(&rt, &mut walked, None));
+    assert_eq!(walked, whole, "a finished walk reports nothing more");
+}
+
+fn memory_walker_reads_a_reused_slot_as_it_is_when_reached<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let inputs: Vec<_> = (0..20_u64).map(|i| rt.create_input(i)).collect();
+    rt.set_label(inputs[15].slot(), "old/input".to_string());
+
+    let mut walker = rt.memory_walker();
+    walker.set_batch(4);
+    let mut walked = MemoryStats::default();
+    assert!(!walker.step(&rt, &mut walked, Some(Instant::now())));
+    assert_eq!(walked.nodes.len(), 4, "one batch of slots per step");
+
+    rt.delete_node(inputs[15]);
+    let reused = rt.create_query(|_| 7_u64);
+    assert_eq!(reused.slot(), inputs[15].slot());
+    rt.set_label(reused.slot(), "new/query".to_string());
+    let after_start = rt.create_input(99_u64);
+    assert!(after_start.slot() >= 20);
+
+    walk_out(&rt, &mut walker, &mut walked);
+    assert_eq!(
+        walked.nodes.len(),
+        20,
+        "slots made after the walk began are not read"
+    );
+    let at_15: Vec<_> = walked.nodes.iter().filter(|n| n.slot == 15).collect();
+    assert_eq!(at_15.len(), 1);
+    assert_eq!(at_15[0].kind, NodeKind::Query);
+    assert_eq!(at_15[0].label.as_deref(), Some("new/query"));
+    assert_eq!(walked.free_slots, 0);
+
+    let mut whole = rt.memory_stats();
+    whole.nodes.retain(|n| n.slot != after_start.slot());
+    assert_eq!(walked.nodes, whole.nodes);
+}
+
+fn memory_walker_skips_state_dropped_mid_walk<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let kept: IncrCollection<u64, C> = rt.create_collection();
+    kept.extend(&rt, 0..10_u64);
+    let dropped: IncrCollection<u64, C> = rt.create_collection();
+    dropped.extend(&rt, 0..5_u64);
+
+    let mut walker = rt.memory_walker();
+    let mut walked = MemoryStats::default();
+    assert!(!walker.step(&rt, &mut walked, Some(Instant::now())));
+    assert_eq!(walked.states.len(), 1, "one state per step");
+    rt.delete_node(dropped.version_node());
+    drop(dropped);
+
+    walk_out(&rt, &mut walker, &mut walked);
+    assert_eq!(walked.states.len(), 1);
+    assert_eq!(walked.states[0].elements, 10);
+    assert_eq!(walked, rt.memory_stats());
 }

@@ -1590,6 +1590,16 @@ impl PyRuntime {
         Ok(())
     }
 
+    /// Each collection's internal version node slot with the slot of the
+    /// node its `version_node` getter hands out.
+    fn bridge_slots(&self) -> HashMap<u32, u32> {
+        self.version_bridges
+            .borrow()
+            .iter()
+            .map(|(version, bridge)| (version.slot(), bridge.slot()))
+            .collect()
+    }
+
     fn rt(&self) -> PyResult<&Runtime> {
         match &self.holder {
             Holder::Owned(rt) => Ok(rt),
@@ -2149,14 +2159,28 @@ impl PyRuntime {
     /// reference; the other figures leave them out. Walks the whole graph,
     /// except for `kept_traces`, which is a running total.
     fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let stats = self.engine_read(|rt| rt.memory_stats())?;
-        let bridges = self
-            .version_bridges
-            .borrow()
-            .iter()
-            .map(|(version, bridge)| (version.slot(), bridge.slot()))
-            .collect();
-        memory::stats_dict(py, &stats, self.state.callables(), &bridges)
+        let mut tally = memory::Tally::new(self.bridge_slots());
+        self.engine_read(|rt| rt.memory_walker().step(rt, &mut tally, None))?;
+        Ok(tally
+            .to_dict(py, self.state.callables())?
+            .expect("an unbudgeted step ends the walk"))
+    }
+
+    /// `memory_stats()` in parts, for a caller that must keep its thread
+    /// responsive: `walker.step(budget_seconds)` walks for about that long
+    /// and returns True once the walk has ended, then `walker.result()`
+    /// returns the dict. On a runtime that does not change between steps
+    /// the result equals `memory_stats()`; changes made between steps can
+    /// make the figures mix moments.
+    fn memory_walker(slf: &Bound<'_, Self>) -> PyResult<memory::PyMemoryWalker> {
+        let this = slf.borrow();
+        let walker = this.engine_read(|rt| rt.memory_walker())?;
+        let tally = memory::Tally::new(this.bridge_slots());
+        Ok(memory::PyMemoryWalker::new(
+            slf.clone().unbind(),
+            walker,
+            tally,
+        ))
     }
 
     /// `{"groups": [{"label", "kind", "nodes"}], "edges": [{"from", "to",
@@ -2273,6 +2297,7 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("_NotReadySignal", m.py().get_type::<_NotReadySignal>())?;
     m.add_class::<PyNotReady>()?;
+    m.add_class::<memory::PyMemoryWalker>()?;
     m.add_class::<PyPending>()?;
     m.add_class::<PyLookupFailed>()?;
     m.add_class::<PyUnavailable>()?;

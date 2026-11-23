@@ -36,11 +36,11 @@ pub use incr_core::{
 pub use incr_core::{
     Change, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher,
     FxHasher, GridKey, GridTable as GridTableInner, GroupedCollection as GroupedCollectionInner,
-    Held, Incr, IncrCollection as IncrCollectionInner, MemoryStats, NodeId, NodeInfo, NodeKind,
-    NodeKindInfo, NodeMemory, NodeState, NodeTable as NodeTableInner, NodeTrace, ObserverId,
-    PropagationTrace, QueryOpts, Replay, RuntimeId, SortDelta,
-    SortedCollection as SortedCollectionInner, StateKind, StateMemory, StateStats, TableKey,
-    TraceAction, Value, ValueType, DEFAULT_MAX_FRAMES,
+    Held, Incr, IncrCollection as IncrCollectionInner, KeptTraceMemory, Labels, MemoryStats,
+    MemoryVisitor, MemoryWalker, NodeId, NodeInfo, NodeKind, NodeKindInfo, NodeMemory, NodeState,
+    NodeTable as NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay,
+    RuntimeId, SortDelta, SortedCollection as SortedCollectionInner, StateKind, StateMemory,
+    StateStats, TableKey, TraceAction, Value, ValueType, WalkEnd, DEFAULT_MAX_FRAMES,
 };
 
 /// Single-threaded runtime: `Runtime<Local>`. Not `Send`/`Sync`. Use the
@@ -74,11 +74,11 @@ mod reexports {
             set_aside_cycle_unwind, take_last_cycle, with_value_code, Change, Cycle, CycleStrategy,
             DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher, GridKey, GridTable,
             GridTableInner, GroupedCollection, GroupedCollectionInner, Held, Incr, IncrCollection,
-            IncrCollectionInner, MemoryStats, NodeId, NodeInfo, NodeKind, NodeKindInfo, NodeMemory,
-            NodeState, NodeTable, NodeTableInner, NodeTrace, ObserverId, PropagationTrace,
-            QueryOpts, Replay, Runtime, RuntimeId, SortDelta, SortedCollection,
-            SortedCollectionInner, StateKind, StateMemory, StateStats, TableKey, TraceAction,
-            Value, ValueType, DEFAULT_MAX_FRAMES,
+            IncrCollectionInner, KeptTraceMemory, Labels, MemoryStats, MemoryVisitor, MemoryWalker,
+            NodeId, NodeInfo, NodeKind, NodeKindInfo, NodeMemory, NodeState, NodeTable,
+            NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay, Runtime,
+            RuntimeId, SortDelta, SortedCollection, SortedCollectionInner, StateKind, StateMemory,
+            StateStats, TableKey, TraceAction, Value, ValueType, WalkEnd, DEFAULT_MAX_FRAMES,
         };
 
         fn named<T: ?Sized>() {}
@@ -136,6 +136,11 @@ mod reexports {
         named::<StateKind>();
         named::<StateMemory>();
         named::<dyn StateStats>();
+        named::<dyn MemoryVisitor>();
+        named::<MemoryWalker>();
+        named::<Labels<'static>>();
+        named::<WalkEnd>();
+        named::<KeptTraceMemory>();
         named::<ValueType>();
         value::<u32>();
         with_value_code(|| ());

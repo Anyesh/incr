@@ -223,6 +223,7 @@ LOCAL_SOURCES = [
 def test_the_local_scan_covers_the_files_with_pymethods():
     assert {
         "incr-python/src/lib.rs",
+        "incr-python/src/memory.rs",
         "incr-python-persist/src/persist_classes.rs",
     } <= set(LOCAL_SOURCES)
 
