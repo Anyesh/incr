@@ -119,6 +119,19 @@ fn a_filter_rejecting_every_delta_calls_the_hook() {
 }
 
 #[test]
+fn filtering_a_filled_collection_to_nothing_calls_the_hook() {
+    let c = Counted::<Local>::new();
+    let col = c.rt.create_collection::<u64>();
+    col.extend(&c.rt, 0..N);
+    let (calls, value) = c.calls_during(|rt| {
+        let none = col.filter(rt, |_| false).count(rt);
+        rt.get(none)
+    });
+    assert_eq!(value, 0);
+    assert!(calls >= BATCHES, "{calls} calls filtering {N} elements");
+}
+
+#[test]
 fn a_count_partition_matching_nothing_calls_the_hook() {
     let c = Counted::<Local>::new();
     let col = c.rt.create_collection::<u64>();
