@@ -23,7 +23,7 @@ fn keep<C: Cells, V: Send + Sync + 'static>(
     held: V,
 ) {
     let mut held = Some(held);
-    let kept = rt.kept_trace(&capture, trace, |_| {
+    let kept = rt.kept_trace(&capture, trace, |_, _| {
         held.take().map_or(StepValue::None, StepValue::Ref)
     });
     rt.retain_trace(capture, kept);
@@ -347,7 +347,7 @@ fn a_capture_from_another_runtime_is_refused<C: Cells>() {
     }
     let other: Runtime<C> = Runtime::new();
     let (_, trace, capture) = traced.get_traced_retaining(q);
-    let foreign = traced.kept_trace(&capture, &trace, |_| StepValue::<Tag>::None);
+    let foreign = traced.kept_trace(&capture, &trace, |_, _| StepValue::<Tag>::None);
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         other.retain_trace(capture, foreign);
     }));
@@ -367,7 +367,7 @@ fn a_trace_for_another_capture_or_shared_is_refused<C: Cells>() {
     let (_, p, _) = counted(&rt);
     rt.delete_node(p);
     let (_, trace, first) = rt.get_traced_retaining(q);
-    let kept = rt.kept_trace(&first, &trace, |_| StepValue::<Tag>::None);
+    let kept = rt.kept_trace(&first, &trace, |_, _| StepValue::<Tag>::None);
     let clone = kept.clone();
     let shared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.retain_trace(first, kept);
@@ -382,7 +382,7 @@ fn a_trace_for_another_capture_or_shared_is_refused<C: Cells>() {
     );
     let (_, trace, other) = rt.get_traced_retaining(q);
     let (_, _, wrong) = rt.get_traced_retaining(reused);
-    let kept = rt.kept_trace(&other, &trace, |_| StepValue::<Tag>::None);
+    let kept = rt.kept_trace(&other, &trace, |_, _| StepValue::<Tag>::None);
     let foreign = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.retain_trace(wrong, kept);
     }));

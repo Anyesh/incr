@@ -197,13 +197,23 @@ impl KeptTrace {
         generation: u32,
         trace: &PropagationTrace,
         step_generation: impl Fn(u32) -> u32,
-        value: impl FnMut(&NodeTrace) -> StepValue<V>,
+        mut value: impl FnMut(&NodeTrace, u32) -> StepValue<V>,
     ) -> KeptTrace {
         const {
             assert!(std::mem::size_of::<V>() <= 8 && std::mem::align_of::<V>() <= 8);
         }
         let steps = trace.node_traces.len();
-        let values: Vec<StepValue<V>> = trace.node_traces.iter().map(value).collect();
+        let gens: Vec<u32> = trace
+            .node_traces
+            .iter()
+            .map(|t| step_generation(t.id.0))
+            .collect();
+        let values: Vec<StepValue<V>> = trace
+            .node_traces
+            .iter()
+            .zip(&gens)
+            .map(|(t, &generation)| value(t, generation))
+            .collect();
         let deps: usize = trace.node_traces.iter().map(|t| t.dependencies.len()).sum();
         let words: usize = values
             .iter()
@@ -245,9 +255,7 @@ impl KeptTrace {
                     .cast::<u64>()
                     .write(step.elapsed_ns);
                 base.add(at.slots + 4 * i).cast::<u32>().write(step.id.0);
-                base.add(at.gens + 4 * i)
-                    .cast::<u32>()
-                    .write(step_generation(step.id.0));
+                base.add(at.gens + 4 * i).cast::<u32>().write(gens[i]);
                 for dep in &step.dependencies {
                     base.add(at.deps + 4 * dep_end).cast::<u32>().write(dep.0);
                     dep_end += 1;
@@ -593,7 +601,7 @@ mod tests {
             StepValue::Ref(Box::new(90_u32)),
         ];
         let mut values = values.into_iter();
-        let kept = KeptTrace::build(2, &trace, |slot| slot + 100, |_| values.next().unwrap());
+        let kept = KeptTrace::build(2, &trace, |slot| slot + 100, |_, _| values.next().unwrap());
 
         assert_eq!(kept.generation(), 2);
         assert_eq!(kept.len(), 5);
@@ -652,16 +660,16 @@ mod tests {
     #[test]
     fn a_five_step_trace_with_seven_dependencies_is_one_216_byte_block() {
         let trace = five_steps();
-        let kept = KeptTrace::build(0, &trace, |_| 0, |_| StepValue::Ref(Box::new(0_u64)));
+        let kept = KeptTrace::build(0, &trace, |_| 0, |_, _| StepValue::Ref(Box::new(0_u64)));
         assert_eq!(kept.heap_bytes(), 216);
         assert_eq!(std::mem::size_of::<(u32, KeptTrace)>(), 16);
-        let bare = KeptTrace::build(0, &trace, |_| 0, |_| StepValue::<()>::None);
+        let bare = KeptTrace::build(0, &trace, |_| 0, |_, _| StepValue::<()>::None);
         assert_eq!(bare.heap_bytes(), 176);
         let empty = PropagationTrace {
             node_traces: Vec::new(),
             ..trace
         };
-        let empty = KeptTrace::build(0, &empty, |_| 0, |_| StepValue::<()>::None);
+        let empty = KeptTrace::build(0, &empty, |_| 0, |_, _| StepValue::<()>::None);
         assert_eq!((empty.len(), empty.heap_bytes(), empty.refs()), (0, 48, 0));
         assert_eq!(empty.steps().count(), 0);
     }
@@ -673,7 +681,7 @@ mod tests {
             0,
             &five_steps(),
             |_| 0,
-            |t| match t.id.0 % 2 {
+            |t, _| match t.id.0 % 2 {
                 0 => StepValue::Ref(Arc::new(CountDrop(Arc::clone(&dropped)))),
                 _ => StepValue::Count(1),
             },
@@ -694,7 +702,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "read as another type")]
     fn a_kept_ref_read_as_another_type_panics() {
-        let kept = KeptTrace::build(0, &five_steps(), |_| 0, |_| StepValue::Ref(Box::new(1_u32)));
+        let kept = KeptTrace::build(
+            0,
+            &five_steps(),
+            |_| 0,
+            |_, _| StepValue::Ref(Box::new(1_u32)),
+        );
         let first = kept.steps().next().map(|s| s.value);
         if let Some(KeptValue::Ref(r)) = first {
             r.get::<Box<u64>>();
@@ -709,7 +722,7 @@ mod tests {
                 0,
                 &trace,
                 |_| 0,
-                |_| match refs {
+                |_, _| match refs {
                     true => StepValue::Ref(Box::new(0_u8)),
                     false => StepValue::None,
                 },

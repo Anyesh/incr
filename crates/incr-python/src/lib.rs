@@ -161,11 +161,12 @@ fn traced_to_py(
 }
 
 /// [`Runtime::kept_trace`] with each step's memoized value: a trace just
-/// left the steps Clean, so nothing recomputes. No value for a dead slot,
-/// a cycle, or a value type other than `PyValue`, `u64` and `(u64, u64)`.
+/// left the steps Clean, so nothing recomputes. No value for a node no
+/// longer at the generation kept for its step, a cycle, or a value type
+/// other than `PyValue`, `u64` and `(u64, u64)`.
 fn kept_trace(rt: &Runtime, capture: &TraceCapture, trace: &PropagationTrace) -> KeptTrace {
-    rt.kept_trace(capture, trace, |step| {
-        rt.erased_handle(step.id)
+    rt.kept_trace(capture, trace, |step, generation| {
+        rt.erased_handle_at(step.id, generation)
             .and_then(|handle| TypedNode::of(rt, handle))
             .map_or(StepValue::None, |node| node.kept_value(rt))
     })

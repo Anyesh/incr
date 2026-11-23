@@ -123,7 +123,7 @@ fn traced_to_py(py: Python<'_>, target: u32, kept: &KeptTrace) -> PyResult<Py<Py
 }
 
 fn kept_trace(rt: &Runtime, capture: &TraceCapture, trace: &PropagationTrace) -> KeptTrace {
-    rt.kept_trace(capture, trace, |_| StepValue::<()>::None)
+    rt.kept_trace(capture, trace, |_, _| StepValue::<()>::None)
 }
 
 /// The closure the engine runs for a Python query: `py_func` called with

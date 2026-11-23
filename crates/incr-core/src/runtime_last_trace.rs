@@ -20,13 +20,14 @@ impl<C: Cells> Runtime<C> {
 
     /// `trace` in the compact form [`Self::retain_trace`] keeps, for the
     /// root of the `get_traced_retaining` call that returned `capture`:
-    /// each step's slot generation as of now, and its value as `value`
-    /// gives it. Takes no lock while `value` runs.
+    /// each step's slot generation as of now, read for every step before
+    /// any `value` call, and its value as `value` gives it from the step
+    /// and that generation. Takes no lock while `value` runs.
     pub fn kept_trace<V: Send + Sync + 'static>(
         &self,
         capture: &TraceCapture,
         trace: &PropagationTrace,
-        value: impl FnMut(&NodeTrace) -> StepValue<V>,
+        value: impl FnMut(&NodeTrace, u32) -> StepValue<V>,
     ) -> KeptTrace {
         let generation_of = |slot: u32| {
             if slot < self.nodes.len() {
