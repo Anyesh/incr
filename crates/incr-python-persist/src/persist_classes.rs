@@ -297,8 +297,10 @@ macro_rules! persist_classes {
                 let core = self.core_outside_overlay(py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
                 let mut pending = Pending::default();
-                pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)?;
-                let counts = key_counts(pending.counts(&keyed));
+                let counts = core.yielding(|| {
+                    pending.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)?;
+                    PyResult::Ok(key_counts(pending.counts(&keyed)))
+                })?;
                 core.write_pending(py, pending)?;
                 self.after_write(&core, py);
                 Ok(counts)
@@ -614,7 +616,7 @@ macro_rules! persist_classes {
             ) -> PyResult<()> {
                 let core = batch_core(&self.store, py)?;
                 let keyed = keyed_of::<$b, $rt>(py, &core, &kc)?;
-                self.batch()?.reconcile(py, &core, &keyed, reconcile_pairs(rows)?)
+                core.yielding(|| self.batch()?.reconcile(py, &core, &keyed, reconcile_pairs(rows)?))
             }
         }
 
@@ -821,15 +823,24 @@ macro_rules! persist_classes {
             /// returns) or `"buffered"`. With `auto_checkpoint_records=n`, a
             /// write first checkpoints once `n` records were applied since the last
             /// snapshot; a failed checkpoint fails that write and leaves the log
-            /// unchanged.
+            /// unchanged. `gil_yield_ms` is the store runtime's, as in `Runtime()`,
+            /// and covers this replay too.
             #[staticmethod]
-            #[pyo3(signature = (backend, *, build_id, durability="sync", auto_checkpoint_records=None))]
+            #[pyo3(signature = (
+                backend,
+                *,
+                build_id,
+                durability="sync",
+                auto_checkpoint_records=None,
+                gil_yield_ms=Some(incr_python_protocol::gil_yield::DEFAULT_GIL_YIELD_MS),
+            ), text_signature = "(backend, *, build_id, durability='sync', auto_checkpoint_records=None, gil_yield_ms=100)")]
             fn open(
                 py: Python<'_>,
                 backend: Py<PyAny>,
                 build_id: &Bound<'_, PyAny>,
                 durability: &str,
                 auto_checkpoint_records: Option<u64>,
+                gil_yield_ms: Option<u64>,
             ) -> PyResult<PyStore> {
                 #[allow(
                     clippy::arc_with_non_send_sync,
@@ -841,6 +852,7 @@ macro_rules! persist_classes {
                     build_id,
                     durability,
                     auto_checkpoint_records,
+                    gil_yield_ms,
                 )?);
                 let runtime = Py::new(py, <$rt as StoreRuntime<$b>>::of_store(Arc::clone(&core)))?;
                 Ok(PyStore::new(core, runtime))

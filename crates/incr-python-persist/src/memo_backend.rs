@@ -72,6 +72,7 @@ use std::marker::PhantomData;
 use std::panic;
 use std::sync::Arc;
 
+use incr_core::{YieldHook, Yielder};
 use incr_persist::memo::{
     decode_delta_header, decode_header, encode_delta_header, encode_header, Chain, DeltaHeader,
     EncodedEntry, GenId, Generation, IndexItem, MemoBackend, Tombstone,
@@ -108,10 +109,15 @@ fn item_of<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Resul
     })
 }
 
-fn items_of<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Result<Vec<IndexItem>> {
+fn items_of<E: PersistExceptions>(
+    object: &Bound<'_, PyAny>,
+    what: &str,
+    yielder: &Yielder<'_>,
+) -> Result<Vec<IndexItem>> {
     object
         .try_iter()
         .map_err(|_| bad_return::<E>(what))?
+        .inspect(|_| yielder.tick())
         .map(|item| item_of::<E>(&item.map_err(raised::<E>)?, what))
         .collect()
 }
@@ -124,6 +130,8 @@ pub struct PyMemoBackend<E> {
     takes_known: bool,
     streams: bool,
     batches: bool,
+    /// The store runtime's hook, for a native backend to tick.
+    yield_hook: Option<YieldHook>,
     exceptions: PhantomData<fn() -> E>,
 }
 
@@ -144,9 +152,18 @@ impl<E: PersistExceptions> PyMemoBackend<E> {
                 takes_known,
                 streams,
                 batches,
+                yield_hook: None,
                 exceptions: PhantomData,
             })
         })
+    }
+
+    pub fn with_yield_hook(self, yield_hook: Option<YieldHook>) -> Self {
+        PyMemoBackend { yield_hook, ..self }
+    }
+
+    fn yielder(&self) -> Yielder<'_> {
+        Yielder::of(self.yield_hook.as_ref())
     }
 
     fn call<'py, A: pyo3::call::PyCallArgs<'py>>(
@@ -155,10 +172,12 @@ impl<E: PersistExceptions> PyMemoBackend<E> {
         method: &Bound<'py, PyString>,
         args: A,
     ) -> Result<Bound<'py, PyAny>> {
-        self.backend
-            .bind(py)
-            .call_method1(method, args)
-            .map_err(raised::<E>)
+        incr_core::with_ambient_hook(self.yield_hook.as_ref(), || {
+            self.backend
+                .bind(py)
+                .call_method1(method, args)
+                .map_err(raised::<E>)
+        })
     }
 }
 
@@ -226,7 +245,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
             Ok(Some(Generation::new(
                 id,
                 header,
-                items_of::<E>(&items, "load")?,
+                items_of::<E>(&items, "load", &self.yielder())?,
             )))
         })
     }
@@ -255,9 +274,11 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
         header: &incr_persist::memo::GenHeader,
         entries: &[EncodedEntry],
     ) -> Result<Generation> {
+        let yielder = self.yielder();
         Python::attach(|py| {
             let frames = entries
                 .iter()
+                .inspect(|_| yielder.tick())
                 .map(|entry| (entry.table, entry.key_hash, PyBytes::new(py, &entry.frame)))
                 .collect::<Vec<_>>();
             let result = self.call(
@@ -270,7 +291,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                     PyList::new(py, frames).map_err(raised::<E>)?,
                 ),
             )?;
-            let items = items_of::<E>(&result, "write_generation")?;
+            let items = items_of::<E>(&result, "write_generation", &self.yielder())?;
             Ok(Generation::new(id, header.clone(), items))
         })
     }
@@ -305,7 +326,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                 Some(Failure::Panic(payload)) => panic::resume_unwind(payload),
                 None => {}
             }
-            let items = items_of::<E>(&result?, "write_generation_streamed")?;
+            let items = items_of::<E>(&result?, "write_generation_streamed", &self.yielder())?;
             if !frames.exhausted() {
                 return Err(raised::<E>(PyRuntimeError::new_err(
                     "write_generation_streamed returned before its frames were exhausted",
@@ -322,6 +343,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                 .map(|item| self.read_entry(generation, item))
                 .collect();
         }
+        let yielder = self.yielder();
         Python::attach(|py| {
             let result = self.call(
                 py,
@@ -334,6 +356,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
             let frames = result
                 .try_iter()
                 .map_err(|_| bad_return::<E>("read_entries"))?
+                .inspect(|_| yielder.tick())
                 .map(|frame| {
                     let frame = frame.map_err(raised::<E>)?;
                     if frame.is_none() {
@@ -396,7 +419,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                     .extract::<(u64, Vec<u8>, Bound<'_, PyAny>)>()
                     .map_err(|_| bad_return::<E>("load_chain"))?;
                 let id = GenId(id);
-                let items = items_of::<E>(&items, "load_chain")?;
+                let items = items_of::<E>(&items, "load_chain", &self.yielder())?;
                 let generation = match (layers.first(), layers.last()) {
                     (Some(base), Some(parent)) => match decode_delta_header(&header) {
                         Ok(delta) => Generation::new_delta(id, delta, items),
@@ -427,9 +450,11 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
         if !self.chains {
             return Err(Error::Unsupported("memo delta"));
         }
+        let yielder = self.yielder();
         Python::attach(|py| {
             let frames = entries
                 .iter()
+                .inspect(|_| yielder.tick())
                 .map(|entry| (entry.table, entry.key_hash, PyBytes::new(py, &entry.frame)))
                 .collect::<Vec<_>>();
             let hidden = tombstones
@@ -447,7 +472,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                     hidden,
                 ),
             )?;
-            let items = items_of::<E>(&result, "write_delta")?;
+            let items = items_of::<E>(&result, "write_delta", &self.yielder())?;
             Ok(Generation::new_delta(id, header.clone(), items))
         })
     }

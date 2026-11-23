@@ -47,6 +47,7 @@ use incr_python_persist::incr_core::{KeptTrace, StateStats, StepValue, TraceCapt
 use incr_python_persist::ready;
 use incr_python_persist::state::RtState;
 use incr_python_protocol::by_id::{keep_traced, resolve, snapshot_values};
+use incr_python_protocol::gil_yield::{check_gil_yield_ms, DEFAULT_GIL_YIELD_MS};
 use incr_python_protocol::inspect::trace_dict;
 use incr_python_protocol::notready::{
     PyIncomplete, PyLookupFailed, PyNotReady, PyPending, PyUnavailable,
@@ -910,14 +911,21 @@ impl PyRuntime {
 
 #[pymethods]
 impl PyRuntime {
+    /// `gil_yield_ms` is accepted for code shared with the `incr` package
+    /// and has no effect: engine calls here never hold the GIL.
     #[new]
-    fn new() -> Self {
-        PyRuntime {
+    #[pyo3(
+        signature = (*, gil_yield_ms=Some(DEFAULT_GIL_YIELD_MS)),
+        text_signature = "(*, gil_yield_ms=100)"
+    )]
+    fn new(gil_yield_ms: Option<u64>) -> PyResult<Self> {
+        check_gil_yield_ms(gil_yield_ms)?;
+        Ok(PyRuntime {
             inner: RtRef::Own(Arc::new(Runtime::new())),
             bridges: Arc::default(),
             state: RtState::default(),
             keyed_labels: Mutex::default(),
-        }
+        })
     }
 
     /// Raises `RuntimeError`: a Shared runtime has no isolation for an

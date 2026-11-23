@@ -12,6 +12,7 @@ use incr_persist::{
     Durability, Input, Options, PendingWrite, PersistedCollection, PersistedKeyed, Store,
     StoreStats,
 };
+use incr_python_protocol::gil_yield::{check_gil_yield_ms, gil_yield_hook};
 use incr_python_protocol::{PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -100,15 +101,23 @@ impl<B: PyBinding> StoreCore<B> {
         build_id: &Bound<'_, PyAny>,
         durability: &str,
         auto_checkpoint_records: Option<u64>,
+        gil_yield_ms: Option<u64>,
     ) -> PyResult<Self> {
         let build_id = build_id_of(build_id)?;
         let registry = Arc::new(Registry::default());
+        let yield_hook = if <B::C as incr_core::Cells>::SINGLE_THREADED {
+            gil_yield_hook(gil_yield_ms)?
+        } else {
+            check_gil_yield_ms(gil_yield_ms)?;
+            None
+        };
         let options = Options {
             durability: durability_of(durability)?,
             auto_checkpoint_records: auto_checkpoint_of(auto_checkpoint_records)?,
             value_scope: Some(registry.value_scope()),
+            yield_hook: yield_hook.clone(),
         };
-        let backend = PyBackend::new(py, backend)?;
+        let backend = PyBackend::new(py, backend)?.with_yield_hook(yield_hook);
         let store = registry.run(py, || Store::open(backend, options))?;
         Ok(StoreCore {
             store: Arc::new(store),
@@ -484,8 +493,16 @@ where
     /// Appends `pending` as one run and applies it.
     pub fn write_pending(&self, py: Python<'_>, pending: Pending<B>) -> PyResult<()> {
         let pending = carry::<B, _>(pending.into_write());
-        self.write(py, move |store, _| {
-            store.write_pending(pending.into_inner()).map(drop)
+        self.yielding(|| {
+            self.write(py, move |store, _| {
+                store.write_pending(pending.into_inner()).map(drop)
+            })
         })
+    }
+
+    /// Runs `work` with the store runtime's yield hook, if it has one, as
+    /// the ambient hook, for staging and writing loops outside the engine.
+    pub fn yielding<R>(&self, work: impl FnOnce() -> R) -> R {
+        incr_core::with_ambient_hook(self.runtime().yield_hook(), work)
     }
 }

@@ -23,6 +23,20 @@ macro_rules! memory_classes {
             $crate::persist_error::<$exc>(py, error)
         }
 
+        /// The bytes of a `bytes` object in one copy; PyO3's `Vec<u8>`
+        /// extraction reads a `bytes` an item at a time.
+        fn bytes_of(object: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+            match object.downcast::<PyBytes>() {
+                Ok(bytes) => Ok(bytes.as_bytes().to_vec()),
+                Err(_) => object.extract(),
+            }
+        }
+
+        fn item_list(py: Python<'_>, items: &[IndexItem]) -> PyResult<Py<PyList>> {
+            let yielder = $crate::incr_core::Yielder::ambient();
+            Ok(PyList::new(py, items.iter().inspect(|_| yielder.tick()).map(item_tuple))?.unbind())
+        }
+
         /// A log held in process memory: the reference implementation of the
         /// backend protocol, for tests and development. Stores opened on the same
         /// object share its log; `read_only()` gives a handle that cannot write.
@@ -46,9 +60,16 @@ macro_rules! memory_classes {
                 }
             }
 
-            fn append(&self, py: Python<'_>, records: Vec<Vec<u8>>) -> PyResult<u64> {
+            fn append(&self, py: Python<'_>, records: Vec<Bound<'_, PyAny>>) -> PyResult<u64> {
+                let yielder = $crate::incr_core::Yielder::ambient();
                 let records = records
                     .iter()
+                    .inspect(|_| yielder.tick())
+                    .map(bytes_of)
+                    .collect::<PyResult<Vec<_>>>()?;
+                let records = records
+                    .iter()
+                    .inspect(|_| yielder.tick())
                     .map(|bytes| Record::decode(bytes))
                     .collect::<Result<Vec<_>>>()
                     .map_err(|e| persist_error(py, e))?;
@@ -65,10 +86,17 @@ macro_rules! memory_classes {
                 &self,
                 py: Python<'_>,
                 after: u64,
-                records: Vec<Vec<u8>>,
+                records: Vec<Bound<'_, PyAny>>,
             ) -> PyResult<u64> {
+                let yielder = $crate::incr_core::Yielder::ambient();
                 let records = records
                     .iter()
+                    .inspect(|_| yielder.tick())
+                    .map(bytes_of)
+                    .collect::<PyResult<Vec<_>>>()?;
+                let records = records
+                    .iter()
+                    .inspect(|_| yielder.tick())
                     .map(|bytes| Record::decode(bytes))
                     .collect::<Result<Vec<_>>>()
                     .map_err(|e| persist_error(py, e))?;
@@ -98,11 +126,13 @@ macro_rules! memory_classes {
                         .into_any()
                         .unbind());
                 }
+                let yielder = $crate::incr_core::Yielder::ambient();
                 let items = found
                     .iter()
+                    .inspect(|_| yielder.tick())
                     .map(|(at, record)| {
                         let bytes = record.encode().map_err(|e| persist_error(py, e))?;
-                        Ok((at.0, PyBytes::new(py, &bytes)))
+                        (at.0, PyBytes::new(py, &bytes)).into_pyobject(py)
                     })
                     .collect::<PyResult<Vec<_>>>()?;
                 Ok(PyList::new(py, items)?.into_any().unbind())
@@ -116,8 +146,10 @@ macro_rules! memory_classes {
                 else {
                     return Ok(None);
                 };
+                let yielder = $crate::incr_core::Yielder::ambient();
                 let records = records
                     .iter()
+                    .inspect(|_| yielder.tick())
                     .map(|record| {
                         let bytes = record.encode().map_err(|e| persist_error(py, e))?;
                         Ok(PyBytes::new(py, &bytes).unbind())
@@ -134,9 +166,21 @@ macro_rules! memory_classes {
                     .map(|id| (id.position.0, id.generation)))
             }
 
-            fn compact(&self, py: Python<'_>, upto: u64, folded: Vec<Vec<u8>>) -> PyResult<()> {
+            fn compact(
+                &self,
+                py: Python<'_>,
+                upto: u64,
+                folded: Vec<Bound<'_, PyAny>>,
+            ) -> PyResult<()> {
+                let yielder = $crate::incr_core::Yielder::ambient();
                 let folded = folded
                     .iter()
+                    .inspect(|_| yielder.tick())
+                    .map(bytes_of)
+                    .collect::<PyResult<Vec<_>>>()?;
+                let folded = folded
+                    .iter()
+                    .inspect(|_| yielder.tick())
                     .map(|bytes| Record::decode(bytes))
                     .collect::<Result<Vec<_>>>()
                     .map_err(|e| persist_error(py, e))?;
@@ -153,7 +197,7 @@ macro_rules! memory_classes {
             ) -> PyResult<()> {
                 let mut pulls = records.try_iter()?.map(|record| {
                     let bytes = record
-                        .and_then(|record| record.extract::<Vec<u8>>())
+                        .and_then(|record| bytes_of(&record))
                         .map_err($crate::backend::raised::<$exc>)?;
                     Record::decode(&bytes)
                 });
@@ -170,7 +214,7 @@ macro_rules! memory_classes {
         fn layer_tuple(
             py: Python<'_>,
             layer: &Generation,
-        ) -> PyResult<(u64, Py<PyBytes>, Vec<ItemTuple>)> {
+        ) -> PyResult<(u64, Py<PyBytes>, Py<PyList>)> {
             let header = match (layer.base(), layer.parent()) {
                 (Some(base), Some(parent)) => encode_delta_header(&DeltaHeader {
                     header: layer.header().clone(),
@@ -183,7 +227,7 @@ macro_rules! memory_classes {
             Ok((
                 layer.id().0,
                 PyBytes::new(py, &header).unbind(),
-                layer.items().iter().map(item_tuple).collect(),
+                item_list(py, layer.items())?,
             ))
         }
 
@@ -225,7 +269,7 @@ macro_rules! memory_classes {
             }
 
             #[allow(clippy::type_complexity)]
-            fn load(&self, py: Python<'_>) -> PyResult<Option<(u64, Py<PyBytes>, Vec<ItemTuple>)>> {
+            fn load(&self, py: Python<'_>) -> PyResult<Option<(u64, Py<PyBytes>, Py<PyList>)>> {
                 let Some(generation) = self.inner.load().map_err(|e| persist_error(py, e))? else {
                     return Ok(None);
                 };
@@ -234,7 +278,7 @@ macro_rules! memory_classes {
                 Ok(Some((
                     generation.id().0,
                     PyBytes::new(py, &header).unbind(),
-                    generation.items().iter().map(item_tuple).collect(),
+                    item_list(py, generation.items())?,
                 )))
             }
 
@@ -263,22 +307,24 @@ macro_rules! memory_classes {
                 base: Option<u64>,
                 generation: u64,
                 header: Vec<u8>,
-                entries: Vec<(u32, u64, Vec<u8>)>,
-            ) -> PyResult<Vec<ItemTuple>> {
+                entries: Vec<(u32, u64, Bound<'_, PyAny>)>,
+            ) -> PyResult<Py<PyList>> {
                 let header = decode_header(&header).map_err(|e| persist_error(py, e))?;
                 let entries = entries
                     .into_iter()
-                    .map(|(table, key_hash, frame)| EncodedEntry {
-                        table,
-                        key_hash,
-                        frame,
+                    .map(|(table, key_hash, frame)| {
+                        Ok(EncodedEntry {
+                            table,
+                            key_hash,
+                            frame: bytes_of(&frame)?,
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<PyResult<Vec<_>>>()?;
                 let written = self
                     .inner
                     .write_generation(base.map(GenId), GenId(generation), &header, &entries)
                     .map_err(|e| persist_error(py, e))?;
-                Ok(written.items().iter().map(item_tuple).collect())
+                item_list(py, written.items())
             }
 
             fn read_entries(
@@ -300,8 +346,10 @@ macro_rules! memory_classes {
                     .inner
                     .read_entries(GenId(generation), &items)
                     .map_err(|e| persist_error(py, e))?;
+                let yielder = $crate::incr_core::Yielder::ambient();
                 Ok(frames
                     .into_iter()
+                    .inspect(|_| yielder.tick())
                     .map(|frame| frame.map(|frame| PyBytes::new(py, &frame).unbind()))
                     .collect())
             }
@@ -312,7 +360,7 @@ macro_rules! memory_classes {
                 &self,
                 py: Python<'_>,
                 known: Option<HashSet<u64>>,
-            ) -> PyResult<Option<Vec<(u64, Option<Py<PyBytes>>, Option<Vec<ItemTuple>>)>>> {
+            ) -> PyResult<Option<Vec<(u64, Option<Py<PyBytes>>, Option<Py<PyList>>)>>> {
                 let known = known.unwrap_or_default();
                 let Some(chain) = self
                     .inner
@@ -341,18 +389,20 @@ macro_rules! memory_classes {
                 tip: u64,
                 generation: u64,
                 header: Vec<u8>,
-                entries: Vec<(u32, u64, Vec<u8>)>,
+                entries: Vec<(u32, u64, Bound<'_, PyAny>)>,
                 tombstones: Vec<(u32, u64)>,
-            ) -> PyResult<Vec<ItemTuple>> {
+            ) -> PyResult<Py<PyList>> {
                 let header = decode_delta_header(&header).map_err(|e| persist_error(py, e))?;
                 let entries = entries
                     .into_iter()
-                    .map(|(table, key_hash, frame)| EncodedEntry {
-                        table,
-                        key_hash,
-                        frame,
+                    .map(|(table, key_hash, frame)| {
+                        Ok(EncodedEntry {
+                            table,
+                            key_hash,
+                            frame: bytes_of(&frame)?,
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<PyResult<Vec<_>>>()?;
                 let tombstones = tombstones
                     .into_iter()
                     .map(|(table, key_hash)| Tombstone { table, key_hash })
@@ -367,7 +417,7 @@ macro_rules! memory_classes {
                         &tombstones,
                     )
                     .map_err(|e| persist_error(py, e))?;
-                Ok(written.items().iter().map(item_tuple).collect())
+                item_list(py, written.items())
             }
 
             fn write_generation_streamed(
@@ -377,11 +427,15 @@ macro_rules! memory_classes {
                 generation: u64,
                 header: Vec<u8>,
                 frames: Bound<'_, PyAny>,
-            ) -> PyResult<Vec<ItemTuple>> {
+            ) -> PyResult<Py<PyList>> {
                 let header = decode_header(&header).map_err(|e| persist_error(py, e))?;
                 let mut pulls = frames.try_iter()?.map(|frame| {
                     let (table, key_hash, frame) = frame
-                        .and_then(|frame| frame.extract::<(u32, u64, Vec<u8>)>())
+                        .and_then(|frame| {
+                            let (table, key_hash, frame) =
+                                frame.extract::<(u32, u64, Bound<'_, PyAny>)>()?;
+                            Ok((table, key_hash, bytes_of(&frame)?))
+                        })
                         .map_err($crate::backend::raised::<$exc>)?;
                     Ok(EncodedEntry {
                         table,
@@ -398,7 +452,7 @@ macro_rules! memory_classes {
                         &mut pulls,
                     )
                     .map_err(|e| persist_error(py, e))?;
-                Ok(written.items().iter().map(item_tuple).collect())
+                item_list(py, written.items())
             }
 
             fn remove_generation(&self, py: Python<'_>, generation: u64) -> PyResult<()> {
