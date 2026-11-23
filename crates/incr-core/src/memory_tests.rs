@@ -266,8 +266,6 @@ fn shared_memory_stats_survives_concurrent_collection_creation() {
     });
 }
 
-/// Steps `walker` one unit at a time to its end, into `walked`, and
-/// returns how many steps it took.
 fn walk_out<C: Cells>(
     rt: &Runtime<C>,
     walker: &mut MemoryWalker,

@@ -176,8 +176,9 @@ for n in totals:
 t = time.perf_counter()
 whole = rt.memory_stats()
 whole_s = time.perf_counter() - t
+t = time.perf_counter()
 walker = rt.memory_walker()
-gaps = []
+gaps = [time.perf_counter() - t]
 while True:
     t = time.perf_counter()
     done = walker.step(BUDGET)
@@ -191,6 +192,7 @@ print(json.dumps({
     "nodes": whole["nodes"],
     "memory_stats_s": whole_s,
     "steps": len(gaps),
+    "create_s": gaps[0],
     "max_step_s": max(gaps),
     "equal": result == whole,
 }))
