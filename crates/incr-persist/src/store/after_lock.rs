@@ -2,6 +2,8 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use incr_core::{with_ambient_hook, YieldHook};
+
 use crate::value_context::hold;
 use crate::ValueScope;
 
@@ -57,13 +59,17 @@ impl AfterLock {
 pub(super) struct Drained<'a> {
     values: Vec<Box<dyn Any + Send>>,
     scope: Option<&'a ValueScope>,
+    /// The ambient hook the drops tick, which runs no user code under a
+    /// lock: the values drop after the store mutex is released.
+    yield_hook: Option<&'a YieldHook>,
 }
 
 impl<'a> Drained<'a> {
-    pub(super) fn new(scope: Option<&'a ValueScope>) -> Self {
+    pub(super) fn new(scope: Option<&'a ValueScope>, yield_hook: Option<&'a YieldHook>) -> Self {
         Drained {
             values: Vec::new(),
             scope,
+            yield_hook,
         }
     }
 
@@ -79,7 +85,7 @@ impl Drop for Drained<'_> {
             return;
         }
         let values = std::mem::take(&mut self.values);
-        hold(self.scope, || drop(values));
+        with_ambient_hook(self.yield_hook, || hold(self.scope, || drop(values)));
     }
 }
 

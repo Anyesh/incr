@@ -2,7 +2,7 @@ use std::any::Any;
 
 use incr_core::persist_hooks::{changed_at, set_returning_displaced};
 use incr_core::value_slot::Compared;
-use incr_core::{with_value_code, Cells, DeleteError, ErasedIncr, Incr, Runtime, Value};
+use incr_core::{with_value_code, Cells, DeleteError, ErasedIncr, Incr, Runtime, Value, Yielder};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -119,7 +119,12 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// The records a snapshot keeps for this key, given its logged state,
     /// made as they are pulled. Empty when the key holds nothing beyond its
     /// logged default, which is how compaction forgets it.
-    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>>;
+    /// Ticks `yielder` through any work it does before returning.
+    fn fold<'a>(
+        &'a self,
+        logged: Option<&'a LoggedKey>,
+        yielder: &Yielder<'_>,
+    ) -> Result<Folded<'a>>;
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -332,7 +337,11 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         Ok(Some((self.fp, self.stamp)))
     }
 
-    fn fold<'a>(&'a self, logged: Option<&'a LoggedKey>) -> Result<Folded<'a>> {
+    fn fold<'a>(
+        &'a self,
+        logged: Option<&'a LoggedKey>,
+        _yielder: &Yielder<'_>,
+    ) -> Result<Folded<'a>> {
         Ok(match logged {
             Some(logged) if !logged.at_default() => {
                 Box::new(logged.iter_records(&self.key).map(Ok))

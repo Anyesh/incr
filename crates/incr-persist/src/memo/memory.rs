@@ -176,8 +176,9 @@ impl MemoBackend for MemoryMemo {
         self.write_generation_streamed(base, id, header, &mut entries.iter().cloned().map(Ok))
     }
 
-    /// Pulls every entry without the store's lock, so the iterator may
-    /// read through this handle, then publishes under it.
+    /// Pulls every entry and builds the generation without the store's
+    /// lock, so the iterator may read through this handle, then publishes
+    /// under it.
     fn write_generation_streamed(
         &self,
         base: Option<GenId>,
@@ -192,12 +193,12 @@ impl MemoBackend for MemoryMemo {
         for entry in entries {
             pulled.push(entry?);
         }
+        let stored = pulled.into_stored(header.clone(), None);
+        let generation = stored.generation(id);
         let mut state = lock(&self.state);
         if state.tip() != base {
             return Err(Error::Busy);
         }
-        let stored = pulled.into_stored(header.clone(), None);
-        let generation = stored.generation(id);
         state.publish(id, stored);
         Ok(generation)
     }
