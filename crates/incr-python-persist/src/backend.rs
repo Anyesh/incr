@@ -283,12 +283,9 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
     fn append(&self, records: &[Record]) -> Result<Position> {
         self.enter(&APPEND, |py| {
             let list = encoded::<E>(py, &APPEND, records)?;
-            let at = position::<E>(
-                &self.call(py, intern!(py, "append"), (list.clone(),))?,
-                "append",
-            )?;
+            let returned = self.call(py, intern!(py, "append"), (list.clone(),));
             emptied::<E>(list)?;
-            Ok(at)
+            position::<E>(&returned?, "append")
         })
     }
 
@@ -364,8 +361,9 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()> {
         self.enter(&COMPACT, |py| {
             let list = encoded::<E>(py, &COMPACT, &folded)?;
-            self.call(py, intern!(py, "compact"), (upto.0, list.clone()))?;
-            emptied::<E>(list)
+            let returned = self.call(py, intern!(py, "compact"), (upto.0, list.clone()));
+            emptied::<E>(list)?;
+            returned.map(drop)
         })
     }
 

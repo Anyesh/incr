@@ -380,19 +380,15 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
         entries: &[EncodedEntry],
     ) -> Result<Generation> {
         let items = self.enter(&WRITE_GENERATION, |py| {
+            let header = PyBytes::new(py, &encode_header(header)?);
             let frames = frames_of::<E>(py, &WRITE_GENERATION, entries)?;
             let result = self.call(
                 py,
                 intern!(py, "write_generation"),
-                (
-                    base.map(|base| base.0),
-                    id.0,
-                    PyBytes::new(py, &encode_header(header)?),
-                    frames.clone(),
-                ),
-            )?;
+                (base.map(|base| base.0), id.0, header, frames.clone()),
+            );
             emptied::<E>(frames)?;
-            items_of::<E>(&WRITE_GENERATION, result, "write_generation")
+            items_of::<E>(&WRITE_GENERATION, result?, "write_generation")
         })?;
         Ok(Generation::new(id, header.clone(), items))
     }
@@ -456,8 +452,9 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                 py,
                 intern!(py, "read_entries"),
                 (generation.0, asked.clone()),
-            )?;
+            );
             emptied::<E>(asked)?;
+            let result = result?;
             let frames = gil::drain(
                 &READ_ENTRIES_FRAMES,
                 result,
@@ -560,6 +557,7 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
             return Err(Error::Unsupported("memo delta"));
         }
         let items = self.enter(&WRITE_DELTA, |py| {
+            let header = PyBytes::new(py, &encode_delta_header(header)?);
             let frames = frames_of::<E>(py, &WRITE_DELTA_FRAMES, entries)?;
             let hidden = gil::build(
                 py,
@@ -576,17 +574,11 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
             let result = self.call(
                 py,
                 intern!(py, "write_delta"),
-                (
-                    tip.0,
-                    id.0,
-                    PyBytes::new(py, &encode_delta_header(header)?),
-                    frames.clone(),
-                    hidden.clone(),
-                ),
-            )?;
+                (tip.0, id.0, header, frames.clone(), hidden.clone()),
+            );
             emptied::<E>(frames)?;
             emptied::<E>(hidden)?;
-            items_of::<E>(&WRITE_DELTA_ITEMS, result, "write_delta")
+            items_of::<E>(&WRITE_DELTA_ITEMS, result?, "write_delta")
         })?;
         Ok(Generation::new_delta(id, header.clone(), items))
     }
