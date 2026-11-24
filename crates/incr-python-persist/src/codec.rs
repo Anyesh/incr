@@ -110,7 +110,7 @@ impl<E: PersistExceptions> Registry<E> {
             .holding(python_hold)
             .idling(python_idle)
             .waiting(python_wait)
-            .starting_workers(gil::run_worker)
+            .starting_workers(python_worker)
     }
 
     fn codecs(&self) -> MutexGuard<'_, HashMap<Slot, Py<PyAny>>> {
@@ -236,6 +236,13 @@ fn python_idle(f: &mut dyn FnMut()) {
     // SAFETY: incr-persist passes its own work, which holds no Python
     // object; a value call inside it enters the gate again.
     unsafe { gil::idle(f) };
+}
+
+/// Runs `body`, a checkpoint worker's life, on one Python thread state.
+fn python_worker(body: &mut dyn FnMut()) {
+    // SAFETY: incr-persist passes the worker's own Rust, whose value calls
+    // enter the gate through this scope's hooks.
+    unsafe { gil::run_worker(body) };
 }
 
 /// Runs `f`, a wait for a checkpoint worker, with the GIL released.

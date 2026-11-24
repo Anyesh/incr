@@ -188,7 +188,11 @@ pub fn on_worker() -> bool {
 /// Runs a checkpoint worker's whole body on this thread: takes one Python
 /// thread state for the worker's life, so a backend's `threading.local`
 /// lasts as long, and runs `body` with the GIL released.
-pub fn run_worker(body: &mut dyn FnMut()) {
+///
+/// # Safety
+///
+/// As for [`idle`]: `body` reaches Python only through the gate.
+pub unsafe fn run_worker(body: &mut dyn FnMut()) {
     Python::attach(|py| {
         let _worker = WorkerMark::start();
         detach(py, body);
@@ -756,16 +760,19 @@ mod tests {
         let caught = Arc::new(Mutex::new(None));
         let inside = Arc::clone(&caught);
         let worker = thread::spawn(move || {
-            run_worker(&mut || {
-                for _ in 0..=MAX_RELEASED_DROPS {
-                    note_value_drop();
-                }
-                let unwound = catch_unwind(AssertUnwindSafe(|| {
-                    let _entry = EntersOnDrop;
-                    panic!("the first panic");
-                }));
-                *inside.lock().unwrap() = unwound.err().map(|payload| message(&*payload));
-            });
+            // SAFETY: the body touches Python only through `enter`.
+            unsafe {
+                run_worker(&mut || {
+                    for _ in 0..=MAX_RELEASED_DROPS {
+                        note_value_drop();
+                    }
+                    let unwound = catch_unwind(AssertUnwindSafe(|| {
+                        let _entry = EntersOnDrop;
+                        panic!("the first panic");
+                    }));
+                    *inside.lock().unwrap() = unwound.err().map(|payload| message(&*payload));
+                })
+            };
         });
         let exit = worker
             .join()
