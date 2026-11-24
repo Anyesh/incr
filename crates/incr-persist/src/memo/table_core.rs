@@ -49,7 +49,7 @@ pub(crate) struct Snap {
     pub(crate) key: KeyPart,
     pub(crate) deps: Vec<LiveDep>,
     pub(crate) in_group: bool,
-    pub(crate) value: Box<dyn Encode>,
+    pub(crate) value: Box<dyn Encode + Send>,
 }
 
 pub(crate) trait Encode {

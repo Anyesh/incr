@@ -68,6 +68,7 @@ macro_rules! memo_backend_conformance {
             stale_delta_is_not_returned,
             compaction_drops_the_chain,
             read_entries_matches_read_entry,
+            declared_concurrent_compaction_lets_reads_through,
         );
     };
     (@cases $harness:expr; $($case:ident),+ $(,)?) => {
@@ -695,6 +696,54 @@ pub fn read_entries_matches_read_entry<H: MemoHarness>(mut h: H) {
     backend.remove_generation(GenId(1)).unwrap();
     let gone = backend.read_entries(GenId(1), old.items()).unwrap();
     assert_eq!(gone, vec![None; old.items().len()]);
+}
+
+/// On a backend that declares
+/// [`MemoBackend::concurrent_compaction`], `read_entry`, `read_entries` and
+/// `load` called from another thread on the same handle return while a
+/// streamed write is pulling. Checks nothing on a backend without the flag.
+pub fn declared_concurrent_compaction_lets_reads_through<H: MemoHarness>(mut h: H) {
+    let store = h.new_store();
+    let backend = std::sync::Arc::new(h.open(&store));
+    if !backend.concurrent_compaction() {
+        return;
+    }
+    let base = write(&*backend, None, 1, &entries(3));
+    let item = base.items()[0];
+    let next = header(2);
+    let mut pulled = 0;
+    let mut pulls = std::iter::from_fn(|| {
+        pulled += 1;
+        match pulled {
+            1 => Some(Ok(entries(2).remove(0))),
+            2 => {
+                let (done, reads) = mpsc::channel();
+                let other = std::sync::Arc::clone(&backend);
+                thread::spawn(move || {
+                    let read = other
+                        .read_entry(GenId(1), &item)
+                        .map(|frame| frame.is_some());
+                    let batch = other
+                        .read_entries(GenId(1), &[item])
+                        .map(|frames| frames.len());
+                    let loaded = other.load().map(|base| base.map(|base| base.id()));
+                    let _ = done.send((read, batch, loaded));
+                });
+                let (read, batch, loaded) = reads
+                    .recv_timeout(STREAM_TIMEOUT)
+                    .expect("a read waited for the streamed write");
+                assert!(read.expect("read_entry failed"));
+                assert_eq!(batch.expect("read_entries failed"), 1);
+                assert_eq!(loaded.expect("load failed"), Some(GenId(1)));
+                Some(Ok(entries(2).remove(1)))
+            }
+            _ => None,
+        }
+    });
+    let written = backend
+        .write_generation_streamed(Some(GenId(1)), GenId(2), &next, &mut pulls)
+        .expect("write_generation_streamed failed");
+    assert_eq!(written.id(), GenId(2));
 }
 
 /// A streamed write whose iterator reads the base through the same handle

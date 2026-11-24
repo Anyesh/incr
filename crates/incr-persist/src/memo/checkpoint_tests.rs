@@ -1385,7 +1385,7 @@ fn a_backend_without_deltas_at_its_cap_reads_each_base_entry_once_per_checkpoint
         next.max_bytes = max_bytes;
         let base_entries = chain.base().entry_count() as usize;
         memo.reset();
-        let done = write_known(&memo, next.clone(), chain.layers()).unwrap();
+        let done = write_known(&memo, next.clone(), chain.layers(), None).unwrap();
         let reads = memo.reads.load(SeqCst);
         assert!(
             reads <= base_entries,
@@ -1459,7 +1459,7 @@ fn a_frame_gone_mid_stream_is_skipped_and_the_rest_carried() {
             next.max_bytes = base.generation.entry_bytes();
         }
         memo.reset();
-        let done = write_known(&memo, next, base.chain.layers()).unwrap();
+        let done = write_known(&memo, next, base.chain.layers(), None).unwrap();
         assert!(memo.reads.load(SeqCst) > 0);
         assert_eq!(done.stats.corrupt, 1, "evicting {evicting}");
         *memo.dropping.lock().unwrap() = None;

@@ -181,6 +181,12 @@ pub enum Error {
     #[error("the checkpoint was cancelled")]
     Cancelled,
 
+    /// A memo backend returned from a streamed generation write before it
+    /// took every entry, so the generation it published may lack some,
+    /// which restores then compute again. The checkpoint saved nothing.
+    #[error("the memo backend returned before it took every entry of the generation")]
+    TruncatedWrite,
+
     /// `BuildId::CurrentExe` could not read the running executable.
     #[error("cannot fingerprint the running executable for the memo build id")]
     BuildIdUnavailable(#[source] std::io::Error),
