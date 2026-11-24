@@ -48,15 +48,35 @@ struct Stored {
     header: GenHeader,
     delta: Option<DeltaHeader>,
     frames: Vec<Vec<u8>>,
-    items: Vec<IndexItem>,
+    items: Arc<Vec<IndexItem>>,
 }
 
 impl Stored {
-    fn generation(&self, id: GenId) -> Generation {
-        let items = self.items.clone();
-        match &self.delta {
-            Some(delta) => Generation::new_delta(id, delta.clone(), items),
-            None => Generation::new(id, self.header.clone(), items),
+    /// What [`Unbuilt::build`] needs, taken in O(1) under the state lock so
+    /// the build runs outside it.
+    fn unbuilt(&self, id: GenId) -> Unbuilt {
+        Unbuilt {
+            id,
+            header: self.header.clone(),
+            delta: self.delta.clone(),
+            items: Arc::clone(&self.items),
+        }
+    }
+}
+
+struct Unbuilt {
+    id: GenId,
+    header: GenHeader,
+    delta: Option<DeltaHeader>,
+    items: Arc<Vec<IndexItem>>,
+}
+
+impl Unbuilt {
+    fn build(self) -> Generation {
+        let items = Vec::clone(&self.items);
+        match self.delta {
+            Some(delta) => Generation::new_delta(self.id, delta, items),
+            None => Generation::new(self.id, self.header, items),
         }
     }
 }
@@ -84,7 +104,7 @@ impl Pulled {
             header,
             delta,
             frames: self.frames,
-            items: self.items,
+            items: Arc::new(self.items),
         }
     }
 }
@@ -137,24 +157,38 @@ impl MemoBackend for MemoryMemo {
     type Guard = MemoryMemoGuard;
 
     fn lock_checkpoint(&self) -> Result<MemoryMemoGuard> {
-        let mut state = lock(&self.state);
-        if state.locked {
-            return Err(Error::Busy);
-        }
-        state.locked = true;
-        let chain = state.chain.clone();
-        state.generations.retain(|id, _| chain.contains(id));
+        let stale: Vec<Stored> = {
+            let mut state = lock(&self.state);
+            if state.locked {
+                return Err(Error::Busy);
+            }
+            state.locked = true;
+            let stale: Vec<GenId> = state
+                .generations
+                .keys()
+                .filter(|id| !state.chain.contains(id))
+                .copied()
+                .collect();
+            stale
+                .iter()
+                .filter_map(|id| state.generations.remove(id))
+                .collect()
+        };
+        drop(stale);
         Ok(MemoryMemoGuard {
             state: Arc::clone(&self.state),
         })
     }
 
     fn load(&self) -> Result<Option<Generation>> {
-        let state = lock(&self.state);
-        Ok(state
-            .chain
-            .first()
-            .map(|&id| state.generations[&id].generation(id)))
+        let base = {
+            let state = lock(&self.state);
+            state
+                .chain
+                .first()
+                .map(|&id| state.generations[&id].unbuilt(id))
+        };
+        Ok(base.map(Unbuilt::build))
     }
 
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
@@ -194,7 +228,7 @@ impl MemoBackend for MemoryMemo {
             pulled.push(entry?);
         }
         let stored = pulled.into_stored(header.clone(), None);
-        let generation = stored.generation(id);
+        let generation = stored.unbuilt(id).build();
         let mut state = lock(&self.state);
         if state.tip() != base {
             return Err(Error::Busy);
@@ -221,21 +255,31 @@ impl MemoBackend for MemoryMemo {
     }
 
     fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
-        let state = lock(&self.state);
-        if state.chain.is_empty() {
+        let layers: Vec<(Option<Arc<Generation>>, Option<Unbuilt>)> = {
+            let state = lock(&self.state);
+            state
+                .chain
+                .iter()
+                .map(|&id| match known.iter().find(|layer| layer.id() == id) {
+                    Some(layer) => (Some(Arc::clone(layer)), None),
+                    None => (None, Some(state.generations[&id].unbuilt(id))),
+                })
+                .collect()
+        };
+        if layers.is_empty() {
             return Ok(None);
         }
-        let layers = state
-            .chain
-            .iter()
-            .map(|&id| match known.iter().find(|layer| layer.id() == id) {
-                Some(layer) => Arc::clone(layer),
-                None => Arc::new(state.generations[&id].generation(id)),
+        let layers = layers
+            .into_iter()
+            .map(|(known, unbuilt)| {
+                known.unwrap_or_else(|| Arc::new(unbuilt.expect("one of the two").build()))
             })
             .collect();
         Chain::new(layers).map(Some)
     }
 
+    /// Builds the layer and its generation without the store's lock, then
+    /// publishes under it.
     fn write_delta(
         &self,
         tip: GenId,
@@ -244,18 +288,12 @@ impl MemoBackend for MemoryMemo {
         entries: &[EncodedEntry],
         tombstones: &[Tombstone],
     ) -> Result<Generation> {
-        let mut state = lock(&self.state);
-        if state.tip() != Some(tip) {
+        if lock(&self.state).tip() != Some(tip) {
             return Err(Error::Busy);
         }
         assert_eq!(
             header.parent, tip,
             "a delta's parent is the tip it is written on"
-        );
-        assert_eq!(
-            Some(header.base),
-            state.chain.first().copied(),
-            "a delta's base is its chain's base"
         );
         let mut pulled = Pulled::default();
         for entry in entries {
@@ -267,18 +305,30 @@ impl MemoBackend for MemoryMemo {
                 .map(|t| IndexItem::tombstone(t.table, t.key_hash)),
         );
         let stored = pulled.into_stored(header.header.clone(), Some(header.clone()));
-        let generation = stored.generation(id);
+        let generation = stored.unbuilt(id).build();
+        let mut state = lock(&self.state);
+        if state.tip() != Some(tip) {
+            return Err(Error::Busy);
+        }
+        assert_eq!(
+            Some(header.base),
+            state.chain.first().copied(),
+            "a delta's base is its chain's base"
+        );
         state.publish(id, stored);
         Ok(generation)
     }
 
     fn remove_generation(&self, generation: GenId) -> Result<()> {
-        let mut state = lock(&self.state);
-        assert!(
-            !state.chain.contains(&generation),
-            "removing a generation of the current chain"
-        );
-        state.generations.remove(&generation);
+        let removed = {
+            let mut state = lock(&self.state);
+            assert!(
+                !state.chain.contains(&generation),
+                "removing a generation of the current chain"
+            );
+            state.generations.remove(&generation)
+        };
+        drop(removed);
         Ok(())
     }
 }
