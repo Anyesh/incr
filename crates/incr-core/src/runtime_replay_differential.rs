@@ -11002,6 +11002,21 @@ fn a_discarded_entry_leaves_a_lower_landed_delivery_for_its_retry() {
     });
 }
 
+/// 0x8ed3: a dissolved episode's root retries as a new run, so a frame
+/// above it popped in the same pass must not hand that run its old direct
+/// read; the walk the unbounded run's read makes there brings queries 4, 5
+/// and 14 into the next episode, which lands its members Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_dissolved_root_retries_without_the_directs_above_it() {
+    const SEED: u64 = 0x8ed3;
+    let case = all_replayable(gen_case(SEED, false, false));
+    quiet(|| {
+        differential::<Local>(&case, SEED);
+        differential::<Shared>(&case, SEED);
+    });
+}
+
 /// Each serial order of the two-thread cases of seeds
 /// `REPLAY_FROM..REPLAY_SCAN` (or the hex seeds in `SEEDS_FILE`), run
 /// unbounded, against [`fresh_read`]: the two-thread differential takes

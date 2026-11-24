@@ -4295,6 +4295,15 @@ impl<C: Cells> Runtime<C> {
                         let generation = self.nodes.get(root).generation();
                         if self.end_dissolved_reads(NodeId(root), generation, v.cidx) {
                             dissolved.push(v.cidx);
+                            replay::with(|c| {
+                                if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                                    for (w, _) in
+                                        popped_frames.iter().filter(|(w, _)| w.cidx > v.cidx)
+                                    {
+                                        x.directs.remove_frame((w.node, w.generation, w.cidx));
+                                    }
+                                }
+                            });
                         }
                         popped_frames.push((v.clone(), false));
                     }
@@ -4425,13 +4434,18 @@ impl<C: Cells> Runtime<C> {
             // stood for, so it owns what that run deferred.
             let at = boundary + level;
             self.own_deferred(at, entry.node);
+            // A frame at or above a dissolved root's was its ended run's,
+            // which the root's retry, a new run, does not read again: its
+            // directs went with the dissolve.
             for (v, _) in popped_frames
                 .iter()
                 .filter(|&(v, landed)| !landed && v.cidx > at)
             {
                 let read = v.computes;
                 if let Some((w, _)) = popped_frames.iter().find(|(w, _)| {
-                    w.cidx + 1 == v.cidx && w.reading == read && !dissolved.contains(&w.cidx)
+                    w.cidx + 1 == v.cidx
+                        && w.reading == read
+                        && !dissolved.iter().any(|&d| w.cidx >= d)
                 }) {
                     replay::with(|c| {
                         let runs = replay::run_snapshot(c, self.runtime_id, w);
