@@ -485,7 +485,7 @@ pub fn build<'py, T, X>(
 /// freed a slice at a time; another `list` or a `tuple` is first copied
 /// into a new list, so a tick never lets another thread change what is
 /// being walked; any other iterable is walked through [`pull`].
-pub fn drain<'py, T, X>(
+pub fn drain<'py, T: Send, X>(
     site: &'static Site,
     sequence: Bound<'py, PyAny>,
     error: impl Fn(PyErr) -> X,
@@ -508,23 +508,31 @@ pub fn drain<'py, T, X>(
     let len = list.len();
     site.note_elements(len);
     let mut out = Vec::with_capacity(len);
-    let mut end = len;
-    while end > 0 {
-        let start = end.saturating_sub(SLICE);
-        for at in (start..end).rev() {
-            tick(py);
-            let item = list.get_item(at).map_err(&error)?;
-            out.push(convert(&item)?);
+    let mut walk = || {
+        let mut end = len;
+        while end > 0 {
+            let start = end.saturating_sub(SLICE);
+            for at in (start..end).rev() {
+                tick(py);
+                let item = list.get_item(at).map_err(&error)?;
+                out.push(convert(&item)?);
+            }
+            list.del_slice(start, end).map_err(&error)?;
+            end = start;
         }
-        list.del_slice(start, end).map_err(&error)?;
-        end = start;
+        Ok(())
+    };
+    match walk() {
+        Ok(()) => Ok(leave(py, move || {
+            out.reverse();
+            out
+        })),
+        Err(failed) => Err(discarded(py, out, failed)),
     }
-    out.reverse();
-    Ok(out)
 }
 
 /// Walks a Python iterable from Rust, ticking per element.
-pub fn pull<'py, T, X>(
+pub fn pull<'py, T: Send, X>(
     site: &'static Site,
     iterable: &Bound<'py, PyAny>,
     error: impl Fn(PyErr) -> X,
@@ -532,12 +540,39 @@ pub fn pull<'py, T, X>(
 ) -> Result<Vec<T>, X> {
     let py = iterable.py();
     let mut out = Vec::new();
-    for item in iterable.try_iter().map_err(&error)? {
-        tick(py);
-        out.push(convert(&item.map_err(&error)?)?);
+    let mut walk = || {
+        for item in iterable.try_iter().map_err(&error)? {
+            tick(py);
+            if out.len() == out.capacity() {
+                out = grown(py, std::mem::take(&mut out));
+            }
+            out.push(convert(&item.map_err(&error)?)?);
+        }
+        Ok(())
+    };
+    match walk() {
+        Ok(()) => {
+            site.note_elements(out.len());
+            Ok(out)
+        }
+        Err(failed) => Err(discarded(py, out, failed)),
     }
-    site.note_elements(out.len());
-    Ok(out)
+}
+
+/// `failed`, after the elements converted before it are freed, off the GIL
+/// on a worker: a walk that fails late holds most of the sequence.
+fn discarded<T: Send, X>(py: Python<'_>, out: Vec<T>, failed: X) -> X {
+    leave(py, move || drop(out));
+    failed
+}
+
+/// `out` with room for as many elements again. A reallocation copies the
+/// whole vector, so on a worker it runs off the GIL.
+fn grown<T: Send>(py: Python<'_>, mut out: Vec<T>) -> Vec<T> {
+    leave(py, move || {
+        out.reserve(out.len().max(SLICE));
+        out
+    })
 }
 
 /// A `frozenset` of the elements of `list`, a list [`build`] made.
@@ -656,14 +691,15 @@ pub mod checks {
 
     struct Probe {
         stop: Arc<AtomicBool>,
-        waits: Arc<Mutex<Vec<(u64, u64)>>>,
+        waits: Arc<Mutex<Vec<(u64, u64, u64)>>>,
         thread: JoinHandle<()>,
     }
 
     static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 
     /// Starts a thread that asks for the GIL, lets go at once and sleeps
-    /// `interval_us`, recording each request's start and wait.
+    /// `interval_us`, recording each request's start, its wait and the part
+    /// of the wait the thread spent runnable but not scheduled.
     #[pyfunction]
     #[pyo3(signature = (interval_us=200))]
     fn _gil_probe_start(interval_us: u64) -> PyResult<()> {
@@ -682,13 +718,16 @@ pub mod checks {
                     Python::attach(|py| {
                         super::detach(py, || {
                             while !stop.load(Ordering::Acquire) {
+                                let queued = run_delay();
                                 let asked = Instant::now();
                                 Python::attach(|_| {});
                                 let waited = asked.elapsed();
-                                waits
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .push((since_base(asked), super::nanos(waited)));
+                                let unscheduled = run_delay().saturating_sub(queued);
+                                waits.lock().unwrap_or_else(PoisonError::into_inner).push((
+                                    since_base(asked),
+                                    super::nanos(waited),
+                                    unscheduled,
+                                ));
                                 thread::sleep(Duration::from_micros(interval_us));
                             }
                         })
@@ -703,9 +742,19 @@ pub mod checks {
         Ok(())
     }
 
-    /// Stops the probe and returns its `(asked_ns, waited_ns)` records.
+    /// Nanoseconds this thread has spent runnable but not scheduled, from
+    /// Linux's schedstat; 0 where it cannot be read.
+    fn run_delay() -> u64 {
+        std::fs::read_to_string("/proc/thread-self/schedstat")
+            .ok()
+            .and_then(|stat| stat.split_whitespace().nth(1)?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Stops the probe and returns its `(asked_ns, waited_ns,
+    /// unscheduled_ns)` records.
     #[pyfunction]
-    fn _gil_probe_stop(py: Python<'_>) -> PyResult<Vec<(u64, u64)>> {
+    fn _gil_probe_stop(py: Python<'_>) -> PyResult<Vec<(u64, u64, u64)>> {
         let probe = PROBE.lock().unwrap_or_else(PoisonError::into_inner).take();
         let Some(probe) = probe else {
             return Err(PyRuntimeError::new_err("the GIL probe is not running"));

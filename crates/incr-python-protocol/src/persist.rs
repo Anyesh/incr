@@ -89,7 +89,7 @@ impl<'de> Deserialize<'de> for PyValue {
 impl Serialize for PyKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let hook = hook().map_err(serde::ser::Error::custom)?;
-        static SITE: gil::Site = gil::Site::one("codec.encode_key");
+        static SITE: gil::Site = gil::Site::caller("codec.encode_key");
         let bytes = gil::enter(&SITE, |py| (hook.encode_key)(py, self))
             .map_err(serde::ser::Error::custom)?;
         serializer.serialize_bytes(&bytes)
