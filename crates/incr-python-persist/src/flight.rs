@@ -7,7 +7,7 @@
 //! freeing it abandons the flight, which the store or memo settles itself.
 
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
@@ -60,10 +60,11 @@ trait Pending: Send + Sync {
 /// the worker with the GIL released, and returns what `checkpoint()`
 /// returns, raising `TimeoutError` with the flight still open when the
 /// timeout passes; `cancel()` stops a flight that has not committed.
-/// `poll`, `result` and `cancel` raise `RuntimeError` on any thread but the
-/// one that began the flight. Leaving a `with` block, or freeing the
-/// handle, abandons the flight: the store or memo ends it on its own once
-/// the worker has stopped, and until then `checkpoint()` raises `Busy`.
+/// `poll`, `result`, `cancel` and leaving a `with` block raise
+/// `RuntimeError` on any thread but the one that began the flight. Leaving
+/// a `with` block, or freeing the handle, abandons the flight: the store
+/// or memo ends it on its own once the worker has stopped, and until then
+/// `checkpoint()` raises `Busy`.
 #[pyclass(name = "PendingCheckpoint", module = "incr.persist", frozen)]
 pub struct PendingCheckpoint {
     opener: ThreadId,
@@ -78,21 +79,26 @@ impl PendingCheckpoint {
         }
     }
 
-    fn with_flight<R>(&self, f: impl FnOnce(&dyn Pending) -> PyResult<R>) -> PyResult<R> {
+    /// The flight's slot, for the opener thread only and never waiting:
+    /// a call holding it may be waiting for the worker with the GIL
+    /// released, and the worker needs the GIL to finish.
+    fn slot(&self) -> PyResult<MutexGuard<'_, Option<Box<dyn Pending>>>> {
         if thread::current().id() != self.opener {
             return Err(PyRuntimeError::new_err(
                 "a pending checkpoint is used only on the thread that began it",
             ));
         }
-        let flight = match self.flight.try_lock() {
-            Ok(flight) => flight,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(PyRuntimeError::new_err(
-                    "the pending checkpoint is in use by another call",
-                ))
-            }
-        };
+        match self.flight.try_lock() {
+            Ok(flight) => Ok(flight),
+            Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => Err(PyRuntimeError::new_err(
+                "the pending checkpoint is in use by another call",
+            )),
+        }
+    }
+
+    fn with_flight<R>(&self, f: impl FnOnce(&dyn Pending) -> PyResult<R>) -> PyResult<R> {
+        let flight = self.slot()?;
         match flight.as_deref() {
             Some(flight) => f(flight),
             None => Err(PyRuntimeError::new_err(
@@ -132,14 +138,10 @@ impl PendingCheckpoint {
     }
 
     #[pyo3(signature = (*_exc))]
-    fn __exit__(&self, _exc: &Bound<'_, pyo3::types::PyTuple>) -> bool {
-        let flight = self
-            .flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+    fn __exit__(&self, _exc: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<bool> {
+        let flight = self.slot()?.take();
         drop(flight);
-        false
+        Ok(false)
     }
 }
 

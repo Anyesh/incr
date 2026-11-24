@@ -222,7 +222,13 @@ def test_a_handle_is_used_only_on_the_thread_that_began_the_flight():
     raised = []
 
     def use_it():
-        for call in (lambda: pending.poll(), lambda: pending.result(), pending.cancel):
+        calls = (
+            lambda: pending.poll(),
+            lambda: pending.result(),
+            pending.cancel,
+            lambda: pending.__exit__(None, None, None),
+        )
+        for call in calls:
             try:
                 call()
             except RuntimeError as error:
@@ -231,7 +237,7 @@ def test_a_handle_is_used_only_on_the_thread_that_began_the_flight():
     thread = threading.Thread(target=use_it)
     thread.start()
     thread.join(DEADLINE)
-    assert len(raised) == 3
+    assert len(raised) == 4
     poll_to_end(pending)
 
 
