@@ -23,6 +23,7 @@ use incr_core::{
 };
 
 pub mod by_id;
+pub mod gil;
 pub mod gil_yield;
 pub mod inspect;
 pub mod notready;
@@ -314,7 +315,8 @@ pub fn routing_error(py: Python<'_>, failure: RoutingFailed) -> PyErr {
 /// A `try_get` result as Python sees it: the value, or `CycleError`
 /// raised as an ordinary exception, never an engine unwind.
 pub fn try_read<E: Exceptions>(read: Result<PyValue, Cycle>) -> PyResult<Py<PyAny>> {
-    read.map(|v| v.0).map_err(|cycle| cycle_error::<E>(&cycle))
+    read.map(PyValue::into_inner)
+        .map_err(|cycle| cycle_error::<E>(&cycle))
 }
 
 /// Newtype around `Py<PyAny>` that satisfies the `Value` bound
@@ -324,14 +326,22 @@ pub fn try_read<E: Exceptions>(read: Result<PyValue, Cycle>) -> PyResult<Py<PyAn
 /// embedding `Py<PyAny>` in trait-bounded Rust code.
 pub struct PyValue(pub Py<PyAny>);
 
+impl Drop for PyValue {
+    fn drop(&mut self) {
+        gil::note_value_drop();
+    }
+}
+
 impl Clone for PyValue {
     fn clone(&self) -> Self {
+        gil::check_value_attach();
         Python::attach(|py| PyValue(self.0.clone_ref(py)))
     }
 }
 
 impl PartialEq for PyValue {
     fn eq(&self, other: &Self) -> bool {
+        gil::check_value_attach();
         Python::attach(|py| {
             let result = or_stash(
                 self.0
@@ -352,6 +362,7 @@ impl Eq for PyValue {}
 
 impl Hash for PyValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        gil::check_value_attach();
         Python::attach(|py| hash_into(self.0.bind(py), state));
     }
 }
@@ -364,6 +375,7 @@ impl PartialOrd for PyValue {
 
 impl Ord for PyValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        gil::check_value_attach();
         Python::attach(|py| {
             let self_ref = self.0.bind(py);
             let other_ref = other.0.bind(py);
@@ -395,14 +407,22 @@ fn hash_into<H: Hasher>(object: &Bound<'_, PyAny>, state: &mut H) {
     state.write_isize(or_stash(object.hash()));
 }
 
+impl Drop for PyKey {
+    fn drop(&mut self) {
+        gil::note_value_drop();
+    }
+}
+
 impl Clone for PyKey {
     fn clone(&self) -> Self {
+        gil::check_value_attach();
         Python::attach(|py| PyKey(self.0.clone_ref(py)))
     }
 }
 
 impl PartialEq for PyKey {
     fn eq(&self, other: &Self) -> bool {
+        gil::check_value_attach();
         Python::attach(|py| same_or_equal(self.0.bind(py), other.0.bind(py)))
     }
 }
@@ -411,6 +431,7 @@ impl Eq for PyKey {}
 
 impl Hash for PyKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        gil::check_value_attach();
         Python::attach(|py| hash_into(self.0.bind(py), state));
     }
 }
@@ -429,8 +450,15 @@ fn pair_item<'py>(pair: &'py PyPair, py: Python<'py>, i: usize) -> Bound<'py, Py
 /// collection is a plain collection of rows, whose operators hash rows.
 pub struct PyPair(pub Py<PyAny>);
 
+impl Drop for PyPair {
+    fn drop(&mut self) {
+        gil::note_value_drop();
+    }
+}
+
 impl Clone for PyPair {
     fn clone(&self) -> Self {
+        gil::check_value_attach();
         Python::attach(|py| PyPair(self.0.clone_ref(py)))
     }
 }
@@ -453,6 +481,7 @@ impl PartialEq for PyPair {
     /// Tuple `==` item by item, which calls a differing row's `__eq__`
     /// once where `tuple.__eq__` calls it twice.
     fn eq(&self, other: &Self) -> bool {
+        gil::check_value_attach();
         Python::attach(|py| {
             self.0.bind(py).is(other.0.bind(py))
                 || (0..2).all(|i| {
@@ -473,9 +502,10 @@ impl Hash for PyPair {
 /// `row_eq` matches rows as the pairs' `==` does.
 impl Pair<PyKey, PyValue> for PyPair {
     fn new(key: PyKey, row: PyValue) -> Self {
+        gil::check_value_attach();
         Python::attach(|py| {
             PyPair(
-                or_stash(PyTuple::new(py, [key.0, row.0]))
+                or_stash(PyTuple::new(py, [key.into_inner(), row.into_inner()]))
                     .into_any()
                     .unbind(),
             )
@@ -483,25 +513,46 @@ impl Pair<PyKey, PyValue> for PyPair {
     }
 
     fn key(&self) -> PyKey {
+        gil::check_value_attach();
         Python::attach(|py| PyKey(pair_item(self, py, 0).unbind()))
     }
 
     fn row(&self) -> PyValue {
+        gil::check_value_attach();
         Python::attach(|py| PyValue(pair_item(self, py, 1).unbind()))
     }
 
     fn key_hash<H: Hasher>(&self, state: &mut H) {
+        gil::check_value_attach();
         Python::attach(|py| hash_into(&pair_item(self, py, 0), state));
     }
 
     fn key_eq(&self, key: &PyKey) -> bool {
+        gil::check_value_attach();
         Python::attach(|py| same_or_equal(&pair_item(self, py, 0), key.0.bind(py)))
     }
 
     fn row_eq(&self, row: &PyValue) -> bool {
+        gil::check_value_attach();
         Python::attach(|py| same_or_equal_lenient(&pair_item(self, py, 1), row.0.bind(py)))
     }
 }
+
+macro_rules! into_inner {
+    ($($type:ident),+) => {$(
+        impl $type {
+            /// The object, moved out without counting a drop.
+            pub fn into_inner(self) -> Py<PyAny> {
+                let this = std::mem::ManuallyDrop::new(self);
+                // SAFETY: `this` is never used or dropped again, so the
+                // field is moved out exactly once.
+                unsafe { std::ptr::read(&this.0) }
+            }
+        }
+    )+};
+}
+
+into_inner!(PyValue, PyKey, PyPair);
 
 /// An input's initial value from a Python callable, called only on a miss.
 pub fn init_fn(init: Py<PyAny>) -> impl FnOnce() -> PyValue {
@@ -623,7 +674,7 @@ impl PyFixpoint {
                     PyValue(call_stashing(
                         py,
                         f.borrow(),
-                        (prev.0.clone_ref(py), out.0, k),
+                        (prev.0.clone_ref(py), out.into_inner(), k),
                     ))
                 })
             });
@@ -632,7 +683,11 @@ impl PyFixpoint {
             let f = hold(f.clone_ref(py));
             fixpoint = fixpoint.on_limit(move |cycle: &Cycle, cur: PyValue| {
                 Python::attach(|py| {
-                    PyValue(call_stashing(py, f.borrow(), (cycle_ids(cycle), cur.0)))
+                    PyValue(call_stashing(
+                        py,
+                        f.borrow(),
+                        (cycle_ids(cycle), cur.into_inner()),
+                    ))
                 })
             });
         }

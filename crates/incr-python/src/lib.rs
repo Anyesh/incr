@@ -349,7 +349,7 @@ impl PyRuntimeRef {
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
         let val: PyValue = engine_in_query(rt, || rt.get(node.inner))?;
-        ready::read::<Signal>(py, val.0, missing)
+        ready::read::<Signal>(py, val.into_inner(), missing)
     }
 
     /// Like `get`, but a cycle that leaves the node without a value
@@ -367,7 +367,7 @@ impl PyRuntimeRef {
         let (_, missing) = self.rt_and_missing()?;
         let lookups = state.lookups();
         let val = engine_in_query(rt, || rt.get(lookups.node(rt, py, &key)))?;
-        ready::read::<Signal>(py, val.0, missing)
+        ready::read::<Signal>(py, val.into_inner(), missing)
     }
 
     /// `(value, status)` as `Runtime.get_with_status` gives them, with
@@ -375,7 +375,7 @@ impl PyRuntimeRef {
     fn get_status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let rt = self.rt()?;
         let val: PyValue = engine_in_query(rt, || rt.get(node.inner))?;
-        Ok(ready::with_status(py, val.0))
+        Ok(ready::with_status(py, val.into_inner()))
     }
 
     /// The row `kc` holds for `key`, or `None`, read as `get` reads a node,
@@ -392,7 +392,11 @@ impl PyRuntimeRef {
         let (source, label) = kc.key_source(py, rt)?;
         let key = PyKey(key);
         let row = engine_in_query(rt, || source.get_key(rt, &key, label))?;
-        ready::read::<Signal>(py, row.map_or_else(|| py.None(), |row| row.0), missing)
+        ready::read::<Signal>(
+            py,
+            row.map_or_else(|| py.None(), |row| row.into_inner()),
+            missing,
+        )
     }
 
     /// A new list of the keys `kc` holds, with a dependency on which keys
@@ -430,7 +434,7 @@ impl PyRuntimeRef {
                 )))
             }
         };
-        pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
+        pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.into_inner()))
     }
 
     /// `(row, status)` for `kc`'s `key` as `get_status` gives them, read
@@ -447,7 +451,7 @@ impl PyRuntimeRef {
         let row = engine_in_query(rt, || source.get_key(rt, &key, label))?;
         Ok(ready::with_status(
             py,
-            row.map_or_else(|| py.None(), |row| row.0),
+            row.map_or_else(|| py.None(), |row| row.into_inner()),
         ))
     }
 
@@ -461,7 +465,7 @@ impl PyRuntimeRef {
     ) -> PyResult<Py<PyAny>> {
         let (rt, missing) = self.rt_and_missing()?;
         let val = table.value_of(py, rt, PyValue(key))?;
-        ready::read::<Signal>(py, val.0, missing)
+        ready::read::<Signal>(py, val.into_inner(), missing)
     }
 
     /// The input child named `key` of this query, created with `init()`
@@ -582,7 +586,7 @@ impl PyNodeTable {
         })?;
         Ok(entries
             .into_iter()
-            .map(|(key, inner)| (key.0, PyNodeId { inner }))
+            .map(|(key, inner)| (key.into_inner(), PyNodeId { inner }))
             .collect())
     }
 }
@@ -1295,7 +1299,7 @@ impl PyKeyedCollection {
             KeyedKind::Plain(keyed) => self.read_core(py, || keyed.row(&key)),
             KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.row(&key)),
         }?;
-        Ok(row.map(|row| row.0))
+        Ok(row.map(|row| row.into_inner()))
     }
 
     fn __contains__(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<bool> {
@@ -1320,7 +1324,7 @@ impl PyKeyedCollection {
             KeyedKind::Plain(keyed) => self.read_core(py, || keyed.keys()),
             KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.keys()),
         }?;
-        pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.0))
+        pyo3::types::PyList::new(py, keys.into_iter().map(|key| key.into_inner()))
     }
 
     /// A new list of the held `(key, row)` tuples, in no particular order.
@@ -1330,7 +1334,7 @@ impl PyKeyedCollection {
             KeyedKind::Plain(keyed) => self.read_core(py, || keyed.items()),
             KeyedKind::Persisted(persisted) => self.read_core(py, || persisted.items()),
         }?;
-        pyo3::types::PyList::new(py, items.into_iter().map(|pair| pair.0))
+        pyo3::types::PyList::new(py, items.into_iter().map(|pair| pair.into_inner()))
     }
 
     /// Make the held rows equal `rows`, a mapping or an iterable of
@@ -1769,7 +1773,7 @@ impl PyRuntime {
     /// value's `value`.
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let val: PyValue = self.engine_read(|rt| rt.get(node.inner))?;
-        Ok(ready::unwrapped(py, val.0))
+        Ok(ready::unwrapped(py, val.into_inner()))
     }
 
     /// The row `kc` holds for `key`, or `None`, as stored. Outside a query
@@ -1785,14 +1789,14 @@ impl PyRuntime {
         let (source, label) = kc.key_source(py, rt)?;
         let key = PyKey(key);
         let row = engine_read(rt, || source.get_key(rt, &key, label))?;
-        Ok(row.map(|row| row.0))
+        Ok(row.map(|row| row.into_inner()))
     }
 
     /// `(value, status)`: the value `get` returns, and `None`, the
     /// `NotReady` value, or the `Incomplete` value.
     fn get_with_status(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let val: PyValue = self.engine_read(|rt| rt.get(node.inner))?;
-        Ok(ready::with_status(py, val.0))
+        Ok(ready::with_status(py, val.into_inner()))
     }
 
     /// The status `get_with_status` gives.
@@ -2019,7 +2023,7 @@ impl PyRuntime {
             let kept = kept_trace(rt, &capture, &trace);
             keep_traced(rt, capture, kept, |py, kept| {
                 let trace = traced_to_py(py, rt, trace.target.0, kept)?;
-                Ok((ready::unwrapped(py, val.0), trace))
+                Ok((ready::unwrapped(py, val.into_inner()), trace))
             })
         })?
     }
@@ -2243,7 +2247,7 @@ impl PyRuntime {
     fn drain_pending_lookups(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let lookups = self.state.lookups();
         let keys = self.engine_read(|rt| lookups.drain(rt, py))?;
-        Ok(keys.into_iter().map(|key| key.0).collect())
+        Ok(keys.into_iter().map(|key| key.into_inner()).collect())
     }
 
     /// Set each lookup to its value, from a mapping or an iterable of

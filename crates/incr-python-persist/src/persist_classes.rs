@@ -11,7 +11,14 @@
 /// registers the classes itself; Shared leaves `PyOverlay` unregistered.
 #[macro_export]
 macro_rules! persist_classes {
-    (binding = $b:ty, runtime = $rt:ty, module = $module:literal, flags = [$($flag:ident),*]) => {
+    (
+        binding = $b:ty,
+        runtime = $rt:ty,
+        module = $module:literal,
+        flags = [$($flag:ident),*]
+        $(, store_methods = { $($store_extra:tt)* })?
+        $(, memo_methods = { $($memo_extra:tt)* })?
+    ) => {
         use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
         use $crate::binding::PyBinding;
@@ -23,6 +30,13 @@ macro_rules! persist_classes {
         use $crate::pyo3::prelude::*;
         use $crate::pyo3::types::PyDict;
         use $crate::incr_python_protocol::PyValue;
+
+        static MEMO_REF_DROP: $crate::incr_python_protocol::gil::Site =
+            $crate::incr_python_protocol::gil::Site::caller("classes.memo_ref_drop");
+        static STORE_DROP: $crate::incr_python_protocol::gil::Site =
+            $crate::incr_python_protocol::gil::Site::caller("classes.store_drop");
+        static BATCH_DROP: $crate::incr_python_protocol::gil::Site =
+            $crate::incr_python_protocol::gil::Site::caller("classes.batch_drop");
 
         /// Persisted inputs and collections over a backend, and the runtime that
         /// reads them.
@@ -66,14 +80,16 @@ macro_rules! persist_classes {
         impl Drop for MemoRef {
             fn drop(&mut self) {
                 if let Some(last) = self.0.take().and_then(Arc::into_inner) {
-                    Python::attach(|py| <$b as PyBinding>::drop_detached(py, last));
+                    $crate::incr_python_protocol::gil::enter(&MEMO_REF_DROP, |py| {
+                        <$b as PyBinding>::drop_detached(py, last)
+                    });
                 }
             }
         }
 
         impl Drop for PyStore {
             fn drop(&mut self) {
-                Python::attach(|py| self.release(py));
+                $crate::incr_python_protocol::gil::enter(&STORE_DROP, |py| self.release(py));
             }
         }
 
@@ -457,7 +473,35 @@ macro_rules! persist_classes {
                 self.release(py);
                 Ok(())
             }
+
+            $($($store_extra)*)?
         });
+
+        impl $crate::flight::StoreOwner<$b> for PyStore {
+            fn with_store<R>(
+                &self,
+                py: Python<'_>,
+                begin: bool,
+                f: impl FnOnce(&Arc<$crate::store::StoreCore<$b>>) -> PyResult<R>,
+            ) -> PyResult<R> {
+                let core = if begin { self.core_outside_overlay(py)? } else { self.core_live(py)? };
+                f(&core)
+            }
+        }
+
+        impl $crate::flight::MemoOwner<$b> for PyMemo {
+            fn with_memo<R>(
+                &self,
+                py: Python<'_>,
+                begin: bool,
+                f: impl FnOnce(&$crate::store::StoreCore<$b>, &MemoCore<$b>) -> PyResult<R>,
+            ) -> PyResult<R> {
+                let store = self.store.bind(py).borrow();
+                let core = if begin { store.core_outside_overlay(py)? } else { store.core_live(py)? };
+                let memo = store.memo()?;
+                f(&core, &memo)
+            }
+        }
 
         /// The writes of a `with store.batch() as b:` block; see `Store.batch`.
         ///
@@ -484,7 +528,9 @@ macro_rules! persist_classes {
                     self.batch.get_mut().unwrap_or_else(PoisonError::into_inner),
                     $crate::batch::Batch::new($crate::batch::Apply::OnExit),
                 );
-                Python::attach(|py| <$b as PyBinding>::drop_detached(py, batch));
+                $crate::incr_python_protocol::gil::enter(&BATCH_DROP, |py| {
+                    <$b as PyBinding>::drop_detached(py, batch)
+                });
             }
         }
 
@@ -752,6 +798,8 @@ macro_rules! persist_classes {
                 dict.set_item("last_auto_checkpoint_error", stats.last_auto_checkpoint_error)?;
                 Ok(dict)
             }
+
+            $($($memo_extra)*)?
         }
 
         /// `with rt.overlay() as ov:` runs candidate changes against the live

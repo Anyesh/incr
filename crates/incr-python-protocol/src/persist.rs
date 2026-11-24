@@ -10,7 +10,7 @@ use pyo3::{Bound, PyAny, Python};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{PyKey, PyPair, PyValue};
+use crate::{gil, PyKey, PyPair, PyValue};
 
 /// How a binding turns values into bytes and back. Both run with the GIL
 /// held, on the thread serde runs on, and report a failure as the message
@@ -40,7 +40,8 @@ fn serialize_value<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     let hook = hook().map_err(serde::ser::Error::custom)?;
-    let bytes = Python::attach(|py| (hook.encode)(py, value.bind(py)))
+    static SITE: gil::Site = gil::Site::one("codec.encode_value");
+    let bytes = gil::enter(&SITE, |py| (hook.encode)(py, value.bind(py)))
         .map_err(serde::ser::Error::custom)?;
     serializer.serialize_bytes(&bytes)
 }
@@ -59,7 +60,7 @@ impl Serialize for PyPair {
 
 impl<'de> Deserialize<'de> for PyPair {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        PyValue::deserialize(deserializer).map(|value| PyPair(value.0))
+        PyValue::deserialize(deserializer).map(|value| PyPair(value.into_inner()))
     }
 }
 
@@ -74,7 +75,8 @@ impl<'de> Visitor<'de> for Bytes {
 
     fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<PyValue, E> {
         let hook = hook().map_err(E::custom)?;
-        Python::attach(|py| (hook.decode)(py, bytes)).map_err(E::custom)
+        static SITE: gil::Site = gil::Site::one("codec.decode_value");
+        gil::enter(&SITE, |py| (hook.decode)(py, bytes)).map_err(E::custom)
     }
 }
 
@@ -87,8 +89,9 @@ impl<'de> Deserialize<'de> for PyValue {
 impl Serialize for PyKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let hook = hook().map_err(serde::ser::Error::custom)?;
-        let bytes =
-            Python::attach(|py| (hook.encode_key)(py, self)).map_err(serde::ser::Error::custom)?;
+        static SITE: gil::Site = gil::Site::one("codec.encode_key");
+        let bytes = gil::enter(&SITE, |py| (hook.encode_key)(py, self))
+            .map_err(serde::ser::Error::custom)?;
         serializer.serialize_bytes(&bytes)
     }
 }
@@ -104,7 +107,8 @@ impl<'de> Visitor<'de> for KeyBytes {
 
     fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<PyKey, E> {
         let hook = hook().map_err(E::custom)?;
-        Python::attach(|py| (hook.decode_key)(py, bytes)).map_err(E::custom)
+        static SITE: gil::Site = gil::Site::caller("codec.decode_key");
+        gil::enter(&SITE, |py| (hook.decode_key)(py, bytes)).map_err(E::custom)
     }
 }
 

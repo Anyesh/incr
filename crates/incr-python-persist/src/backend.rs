@@ -38,17 +38,31 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::panic;
 
-use incr_core::{YieldHook, Yielder};
+use incr_core::YieldHook;
 use incr_persist::{
     Backend, ConditionalAppend, Error, Position, ReadOutcome, Record, Result, SnapshotId,
 };
+use incr_python_protocol::gil::{self, Site};
 use pyo3::exceptions::PyTypeError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
+use pyo3::types::{PyAny, PyBytes, PyString};
 
 use crate::lent::{self, Failure, Lending, Names};
 use crate::PersistExceptions;
+
+static RAISED: Site = Site::one("log.raised");
+static ERROR_TEXT: Site = Site::caller("log.error_text");
+static APPEND: Site = Site::caller("log.append");
+static APPEND_AT: Site = Site::caller("log.append_at");
+static SYNC: Site = Site::caller("log.sync");
+static READ_FROM: Site = Site::caller("log.read_from");
+static LOAD_SNAPSHOT: Site = Site::caller("log.load_snapshot");
+static SNAPSHOT_ID: Site = Site::caller("log.snapshot_id");
+static COMPACT: Site = Site::caller("log.compact");
+static COMPACT_STREAMED: Site = Site::one("log.compact_streamed");
+static LENT_DROP: Site = Site::one("log.lent_drop");
+static WRITABLE: Site = Site::caller("log.writable");
 
 /// A Python exception a backend method raised, carried through
 /// incr-persist's `Error::Backend` so the store call raises it unchanged.
@@ -63,7 +77,7 @@ impl PyBackendError {
 
 impl fmt::Display for PyBackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Python::attach(|py| {
+        gil::enter(&ERROR_TEXT, |py| {
             let value = self.0.value(py);
             let name = self.0.get_type(py).name();
             match (name, value.str()) {
@@ -81,7 +95,7 @@ impl std::error::Error for PyBackendError {}
 /// checkpoint or a rejected write stays one, and any other exception is
 /// carried so the call raises it unchanged.
 pub fn raised<E: PersistExceptions>(err: PyErr) -> Error {
-    if let Some(known) = Python::attach(|py| well_known::<E>(py, &err)) {
+    if let Some(known) = gil::enter(&RAISED, |py| well_known::<E>(py, &err)) {
         return known;
     }
     Error::Backend(Box::new(PyBackendError(err)))
@@ -115,6 +129,61 @@ pub fn bad_return<E: PersistExceptions>(what: &str) -> Error {
     )))
 }
 
+/// The error for a sequence a backend returned: a `TypeError` from walking
+/// it means it had the wrong shape, anything else is the backend's own.
+pub(crate) fn sequence_error<E: PersistExceptions>(what: &'static str) -> impl Fn(PyErr) -> Error {
+    move |err| {
+        if gil::enter(&RAISED, |py| err.is_instance_of::<PyTypeError>(py)) {
+            bad_return::<E>(what)
+        } else {
+            raised::<E>(err)
+        }
+    }
+}
+
+/// An argument a backend call may pass: a scalar or a Python object, so a
+/// Rust collection is never converted by PyO3 in one hold.
+pub trait Arg<'py>: IntoPyObject<'py> {}
+
+impl Arg<'_> for u32 {}
+impl Arg<'_> for u64 {}
+impl Arg<'_> for Option<u64> {}
+impl<'py> Arg<'py> for Bound<'py, PyAny> {}
+impl<'py> Arg<'py> for Bound<'py, PyBytes> {}
+impl<'py> Arg<'py> for Py<PyAny> {}
+
+/// The arguments of a backend call, each an [`Arg`].
+pub trait Args<'py>: pyo3::call::PyCallArgs<'py> {}
+
+impl Args<'_> for () {}
+impl<'py, A: Arg<'py>> Args<'py> for (A,) where (A,): pyo3::call::PyCallArgs<'py> {}
+impl<'py, A: Arg<'py>, B: Arg<'py>> Args<'py> for (A, B) where (A, B): pyo3::call::PyCallArgs<'py> {}
+impl<'py, A: Arg<'py>, B: Arg<'py>, C: Arg<'py>, D: Arg<'py>> Args<'py> for (A, B, C, D) where
+    (A, B, C, D): pyo3::call::PyCallArgs<'py>
+{
+}
+impl<'py, A: Arg<'py>, B: Arg<'py>, C: Arg<'py>, D: Arg<'py>, F: Arg<'py>> Args<'py>
+    for (A, B, C, D, F)
+where
+    (A, B, C, D, F): pyo3::call::PyCallArgs<'py>,
+{
+}
+
+/// Whether `backend`'s class declares `concurrent_compaction` true. Read
+/// from the class, so a wrapper that forwards attributes to another
+/// backend does not inherit that backend's promise.
+pub(crate) fn declares_concurrent(backend: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = backend.py();
+    match backend
+        .get_type()
+        .getattr(intern!(py, "concurrent_compaction"))
+    {
+        Ok(flag) => flag.is_truthy(),
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 /// A Python object implementing the backend protocol, as a `Backend`
 /// whose errors use the exceptions `E`. It offers a `ConditionalAppend`
 /// exactly when the object had an `append_at` attribute when wrapped.
@@ -122,21 +191,27 @@ pub struct PyBackend<E> {
     backend: Py<PyAny>,
     has_append_at: bool,
     streams: bool,
-    /// The store runtime's hook, ticked per record converted.
+    concurrent: bool,
+    /// The store runtime's hook, ticked per record converted on the
+    /// engine's thread and never on a checkpoint worker.
     yield_hook: Option<YieldHook>,
     exceptions: PhantomData<fn() -> E>,
 }
 
 impl<E: PersistExceptions> PyBackend<E> {
-    /// Wraps `backend`; raises what looking up its `append_at` raises,
-    /// other than `AttributeError`.
+    /// Wraps `backend`; raises what looking up its `append_at`,
+    /// `compact_streamed` or `concurrent_compaction` raises, other than
+    /// `AttributeError`.
     pub fn new(py: Python<'_>, backend: Py<PyAny>) -> PyResult<Self> {
-        let has_append_at = backend.bind(py).hasattr(intern!(py, "append_at"))?;
-        let streams = backend.bind(py).hasattr(intern!(py, "compact_streamed"))?;
+        let object = backend.bind(py);
+        let has_append_at = object.hasattr(intern!(py, "append_at"))?;
+        let streams = object.hasattr(intern!(py, "compact_streamed"))?;
+        let concurrent = streams && declares_concurrent(object)?;
         Ok(PyBackend {
             backend,
             has_append_at,
             streams,
+            concurrent,
             yield_hook: None,
             exceptions: PhantomData,
         })
@@ -146,36 +221,43 @@ impl<E: PersistExceptions> PyBackend<E> {
         PyBackend { yield_hook, ..self }
     }
 
-    fn yielder(&self) -> Yielder<'_> {
-        Yielder::of(self.yield_hook.as_ref())
+    fn hook(&self) -> Option<&YieldHook> {
+        self.yield_hook.as_ref().filter(|_| !gil::on_worker())
     }
 
-    fn call<'py, A: pyo3::call::PyCallArgs<'py>>(
+    /// Runs a backend method's whole body through `site` with the store
+    /// runtime's hook ambient, so the gate's sequence functions tick it.
+    fn enter<R>(&self, site: &'static Site, f: impl for<'py> FnOnce(Python<'py>) -> R) -> R {
+        incr_core::with_ambient_hook(self.hook(), || gil::enter(site, f))
+    }
+
+    fn call_raw<'py>(
         &self,
         py: Python<'py>,
         method: &Bound<'py, PyString>,
-        args: A,
+        args: impl Args<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.backend.bind(py).call_method1(method, args)
+    }
+
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        method: &Bound<'py, PyString>,
+        args: impl Args<'py>,
     ) -> Result<Bound<'py, PyAny>> {
-        incr_core::with_ambient_hook(self.yield_hook.as_ref(), || {
-            self.backend
-                .bind(py)
-                .call_method1(method, args)
-                .map_err(raised::<E>)
-        })
+        self.call_raw(py, method, args).map_err(raised::<E>)
     }
 }
 
 fn encoded<'py, E: PersistExceptions>(
     py: Python<'py>,
+    site: &'static Site,
     records: &[Record],
-    yielder: &Yielder<'_>,
-) -> Result<Bound<'py, PyList>> {
-    let items = records
-        .iter()
-        .inspect(|_| yielder.tick())
-        .map(|record| Ok(PyBytes::new(py, &record.encode()?)))
-        .collect::<Result<Vec<_>>>()?;
-    PyList::new(py, items).map_err(raised::<E>)
+) -> Result<Bound<'py, PyAny>> {
+    gil::build(py, site, records, raised::<E>, |py, record| {
+        Ok(PyBytes::new(py, &record.encode()?).into_any())
+    })
 }
 
 fn decoded<E: PersistExceptions>(object: &Bound<'_, PyAny>) -> Result<Record> {
@@ -185,18 +267,6 @@ fn decoded<E: PersistExceptions>(object: &Bound<'_, PyAny>) -> Result<Record> {
     Record::decode(bytes.as_bytes())
 }
 
-fn decoded_all<E: PersistExceptions>(
-    object: &Bound<'_, PyAny>,
-    yielder: &Yielder<'_>,
-) -> Result<Vec<Record>> {
-    object
-        .try_iter()
-        .map_err(raised::<E>)?
-        .inspect(|_| yielder.tick())
-        .map(|item| decoded::<E>(&item.map_err(raised::<E>)?))
-        .collect()
-}
-
 fn position<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Result<Position> {
     object
         .extract::<u64>()
@@ -204,67 +274,79 @@ fn position<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Resu
         .map_err(|_| bad_return::<E>(what))
 }
 
+/// Frees an argument list once the call that took it has returned.
+fn emptied<E: PersistExceptions>(list: Bound<'_, PyAny>) -> Result<()> {
+    gil::empty(list).map_err(raised::<E>)
+}
+
 impl<E: PersistExceptions> Backend for PyBackend<E> {
     fn append(&self, records: &[Record]) -> Result<Position> {
-        Python::attach(|py| {
-            let list = encoded::<E>(py, records, &self.yielder())?;
-            position::<E>(&self.call(py, intern!(py, "append"), (list,))?, "append")
+        self.enter(&APPEND, |py| {
+            let list = encoded::<E>(py, &APPEND, records)?;
+            let at = position::<E>(
+                &self.call(py, intern!(py, "append"), (list.clone(),))?,
+                "append",
+            )?;
+            emptied::<E>(list)?;
+            Ok(at)
         })
     }
 
     fn sync(&self, upto: Position) -> Result<()> {
-        Python::attach(|py| self.call(py, intern!(py, "sync"), (upto.0,)).map(drop))
+        self.enter(&SYNC, |py| {
+            self.call(py, intern!(py, "sync"), (upto.0,)).map(drop)
+        })
     }
 
     fn read_from(&self, after: Position, out: &mut Vec<(Position, Record)>) -> Result<ReadOutcome> {
-        Python::attach(|py| {
+        self.enter(&READ_FROM, |py| {
             let result = self.call(py, intern!(py, "read_from"), (after.0,))?;
-            if let Ok(tuple) = result.downcast::<PyTuple>() {
-                if let Some(snapshot_at) = compacted::<E>(tuple)? {
-                    return Ok(ReadOutcome::Compacted { snapshot_at });
+            if let Ok((tag, snapshot_at)) = result.extract::<(Bound<'_, PyString>, u64)>() {
+                if tag.to_str().is_ok_and(|tag| tag == "compacted") {
+                    return Ok(ReadOutcome::Compacted {
+                        snapshot_at: Position(snapshot_at),
+                    });
                 }
             }
-            let mut found = Vec::new();
-            let yielder = self.yielder();
-            for item in result.try_iter().map_err(raised::<E>)? {
-                yielder.tick();
-                let pair = item.map_err(raised::<E>)?;
-                let pair = pair
-                    .downcast::<PyTuple>()
-                    .map_err(|_| bad_return::<E>("read_from"))?;
-                if pair.len() != 2 {
-                    return Err(bad_return::<E>("read_from"));
-                }
-                let at = position::<E>(&pair.get_item(0).map_err(raised::<E>)?, "read_from")?;
-                found.push((at, decoded::<E>(&pair.get_item(1).map_err(raised::<E>)?)?));
-            }
+            let found = gil::drain(
+                &READ_FROM,
+                result,
+                sequence_error::<E>("read_from"),
+                |pair| {
+                    let (at, record) = pair
+                        .extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()
+                        .map_err(|_| bad_return::<E>("read_from"))?;
+                    Ok((position::<E>(&at, "read_from")?, decoded::<E>(&record)?))
+                },
+            )?;
             out.extend(found);
             Ok(ReadOutcome::Records)
         })
     }
 
     fn load_snapshot(&self) -> Result<Option<(Position, Vec<Record>)>> {
-        Python::attach(|py| {
+        self.enter(&LOAD_SNAPSHOT, |py| {
             let result = self.call(py, intern!(py, "load_snapshot"), ())?;
             if result.is_none() {
                 return Ok(None);
             }
-            let pair = result
-                .downcast::<PyTuple>()
+            let (at, records) = result
+                .extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()
                 .map_err(|_| bad_return::<E>("load_snapshot"))?;
-            if pair.len() != 2 {
-                return Err(bad_return::<E>("load_snapshot"));
-            }
-            let at = position::<E>(&pair.get_item(0).map_err(raised::<E>)?, "load_snapshot")?;
-            Ok(Some((
-                at,
-                decoded_all::<E>(&pair.get_item(1).map_err(raised::<E>)?, &self.yielder())?,
-            )))
+            drop(result);
+            let at = position::<E>(&at, "load_snapshot")?;
+            let records = gil::drain(
+                &LOAD_SNAPSHOT,
+                records,
+                sequence_error::<E>("load_snapshot"),
+                decoded::<E>,
+            )?;
+            Ok(Some((at, records)))
         })
     }
 
     fn snapshot_id(&self) -> Result<Option<SnapshotId>> {
-        Python::attach(|py| {
+        self.enter(&SNAPSHOT_ID, |py| {
             let result = self.call(py, intern!(py, "snapshot_id"), ())?;
             if result.is_none() {
                 return Ok(None);
@@ -280,10 +362,10 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
     }
 
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()> {
-        Python::attach(|py| {
-            let list = encoded::<E>(py, &folded, &self.yielder())?;
-            self.call(py, intern!(py, "compact"), (upto.0, list))
-                .map(drop)
+        self.enter(&COMPACT, |py| {
+            let list = encoded::<E>(py, &COMPACT, &folded)?;
+            self.call(py, intern!(py, "compact"), (upto.0, list.clone()))?;
+            emptied::<E>(list)
         })
     }
 
@@ -296,12 +378,12 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
             let folded = records.collect::<Result<Vec<_>>>()?;
             return self.compact(upto, folded);
         }
-        Python::attach(|py| {
+        self.enter(&COMPACT_STREAMED, |py| {
             let lent = Lent::new(py, records).map_err(raised::<E>)?;
             let result = self.call(
                 py,
                 intern!(py, "compact_streamed"),
-                (upto.0, lent.records.clone_ref(py)),
+                (upto.0, lent.records.clone_ref(py).into_any()),
             );
             let records = lent.end(py);
             match (records.get().lending.failure(), result) {
@@ -317,12 +399,16 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
     }
 
     fn writable(&self) -> bool {
-        Python::attach(|py| {
+        self.enter(&WRITABLE, |py| {
             self.call(py, intern!(py, "writable"), ())
                 .ok()
                 .and_then(|writable| writable.is_truthy().ok())
                 .unwrap_or(false)
         })
+    }
+
+    fn concurrent_compaction(&self) -> bool {
+        self.concurrent
     }
 
     fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {
@@ -332,33 +418,19 @@ impl<E: PersistExceptions> Backend for PyBackend<E> {
 
 impl<E: PersistExceptions> ConditionalAppend for PyBackend<E> {
     fn append_at(&self, after: Position, records: &[Record]) -> Result<Position> {
-        Python::attach(|py| {
-            let list = encoded::<E>(py, records, &self.yielder())?;
-            let landed = self
-                .backend
-                .bind(py)
-                .call_method1(intern!(py, "append_at"), (after.0, list));
-            match landed {
+        self.enter(&APPEND_AT, |py| {
+            let list = encoded::<E>(py, &APPEND_AT, records)?;
+            let landed = self.call_raw(py, intern!(py, "append_at"), (after.0, list.clone()));
+            let landed = match landed {
                 Ok(landed) => position::<E>(&landed, "append_at"),
                 Err(err) if err.is_instance(py, &E::tail_moved(py)) => {
                     Err(Error::TailMoved { after })
                 }
                 Err(err) => Err(raised::<E>(err)),
-            }
+            };
+            emptied::<E>(list)?;
+            landed
         })
-    }
-}
-
-fn compacted<E: PersistExceptions>(tuple: &Bound<'_, PyTuple>) -> Result<Option<Position>> {
-    if tuple.len() != 2 {
-        return Ok(None);
-    }
-    let first = tuple.get_item(0).map_err(raised::<E>)?;
-    match first.downcast::<PyString>() {
-        Ok(tag) if tag.to_str().is_ok_and(|tag| tag == "compacted") => {
-            position::<E>(&tuple.get_item(1).map_err(raised::<E>)?, "read_from").map(Some)
-        }
-        _ => Ok(None),
     }
 }
 
@@ -419,6 +491,6 @@ impl Lent {
 
 impl Drop for Lent {
     fn drop(&mut self) {
-        Python::attach(|py| self.invalidate(py));
+        gil::enter(&LENT_DROP, |py| self.invalidate(py));
     }
 }

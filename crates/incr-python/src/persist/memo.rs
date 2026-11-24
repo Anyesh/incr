@@ -5,7 +5,7 @@ use std::cell::Cell;
 
 use incr_core::Local;
 use incr_persist::memo::MemoCtx;
-use incr_python_protocol::{in_runtime, PyValue};
+use incr_python_protocol::{gil, in_runtime, PyValue};
 use pyo3::prelude::*;
 
 use crate::state::PyCallable;
@@ -20,7 +20,8 @@ pub(super) fn memo_fn(
 ) -> impl Fn(&MemoCtx<'_, Local>, &PyValue) -> PyValue + Send + Sync + 'static {
     move |ctx: &MemoCtx<'_, Local>, key: &PyValue| -> PyValue {
         let rt = ctx.rt();
-        Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("memo_fn.call");
+        gil::enter(&SITE, |py| {
             let missing = Cell::new(0);
             let rt_ref = Py::new(
                 py,

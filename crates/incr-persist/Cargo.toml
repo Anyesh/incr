@@ -11,6 +11,7 @@ categories = ["algorithms", "database"]
 
 [features]
 backend-tests = []
+frame-limit = []
 sqlite = ["dep:rusqlite"]
 yield-hook = ["incr-core/yield-hook"]
 

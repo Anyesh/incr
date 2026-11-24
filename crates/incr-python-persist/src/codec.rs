@@ -30,6 +30,7 @@ use incr_persist::{
     current_value_context, current_value_scope, enter_value_scope, MemoPart, ValueContext,
     ValueScope,
 };
+use incr_python_protocol::gil::{self, Site};
 use incr_python_protocol::notready::{
     self, PyIncomplete, PyLookupFailed, PyPending, PyUnavailable,
 };
@@ -41,6 +42,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyTuple};
 
 use crate::PersistExceptions;
+
+static HOLD: Site = Site::one("value.hold");
+static STASH: Site = Site::one("codec.stash");
 
 const PLAIN: u8 = 0;
 const PENDING: u8 = 1;
@@ -102,7 +106,11 @@ impl<E> Default for Registry<E> {
 impl<E: PersistExceptions> Registry<E> {
     /// The value scope a store opened with these codecs carries.
     pub fn value_scope(self: &Arc<Self>) -> ValueScope {
-        ValueScope::new(Arc::clone(self)).holding(python_hold)
+        ValueScope::new(Arc::clone(self))
+            .holding(python_hold)
+            .idling(python_idle)
+            .waiting(python_wait)
+            .starting_workers(gil::run_worker)
     }
 
     fn codecs(&self) -> MutexGuard<'_, HashMap<Slot, Py<PyAny>>> {
@@ -174,11 +182,17 @@ impl<E: PersistExceptions> Registry<E> {
     /// [`Self::run`] or call to this, for a decode that went through serde
     /// directly.
     pub fn take_failure(&self) -> Option<PyErr> {
-        self.failures().remove(&std::thread::current().id())
+        self.take_failure_of(std::thread::current().id())
+    }
+
+    /// The exception a codec raised on `thread`, such as a checkpoint
+    /// worker whose failure its flight reports.
+    pub fn take_failure_of(&self, thread: ThreadId) -> Option<PyErr> {
+        self.failures().remove(&thread)
     }
 
     fn stash(&self, err: PyErr) -> String {
-        let message = Python::attach(|py| err.value(py).to_string());
+        let message = gil::enter(&STASH, |py| err.value(py).to_string());
         let mut failures = self.failures();
         let duplicate = match failures.entry(std::thread::current().id()) {
             Entry::Occupied(_) => Some(err),
@@ -213,7 +227,18 @@ impl<E: PersistExceptions> Registry<E> {
 /// Runs `f`, a batch of value calls, holding the GIL, so each call in it
 /// finds the GIL held instead of taking it.
 fn python_hold(f: &mut dyn FnMut()) {
-    Python::attach(|_| f());
+    gil::enter(&HOLD, |_| f());
+}
+
+/// Runs `f`, incr-persist's own work with no value call, with the GIL
+/// released on a checkpoint worker inside the gate.
+fn python_idle(f: &mut dyn FnMut()) {
+    gil::idle(f);
+}
+
+/// Runs `f`, a wait for a checkpoint worker, with the GIL released.
+fn python_wait(f: &mut dyn FnMut()) {
+    gil::release_held(f);
 }
 
 fn active<E: PersistExceptions>() -> Result<Arc<Registry<E>>, String> {

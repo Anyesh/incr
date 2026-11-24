@@ -12,6 +12,7 @@ doc = false
 
 [features]
 conformance = ["incr-persist/backend-tests"]
+gil-checks = ["incr-python-protocol/gil-checks", "incr-persist/frame-limit"]
 
 [dependencies]
 incr-core = { workspace = true, features = ["yield-hook"] }

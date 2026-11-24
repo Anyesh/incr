@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, Runtime};
-use incr_python_protocol::{call_stashing, PyKey, PyPair, PyValue};
+use incr_python_protocol::{call_stashing, gil, PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::PyClass;
@@ -139,8 +139,11 @@ impl<B: PyBinding> KeyedSource<'_, B> {
         _rt: &Runtime<B::C>,
         f: Py<PyAny>,
     ) -> incr_core::KeyPartitions<PyKey> {
+        static SITE: gil::Site = gil::Site::caller("classes.key_partitions");
         let f = move |key: &PyKey| {
-            Python::attach(|py| PyKey(call_stashing(py, &f, (key.0.clone_ref(py),))))
+            gil::enter(&SITE, |py| {
+                PyKey(call_stashing(py, &f, (key.0.clone_ref(py),)))
+            })
         };
         match self {
             KeyedSource::Plain(keyed) => keyed.key_partitions(f),
@@ -212,7 +215,8 @@ impl<B: PyBinding> KeyedSource<'_, B> {
 /// Labels `slot` `<label>/<str(key)>`; a key whose `__str__` raises leaves
 /// it unlabelled and the error is reported as unraisable.
 pub(crate) fn label_key<C: Cells>(rt: &Runtime<C>, slot: u32, label: &str, key: &PyKey) {
-    let text = Python::attach(|py| match key.0.bind(py).str() {
+    static SITE: gil::Site = gil::Site::caller("classes.label_key");
+    let text = gil::enter(&SITE, |py| match key.0.bind(py).str() {
         Ok(text) => Some(text.to_string()),
         Err(e) => {
             e.write_unraisable(py, Some(key.0.bind(py)));

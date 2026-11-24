@@ -14,6 +14,7 @@ use std::panic::{self, AssertUnwindSafe};
 
 use incr_persist::conformance::{self as store_cases, Harness};
 use incr_persist::memo::conformance::{self as memo_cases, MemoHarness};
+use incr_python_protocol::gil;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -25,7 +26,8 @@ struct StoreFactory<E>(Py<PyAny>, PhantomData<fn() -> E>);
 
 impl<E> StoreFactory<E> {
     fn call(&self, method: &str, arg: Option<&Py<PyAny>>) -> Py<PyAny> {
-        Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.call");
+        gil::enter(&SITE, |py| {
             let factory = self.0.bind(py);
             let result = match arg {
                 Some(arg) => factory.call_method1(method, (arg.bind(py),)),
@@ -52,12 +54,14 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
 
     fn open_read_only(&mut self, log: &Self::Log) -> Option<PyBackend<E>> {
         let handle = self.call("open_read_only", Some(log));
-        let none = Python::attach(|py| handle.is_none(py));
+        static SITE: gil::Site = gil::Site::caller("conformance.is_none");
+        let none = gil::enter(&SITE, |py| handle.is_none(py));
         (!none).then(|| wrap(handle))
     }
 
     fn multi_writer(&self) -> bool {
-        Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.multi_writer");
+        gil::enter(&SITE, |py| {
             self.0
                 .bind(py)
                 .call_method0("multi_writer")
@@ -67,7 +71,8 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
     }
 
     fn fence(&mut self, log: &Self::Log) -> bool {
-        let has_fence = Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.has_fence");
+        let has_fence = gil::enter(&SITE, |py| {
             self.0
                 .bind(py)
                 .hasattr("fence")
@@ -81,7 +86,8 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
 }
 
 fn wrap<E: PersistExceptions>(handle: Py<PyAny>) -> PyBackend<E> {
-    Python::attach(|py| {
+    static SITE: gil::Site = gil::Site::caller("conformance.wrap");
+    gil::enter(&SITE, |py| {
         PyBackend::new(py, handle)
             .unwrap_or_else(|e| panic!("looking up the handle's append_at raised: {e}"))
     })
@@ -103,7 +109,8 @@ impl<E: PersistExceptions> MemoHarness for MemoFactory<E> {
     }
 
     fn exclusive_lock(&self) -> bool {
-        Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.exclusive_lock");
+        gil::enter(&SITE, |py| {
             self.0
                  .0
                 .bind(py)
@@ -213,10 +220,11 @@ fn run(
     factory: &Py<PyAny>,
     stop: bool,
 ) -> Vec<(&'static str, Option<String>)> {
-    py.detach(|| {
+    gil::release(py, || {
         let mut outcomes = Vec::with_capacity(cases.len());
         for (name, case) in cases {
-            let handle = Python::attach(|py| factory.clone_ref(py));
+            static SITE: gil::Site = gil::Site::caller("conformance.run_handle");
+            let handle = gil::enter(&SITE, |py| factory.clone_ref(py));
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| case(handle)));
             let failed = outcome.is_err();
             outcomes.push((name, outcome.err().map(panic_message)));

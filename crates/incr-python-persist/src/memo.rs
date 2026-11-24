@@ -4,6 +4,7 @@
 //! the closure the engine runs for its function.
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::thread::ThreadId;
 
 use incr_core::{Cells, Incr, Runtime};
 use incr_persist::memo::{
@@ -583,6 +584,27 @@ where
         py: Python<'_>,
         checkpoint: impl FnOnce(&OpenMemo<B>) -> Result<Option<CheckpointStats>, Error> + Send,
     ) -> PyResult<Option<CheckpointStats>> {
+        self.run_memo_call(core, py, None, checkpoint, Option::is_some)
+    }
+}
+
+impl<B: PyBinding> MemoCore<B>
+where
+    for<'a> B::Task<&'a OpenMemo<B>>: Send,
+{
+    /// Runs `call` on the open memo as a store call, and raises its error,
+    /// or the exception a codec raised on `worker` when the call failed
+    /// there. Once `saved` says it saved entries, raises `ValueError`
+    /// naming the tables whose entries did not round-trip through their
+    /// codec.
+    pub(crate) fn run_memo_call<R: Send>(
+        &self,
+        core: &StoreCore<B>,
+        py: Python<'_>,
+        worker: Option<ThreadId>,
+        call: impl FnOnce(&OpenMemo<B>) -> Result<R, Error> + Send,
+        saved: fn(&R) -> bool,
+    ) -> PyResult<R> {
         let memo = self.memo()?;
         drop(core.registry().take_failure());
         let registry = core.registry();
@@ -590,10 +612,10 @@ where
         let (done, mismatches) = B::write(py, core.store(), move |_, _| {
             registry.scoped(|| {
                 let memo = task.into_inner();
-                let done = checkpoint(memo);
+                let done = call(memo);
                 // Takes the memo lock, which a Shared checkpoint thread holds
                 // while it needs the GIL: never with the GIL held.
-                let mismatches = if done.is_ok() {
+                let mismatches = if done.as_ref().is_ok_and(saved) {
                     memo.take_encode_mismatches()
                 } else {
                     Vec::new()
@@ -601,9 +623,13 @@ where
                 (done, mismatches)
             })
         })?;
+        let on_worker = worker.and_then(|worker| core.registry().take_failure_of(worker));
         let cause = core.registry().take_failure();
-        let stats = done.map_err(|error| crate::persist_error::<B::Exceptions>(py, error))?;
-        if stats.is_some() {
+        let done = match (done, on_worker) {
+            (Err(_), Some(raised)) => return Err(raised),
+            (done, _) => done.map_err(|error| crate::persist_error::<B::Exceptions>(py, error))?,
+        };
+        if saved(&done) {
             self.auto().retry_above = None;
         }
         if !mismatches.is_empty() {
@@ -621,6 +647,6 @@ where
             err.set_cause(py, cause);
             return Err(err);
         }
-        Ok(stats)
+        Ok(done)
     }
 }
