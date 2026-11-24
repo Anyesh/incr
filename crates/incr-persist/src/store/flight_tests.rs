@@ -4,11 +4,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize, Serializer};
 
+use super::flight::{StorePark, STORE_CHECKPOINT_PARK};
 use super::logged::LoggedKey;
-use super::{Input, Options, PersistedCollection, PersistedKeyed, Store, StoreCheckpoint};
+use super::{
+    Durability, Input, Options, PersistedCollection, PersistedKeyed, Store, StoreCheckpoint,
+};
 use crate::{
-    Backend, ConditionalAppend, Error, Kind, Local, MemoryBackend, Position, ReadOutcome, Record,
-    Result, SnapshotId,
+    Backend, ConditionalAppend, Error, FileBackend, Kind, Local, MemoryBackend, Position,
+    ReadOutcome, Record, Result, SnapshotId,
 };
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -52,12 +55,17 @@ impl Gate {
 
     /// Waits until opened, or for [`GATE_TIMEOUT`].
     fn wait(&self) {
+        self.wait_within(GATE_TIMEOUT);
+    }
+
+    /// Whether the gate opened within `timeout`.
+    fn wait_within(&self, timeout: Duration) -> bool {
         let open = self.open.lock().unwrap();
-        drop(
-            self.changed
-                .wait_timeout_while(open, GATE_TIMEOUT, |open| !*open)
-                .unwrap(),
-        );
+        *self
+            .changed
+            .wait_timeout_while(open, timeout, |open| !*open)
+            .unwrap()
+            .0
     }
 }
 
@@ -203,6 +211,28 @@ impl<B: Backend + 'static> Fx<B> {
     /// keys no binding holds: one with elements, one at its default and
     /// one set.
     fn populate(&self, n: u32) {
+        self.fill(n);
+        let store = &self.store;
+        self.log
+            .append(&[
+                declare("ghost", Kind::Collection, &[]),
+                insert("ghost", &enc("g1")),
+                insert("ghost", &enc("g2")),
+                insert("ghost", &enc("g1")),
+                declare("idle", Kind::Input, b"d"),
+                declare("held", Kind::Input, b"d"),
+                Record::Set {
+                    key: "held".to_owned(),
+                    value: b"v".to_vec(),
+                },
+            ])
+            .unwrap();
+        store.refresh().unwrap();
+    }
+
+    /// [`Self::populate`] without the keys no binding holds, all through
+    /// the store.
+    fn fill(&self, n: u32) {
         let store = &self.store;
         store.set(self.x, 7).unwrap();
         for k in 0..n {
@@ -224,21 +254,6 @@ impl<B: Backend + 'static> Fx<B> {
             overlay.upsert(rt, k, format!("row{k}"));
         }
         scope.close().unwrap();
-        self.log
-            .append(&[
-                declare("ghost", Kind::Collection, &[]),
-                insert("ghost", &enc("g1")),
-                insert("ghost", &enc("g2")),
-                insert("ghost", &enc("g1")),
-                declare("idle", Kind::Input, b"d"),
-                declare("held", Kind::Input, b"d"),
-                Record::Set {
-                    key: "held".to_owned(),
-                    value: b"v".to_vec(),
-                },
-            ])
-            .unwrap();
-        store.refresh().unwrap();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -271,13 +286,17 @@ struct Contents {
 /// What a store reopened on `log` holds. Leaves out `idle`, which a
 /// snapshot forgets at its default and a log without one lists.
 fn reopened(log: &MemoryBackend) -> Contents {
-    let fx = Fx::over(log, log.clone(), Options::default());
+    reopened_fx(&Fx::over(log, log.clone(), Options::default()))
+}
+
+/// [`reopened`] for a store just opened on any backend.
+fn reopened_fx<B: Backend + 'static>(fx: &Fx<B>) -> Contents {
     let mut keys = fx.store.restored_keys("").unwrap();
     keys.retain(|key| key != "idle");
     let ghost = fx.store.collection::<String>("ghost").unwrap();
     let mut ghost = ghost.handle().snapshot_values();
     ghost.sort();
-    let mut contents = contents(&fx);
+    let mut contents = contents(fx);
     contents.ghost = ghost;
     contents.keys = keys;
     contents
@@ -1316,4 +1335,384 @@ fn reconcile_wait_a_declare_meeting_own_adopts() {
     a_reconcile_meeting_own_waits_and_adopts(|fx| {
         fx.store.input::<u32>("idle", IDLE).unwrap();
     });
+}
+
+const SEEDS: [u64; 4] = [1, 7, 42, 1009];
+const SCRIPT_ROWS: u32 = 2_000;
+const EDITS: u32 = 48;
+
+/// Edits drawn from a seeded splitmix64: inputs set, the `y` input moved
+/// around its default, keyed upserts and removes, plain inserts and
+/// deletes, and while `declares` holds, inputs declared under new keys
+/// and set.
+struct Script {
+    state: u64,
+    step: u32,
+    declares: bool,
+    declared: Vec<(String, u32)>,
+}
+
+impl Script {
+    fn new(seed: u64) -> Self {
+        Script {
+            state: seed,
+            step: 0,
+            declares: true,
+            declared: Vec::new(),
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn edit<B: Backend + 'static>(&mut self, fx: &Fx<B>) {
+        let r = self.next();
+        let step = self.step;
+        self.step += 1;
+        let store = &fx.store;
+        let small = u32::try_from((r >> 16) % 1_000).unwrap();
+        let key = u32::try_from((r >> 16) % u64::from(SCRIPT_ROWS + 50)).unwrap();
+        let element =
+            ["a", "b", "e", "q", "zz"][usize::try_from((r >> 40) % 5).unwrap()].to_owned();
+        match r % 9 {
+            0 => store.set(fx.x, small),
+            1 => store.set(fx.y, 4 + small % 3),
+            2 | 3 => store.upsert(&fx.rows, key, format!("s{step}")),
+            4 => store.remove(&fx.rows, &key),
+            5 | 6 => fx.plain.insert(store, element),
+            7 => fx.plain.delete(store, &element),
+            _ if !self.declares => store.set(fx.x, small),
+            _ => {
+                let name = format!("new{step}");
+                let input = store.input(&name, small).unwrap();
+                self.declared.push((name, small));
+                store.set(input, small + 1)
+            }
+        }
+        .unwrap();
+    }
+
+    fn edits<B: Backend + 'static>(&mut self, fx: &Fx<B>, n: u32) {
+        for _ in 0..n {
+            self.edit(fx);
+        }
+    }
+
+    /// `seed`'s script applied to `fx` as `runs` say: so many edits with
+    /// declares or without.
+    fn replayed<B: Backend + 'static>(fx: &Fx<B>, seed: u64, runs: &[(u32, bool)]) -> Script {
+        let mut script = Script::new(seed);
+        for &(n, declares) in runs {
+            script.declares = declares;
+            script.edits(fx, n);
+        }
+        script
+    }
+}
+
+/// Whether edits made while a flight's worker waits at `at` may declare:
+/// not once the backend committed, where a declare waits for the verdict.
+fn declares_at(at: StorePark) -> bool {
+    at != StorePark::Committed
+}
+
+/// What a store just opened holds, and the values of the inputs `script`
+/// declared.
+fn scripted<B: Backend + 'static>(fx: &Fx<B>, script: &Script) -> (Contents, Vec<u32>) {
+    let rt = fx.store.runtime();
+    let declared = script
+        .declared
+        .iter()
+        .map(|(name, default)| rt.get(fx.store.input(name, *default).unwrap().handle()))
+        .collect();
+    (reopened_fx(fx), declared)
+}
+
+/// What a store that never checkpointed holds, reopened, after `before`
+/// and `seed`'s script replayed as `runs` say.
+fn scripted_control(
+    before: impl Fn(&Fx<MemoryBackend>),
+    seed: u64,
+    runs: &[(u32, bool)],
+) -> (Contents, Vec<u32>) {
+    let fx = Fx::memory();
+    before(&fx);
+    let script = Script::replayed(&fx, seed, runs);
+    let reopened = Fx::over(&fx.log, fx.log.clone(), Options::default());
+    scripted(&reopened, &script)
+}
+
+/// Half the records of the snapshot a checkpoint after `before` writes.
+fn half_of(before: impl Fn(&Fx<MemoryBackend>)) -> u64 {
+    let (_, records) = twin_snapshot(before).expect("a snapshot");
+    u64::try_from(records.len() / 2).unwrap()
+}
+
+/// Has a flight begun on this thread open the first gate on reaching
+/// `at`, then wait at it until the second gate opens.
+fn park_this_thread_at(at: StorePark) -> (Arc<Gate>, Arc<Gate>) {
+    let reached = Arc::new(Gate::default());
+    let release = Arc::new(Gate::default());
+    let hook = {
+        let reached = Arc::clone(&reached);
+        let release = Arc::clone(&release);
+        move |point| {
+            if point == at {
+                reached.open();
+                release.wait_within(WAIT);
+            }
+        }
+    };
+    STORE_CHECKPOINT_PARK.set(Some(Arc::new(hook)));
+    (reached, release)
+}
+
+/// Polls `flight` until its worker opens `reached`.
+fn poll_until<B: Backend + 'static>(fx: &Fx<B>, flight: &StoreCheckpoint, reached: &Gate) {
+    let started = std::time::Instant::now();
+    while !reached.wait_within(Duration::from_millis(1)) {
+        flight.poll(&fx.store, STEP).unwrap();
+        assert!(
+            started.elapsed() < WAIT,
+            "the worker never reached its park"
+        );
+    }
+}
+
+/// For each seed, a flight over a populated store with half the script
+/// applied across polls and the rest while its worker waits at `at`,
+/// given half the snapshot's records; the snapshot is a blocking
+/// checkpoint's at begin and a reopen equals a store that never
+/// checkpointed.
+fn parked_with_edits(at: fn(u64) -> StorePark) {
+    let before = |fx: &Fx<MemoryBackend>| fx.populate(SCRIPT_ROWS);
+    let half = half_of(before);
+    let twin = twin_snapshot(before);
+    for seed in SEEDS {
+        let fx = Fx::memory();
+        before(&fx);
+        let point = at(half);
+        let (reached, release) = park_this_thread_at(point);
+        let flight = fx.begin();
+        let mut script = Script::new(seed);
+        for _ in 0..EDITS / 2 {
+            script.edit(&fx);
+            flight.poll(&fx.store, STEP).unwrap();
+        }
+        poll_until(&fx, &flight, &reached);
+        script.declares = declares_at(point);
+        script.edits(&fx, EDITS - EDITS / 2);
+        release.open();
+        let upto = fx.finish(&flight);
+        STORE_CHECKPOINT_PARK.set(None);
+        assert!(!fx.store.capture_installed());
+        let snapshot = fx.snapshot();
+        assert_eq!(snapshot.as_ref().map(|(at, _)| *at), Some(upto));
+        assert_eq!(snapshot, twin, "seed {seed}");
+        let reopened = Fx::over(&fx.log, fx.log.clone(), Options::default());
+        assert_eq!(
+            scripted(&reopened, &script),
+            scripted_control(
+                before,
+                seed,
+                &[(EDITS / 2, true), (EDITS - EDITS / 2, declares_at(point))]
+            ),
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn park_edits_while_the_worker_waits_captured() {
+    parked_with_edits(|_| StorePark::Captured);
+}
+
+#[test]
+fn park_edits_while_the_worker_waits_half_pulled() {
+    parked_with_edits(StorePark::Pulled);
+}
+
+#[test]
+fn park_edits_while_the_worker_waits_committed() {
+    parked_with_edits(|_| StorePark::Committed);
+}
+
+const CHILD_DIR: &str = "INCR_STORE_FLIGHT_CHILD_DIR";
+const KILL_ROWS: u32 = 2_000;
+const KILL_SEED: u64 = 7;
+
+/// Kills the child process when dropped, so a failed wait leaves none.
+struct Child(std::process::Child);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.kill().and_then(|()| self.0.wait().map(drop)) {
+            eprintln!("the child was not killed: {error}");
+        }
+    }
+}
+
+/// A store on a file log in `dir` whose writes skip `sync`: a killed
+/// process still leaves them in the file.
+fn file_fx(dir: &std::path::Path) -> Fx<FileBackend> {
+    Fx::over(
+        &MemoryBackend::new(),
+        FileBackend::open(dir.join("log")).unwrap(),
+        Options {
+            durability: Durability::Buffered,
+            ..Options::default()
+        },
+    )
+}
+
+/// The writes the child makes before its flight begins, a checkpoint
+/// among them, which leave `script` to go on with.
+fn before_kill<B: Backend + 'static>(fx: &Fx<B>, script: &mut Script) {
+    fx.fill(KILL_ROWS);
+    fx.store.checkpoint().unwrap();
+    script.edits(fx, EDITS / 3);
+}
+
+/// The child: fills a store on a file log and checkpoints it, edits,
+/// notes the snapshot id and the position, begins a flight whose worker
+/// stops for good at `at`, edits until and while it is stopped there,
+/// marks `parked` and waits to be killed.
+fn child_parked_for_good(dir: &std::path::Path, at: fn(u64) -> StorePark) -> ! {
+    let half = half_of(|fx| before_kill(fx, &mut Script::new(KILL_SEED)));
+    let fx = file_fx(dir);
+    let mut script = Script::new(KILL_SEED);
+    before_kill(&fx, &mut script);
+    let previous = FileBackend::open_read_only(dir.join("log"))
+        .unwrap()
+        .snapshot_id()
+        .unwrap()
+        .expect("the checkpoint's snapshot");
+    let begun = fx.store.stats().unwrap().position;
+    std::fs::write(
+        dir.join("previous"),
+        format!(
+            "{} {} {}",
+            previous.position.0, previous.generation, begun.0
+        ),
+    )
+    .unwrap();
+    let reached = Arc::new(Gate::default());
+    let hook = {
+        let reached = Arc::clone(&reached);
+        move |point| {
+            if point == at(half) {
+                reached.open();
+                loop {
+                    std::thread::park();
+                }
+            }
+        }
+    };
+    STORE_CHECKPOINT_PARK.set(Some(Arc::new(hook)));
+    let flight = fx.begin();
+    for _ in 0..EDITS / 3 {
+        script.edit(&fx);
+        flight.poll(&fx.store, STEP).unwrap();
+    }
+    poll_until(&fx, &flight, &reached);
+    script.declares = declares_at(at(half));
+    script.edits(&fx, EDITS - 2 * (EDITS / 3));
+    std::fs::write(dir.join("parked"), b"").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Runs this test's child, kills it once its worker is stopped at `at`,
+/// and reopens the file log: on the snapshot the child noted unless
+/// `committed`, else on the flight's own snapshot at the noted position;
+/// either way equal to a store that never checkpointed.
+fn killed_at(name: &str, at: fn(u64) -> StorePark, committed: bool) {
+    if let Ok(dir) = std::env::var(CHILD_DIR) {
+        child_parked_for_good(std::path::Path::new(&dir), at);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let test = module_path!().split_once("::").unwrap().1;
+    let mut child = Child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("{test}::{name}"), "--exact", "--test-threads=1"])
+            .env(CHILD_DIR, dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let started = std::time::Instant::now();
+    while !dir.path().join("parked").exists() {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!("the child exited before its park: {status}");
+        }
+        assert!(started.elapsed() < WAIT, "the child never reached its park");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let noted: Vec<u64> = std::fs::read_to_string(dir.path().join("previous"))
+        .unwrap()
+        .split(' ')
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let previous = SnapshotId {
+        position: Position(noted[0]),
+        generation: noted[1],
+    };
+    let expected = if committed {
+        SnapshotId {
+            position: Position(noted[2]),
+            generation: previous.generation + 1,
+        }
+    } else {
+        previous
+    };
+    let id = FileBackend::open_read_only(dir.path().join("log"))
+        .unwrap()
+        .snapshot_id()
+        .unwrap();
+    assert_eq!(id, Some(expected));
+    let runs = [
+        (2 * (EDITS / 3), true),
+        (EDITS - 2 * (EDITS / 3), declares_at(at(0))),
+    ];
+    let script = Script::replayed(&Fx::memory(), KILL_SEED, &runs);
+    assert_eq!(
+        scripted(&file_fx(dir.path()), &script),
+        scripted_control(|fx| fx.fill(KILL_ROWS), KILL_SEED, &runs)
+    );
+}
+
+#[test]
+fn kill_a_child_parked_captured_reopens_on_the_previous_snapshot() {
+    killed_at(
+        "kill_a_child_parked_captured_reopens_on_the_previous_snapshot",
+        |_| StorePark::Captured,
+        false,
+    );
+}
+
+#[test]
+fn kill_a_child_parked_half_pulled_reopens_on_the_previous_snapshot() {
+    killed_at(
+        "kill_a_child_parked_half_pulled_reopens_on_the_previous_snapshot",
+        StorePark::Pulled,
+        false,
+    );
+}
+
+#[test]
+fn kill_a_child_parked_committed_reopens_on_the_new_snapshot() {
+    killed_at(
+        "kill_a_child_parked_committed_reopens_on_the_new_snapshot",
+        |_| StorePark::Committed,
+        true,
+    );
 }

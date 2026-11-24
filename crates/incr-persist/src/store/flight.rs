@@ -28,6 +28,38 @@ use crate::{Backend, Error, Kind, Position, Record, Result, SnapshotId, ValueSco
 /// again, and how much an `undeclare` captures between two sends.
 const SLICE: Duration = Duration::from_millis(50);
 
+/// Where a store flight's worker calls the [`STORE_CHECKPOINT_PARK`] hook
+/// its begin took.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StorePark {
+    /// Every slice and the seal are in, and the backend is not called yet.
+    Captured,
+    /// The fold has handed out this many records.
+    Pulled(u64),
+    /// The backend's compaction returned `Ok` and no verdict is posted.
+    Committed,
+}
+
+#[cfg(test)]
+pub(crate) type StoreParkHook = Arc<dyn Fn(StorePark) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    /// The hook that a flight begun on this thread hands its worker.
+    pub(crate) static STORE_CHECKPOINT_PARK: std::cell::RefCell<Option<StoreParkHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn park(point: StorePark) {
+    STORE_CHECKPOINT_PARK.with(|hook| {
+        if let Some(hook) = &*hook.borrow() {
+            hook(point);
+        }
+    });
+}
+
 /// A store checkpoint begun with [`Store::begin_checkpoint`]. It holds only
 /// the flight's token, so it may be sent and dropped on any thread;
 /// dropping it abandons the flight, which the store then settles at its
@@ -512,7 +544,11 @@ impl<B: Backend + 'static> Store<Local, B> {
         let worker_scope = scope.clone();
         let pulled = Arc::new(AtomicBool::new(false));
         let worker_pulled = Arc::clone(&pulled);
+        #[cfg(test)]
+        let park = STORE_CHECKPOINT_PARK.with(|hook| hook.borrow().clone());
         let started = Flight::start(scope.clone(), move |inbox| {
+            #[cfg(test)]
+            STORE_CHECKPOINT_PARK.set(park);
             work(inbox, jobs, &*backend, upto, worker_scope, worker_pulled)
         });
         let (flight, token) = match started {
@@ -660,6 +696,8 @@ fn work<B: Backend>(
     if inbox.control().stopped() {
         return Verdict::Cancelled;
     }
+    #[cfg(test)]
+    park(StorePark::Captured);
     let (keys, rows): (Vec<_>, Vec<_>) = jobs
         .into_iter()
         .map(|job| ((job.key, job.logged), job.rows))
@@ -673,9 +711,15 @@ fn work<B: Backend>(
         failed: false,
         pulled,
         yielder: Yielder::ambient(),
+        #[cfg(test)]
+        handed: 0,
     };
     let mut chunked = Chunked::new(fold, Arc::clone(inbox.control()), scope);
     let result = backend.compact_streamed(upto, &mut chunked);
+    #[cfg(test)]
+    if result.is_ok() {
+        park(StorePark::Committed);
+    }
     let (verdict, fold) = chunked.finish(result);
     match verdict {
         Verdict::Committed(()) => Verdict::Committed(mem::take(&mut { fold }.empty)),
@@ -699,6 +743,8 @@ struct FlightFold<'a> {
     /// Set once the fold returns its end.
     pulled: Arc<AtomicBool>,
     yielder: Yielder<'static>,
+    #[cfg(test)]
+    handed: u64,
 }
 
 impl<'a> FlightFold<'a> {
@@ -723,6 +769,11 @@ impl Iterator for FlightFold<'_> {
                 match records.next() {
                     Some(Ok(record)) => {
                         *pulled = true;
+                        #[cfg(test)]
+                        {
+                            self.handed += 1;
+                            park(StorePark::Pulled(self.handed));
+                        }
                         return Some(Ok(record));
                     }
                     Some(Err(e)) => {
