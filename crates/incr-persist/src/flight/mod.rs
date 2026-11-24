@@ -193,33 +193,23 @@ impl<M, T> Flight<M, T> {
     /// Blocks until the worker posts its verdict or `timeout` passes, and
     /// returns whether it was posted.
     pub(crate) fn wait(&self, timeout: Option<Duration>) -> bool {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let mut verdict = self
-            .posted
-            .verdict
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while !self.has_verdict() {
-            verdict = match deadline {
-                None => self
-                    .posted
-                    .changed
-                    .wait(verdict)
-                    .unwrap_or_else(PoisonError::into_inner),
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return false;
-                    }
-                    self.posted
-                        .changed
-                        .wait_timeout(verdict, left)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0
-                }
-            };
-        }
-        true
+        self.posted.wait(timeout)
+    }
+
+    /// A handle to wait for the verdict on without holding the flight's
+    /// owner.
+    pub(crate) fn waiter(&self) -> Waiter<T> {
+        Waiter(Arc::clone(&self.posted))
+    }
+}
+
+/// What [`Flight::waiter`] returns.
+pub(crate) struct Waiter<T>(Arc<Posted<T>>);
+
+impl<T> Waiter<T> {
+    /// [`Flight::wait`].
+    pub(crate) fn wait(&self, timeout: Option<Duration>) -> bool {
+        self.0.wait(timeout)
     }
 }
 
@@ -274,6 +264,30 @@ impl<T> Default for Posted<T> {
 }
 
 impl<T> Posted<T> {
+    fn wait(&self, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let mut verdict = self.verdict.lock().unwrap_or_else(PoisonError::into_inner);
+        while !self.ready.load(Ordering::Acquire) {
+            verdict = match deadline {
+                None => self
+                    .changed
+                    .wait(verdict)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    self.changed
+                        .wait_timeout(verdict, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
+        }
+        true
+    }
+
     fn post(&self, verdict: Verdict<T>) {
         let mut slot = self.verdict.lock().unwrap_or_else(PoisonError::into_inner);
         *slot = Some(verdict);

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Duration;
 
 use incr_core::persist_hooks::{self, Deferred, Displaced, RepSide, RepSink};
 use incr_core::{
@@ -16,8 +17,11 @@ use super::after_lock::AfterLock;
 use super::binding::{decode, encode, Binding, Folded};
 use super::dep_index::{fp_of, DepFp, DepIndex, DepMap, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
-use super::rows::{element_fingerprint, fold_elements, ElementRows, Fingerprints};
+use super::rows::{
+    element_fingerprint, fold_elements, ElementBatch, ElementRows, Fingerprints, RowBatch,
+};
 use super::{Batch, KeyRef, PersistValue, State, Store};
+use crate::flight::Parcel;
 use crate::value_context::{enter_value_scope, hold};
 use crate::{Backend, Error, Kind, Position, Record, Result, ValueScope};
 
@@ -752,6 +756,35 @@ where
             logged,
             yielder,
         )?))
+    }
+
+    fn folds_empty(&self, logged: Option<&LoggedKey>) -> bool {
+        self.collection.distinct_len() == 0 && logged.is_none_or(|logged| logged.value.is_none())
+    }
+
+    fn begin_capture(&self, scope: Option<ValueScope>) -> Option<Box<dyn RowBatch>> {
+        self.collection.begin_capture();
+        Some(Box::new(ElementBatch::<T>(Parcel::new(Vec::new(), scope))))
+    }
+
+    fn capture_step(
+        &self,
+        budget: Duration,
+        scope: Option<ValueScope>,
+    ) -> (Option<Box<dyn RowBatch>>, bool) {
+        let step = self.collection.capture_step(budget);
+        let rows = (!step.rows.is_empty())
+            .then(|| Box::new(ElementBatch(Parcel::new(step.rows, scope))) as Box<dyn RowBatch>);
+        (rows, step.done)
+    }
+
+    fn end_capture(&self) {
+        self.collection.end_capture();
+    }
+
+    #[cfg(test)]
+    fn capture_installed(&self) -> bool {
+        self.collection.capture_installed()
     }
 
     fn as_any(&self) -> &dyn Any {

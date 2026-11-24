@@ -1,13 +1,15 @@
+use std::any::Any;
 use std::iter::Peekable;
 use std::vec;
 
 use incr_core::Yielder;
 use serde::Serialize;
 
-use super::binding::encode;
+use super::binding::{encode, Folded};
 use super::dep_index::fp_of;
 use super::keyed::UNLOGGED_RANK;
 use super::logged::LoggedKey;
+use crate::flight::Parcel;
 use crate::{Record, Result};
 
 /// A keyed collection's pairs and their ranks, each named by a `Row`, as
@@ -237,17 +239,15 @@ impl<S: PairRows> Iterator for RankMerge<S> {
 }
 
 /// Pairs and ranks a capture handed over, for a fold off the owner thread.
-#[allow(dead_code)]
 pub(crate) struct CapturedPairs<P> {
     key: String,
-    pairs: Vec<(P, u128)>,
+    pairs: Parcel<(P, u128)>,
 }
 
-#[allow(dead_code)]
 impl<P: Serialize> CapturedPairs<P> {
     /// Orders `pairs` by rank and returns the rows [`fold_pairs`] takes.
-    pub(crate) fn new(key: String, mut pairs: Vec<(P, u128)>) -> (Self, Vec<usize>) {
-        pairs.sort_unstable_by_key(|&(_, rank)| rank);
+    pub(crate) fn new(key: String, mut pairs: Parcel<(P, u128)>) -> (Self, Vec<usize>) {
+        pairs.as_mut_slice().sort_unstable_by_key(|&(_, rank)| rank);
         let rows = (0..pairs.len()).collect();
         (CapturedPairs { key, pairs }, rows)
     }
@@ -262,30 +262,29 @@ impl<P: Serialize> PairRows for CapturedPairs<P> {
     }
 
     fn with_pair<R>(&self, row: usize, f: impl FnOnce(&P, u128) -> R) -> Result<R> {
-        let (pair, rank) = &self.pairs[row];
+        let (pair, rank) = self.pairs.get(row).expect("a row of these pairs");
         Ok(f(pair, *rank))
     }
 }
 
 /// Distinct elements and multiplicities a capture handed over, for a fold
 /// off the owner thread.
-#[allow(dead_code)]
 pub(crate) struct CapturedElements<T> {
     key: String,
-    elements: Vec<(T, usize)>,
+    elements: Parcel<(T, usize)>,
 }
 
-#[allow(dead_code)]
 impl<T: Serialize> CapturedElements<T> {
     /// Returns the elements with the fingerprints [`fold_elements`] takes.
     pub(crate) fn new(
         key: String,
-        elements: Vec<(T, usize)>,
+        elements: Parcel<(T, usize)>,
     ) -> Result<(Self, Fingerprints<usize>)> {
-        let fingerprints = elements
-            .iter()
-            .enumerate()
-            .map(|(row, (element, _))| Ok((element_fingerprint(&key, element)?, row)))
+        let fingerprints = (0..elements.len())
+            .map(|row| {
+                let (element, _) = elements.get(row).expect("a row of these elements");
+                Ok((element_fingerprint(&key, element)?, row))
+            })
             .collect::<Result<_>>()?;
         Ok((CapturedElements { key, elements }, fingerprints))
     }
@@ -300,7 +299,86 @@ impl<T: Serialize> ElementRows for CapturedElements<T> {
     }
 
     fn with_element<R>(&self, row: usize, f: impl FnOnce(&T, usize) -> R) -> Result<R> {
-        let (element, count) = &self.elements[row];
+        let (element, count) = self.elements.get(row).expect("a row of these elements");
         Ok(f(element, *count))
+    }
+}
+
+/// Rows a bound collection's capture handed over, on their way to a
+/// checkpoint worker, typed by the binding that made them.
+pub(crate) trait RowBatch: Send {
+    /// Moves the rows of `more`, which the same binding made, to the end
+    /// of these.
+    fn absorb(&mut self, more: Box<dyn RowBatch>);
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
+
+    /// The key's snapshot records from these rows and `logged`, as the
+    /// binding's [`fold`](super::binding::Binding::fold) makes them from
+    /// its live rows.
+    fn fold<'a>(
+        self: Box<Self>,
+        key: &str,
+        logged: Option<&'a LoggedKey>,
+        yielder: &Yielder<'_>,
+    ) -> Result<Folded<'a>>;
+}
+
+/// A keyed collection's captured pairs and ranks.
+pub(crate) struct PairBatch<P>(pub(crate) Parcel<(P, u128)>);
+
+impl<P: Serialize + Send + 'static> RowBatch for PairBatch<P> {
+    fn absorb(&mut self, more: Box<dyn RowBatch>) {
+        let more = more
+            .into_any()
+            .downcast::<Self>()
+            .expect("a batch of the same binding");
+        self.0.append(more.0);
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
+    }
+
+    fn fold<'a>(
+        self: Box<Self>,
+        key: &str,
+        logged: Option<&'a LoggedKey>,
+        yielder: &Yielder<'_>,
+    ) -> Result<Folded<'a>> {
+        let (source, rows) = CapturedPairs::new(key.to_owned(), self.0);
+        Ok(Box::new(fold_pairs(source, rows, logged, yielder)?))
+    }
+}
+
+/// A plain collection's captured distinct elements and multiplicities.
+pub(crate) struct ElementBatch<T>(pub(crate) Parcel<(T, usize)>);
+
+impl<T: Serialize + Send + 'static> RowBatch for ElementBatch<T> {
+    fn absorb(&mut self, more: Box<dyn RowBatch>) {
+        let more = more
+            .into_any()
+            .downcast::<Self>()
+            .expect("a batch of the same binding");
+        self.0.append(more.0);
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
+    }
+
+    fn fold<'a>(
+        self: Box<Self>,
+        key: &str,
+        logged: Option<&'a LoggedKey>,
+        yielder: &Yielder<'_>,
+    ) -> Result<Folded<'a>> {
+        let (source, fingerprints) = CapturedElements::new(key.to_owned(), self.0)?;
+        Ok(Box::new(fold_elements(
+            source,
+            fingerprints,
+            logged,
+            yielder,
+        )?))
     }
 }

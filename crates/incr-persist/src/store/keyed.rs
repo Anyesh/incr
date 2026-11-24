@@ -5,6 +5,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use incr_core::persist_hooks::Deferred;
 use incr_core::{
@@ -18,8 +19,9 @@ use super::binding::{decode, encode, Binding, Folded};
 use super::collection::{fp_in_scope, fp_of_elements, FpDelta};
 use super::dep_index::{fp_of, DepFp, DepIndex, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
-use super::rows::{fold_pairs, PairRows};
+use super::rows::{fold_pairs, PairBatch, PairRows, RowBatch};
 use super::{set_record, Input, KeyRef, PersistValue, PersistedCollection, State, Store};
+use crate::flight::Parcel;
 use crate::value_context::hold;
 use crate::{Backend, Error, Kind, Position, Record, Result, ValueScope};
 
@@ -1485,6 +1487,35 @@ where
             epoch,
         };
         Ok(Box::new(fold_pairs(source, handles, logged, yielder)?))
+    }
+
+    fn folds_empty(&self, logged: Option<&LoggedKey>) -> bool {
+        self.keyed.is_empty() && logged.is_none_or(|logged| logged.value.is_none())
+    }
+
+    fn begin_capture(&self, scope: Option<ValueScope>) -> Option<Box<dyn RowBatch>> {
+        self.keyed.begin_capture();
+        Some(Box::new(PairBatch::<P>(Parcel::new(Vec::new(), scope))))
+    }
+
+    fn capture_step(
+        &self,
+        budget: Duration,
+        scope: Option<ValueScope>,
+    ) -> (Option<Box<dyn RowBatch>>, bool) {
+        let step = self.keyed.capture_step(budget);
+        let rows = (!step.rows.is_empty())
+            .then(|| Box::new(PairBatch(Parcel::new(step.rows, scope))) as Box<dyn RowBatch>);
+        (rows, step.done)
+    }
+
+    fn end_capture(&self) {
+        self.keyed.end_capture();
+    }
+
+    #[cfg(test)]
+    fn capture_installed(&self) -> bool {
+        self.keyed.capture_installed()
     }
 
     fn as_any(&self) -> &dyn Any {

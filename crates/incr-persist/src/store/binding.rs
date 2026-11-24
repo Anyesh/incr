@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::time::Duration;
 
 use incr_core::persist_hooks::{changed_at, set_returning_displaced};
 use incr_core::value_slot::Compared;
@@ -11,6 +12,7 @@ use crate::value_context::in_key;
 use super::after_lock::AfterLock;
 use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard, Registered};
 use super::logged::{Elements, LoggedKey};
+use super::rows::RowBatch;
 use crate::{Error, Kind, Record, Result, ValueScope};
 
 /// A key's snapshot records, made as they are pulled, as
@@ -125,6 +127,36 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
         logged: Option<&'a LoggedKey>,
         yielder: &Yielder<'_>,
     ) -> Result<Folded<'a>>;
+
+    /// Whether [`Binding::fold`] would yield nothing for `logged`, told
+    /// without reading the node's elements.
+    fn folds_empty(&self, logged: Option<&LoggedKey>) -> bool;
+
+    /// For a collection, installs a capture of its elements as they are
+    /// now and returns an empty batch of the kind its steps hand over;
+    /// `None` for an input, whose fold reads only its logged state.
+    fn begin_capture(&self, _scope: Option<ValueScope>) -> Option<Box<dyn RowBatch>> {
+        None
+    }
+
+    /// Hands over what the capture took during about `budget`, at least
+    /// one unit of table slots, and whether it is done, which removes the
+    /// capture. Without a capture, nothing and done.
+    fn capture_step(
+        &self,
+        _budget: Duration,
+        _scope: Option<ValueScope>,
+    ) -> (Option<Box<dyn RowBatch>>, bool) {
+        (None, true)
+    }
+
+    /// Removes the capture, if one is installed.
+    fn end_capture(&self) {}
+
+    #[cfg(test)]
+    fn capture_installed(&self) -> bool {
+        false
+    }
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -348,6 +380,10 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
             }
             _ => Box::new(std::iter::empty()),
         })
+    }
+
+    fn folds_empty(&self, logged: Option<&LoggedKey>) -> bool {
+        logged.is_none_or(LoggedKey::at_default)
     }
 
     fn as_any(&self) -> &dyn Any {
