@@ -354,15 +354,26 @@ def test_a_worker_keeps_one_thread_state_for_its_life():
     assert len({(t, i) for _, t, i in worker}) == 1, worker
 
 
-def test_a_memo_flight_refuses_a_memo_backend_without_the_flag():
-    class Unflagged:
-        def __init__(self):
-            self.inner = persist.MemoryMemo()
+class UnflaggedMemo:
+    def __init__(self):
+        self.inner = persist.MemoryMemo()
 
-        def __getattr__(self, name):
-            return getattr(self.inner, name)
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
-    store, memo, _ = memo_graph(Unflagged(), 3)
+
+class FlaggedMemoWithoutStream(UnflaggedMemo):
+    concurrent_compaction = True
+
+    def __getattr__(self, name):
+        if name == "write_generation_streamed":
+            raise AttributeError(name)
+        return getattr(self.inner, name)
+
+
+@pytest.mark.parametrize("backend", [UnflaggedMemo, FlaggedMemoWithoutStream])
+def test_a_memo_flight_refuses_a_memo_backend_without_the_promise(backend):
+    store, memo, _ = memo_graph(backend(), 3)
     with pytest.raises(persist.PersistError, match="concurrent"):
         memo.begin_checkpoint()
     memo.checkpoint()
