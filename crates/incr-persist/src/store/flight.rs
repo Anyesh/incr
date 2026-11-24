@@ -9,6 +9,7 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,11 +17,12 @@ use incr_core::{Cells, Local, Yielder};
 
 use super::after_lock::AfterLock;
 use super::binding::Folded;
-use super::logged::LoggedKey;
+use super::logged::{Declared, LoggedKey};
 use super::rows::RowBatch;
 use super::{fold_logged, Locked, State, Store, TRUNCATED};
 use crate::flight::{Chunked, Control, Flight, FlightToken, Inbox, Verdict, Waiter};
-use crate::{Backend, Error, Position, Record, Result, SnapshotId, ValueScope};
+use crate::value_context::idle;
+use crate::{Backend, Error, Kind, Position, Record, Result, SnapshotId, ValueScope};
 
 /// How long [`StoreCheckpoint::result`] polls before it looks at the clock
 /// again, and how much an `undeclare` captures between two sends.
@@ -92,6 +94,9 @@ impl StoreCheckpoint {
 pub(super) struct Slot {
     open: Option<StoreFlight>,
     ended: Option<Ended>,
+    /// Set when a flight committed a snapshot it could not adopt, until the
+    /// store reconciles with the backend's snapshot.
+    reconcile: bool,
 }
 
 impl Slot {
@@ -100,6 +105,42 @@ impl Slot {
         if let Some(flight) = &mut self.open {
             flight.applied += 1;
         }
+    }
+
+    /// Notes a `Declare` of `key` being applied, the first one after the
+    /// open flight's position that it notes for a key it forgets.
+    pub(super) fn note_declare(&mut self, key: &str, kind: Kind, default: &[u8]) {
+        let Some(forgotten) = self
+            .open
+            .as_mut()
+            .and_then(|flight| flight.forgotten_mut(key))
+        else {
+            return;
+        };
+        if forgotten.noted.is_none() {
+            forgotten.noted = Some(Declared {
+                kind,
+                default: default.to_vec(),
+            });
+        }
+    }
+
+    /// Whether the open flight forgets `key` and has noted no `Declare` of
+    /// it since its position, so that binding the key needs one in the log.
+    pub(super) fn wants_declare(&self, key: &str) -> bool {
+        self.open.as_ref().is_some_and(|flight| {
+            flight
+                .forgotten_at(key)
+                .is_some_and(|at| flight.forgotten[at].noted.is_none())
+        })
+    }
+
+    pub(super) fn reconcile_asked(&self) -> bool {
+        self.reconcile
+    }
+
+    pub(super) fn reconciled(&mut self) {
+        self.reconcile = false;
     }
 }
 
@@ -126,10 +167,24 @@ struct StoreFlight {
     /// The first entry of `tables` whose capture is not finished.
     next: usize,
     sealed: bool,
-    /// The keys whose fold was empty at begin, in key order, with their
-    /// entries as of begin.
+    /// The keys whose fold was empty at begin, in key order.
     forgotten: Vec<Forgotten>,
+    /// Set by the worker once the backend has pulled the fold to its end.
+    pulled: Arc<AtomicBool>,
     scope: Option<ValueScope>,
+}
+
+impl StoreFlight {
+    fn forgotten_at(&self, key: &str) -> Option<usize> {
+        self.forgotten
+            .binary_search_by(|forgotten| forgotten.key.as_str().cmp(key))
+            .ok()
+    }
+
+    fn forgotten_mut(&mut self, key: &str) -> Option<&mut Forgotten> {
+        let at = self.forgotten_at(key)?;
+        Some(&mut self.forgotten[at])
+    }
 }
 
 struct Table {
@@ -141,7 +196,8 @@ struct Table {
 struct Forgotten {
     job: usize,
     key: String,
-    logged: Arc<LoggedKey>,
+    /// The first `Declare` of the key applied after the flight's position.
+    noted: Option<Declared>,
 }
 
 enum ToWorker {
@@ -186,8 +242,11 @@ impl<C: Cells> State<C> {
         self.abort_flight(Outcome::Failed(Error::Poisoned));
     }
 
-    /// [`Self::abort_flight`] for a rebuild of the folded log.
+    /// [`Self::abort_flight`] for a rebuild of the folded log, which also
+    /// answers a reconcile a settled flight asked for, since every rebuild
+    /// starts from the backend's current snapshot.
     pub(super) fn abort_flight_rebuilt(&mut self) {
+        self.flight.reconcile = false;
         self.abort_flight(Outcome::Failed(Error::Cancelled));
     }
 
@@ -271,9 +330,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 
     /// Takes the committed snapshot as this store's checkpoint at the
-    /// flight's position. A key forgotten at begin is dropped only while
-    /// its entry is the one begin shared; when any changed, the snapshot
-    /// stays unaccounted and the next reconcile rebuilds from it.
+    /// flight's position, where the snapshot forgot the keys begin found
+    /// empty: such a key with no `Declare` applied since loses its
+    /// `Declare`, and goes once that leaves it empty. When a key's first
+    /// `Declare` since differs from its live one, which the snapshot's
+    /// reopen would take instead, nothing is adopted: the snapshot stays
+    /// unaccounted and the store asks for a reconcile.
     fn adopt(&self, state: &mut State<C>, flight: &StoreFlight, empty: &[usize]) {
         debug_assert!(
             flight
@@ -283,21 +345,65 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 .eq(empty.iter().copied()),
             "the keys a flight's worker folded to nothing are those its begin forgot"
         );
-        let mut unchanged = true;
-        for forgotten in &flight.forgotten {
-            match state.logged.shared(&forgotten.key) {
-                Some(entry) if Arc::ptr_eq(&entry, &forgotten.logged) => {
-                    drop(entry);
-                    state.logged.remove(&forgotten.key);
-                }
-                _ => unchanged = false,
+        let redeclared = flight.forgotten.iter().any(|forgotten| {
+            forgotten.noted.as_ref().is_some_and(|noted| {
+                state
+                    .logged
+                    .get(&forgotten.key)
+                    .and_then(|logged| logged.declared.as_ref())
+                    != Some(noted)
+            })
+        });
+        if redeclared {
+            state.flight.reconcile = true;
+            return;
+        }
+        for forgotten in flight
+            .forgotten
+            .iter()
+            .filter(|forgotten| forgotten.noted.is_none())
+        {
+            let key = forgotten.key.as_str();
+            if state
+                .logged
+                .get(key)
+                .is_none_or(|logged| logged.declared.is_none())
+            {
+                continue;
+            }
+            let logged = state.logged.get_mut(key).expect("checked present");
+            logged.declared = None;
+            if logged.is_empty() {
+                state.logged.remove(key);
             }
         }
         state.since_checkpoint = flight.applied;
         state.snapshot_at = flight.upto;
-        if unchanged && matches!(self.backend.snapshot_id(), Ok(Some(id)) if id == flight.own) {
+        if matches!(self.backend.snapshot_id(), Ok(Some(id)) if id == flight.own) {
             state.snapshot = Some(flight.own);
         }
+    }
+
+    /// Settles an open flight whose snapshot id is `id` and whose fold the
+    /// backend pulled to its end, once its verdict is in, and returns
+    /// whether there was one. Such a backend is in the flight's commit
+    /// step, so the wait runs inside the value scope's `idle`; an `id` met
+    /// before the end was pulled is another writer's.
+    pub(super) fn settle_committing(&self, state: &mut State<C>, id: SnapshotId) -> Result<bool> {
+        let Some(flight) = state
+            .flight
+            .open
+            .as_ref()
+            .filter(|flight| flight.own == id && flight.pulled.load(Ordering::Acquire))
+        else {
+            return Ok(false);
+        };
+        let waiter = flight.flight.waiter();
+        idle(flight.scope.as_ref(), || {
+            waiter.wait(None);
+        });
+        self.settle_flight(state)?;
+        Ok(true)
     }
 
     /// The open flight's verdict to wait on, when `token` is its handle and
@@ -389,11 +495,11 @@ impl<B: Backend + 'static> Store<Local, B> {
                 }
                 None => (logged.as_deref().is_none_or(LoggedKey::at_default), None),
             };
-            if let Some(logged) = logged.as_ref().filter(|_| empty) {
+            if logged.is_some() && empty {
                 forgotten.push(Forgotten {
                     job: jobs.len(),
                     key: key.clone(),
-                    logged: Arc::clone(logged),
+                    noted: None,
                 });
             }
             jobs.push(Job {
@@ -404,8 +510,10 @@ impl<B: Backend + 'static> Store<Local, B> {
         }
         let backend = Arc::clone(&self.backend);
         let worker_scope = scope.clone();
+        let pulled = Arc::new(AtomicBool::new(false));
+        let worker_pulled = Arc::clone(&pulled);
         let started = Flight::start(scope.clone(), move |inbox| {
-            work(inbox, jobs, &*backend, upto, worker_scope)
+            work(inbox, jobs, &*backend, upto, worker_scope, worker_pulled)
         });
         let (flight, token) = match started {
             Ok(started) => started,
@@ -425,6 +533,7 @@ impl<B: Backend + 'static> Store<Local, B> {
             next: 0,
             sealed: false,
             forgotten,
+            pulled,
             scope,
         });
         state.set_ended(None);
@@ -535,6 +644,7 @@ fn work<B: Backend>(
     backend: &B,
     upto: Position,
     scope: Option<ValueScope>,
+    pulled: Arc<AtomicBool>,
 ) -> Verdict<Vec<usize>> {
     loop {
         match inbox.recv() {
@@ -561,6 +671,7 @@ fn work<B: Backend>(
         current: None,
         empty: Vec::new(),
         failed: false,
+        pulled,
         yielder: Yielder::ambient(),
     };
     let mut chunked = Chunked::new(fold, Arc::clone(inbox.control()), scope);
@@ -585,6 +696,8 @@ struct FlightFold<'a> {
     /// The jobs whose key is logged and folded to nothing.
     empty: Vec<usize>,
     failed: bool,
+    /// Set once the fold returns its end.
+    pulled: Arc<AtomicBool>,
     yielder: Yielder<'static>,
 }
 
@@ -626,6 +739,7 @@ impl Iterator for FlightFold<'_> {
             }
             let job = self.next;
             if job == self.keys.len() {
+                self.pulled.store(true, Ordering::Release);
                 return None;
             }
             self.next += 1;

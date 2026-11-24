@@ -1,9 +1,10 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize, Serializer};
 
+use super::logged::LoggedKey;
 use super::{Input, Options, PersistedCollection, PersistedKeyed, Store, StoreCheckpoint};
 use crate::{
     Backend, ConditionalAppend, Error, Kind, Local, MemoryBackend, Position, ReadOutcome, Record,
@@ -65,13 +66,14 @@ fn on_worker() -> bool {
 }
 
 /// A [`MemoryBackend`] whose compaction may wait at a gate, on a checkpoint
-/// worker only, or pull as a test says, and which may decline concurrent
-/// compaction.
+/// worker only, or pull as a test says, which may decline concurrent
+/// compaction, and whose reads may stop at a position.
 struct Wrap {
     inner: MemoryBackend,
     concurrent: bool,
     gate: Option<Arc<Gate>>,
     pull: Option<Box<Pull>>,
+    read_upto: Option<Arc<AtomicU64>>,
 }
 
 impl Wrap {
@@ -81,6 +83,7 @@ impl Wrap {
             concurrent: true,
             gate: None,
             pull: None,
+            read_upto: None,
         }
     }
 
@@ -115,7 +118,12 @@ impl Backend for Wrap {
     }
 
     fn read_from(&self, after: Position, out: &mut Vec<(Position, Record)>) -> Result<ReadOutcome> {
-        self.inner.read_from(after, out)
+        let outcome = self.inner.read_from(after, out)?;
+        if let Some(upto) = &self.read_upto {
+            let upto = Position(upto.load(Ordering::SeqCst));
+            out.retain(|(position, _)| *position <= upto);
+        }
+        Ok(outcome)
     }
 
     fn load_snapshot(&self) -> Result<Option<(Position, Vec<Record>)>> {
@@ -874,7 +882,8 @@ fn a_flight_cancelled_by_a_rebuild_is_not_adopted_when_its_worker_still_commits(
     };
     let fx = Fx::over(&log, backend, Options::default());
     fx.populate(100);
-    let other = Fx::over(&fx.log, fx.log.clone(), Options::default());
+    let other = Second::lagging(&log);
+    fx.store.set(fx.x, 8).unwrap();
     let flight = fx.begin();
     assert!(!flight.poll(&fx.store, WAIT).unwrap());
     pulled.wait();
@@ -892,4 +901,419 @@ fn a_flight_cancelled_by_a_rebuild_is_not_adopted_when_its_worker_still_commits(
     fx.store.set(fx.x, 9).unwrap();
     fx.store.checkpoint().unwrap();
     assert_eq!(reopened(&fx.log), reopened_of(&fx));
+}
+
+/// A second store on a log, which reads no further than the position it
+/// opened at until [`Second::lift`].
+struct Second {
+    store: Store<Local, Wrap>,
+    read_upto: Arc<AtomicU64>,
+}
+
+impl Second {
+    fn lagging(log: &MemoryBackend) -> Self {
+        let read_upto = Arc::new(AtomicU64::new(u64::MAX));
+        let backend = Wrap {
+            read_upto: Some(Arc::clone(&read_upto)),
+            ..Wrap::new(log)
+        };
+        let store = Store::open(backend, Options::default()).unwrap();
+        read_upto.store(store.stats().unwrap().position.0, Ordering::SeqCst);
+        Second { store, read_upto }
+    }
+
+    fn lift(&self) {
+        self.read_upto.store(u64::MAX, Ordering::SeqCst);
+    }
+}
+
+/// The keys whose fold is empty when a [`Forgetting`] begins its flight:
+/// `empty`, a bound collection without elements; `idle`, unbound at its
+/// default; `spare`, an unbound collection key; `y`, bound at its default.
+const FORGOTTEN: [&str; 4] = ["empty", "idle", "spare", "y"];
+
+/// The default `populate` logs for `idle`, decoded as a `u32`.
+const IDLE: u32 = 100;
+
+/// A populated store whose worker waits at `gate`, and a second store on
+/// its log that reads one record behind it.
+struct Forgetting {
+    fx: Fx<Wrap>,
+    gate: Arc<Gate>,
+    second: Second,
+}
+
+impl Forgetting {
+    /// Its flight fails on a value the worker cannot encode when `failed`.
+    fn new(failed: bool) -> Self {
+        let log = MemoryBackend::new();
+        let gate = Arc::new(Gate::default());
+        let fx = Fx::over(&log, Wrap::gated(&log, &gate), Options::default());
+        fx.populate(20);
+        fx.store.collection::<String>("empty").unwrap();
+        log.append(&[declare("spare", Kind::Collection, &[])])
+            .unwrap();
+        if failed {
+            fx.touchy.insert(&fx.store, Touchy(TOUCHY + 1)).unwrap();
+        }
+        fx.store.refresh().unwrap();
+        let second = Second::lagging(&log);
+        fx.store.set(fx.x, 8).unwrap();
+        Forgetting { fx, gate, second }
+    }
+
+    fn foreign(&self, records: &[Record]) {
+        self.fx.log.append(records).unwrap();
+        self.fx.store.refresh().unwrap();
+    }
+}
+
+/// Runs `during` between the begin and the adoption of a flight that
+/// commits or, when `failed`, fails, and on a twin after a blocking
+/// checkpoint at the flight's position, or none when `failed`. Checks
+/// that after the first plain write, and again after a checkpoint, both
+/// stores and their reopens hold the forgotten keys alike, and that the
+/// two checkpoints write the same snapshot. Returns the flight's result.
+fn forget_and_compare(failed: bool, during: impl Fn(&Forgetting)) -> Result<Option<Position>> {
+    compare_forgetting(failed, true, during)
+}
+
+/// [`forget_and_compare`], comparing the stores' positions only when
+/// `positions`. A failed flight's store may log a `Declare` twice, so its
+/// positions run ahead of the twin's from the first one on.
+fn compare_forgetting(
+    failed: bool,
+    positions: bool,
+    during: impl Fn(&Forgetting),
+) -> Result<Option<Position>> {
+    let ours = Forgetting::new(failed);
+    let twin = Forgetting::new(failed);
+    let flight = ours.fx.begin();
+    assert!(!flight.poll(&ours.fx.store, WAIT).unwrap());
+    if !failed {
+        twin.fx.store.checkpoint().unwrap();
+    }
+    during(&ours);
+    during(&twin);
+    ours.gate.open();
+    let result = flight.result(&ours.fx.store, Some(WAIT));
+    assert!(!ours.fx.store.capture_installed());
+    for side in [&ours, &twin] {
+        side.fx.store.set(side.fx.x, 50).unwrap();
+    }
+    assert_alike(&ours.fx, &twin.fx, positions, positions && !failed);
+    for side in [&ours, &twin] {
+        side.fx.store.checkpoint().unwrap();
+    }
+    assert_alike(&ours.fx, &twin.fx, positions && !failed, positions);
+    assert_eq!(
+        ours.fx.snapshot().map(|(_, records)| records),
+        twin.fx.snapshot().map(|(_, records)| records)
+    );
+    result
+}
+
+#[derive(Debug, PartialEq)]
+struct Forgotten {
+    logged: Vec<Option<LoggedKey>>,
+    idle: Option<u32>,
+    empty: Option<Vec<String>>,
+    spare: Option<Vec<String>>,
+}
+
+/// What `store` holds for the [`FORGOTTEN`] keys: their logged entries,
+/// and the values of those it binds.
+fn forgotten<B: Backend + 'static>(store: &Store<Local, B>) -> Forgotten {
+    let (logged, bound) = {
+        let state = store.state.lock().unwrap();
+        let logged = FORGOTTEN
+            .iter()
+            .map(|key| state.logged.get(key).cloned())
+            .collect();
+        let bound = |key: &str| state.bound.contains_key(key);
+        (logged, [bound("idle"), bound("empty"), bound("spare")])
+    };
+    let elements = |key: &str| {
+        let mut elements = store
+            .collection::<String>(key)
+            .unwrap()
+            .handle()
+            .snapshot_values();
+        elements.sort();
+        elements
+    };
+    Forgotten {
+        logged,
+        idle: bound[0].then(|| {
+            let idle = store.input::<u32>("idle", IDLE).unwrap();
+            store.runtime().get(idle.handle())
+        }),
+        empty: bound[1].then(|| elements("empty")),
+        spare: bound[2].then(|| elements("spare")),
+    }
+}
+
+fn assert_alike(ours: &Fx<Wrap>, twin: &Fx<Wrap>, positions: bool, counts: bool) {
+    assert_eq!(forgotten(&ours.store), forgotten(&twin.store), "live");
+    assert_eq!(contents(ours), contents(twin));
+    let reopen = |log: &MemoryBackend| Store::<Local, _>::open(log.clone(), Options::default());
+    assert_eq!(
+        forgotten(&reopen(&ours.log).unwrap()),
+        forgotten(&reopen(&twin.log).unwrap()),
+        "reopened"
+    );
+    let (ours, twin) = (ours.store.stats().unwrap(), twin.store.stats().unwrap());
+    if positions {
+        assert_eq!(ours.snapshot_position, twin.snapshot_position);
+    }
+    if counts {
+        assert_eq!(ours.records_since_checkpoint, twin.records_since_checkpoint);
+    }
+}
+
+fn declare_idle(side: &Forgetting) {
+    side.fx.store.input::<u32>("idle", IDLE).unwrap();
+}
+
+#[test]
+fn forgotten_declare_after_a_committed_flight() {
+    forget_and_compare(false, declare_idle).unwrap();
+}
+
+#[test]
+fn forgotten_declare_after_a_failed_flight() {
+    forget_and_compare(true, declare_idle).unwrap_err();
+}
+
+fn set_y(side: &Forgetting) {
+    side.fx.store.set(side.fx.y, 6).unwrap();
+}
+
+#[test]
+fn forgotten_set_after_a_committed_flight() {
+    forget_and_compare(false, set_y).unwrap();
+}
+
+#[test]
+fn forgotten_set_after_a_failed_flight() {
+    forget_and_compare(true, set_y).unwrap_err();
+}
+
+fn delete_idle_and_y(side: &Forgetting) {
+    side.fx.store.delete("idle").unwrap();
+    side.fx.store.delete(side.fx.y).unwrap();
+}
+
+#[test]
+fn forgotten_delete_after_a_committed_flight() {
+    forget_and_compare(false, delete_idle_and_y).unwrap();
+}
+
+#[test]
+fn forgotten_delete_after_a_failed_flight() {
+    forget_and_compare(true, delete_idle_and_y).unwrap_err();
+}
+
+fn foreign_set_and_insert(side: &Forgetting) {
+    side.foreign(&[
+        Record::Set {
+            key: "idle".to_owned(),
+            value: postcard::to_stdvec(&7u32).unwrap(),
+        },
+        insert("spare", &enc("s1")),
+    ]);
+}
+
+#[test]
+fn forgotten_foreign_record_after_a_committed_flight() {
+    forget_and_compare(false, foreign_set_and_insert).unwrap();
+}
+
+#[test]
+fn forgotten_foreign_record_after_a_failed_flight() {
+    forget_and_compare(true, foreign_set_and_insert).unwrap_err();
+}
+
+fn write_and_undeclare_empty(side: &Forgetting) {
+    let store = &side.fx.store;
+    let empty = store.collection::<String>("empty").unwrap();
+    empty.insert(store, "e1".to_owned()).unwrap();
+    store.undeclare(&empty).unwrap();
+}
+
+#[test]
+fn forgotten_empty_collection_written_and_undeclared_after_a_committed_flight() {
+    forget_and_compare(false, write_and_undeclare_empty).unwrap();
+}
+
+#[test]
+fn forgotten_empty_collection_written_and_undeclared_after_a_failed_flight() {
+    forget_and_compare(true, write_and_undeclare_empty).unwrap_err();
+}
+
+fn bind_write_and_undeclare_idle(side: &Forgetting) {
+    let store = &side.fx.store;
+    let idle = store.input::<u32>("idle", IDLE).unwrap();
+    store.set(idle, 9).unwrap();
+    store.undeclare(idle).unwrap();
+}
+
+#[test]
+fn forgotten_unbound_key_bound_written_and_undeclared_after_a_committed_flight() {
+    forget_and_compare(false, bind_write_and_undeclare_idle).unwrap();
+}
+
+#[test]
+fn forgotten_unbound_key_bound_written_and_undeclared_after_a_failed_flight() {
+    forget_and_compare(true, bind_write_and_undeclare_idle).unwrap_err();
+}
+
+fn foreign_insert_then_bind_spare(side: &Forgetting) {
+    side.foreign(&[insert("spare", &enc("s1"))]);
+    side.fx.store.collection::<String>("spare").unwrap();
+}
+
+/// The snapshot's `Insert`s of `s1` into `spare`.
+fn spare_inserts(fx: &Fx<Wrap>) -> usize {
+    let (_, records) = fx.snapshot().unwrap();
+    records
+        .iter()
+        .filter(|record| **record == insert("spare", &enc("s1")))
+        .count()
+}
+
+#[test]
+fn forgotten_foreign_insert_then_bound_after_a_committed_flight() {
+    forget_and_compare(false, foreign_insert_then_bind_spare).unwrap();
+    let ours = Forgetting::new(false);
+    let flight = ours.fx.begin();
+    assert!(!flight.poll(&ours.fx.store, WAIT).unwrap());
+    foreign_insert_then_bind_spare(&ours);
+    ours.gate.open();
+    ours.fx.finish(&flight);
+    ours.fx.store.checkpoint().unwrap();
+    assert_eq!(spare_inserts(&ours.fx), 1);
+}
+
+#[test]
+fn forgotten_foreign_insert_then_bound_after_a_failed_flight() {
+    forget_and_compare(true, foreign_insert_then_bind_spare).unwrap_err();
+}
+
+fn foreign_declare_of_y_with_another_default(side: &Forgetting) {
+    side.foreign(&[declare(
+        "y",
+        Kind::Input,
+        &postcard::to_stdvec(&9u32).unwrap(),
+    )]);
+}
+
+#[test]
+fn forgotten_foreign_declare_with_another_default_after_a_committed_flight() {
+    forget_and_compare(false, foreign_declare_of_y_with_another_default).unwrap();
+    let ours = Forgetting::new(false);
+    let flight = ours.fx.begin();
+    assert!(!flight.poll(&ours.fx.store, WAIT).unwrap());
+    foreign_declare_of_y_with_another_default(&ours);
+    ours.gate.open();
+    ours.fx.finish(&flight);
+    ours.fx.store.set(ours.fx.x, 1).unwrap();
+    assert_eq!(ours.fx.store.runtime().get(ours.fx.y.handle()), 9);
+    assert_eq!(reopened(&ours.fx.log).y, 9);
+}
+
+#[test]
+fn forgotten_foreign_declare_with_another_default_after_a_failed_flight() {
+    forget_and_compare(true, foreign_declare_of_y_with_another_default).unwrap_err();
+}
+
+/// The second store checkpoints after `before`, then declares `idle` with
+/// another default, and the first store catches up.
+fn second_checkpoints_and_declares(side: &Forgetting, before: impl Fn(&Forgetting)) {
+    before(side);
+    side.second.store.checkpoint().unwrap();
+    side.second.lift();
+    side.second.store.input::<u32>("idle", 200).unwrap();
+    side.fx.store.refresh().unwrap();
+}
+
+#[test]
+fn second_store_checkpoint_below_upto_then_declares_a_forgotten_key() {
+    let result = compare_forgetting(false, false, |side| {
+        second_checkpoints_and_declares(side, |_| {});
+    });
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+}
+
+#[test]
+fn second_store_checkpoint_at_upto_then_declares_a_forgotten_key() {
+    let result = compare_forgetting(false, false, |side| {
+        second_checkpoints_and_declares(side, |side| side.second.lift());
+    });
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+}
+
+#[test]
+fn second_store_checkpoint_above_upto_then_declares_a_forgotten_key() {
+    let result = compare_forgetting(false, false, |side| {
+        second_checkpoints_and_declares(side, |side| {
+            side.fx.store.set(side.fx.x, 9).unwrap();
+            side.second.lift();
+        });
+    });
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+}
+
+/// A flight whose backend parks after its commit until the test lets it
+/// return; `meet` runs in between, while a thread lets the backend go
+/// after a while. `meet` must wait for the verdict and settle the flight
+/// as adopted.
+fn a_reconcile_meeting_own_waits_and_adopts(meet: impl FnOnce(&Fx<Wrap>)) {
+    let log = MemoryBackend::new();
+    let committed = Arc::new(Gate::default());
+    let go = Arc::new(Gate::default());
+    let backend = {
+        let (committed, go) = (Arc::clone(&committed), Arc::clone(&go));
+        Wrap::pulling(&log, move |inner, upto, records| {
+            let done = inner.compact_streamed(upto, records);
+            committed.open();
+            go.wait();
+            done
+        })
+    };
+    let fx = Fx::over(&log, backend, Options::default());
+    fx.populate(50);
+    let begun = fx.store.stats().unwrap().position;
+    let flight = fx.begin();
+    assert!(!flight.poll(&fx.store, WAIT).unwrap());
+    committed.wait();
+    let release = {
+        let go = Arc::clone(&go);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            go.open();
+        })
+    };
+    meet(&fx);
+    assert!(*go.open.lock().unwrap(), "the call waited for the backend");
+    release.join().unwrap();
+    assert_eq!(flight.result(&fx.store, Some(WAIT)).unwrap(), Some(begun));
+    assert_eq!(fx.store.stats().unwrap().snapshot_position, begun);
+    fx.store.set(fx.x, 3).unwrap();
+    fx.store.checkpoint().unwrap();
+    assert_eq!(reopened(&fx.log), reopened_of(&fx));
+}
+
+#[test]
+fn reconcile_wait_a_catch_up_meeting_own_adopts() {
+    a_reconcile_meeting_own_waits_and_adopts(|fx| {
+        fx.store.refresh().unwrap();
+    });
+}
+
+#[test]
+fn reconcile_wait_a_declare_meeting_own_adopts() {
+    a_reconcile_meeting_own_waits_and_adopts(|fx| {
+        fx.store.input::<u32>("idle", IDLE).unwrap();
+    });
 }

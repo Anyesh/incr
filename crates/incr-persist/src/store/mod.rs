@@ -1018,7 +1018,18 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let mut caught_up = false;
         let declared = loop {
             if let Some(declared) = state.logged.get(key).and_then(|k| k.declared.as_ref()) {
-                break declared.clone();
+                if declared.kind != kind || !state.flight.wants_declare(key) {
+                    break declared.clone();
+                }
+                // An open flight's snapshot forgets this Declare, so the
+                // log after it needs one for the key being bound.
+                let record = Record::Declare {
+                    key: key.to_owned(),
+                    kind,
+                    default: declared.default.clone(),
+                };
+                self.write(state, vec![record])?;
+                continue;
             }
             // Another writer may have declared the key since this store last
             // read the log; appending without looking would add a redundant
@@ -1156,6 +1167,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if self.settle_flight(state)? {
             return Ok(());
         }
+        if state.flight.reconcile_asked() {
+            self.reconcile_snapshot(state)?;
+        }
         match self.options.auto_checkpoint_records {
             Some(threshold) if state.since_checkpoint >= threshold => {
                 self.checkpoint_locked(state).map(drop)
@@ -1290,8 +1304,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 .snapshot_id()?
                 .filter(|id| Some(*id) != state.snapshot && id.position <= state.applied)
             else {
+                state.flight.reconciled();
                 return Ok(());
             };
+            if self.settle_committing(state, id)? {
+                continue;
+            }
             let loaded = self.backend.load_snapshot()?;
             let mut later = Vec::new();
             let outcome = self.backend.read_from(id.position, &mut later)?;
@@ -1349,6 +1367,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
+        if let Record::Declare { key, kind, default } = &record {
+            state.flight.note_declare(key, *kind, default);
+        }
         if let Some(&id) = state.bound.get(record.key()) {
             let binding = bound_binding(&mut state.bindings, id);
             let deps = state.deps.as_deref();
