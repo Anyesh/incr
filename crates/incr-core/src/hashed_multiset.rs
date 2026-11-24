@@ -567,7 +567,6 @@ impl<T> HashedMultiset<T> {
         if ctrl[i] == EMPTY {
             self.growth_left -= 1;
         }
-        capture::settle_free(&mut self.capture, i);
         entries[i].write(Entry {
             hash,
             count: 1,
@@ -575,6 +574,7 @@ impl<T> HashedMultiset<T> {
         });
         ctrl[i] = tag(hash);
         self.len += 1;
+        capture::settle_free(&mut self.capture, i);
     }
 
     /// Insert `value` with count 1 at the first free slot of its probe
