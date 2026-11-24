@@ -1037,8 +1037,9 @@ pub fn default_streamed_compaction_goes_through_compact<H: Harness>(mut h: H) {
 /// A backend whose `concurrent_compaction` is `true` lets `append`,
 /// `append_at`, `sync`, `read_from`, `snapshot_id` and `load_snapshot`
 /// through on another thread while its `compact_streamed` pulls, and keeps
-/// what they appended above `upto`. Skipped for a backend that returns
-/// `false`.
+/// what they appended above `upto`. The pull waits for them inside the
+/// value scope's `idle`, as a checkpoint worker's pulls do. Skipped for a
+/// backend that returns `false`.
 pub fn declared_concurrent_compaction_lets_other_calls_through<H: Harness>(mut h: H)
 where
     H::Backend: 'static,
@@ -1056,7 +1057,10 @@ where
         match pulls {
             1 => Some(Ok(declare("a"))),
             2 => {
-                calls_beside_a_compaction(&other, upto);
+                let scope = crate::current_value_scope();
+                crate::value_context::idle(scope.as_ref(), || {
+                    calls_beside_a_compaction(&other, upto)
+                });
                 Some(Ok(set("a", 1)))
             }
             _ => None,

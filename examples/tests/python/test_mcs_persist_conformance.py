@@ -843,3 +843,60 @@ def test_quarantined_inputs_and_incomplete_memo_values_restore_on_sqlite3(paths)
     assert type(store.runtime.status(shift)) is incr.Unavailable
     assert store.runtime.get_with_status(memo.get_or_insert(table, "k")) == expected
     assert calls == []
+
+
+class DictConcurrentBackend(DictStreamingBackend):
+    concurrent_compaction = True
+
+
+class DictConcurrentLogFactory(DictLogFactory):
+    backend_type = DictConcurrentBackend
+
+
+class DictConcurrentMemo(DictDeltaMemo):
+    concurrent_compaction = True
+
+
+class DictConcurrentMemoFactory(DictDeltaMemoFactory):
+    def open(self, store):
+        return DictConcurrentMemo(store, persist=self.persist)
+
+
+class KeepingMemo(DictConcurrentMemo):
+    def write_generation_streamed(self, base, generation, header, frames):
+        super().write_generation_streamed(base, generation, header, frames)
+        return self.state.generations[generation][1]
+
+
+class TupleMemo(DictConcurrentMemo):
+    def read_entries(self, generation, items):
+        return tuple(super().read_entries(generation, items))
+
+
+def memo_factory_of(memo_type):
+    class Factory(DictConcurrentMemoFactory):
+        def open(self, store):
+            return memo_type(store, persist=self.persist)
+
+    return Factory()
+
+
+CONCURRENT_CASES = [
+    ("store", DictConcurrentLogFactory, "declared_concurrent_compaction_lets_other_calls_through"),
+    ("memo", DictConcurrentMemoFactory, "declared_concurrent_compaction_lets_reads_through"),
+    ("memo", DictConcurrentMemoFactory, "declared_returns_are_new_lists"),
+]
+
+
+@pytest.mark.skipif(not HAS_CONFORMANCE, reason=SKIP_REASON)
+@pytest.mark.parametrize(("kind", "factory", "case"), CONCURRENT_CASES, ids=lambda v: str(v))
+def test_flagged_backends_pass_the_concurrent_compaction_cases(kind, factory, case):
+    assert persist._conformance(kind, factory(), case) == {case: None}
+
+
+@pytest.mark.skipif(not HAS_CONFORMANCE, reason=SKIP_REASON)
+@pytest.mark.parametrize("memo_type", [KeepingMemo, TupleMemo], ids=lambda t: t.__name__)
+def test_a_flagged_memo_that_keeps_or_wraps_a_promised_return_fails(memo_type):
+    case = "declared_returns_are_new_lists"
+    outcome = persist._conformance("memo", memo_factory_of(memo_type), case)
+    assert outcome[case] is not None

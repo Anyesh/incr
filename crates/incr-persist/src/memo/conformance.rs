@@ -701,7 +701,9 @@ pub fn read_entries_matches_read_entry<H: MemoHarness>(mut h: H) {
 /// On a backend that declares
 /// [`MemoBackend::concurrent_compaction`], `read_entry`, `read_entries` and
 /// `load` called from another thread on the same handle return while a
-/// streamed write is pulling. Checks nothing on a backend without the flag.
+/// streamed write is pulling, which waits for them inside the value
+/// scope's `idle` as a checkpoint worker's pulls do. Checks nothing on a
+/// backend without the flag.
 pub fn declared_concurrent_compaction_lets_reads_through<H: MemoHarness>(mut h: H) {
     let store = h.new_store();
     let backend = std::sync::Arc::new(h.open(&store));
@@ -717,24 +719,27 @@ pub fn declared_concurrent_compaction_lets_reads_through<H: MemoHarness>(mut h: 
         match pulled {
             1 => Some(Ok(entries(2).remove(0))),
             2 => {
-                let (done, reads) = mpsc::channel();
-                let other = std::sync::Arc::clone(&backend);
-                thread::spawn(move || {
-                    let read = other
-                        .read_entry(GenId(1), &item)
-                        .map(|frame| frame.is_some());
-                    let batch = other
-                        .read_entries(GenId(1), &[item])
-                        .map(|frames| frames.len());
-                    let loaded = other.load().map(|base| base.map(|base| base.id()));
-                    let _ = done.send((read, batch, loaded));
+                let scope = crate::current_value_scope();
+                crate::value_context::idle(scope.as_ref(), || {
+                    let (done, reads) = mpsc::channel();
+                    let other = std::sync::Arc::clone(&backend);
+                    thread::spawn(move || {
+                        let read = other
+                            .read_entry(GenId(1), &item)
+                            .map(|frame| frame.is_some());
+                        let batch = other
+                            .read_entries(GenId(1), &[item])
+                            .map(|frames| frames.len());
+                        let loaded = other.load().map(|base| base.map(|base| base.id()));
+                        let _ = done.send((read, batch, loaded));
+                    });
+                    let (read, batch, loaded) = reads
+                        .recv_timeout(STREAM_TIMEOUT)
+                        .expect("a read waited for the streamed write");
+                    assert!(read.expect("read_entry failed"));
+                    assert_eq!(batch.expect("read_entries failed"), 1);
+                    assert_eq!(loaded.expect("load failed"), Some(GenId(1)));
                 });
-                let (read, batch, loaded) = reads
-                    .recv_timeout(STREAM_TIMEOUT)
-                    .expect("a read waited for the streamed write");
-                assert!(read.expect("read_entry failed"));
-                assert_eq!(batch.expect("read_entries failed"), 1);
-                assert_eq!(loaded.expect("load failed"), Some(GenId(1)));
                 Some(Ok(entries(2).remove(1)))
             }
             _ => None,
