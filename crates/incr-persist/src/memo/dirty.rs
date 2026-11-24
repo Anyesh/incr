@@ -218,16 +218,18 @@ impl Dirty {
         Carried::Counted
     }
 
-    /// Counts again an entry an attempt carried after an earlier attempt
-    /// had, now that it landed, if it was not computed since: its landing
-    /// is what lets a checkpoint save it.
+    /// Counts as unsaved a dirty entry that landed with no compute, unless
+    /// something counted it since the attempt began: an attempt that
+    /// carried it again did not, and its landing is what lets a
+    /// checkpoint save it.
     pub(crate) fn landed(&self, handle: ErasedIncr) {
         let mut shard = self.shard(handle);
-        let Shard { marks, carried } = &mut *shard;
-        if !carried.contains(&handle) {
-            return;
-        }
-        if let Some(current) = marks.get_mut(&handle) {
+        let attempt = self.attempt.load(Relaxed);
+        if let Some(current) = shard
+            .marks
+            .get_mut(&handle)
+            .filter(|marked| marked.mark <= attempt)
+        {
             current.mark = self.marks.fetch_add(1, Relaxed) + 1;
             self.unsaved.fetch_add(1, Relaxed);
         }
@@ -357,6 +359,22 @@ mod tests {
         assert_eq!(dirty.unsaved(), 2);
         dirty.failed();
         assert_eq!(dirty.unsaved(), 2);
+    }
+
+    #[test]
+    fn a_landing_counts_an_entry_once_per_attempt() {
+        let (_rt, h) = handles(1);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        dirty.carry(&mark(&marks, h[0]));
+        dirty.landed(h[0]);
+        assert_eq!(dirty.unsaved(), 1);
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Before);
+        dirty.landed(h[0]);
+        dirty.landed(h[0]);
+        assert_eq!(dirty.unsaved(), 1);
     }
 
     #[test]
