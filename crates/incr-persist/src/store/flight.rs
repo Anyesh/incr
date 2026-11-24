@@ -73,11 +73,12 @@ pub struct StoreCheckpoint {
 impl StoreCheckpoint {
     /// Hands the worker what the captures take for about `budget`, plus
     /// one unit of table slots, and settles the flight once the worker's
-    /// verdict is in. `Ok(true)` once the snapshot is committed, adopted
-    /// or, when a `Declare` applied since begin differs from the live one,
-    /// left for the store's next reconcile; the worker's error or [`Error::Cancelled`] once it is not
-    /// going to be, and [`Error::Corrupt`], poisoning the store, when the
-    /// backend returned before it pulled the whole snapshot.
+    /// verdict is in. `Ok(true)` once the snapshot is committed, then
+    /// either adopted or, when a forgotten key was declared differently
+    /// since begin, left for the store's next reconcile; the worker's error
+    /// or [`Error::Cancelled`] once it is not going to be committed, and
+    /// [`Error::Corrupt`], poisoning the store, when the backend returned
+    /// before it pulled the whole snapshot.
     pub fn poll<B: Backend + 'static>(
         &self,
         store: &Store<Local, B>,
