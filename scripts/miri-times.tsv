@@ -1004,6 +1004,7 @@
 0	runtime::seed_tests::local::a_seeded_hit_leaves_its_key_and_closure_in_the_bag
 5	runtime::seed_tests::local::a_seeded_type_fallback_miss_needs_the_types_fallback
 0	runtime::seed_tests::local::changed_at_erased_refuses_dead_and_foreign_handles
+1	runtime::seed_tests::local::is_clean_follows_a_query_and_refuses_dead_and_foreign_handles
 2	runtime::seed_tests::local::failures_return_the_value_and_land_new
 0	runtime::seed_tests::local::if_unchanged_over_unchanged_deps_never_runs
 0	runtime::seed_tests::local::inspect_reads_a_clean_node_with_its_deps
@@ -1020,6 +1021,7 @@
 0	runtime::seed_tests::shared::a_seeded_hit_leaves_its_key_and_closure_in_the_bag
 5	runtime::seed_tests::shared::a_seeded_type_fallback_miss_needs_the_types_fallback
 1	runtime::seed_tests::shared::changed_at_erased_refuses_dead_and_foreign_handles
+1	runtime::seed_tests::shared::is_clean_follows_a_query_and_refuses_dead_and_foreign_handles
 3	runtime::seed_tests::shared::failures_return_the_value_and_land_new
 0	runtime::seed_tests::shared::if_unchanged_over_unchanged_deps_never_runs
 1	runtime::seed_tests::shared::inspect_reads_a_clean_node_with_its_deps

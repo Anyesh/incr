@@ -73,6 +73,12 @@ pub fn changed_at_erased<C: Cells>(rt: &Runtime<C>, handle: ErasedIncr) -> Optio
     rt.changed_at_erased(handle)
 }
 
+/// Whether `handle` names a node of `rt` that is Clean now: `false` for
+/// a dead, recycled or foreign handle.
+pub fn is_clean<C: Cells>(rt: &Runtime<C>, handle: ErasedIncr) -> bool {
+    rt.clean_erased(handle)
+}
+
 /// Panics unless `rt`, at quiescence, holds invariant (I) and every
 /// installed dep has its reverse edge. For incr-persist's restart tests.
 #[cfg(any(test, feature = "test-hooks"))]

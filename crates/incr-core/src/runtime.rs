@@ -4486,6 +4486,16 @@ impl<C: Cells> Runtime<C> {
         (node.generation() == handle.generation()).then_some(stamp)
     }
 
+    /// Whether `handle` names a live node of this runtime that is Clean.
+    pub(crate) fn clean_erased(&self, handle: ErasedIncr) -> bool {
+        if handle.runtime_id() != self.runtime_id {
+            return false;
+        }
+        let node = self.nodes.get(handle.slot());
+        let state = C::state_load_acquire(node.state_cell());
+        state == NodeState::Clean.as_u8() && node.generation() == handle.generation()
+    }
+
     /// [`Self::set`] that hands back what it would drop: the displaced
     /// value if it wrote, or the rejected equal value if it did not, with
     /// the input's `changed_at` as this call left it.
