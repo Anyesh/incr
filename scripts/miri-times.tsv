@@ -405,6 +405,8 @@
 0	replay::tests::a_containment_of_a_payload_regenerated_for_its_read_retires_its_landing
 0	replay::tests::a_containment_of_a_regenerated_payload_retires_its_passed_landing
 0	replay::tests::a_containment_of_a_resumed_copy_retires_its_passed_landing
+0	replay::tests::a_doom_arms_again_only_what_was_taken_since_its_run_began
+13	replay::tests::a_take_log_stays_near_the_takes_still_live
 0	replay::tests::a_cut_newer_note_leaves_the_older_stamp
 10	replay::tests::a_deep_direct_held_again_makes_no_positions_again
 0	replay::tests::a_delivery_left_just_above_its_frame_is_reached_there

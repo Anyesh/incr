@@ -23,6 +23,59 @@ thread_local! {
     pub(crate) static DIVERT_EVERY_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Dooms a test names, for a case whose byte budget's cut points move
+/// with frame sizes: each is a read as `(reader slot, read slot, depth)`,
+/// doomed as an over-budget read is when it comes first in the list.
+pub(crate) mod doom_schedule {
+    #[cfg(test)]
+    thread_local! {
+        static DOOMS: std::cell::RefCell<std::collections::VecDeque<(u32, u32, u32)>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+
+    /// Runs `f` with `dooms` scheduled, returning how many it left untaken.
+    #[cfg(test)]
+    #[cfg_attr(loom, allow(dead_code))]
+    pub(crate) fn with<R>(dooms: &[(u32, u32, u32)], f: impl FnOnce() -> R) -> (R, usize) {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                DOOMS.with(|d| d.borrow_mut().clear());
+            }
+        }
+        DOOMS.with(|d| *d.borrow_mut() = dooms.iter().copied().collect());
+        let _clear = Clear;
+        let r = f();
+        (r, DOOMS.with(|d| d.borrow().len()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn due(reader: u32, read: u32, depth: u32) -> bool {
+        DOOMS.with(|d| d.borrow().front() == Some(&(reader, read, depth)))
+    }
+
+    /// The read was doomed: a doom scheduled for it is spent.
+    #[cfg(test)]
+    pub(super) fn taken(reader: u32, read: u32, depth: u32) {
+        DOOMS.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.front() == Some(&(reader, read, depth)) {
+                d.pop_front();
+            }
+        });
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn due(_: u32, _: u32, _: u32) -> bool {
+        false
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn taken(_: u32, _: u32, _: u32) {}
+}
+
 /// What the doom point saw, for tests.
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -83,6 +136,10 @@ enum VPop {
     /// The run of the frame at the popped position ended: no retry
     /// computes it again.
     Finished(u32, Ended),
+    /// The episode rooted at the node deferred to a lower root, which
+    /// ended the run of the root's frame with the root held, as the native
+    /// pop's: the root's entry, if this pop is at its position, is done.
+    Deferred(u32),
 }
 
 /// How the run of a popped frame ended.
@@ -1790,11 +1847,13 @@ impl<C: Cells> Runtime<C> {
                         return ControlFlow::Break(read);
                     }
                 }
-                if self.over_budget(f.depth)
+                if (self.over_budget(f.depth)
+                    || doom_schedule::due(f.node.0, handle.slot(), f.depth))
                     && !self.undoomable(ctl, f.depth)
                     && self.replayable(f.node.0)
                     && self.placeholder::<T>().is_some()
                 {
+                    doom_schedule::taken(f.node.0, handle.slot(), f.depth);
                     mode |= ARMED;
                 }
             }
@@ -4206,7 +4265,7 @@ impl<C: Cells> Runtime<C> {
                     self.tarjan_pop(id, &v, &mut kept)
                 };
                 match popped {
-                    VPop::Next | VPop::Left => {
+                    VPop::Next | VPop::Left | VPop::Deferred(_) => {
                         if retried && !kept.is_empty() {
                             taint_memo::restore(kept);
                         }
@@ -4214,11 +4273,37 @@ impl<C: Cells> Runtime<C> {
                             self.rest_unowed_reservation(v.node, v.generation);
                         }
                         popped_frames.push((v.clone(), false));
+                        if let VPop::Deferred(root) = popped {
+                            let boundary = replay::with(|c| {
+                                c.iter()
+                                    .find(|x| x.id == id)
+                                    .expect("incr-core: a running context is open")
+                                    .boundary
+                            });
+                            let generation = self.nodes.get(root).generation();
+                            if v.cidx == boundary + level
+                                && (entry.node, entry.generation) == (root, generation)
+                            {
+                                match self.held_entry_done(id, level, boundary) {
+                                    Some(computed) => return computed,
+                                    None => continue 'entries,
+                                }
+                            }
+                        }
                     }
                     VPop::Dissolved(root) => {
                         let generation = self.nodes.get(root).generation();
                         if self.end_dissolved_reads(NodeId(root), generation, v.cidx) {
                             dissolved.push(v.cidx);
+                            replay::with(|c| {
+                                if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                                    for (w, _) in
+                                        popped_frames.iter().filter(|(w, _)| w.cidx > v.cidx)
+                                    {
+                                        x.directs.remove_frame((w.node, w.generation, w.cidx));
+                                    }
+                                }
+                            });
                         }
                         popped_frames.push((v.clone(), false));
                     }
@@ -4272,6 +4357,7 @@ impl<C: Cells> Runtime<C> {
                 if !buffered {
                     let cidx = boundary + level;
                     self.retry_deliveries(id, entry.node, entry.generation, cidx);
+                    let since = replay::take_mark();
                     let ran = {
                         // Its frames sit above `cidx`, as an entry's run's do:
                         // at a lower position a panic among them releases
@@ -4289,6 +4375,7 @@ impl<C: Cells> Runtime<C> {
                         self.runtime_id,
                         cidx,
                         matches!(ran, Ok(None)),
+                        since,
                     ));
                     if !matches!(ran, Ok(None)) {
                         self.end_deliveries(id, entry.node, entry.generation, cidx);
@@ -4338,15 +4425,8 @@ impl<C: Cells> Runtime<C> {
                         }
                     }
                 }
-                replay::with(|c| {
-                    if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                        x.pop_entry(level);
-                        x.claims.retain(|&(l, _)| l < level);
-                    }
-                });
-                if level == 0 {
-                    self.close_context(id, boundary);
-                    return Computed::Deferred;
+                if let Some(computed) = self.held_entry_done(id, level, boundary) {
+                    return computed;
                 }
                 continue;
             }
@@ -4354,13 +4434,18 @@ impl<C: Cells> Runtime<C> {
             // stood for, so it owns what that run deferred.
             let at = boundary + level;
             self.own_deferred(at, entry.node);
+            // A frame at or above a dissolved root's was its ended run's,
+            // which the root's retry, a new run, does not read again: its
+            // directs went with the dissolve.
             for (v, _) in popped_frames
                 .iter()
                 .filter(|&(v, landed)| !landed && v.cidx > at)
             {
                 let read = v.computes;
                 if let Some((w, _)) = popped_frames.iter().find(|(w, _)| {
-                    w.cidx + 1 == v.cidx && w.reading == read && !dissolved.contains(&w.cidx)
+                    w.cidx + 1 == v.cidx
+                        && w.reading == read
+                        && !dissolved.iter().any(|&d| w.cidx >= d)
                 }) {
                     replay::with(|c| {
                         let runs = replay::run_snapshot(c, self.runtime_id, w);
@@ -4371,6 +4456,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             let placement = self.dep_stack.place_next_at(at, level > 0);
+            let since = replay::take_mark();
             let ran = {
                 let _speculating = entry
                     .spec
@@ -4416,11 +4502,10 @@ impl<C: Cells> Runtime<C> {
             if matches!(ran, Ok(Computed::Discarded)) && dropped.is_none() {
                 replay::with(|c| {
                     if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                        let own = x.pending.of_frame(entry.node, entry.generation, at);
-                        for i in x.pending.of_maker(level).into_iter().chain(own) {
+                        x.rearm_doomed(level, at, since);
+                        for i in x.pending.of_frame(entry.node, entry.generation, at) {
                             x.pending.set_taken(i, false);
                         }
-                        x.directs.rearm_maker(level);
                         x.directs.rearm_frame((entry.node, entry.generation, at));
                     }
                 });
@@ -4625,11 +4710,17 @@ impl<C: Cells> Runtime<C> {
                 .partition(|&(_, owner)| owner == v.cidx + 1);
             *kept = above;
             taint_memo::restore(own);
+            let since = replay::take_mark();
             let ran = {
                 let _speculating = v.spec.then(|| replay::Speculating::enter(self.runtime_id));
                 self.member_run(v.node, v.cidx, true, v.walked, true)
             };
-            drop(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
+            drop(replay::run_ended(
+                rt,
+                v.cidx,
+                matches!(ran, Ok(None)),
+                since,
+            ));
             match ran {
                 Ok(Some(l)) => {
                     self.end_deliveries(id, v.node, v.generation, v.cidx);
@@ -4764,6 +4855,7 @@ impl<C: Cells> Runtime<C> {
             PopEnd::Landed => VPop::Finished(root.0, Ended::Landed),
             PopEnd::Contained => VPop::Finished(root.0, Ended::Contained),
             PopEnd::Dissolved => VPop::Dissolved(root.0),
+            PopEnd::Deferred => VPop::Deferred(root.0),
             _ => VPop::Next,
         };
         if let PopEnd::Dissolved = end {
@@ -5710,6 +5802,21 @@ impl<C: Cells> Runtime<C> {
         }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(payload)
+    }
+
+    /// The held entry at `level` is done, its run over and its node held
+    /// for the root of its cycle to land: `Deferred` if it is the target.
+    fn held_entry_done(&self, id: u64, level: u32, boundary: u32) -> Option<Computed> {
+        replay::with(|c| {
+            if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                x.pop_entry(level);
+                x.claims.retain(|&(l, _)| l < level);
+            }
+        });
+        (level == 0).then(|| {
+            self.close_context(id, boundary);
+            Computed::Deferred
+        })
     }
 
     /// A virtual frame's pop at position `v.cidx` finished the run of the

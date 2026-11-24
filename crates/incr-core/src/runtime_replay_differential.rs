@@ -10895,6 +10895,128 @@ fn a_failure_over_a_dirty_dep_over_a_discarded_frame_flips_as_unbounded() {
     });
 }
 
+/// `case` with its Native queries replayable, as `INCR_TEST_ALL_REPLAYABLE`
+/// makes them, so a test of a replay-only seed fails without the switch.
+fn all_replayable(mut case: Case) -> Case {
+    let replayable = |spec: &mut Spec| {
+        if let Spec::Query { expr, replay, .. } = spec {
+            *replay |= !has_first_run(expr);
+        }
+    };
+    case.specs
+        .iter_mut()
+        .chain(&mut case.specs2)
+        .for_each(replayable);
+    for op in &mut case.ops {
+        if let Op::Recreate(_, spec) = op {
+            replayable(spec);
+        }
+    }
+    case
+}
+
+/// 0x9921: the episode rooted at query 2 defers at its landing end, as the
+/// unbounded run's does, after which 2's frame is over; the bounded run ran
+/// 2's closure once more, which read 3's landing-pass value and landed
+/// query 8, a node the unbounded run never computes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_deferred_episode_root_runs_no_more_than_unbounded() {
+    const SEED: u64 = 0x9921;
+    let case = gen_case(SEED, false, false);
+    quiet(|| {
+        differential::<Local>(&case, SEED);
+        differential::<Shared>(&case, SEED);
+    });
+}
+
+/// 0x44f9: a doomed member run took a delivery a lower level made for its
+/// first read; its retry must take it again, or that read gets the cycle
+/// outcome and the run lands query 13, which the unbounded run never reads.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_run_leaves_a_lower_delivery_for_its_retry() {
+    const SEED: u64 = 0x44f9;
+    let case = all_replayable(gen_case(SEED, false, false));
+    quiet(|| {
+        differential::<Local>(&case, SEED);
+        differential::<Shared>(&case, SEED);
+    });
+}
+
+/// [`differential`] for a case whose byte budget's cut points move with
+/// frame sizes: the bounded run dooms the reads `dooms` names, as
+/// `(reader slot, read slot, depth)` in order, under a byte budget no read
+/// reaches, and must take every one.
+fn differential_doomed<C: Cells>(case: &Case, seed: u64, dooms: &[(u32, u32, u32)]) {
+    let (unbounded, native) = labelled(&format!("seed {seed:#x}, unbounded"), || {
+        run_counted::<C>(case, None, 0)
+    });
+    let label = format!("seed {seed:#x}, dooms {dooms:?}");
+    let ((bounded, runs), left) = labelled(&label, || {
+        super::replay_impl::doom_schedule::with(dooms, || run_counted::<C>(case, None, 1 << 40))
+    });
+    assert_eq!(left, 0, "{label}: dooms left untaken");
+    compare(case, &unbounded, &bounded, &label);
+    compare_native(&native, &runs, &label);
+}
+
+/// 0x12f3f: under the 16 KiB budget the level-6 entry run of query 10 took
+/// a delivery maker 0 made for query 11's read of 22 above it, then was
+/// doomed; the retry must take it again, or that read unwinds the cycle
+/// and queries 9, 10, 11, 15 and 16 end New where the unbounded run has
+/// them Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_discarded_entry_leaves_a_lower_delivery_for_its_retry() {
+    const SEED: u64 = 0x12f3f;
+    let case = all_replayable(gen_case(SEED, false, false));
+    let dooms = [(14, 3, 8), (16, 15, 6), (3, 8, 5)];
+    quiet(|| {
+        differential_doomed::<Local>(&case, SEED, &dooms);
+        differential_doomed::<Shared>(&case, SEED, &dooms);
+    });
+}
+
+/// 0xb8df: as 0x12f3f, for query 19's read of 20, taken by the doomed
+/// entry run of 18 below it; without it 19 (slot 8) catches the cycle and
+/// lands over 20 alone where the unbounded run read 20 and 6 (slots 7, 21).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_discarded_entry_leaves_a_lower_landed_delivery_for_its_retry() {
+    const SEED: u64 = 0xb8df;
+    let case = all_replayable(gen_case(SEED, false, false));
+    let dooms = [
+        (8, 7, 8),
+        (17, 16, 7),
+        (18, 17, 6),
+        (10, 9, 6),
+        (17, 16, 6),
+        (16, 21, 5),
+        (18, 17, 5),
+        (20, 19, 5),
+    ];
+    quiet(|| {
+        differential_doomed::<Local>(&case, SEED, &dooms);
+        differential_doomed::<Shared>(&case, SEED, &dooms);
+    });
+}
+
+/// 0x8ed3: a dissolved episode's root retries as a new run, so a frame
+/// above it popped in the same pass must not hand that run its old direct
+/// read; the walk the unbounded run's read makes there brings queries 4, 5
+/// and 14 into the next episode, which lands its members Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_dissolved_root_retries_without_the_directs_above_it() {
+    const SEED: u64 = 0x8ed3;
+    let case = all_replayable(gen_case(SEED, false, false));
+    quiet(|| {
+        differential::<Local>(&case, SEED);
+        differential::<Shared>(&case, SEED);
+    });
+}
+
 /// Each serial order of the two-thread cases of seeds
 /// `REPLAY_FROM..REPLAY_SCAN` (or the hex seeds in `SEEDS_FILE`), run
 /// unbounded, against [`fresh_read`]: the two-thread differential takes

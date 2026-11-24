@@ -557,6 +557,11 @@ pub(crate) struct Pending {
     /// retires them.
     by_payload: BTreeSet<(u32, PayloadKey, usize)>,
     filed: HashMap<usize, Filed, FxBuildHasher>,
+    /// Each take, as `(take_seq, frame position, index)`, oldest first: a
+    /// doomed run's retry reads again those taken since the run began. An
+    /// entry may outlast its delivery's take until a compaction or a doom
+    /// drops it; a slot is not reused while the log holds it.
+    taken_log: Vec<(u64, u32, usize)>,
 }
 
 /// Where a passed delivery is filed for the events that retire its
@@ -766,6 +771,7 @@ impl Pending {
                 "a maker list outlived its deliveries"
             );
             self.slots.clear();
+            self.taken_log.clear();
         }
     }
 
@@ -984,10 +990,35 @@ impl Pending {
         }
         let (counted, frame) = (d.key.foreign.is_none(), frame_of(&d.key));
         d.taken = taken;
+        if taken {
+            self.taken_log.push((next_take(), frame.2, i));
+            if self.taken_log.len() > 2 * self.live + 64 {
+                let slots = &self.slots;
+                compact_takes(&mut self.taken_log, |&(_, _, i)| {
+                    slots[i].as_ref().is_some_and(|d| d.taken)
+                });
+            }
+        }
         if counted && taken {
             self.count_taken(frame);
         } else if counted {
             *self.untaken.entry(frame).or_default() += 1;
+        }
+    }
+
+    /// Arms again the deliveries for frames above position `cidx` taken
+    /// at or after `since`, dropping them from the log.
+    fn rearm_taken_since(&mut self, since: u64, cidx: u32) {
+        let from = self.taken_log.partition_point(|&(n, _, _)| n < since);
+        let tail = self.taken_log.split_off(from);
+        note_work(tail.len());
+        for (n, at, i) in tail {
+            let live = self.slots[i].as_ref().is_some_and(|d| d.taken);
+            if live && at > cidx {
+                self.set_taken(i, false);
+            } else if live {
+                self.taken_log.push((n, at, i));
+            }
         }
     }
 
@@ -1272,6 +1303,9 @@ pub(crate) struct Directs {
     released: HashMap<(u32, u32), u32, FxBuildHasher>,
     /// Positions by maker, dropped lazily as in [`Pending::by_maker`].
     by_maker: HashMap<u32, Made, FxBuildHasher>,
+    /// Each take, as `(take_seq, position, stamp)`, as [`Pending`]'s
+    /// `taken_log`.
+    taken_log: Vec<(u64, u32, u32)>,
 }
 
 impl Directs {
@@ -1496,10 +1530,14 @@ impl Directs {
         self.released.clear();
         let mut old = std::mem::take(&mut self.more_runs);
         let mut stamp = 0;
+        let mut moved = HashMap::new();
         let mut restamp = |i: u32, d: &mut Direct| {
             if d.owner & MORE_RUNS != 0 {
                 let runs = old.remove(&(i, d.stamp)).unwrap_or_default();
                 self.more_runs.insert((i, stamp), runs);
+            }
+            if d.taken() {
+                moved.insert((i, d.stamp), stamp);
             }
             d.stamp = stamp;
             stamp += 1;
@@ -1518,6 +1556,8 @@ impl Directs {
         }
         debug_assert!(old.is_empty(), "more runs outlived their directs");
         self.next_stamp = stamp;
+        self.taken_log
+            .retain_mut(|(_, i, s)| moved.get(&(*i, *s)).map(|&new| *s = new).is_some());
     }
 
     /// Removes the directs at position `i`, gone ones included, that `f`
@@ -1571,6 +1611,7 @@ impl Directs {
         }
         if self.live == 0 {
             self.released.clear();
+            self.taken_log.clear();
             debug_assert!(
                 self.by_maker.is_empty() && self.more_at.is_empty() && self.more_runs.is_empty(),
                 "a direct list outlived its directs"
@@ -1636,19 +1677,27 @@ impl Directs {
                 true
             },
         );
+        if let Some(d) = &found {
+            self.log_take(i as u32, d.stamp);
+        }
         found.map(|d| self.runs_of(i, &d))
     }
 
     /// Marks the direct for read `key` taken, if there is one.
     pub(crate) fn take_keyed(&mut self, key: &ReadKey) {
+        let mut found = None;
         self.find_mut(
             key.cidx,
             |d| d.is(key),
             |d, _| {
+                found = (!d.taken()).then_some(d.stamp);
                 d.set_taken(true);
                 true
             },
         );
+        if let (Some(i), Some(stamp)) = (self.position(key.cidx), found) {
+            self.log_take(i as u32, stamp);
+        }
     }
 
     /// Counts the run of `node` at `generation` along `path` in the
@@ -1706,6 +1755,35 @@ impl Directs {
     pub(crate) fn rearm_maker(&mut self, level: u32) {
         for i in self.of_maker(level) {
             self.rearm_at(i, |d| d.maker == level);
+        }
+    }
+
+    fn log_take(&mut self, i: u32, stamp: u32) {
+        self.taken_log.push((next_take(), i, stamp));
+        if self.taken_log.len() > 2 * self.live + 64 {
+            let mut log = std::mem::take(&mut self.taken_log);
+            compact_takes(&mut log, |&(_, i, stamp)| {
+                self.all_at(i as usize)
+                    .any(|d| d.stamp == stamp && d.taken())
+            });
+            self.taken_log = log;
+        }
+    }
+
+    /// As [`Pending`]'s `rearm_taken_since`, for directs.
+    fn rearm_taken_since(&mut self, since: u64, cidx: u32) {
+        let from = self.taken_log.partition_point(|&(n, _, _)| n < since);
+        let tail = self.taken_log.split_off(from);
+        note_work(tail.len());
+        let above = self.position(cidx).map_or(0, |at| at as u32 + 1);
+        for (n, i, stamp) in tail {
+            let taken = |d: &Direct| d.stamp == stamp && d.taken();
+            let live = self.all_at(i as usize).any(|d| d.node != EMPTY && taken(d));
+            if live && i >= above {
+                self.rearm_at(i as usize, taken);
+            } else if live {
+                self.taken_log.push((n, i, stamp));
+            }
         }
     }
 
@@ -2422,6 +2500,21 @@ impl Context {
     pub(crate) fn end_node_runs(&mut self, node: u32, generation: u32) {
         self.claim_revs.end_node(node, generation);
         self.run_failures.end_node(node, generation);
+    }
+
+    /// The run at `level`, at position `cidx`, begun at take [`take_mark`]
+    /// `since`, was doomed, so its retry reads again what its frames read:
+    /// the deliveries and directs its run made, and those its frames took
+    /// since it began that a run below made, which the doom leaves that
+    /// run's to deliver again. A run nested in it runs again in the retry,
+    /// and one that ended before it began does not.
+    pub(crate) fn rearm_doomed(&mut self, level: u32, cidx: u32, since: u64) {
+        for i in self.pending.of_maker(level) {
+            self.pending.set_taken(i, false);
+        }
+        self.pending.rearm_taken_since(since, cidx);
+        self.directs.rearm_maker(level);
+        self.directs.rearm_taken_since(since, cidx);
     }
 
     /// The run of the entry at `level` ended: the deliveries it made for
@@ -4602,11 +4695,12 @@ pub(crate) fn end_run(rt: RuntimeId, frame: Frame, path: u64) {
 }
 
 /// A run at position `cidx` that is not a driver entry's, a member run,
-/// ended. The deliveries for the frames its run made are read again by its
-/// retry if a doom discarded it, and returned to be dropped otherwise, as
-/// the driver does for an entry's run.
+/// begun at take [`take_mark`] `since`, ended. The deliveries for the
+/// frames its run made are read again by its retry if a doom discarded it,
+/// and returned to be dropped otherwise, as the driver does for an entry's
+/// run.
 #[must_use]
-pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery> {
+pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool, since: u64) -> Vec<Delivery> {
     with(|c| {
         let Some(at) = covering(c, rt, cidx) else {
             return Vec::new();
@@ -4614,14 +4708,47 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
         let x = &mut c[at];
         let level = cidx - x.boundary;
         if doomed {
-            for i in x.pending.of_maker(level) {
-                x.pending.set_taken(i, false);
-            }
-            x.directs.rearm_maker(level);
+            x.rearm_doomed(level, cidx, since);
             return Vec::new();
         }
         x.end_maker(level)
     })
+}
+
+/// Keeps, of take log `log`, the newest entry of each item `taken` says is
+/// still taken, in order, so a log holds about one entry per live item.
+fn compact_takes<K: Copy + Eq + std::hash::Hash>(
+    log: &mut Vec<(u64, u32, K)>,
+    taken: impl Fn(&(u64, u32, K)) -> bool,
+) {
+    let mut seen = HashSet::with_capacity_and_hasher(log.len(), FxBuildHasher);
+    let mut kept: Vec<(u64, u32, K)> = (log.iter().rev())
+        .filter(|e| seen.insert((e.1, e.2)) && taken(e))
+        .copied()
+        .collect();
+    kept.reverse();
+    note_work(log.len());
+    *log = kept;
+}
+
+thread_local! {
+    /// The takes of deliveries and directs on this thread, counted.
+    static TAKES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn next_take() -> u64 {
+    TAKES.with(|t| {
+        let n = t.get();
+        t.set(n + 1);
+        n
+    })
+}
+
+/// The mark a run beginning now passes to [`run_ended`] or
+/// [`Context::rearm_doomed`]: a doom of the run arms again what was taken
+/// from it on.
+pub(crate) fn take_mark() -> u64 {
+    TAKES.with(Cell::get)
 }
 
 /// The earliest value noted for each doomed frame, as in
@@ -5165,6 +5292,92 @@ mod tests {
             false,
         );
         assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A doomed run's retry reads again what its frames took from a run
+    /// below since it began, deliveries and directs alike, but not what a
+    /// run that ended before it began took at the same positions.
+    #[test]
+    fn a_doom_arms_again_only_what_was_taken_since_its_run_began() {
+        unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> KeyParts {
+            unreachable!()
+        }
+        let entry = Entry {
+            node: 1,
+            generation: 0,
+            suspect: false,
+            spec: false,
+            retry: Retry::Compute,
+            walked: false,
+            r5: false,
+        };
+        let keys = FrameKeys {
+            owner: std::ptr::null(),
+            parts: no_parts,
+        };
+        let mut x = Context::new(1, RuntimeId::SENTINEL, 0, entry, keys);
+        let read = |ordinal| ReadKey {
+            node: 1,
+            generation: 0,
+            cidx: 3,
+            reading: 2,
+            ordinal,
+            path: 0,
+            seq: 0,
+            episode: None,
+            foreign: None,
+        };
+        let runs = |ordinal| RunSlot {
+            path: Direct::new(&read(ordinal), 0, 0, 0).run_path(),
+            owner: 0,
+            counts: Few::None,
+        };
+        for ordinal in [1, 2] {
+            let what = Delivered::Unwind {
+                cycle: true,
+                poison: crate::cycle::POISONED,
+                attributed: false,
+                payload: Box::new("p"),
+                nodes: Landings::default(),
+            };
+            x.pending.push(Delivery::new(read(ordinal), 0, what));
+            x.directs.deliver(read(ordinal), 0, runs(ordinal));
+        }
+        x.pending.set_taken(0, true);
+        assert!(x.directs.take(&read(1)).is_some());
+        let since = take_mark();
+        x.pending.set_taken(1, true);
+        assert!(x.directs.take(&read(2)).is_some());
+        x.rearm_doomed(2, 2, since);
+        assert!(
+            x.pending.get(0).taken,
+            "an ended run's take was armed again"
+        );
+        assert!(
+            !x.pending.get(1).taken,
+            "the doomed run's take stayed taken"
+        );
+        assert!(x.directs.take(&read(1)).is_none());
+        assert!(x.directs.take(&read(2)).is_some());
+        drop(x.pending.extract_maker(0));
+        x.directs.remove_maker(0);
+    }
+
+    /// A delivery taken and armed again many times, as a long retry chain
+    /// does, leaves its take log about one entry per item still taken.
+    #[test]
+    fn a_take_log_stays_near_the_takes_still_live() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        for _ in 0..1000 {
+            pending.set_taken(0, true);
+            pending.set_taken(0, false);
+        }
+        pending.set_taken(0, true);
+        assert!(
+            pending.taken_log.len() <= 2 * pending.live + 64,
+            "the take log grew to {}",
+            pending.taken_log.len()
+        );
     }
 
     /// Opens a context holding `pending`, runs `f` on it and closes it.

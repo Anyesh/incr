@@ -1620,12 +1620,14 @@ impl<C: Cells> Runtime<C> {
                 id: replay::member_run_episode(cidx),
                 slot,
             });
+        let since = replay::take_mark();
         let ran = self.member_run(slot, cidx, true, false, false);
         replay::leave_member_run();
         drop(replay::run_ended(
             self.runtime_id,
             cidx,
             matches!(ran, Ok(None)),
+            since,
         ));
         match ran {
             Ok(Some(l)) => {
