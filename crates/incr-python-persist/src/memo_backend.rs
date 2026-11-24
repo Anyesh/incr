@@ -150,6 +150,24 @@ fn bytes_of<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Resu
         .map_err(|_| bad_return::<E>(what))
 }
 
+/// A layer header, which a backend may return as any bytes-like object
+/// (a driver's binary column type is often a `memoryview`), but not an
+/// integer, which `bytes()` would read as a length.
+fn header_of<E: PersistExceptions>(object: &Bound<'_, PyAny>, what: &str) -> Result<Vec<u8>> {
+    if let Ok(bytes) = object.downcast::<PyBytes>() {
+        return Ok(bytes.as_bytes().to_vec());
+    }
+    if object.hasattr("__index__").unwrap_or(true) {
+        return Err(bad_return::<E>(what));
+    }
+    let bytes = object
+        .py()
+        .get_type::<PyBytes>()
+        .call1((object,))
+        .map_err(|_| bad_return::<E>(what))?;
+    bytes_of::<E>(&bytes, what)
+}
+
 fn frames_of<'py, E: PersistExceptions>(
     py: Python<'py>,
     site: &'static Site,
@@ -296,7 +314,7 @@ impl<E: PersistExceptions> PyMemoBackend<E> {
                 items: None,
             });
         }
-        let header = bytes_of::<E>(&header, what)?;
+        let header = header_of::<E>(&header, what)?;
         Ok(Layer {
             id: GenId(id),
             header: Some(header),

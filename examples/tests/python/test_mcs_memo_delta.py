@@ -247,6 +247,37 @@ def test_a_known_backend_restores_the_same_chain(persist):
     assert again.calls == []
 
 
+class ViewHeaders(DictDeltaMemo):
+    """Returns layer headers as a `memoryview` and a `bytearray`, as a
+    driver's binary column type may."""
+
+    def load_chain(self):
+        layers = super().load_chain()
+        if layers is None:
+            return None
+        kinds = [memoryview, bytearray]
+        return [
+            (gen, kinds[i % 2](header), items) for i, (gen, header, items) in enumerate(layers)
+        ]
+
+
+def test_a_layer_header_may_be_any_bytes_like_object(persist):
+    factory = DictDeltaMemoFactory(persist)
+    state = factory.new_store()
+    log = persist.MemoryBackend()
+    graph = Graph(persist, log, ViewHeaders(state, persist=persist))
+    graph.read_all(range(10))
+    graph.memo.checkpoint()
+    for key in range(10, 13):
+        graph.read(key)
+        assert graph.memo.checkpoint()["delta"] is True
+    graph.store.close()
+
+    again = Graph(persist, log, ViewHeaders(state, persist=persist))
+    assert again.read_all(range(13)) == [key * key for key in range(13)]
+    assert again.calls == []
+
+
 def test_a_zero_argument_load_chain_still_works(persist):
     factory = DictDeltaMemoFactory(persist)
     state = factory.new_store()
