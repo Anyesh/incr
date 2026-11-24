@@ -18,6 +18,7 @@ use super::binding::{decode, encode, Binding, Folded};
 use super::collection::{fp_in_scope, fp_of_elements, FpDelta};
 use super::dep_index::{fp_of, DepFp, DepIndex, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
+use super::rows::{fold_pairs, PairRows};
 use super::{set_record, Input, KeyRef, PersistValue, PersistedCollection, State, Store};
 use crate::value_context::hold;
 use crate::{Backend, Error, Kind, Position, Record, Result, ValueScope};
@@ -31,7 +32,7 @@ type Ranked<P> = (P, u128);
 
 /// The rank `KeyedCollection::upsert` and `reconcile` give a pair, which
 /// an unlogged scope's writes leave behind: no logged bytes back it.
-const UNLOGGED_RANK: u128 = incr_core::UNIDENTIFYING_RANK;
+pub(super) const UNLOGGED_RANK: u128 = incr_core::UNIDENTIFYING_RANK;
 
 /// A key's bytes and its row's fingerprint, `None` for no row.
 pub(crate) type RowDep = (Vec<u8>, Option<u128>);
@@ -1479,34 +1480,11 @@ where
         yielder: &Yielder<'_>,
     ) -> Result<Folded<'a>> {
         let (epoch, handles) = self.keyed.pair_handles();
-        let has_value = logged.is_some_and(|logged| logged.value.is_some());
-        if handles.is_empty() && !has_value {
-            return Ok(Box::new(std::iter::empty()));
-        }
-        let mut logged_pairs = handles.into_iter().peekable();
-        let mut unlogged = Vec::new();
-        while let Some(&handle) = logged_pairs.peek() {
-            yielder.tick();
-            let element = self.keyed.with_pair(epoch, handle, |pair, rank| {
-                (rank == UNLOGGED_RANK).then(|| encode(&self.key, pair))
-            });
-            match element.ok_or_else(|| self.bypassed())? {
-                Some(element) => unlogged.push((fp_of(&element?), handle)),
-                None => break,
-            }
-            logged_pairs.next();
-        }
-        unlogged.sort_unstable_by_key(|&(fp, _)| fp);
-        let head = logged.map(|logged| logged.iter_records(&self.key).map(Ok));
-        let elements = RankMerge {
+        let source = LivePairs {
             binding: self,
             epoch,
-            logged: logged_pairs,
-            logged_rank: None,
-            unlogged: unlogged.into_iter().peekable(),
-            failed: false,
         };
-        Ok(Box::new(head.into_iter().flatten().chain(elements)))
+        Ok(Box::new(fold_pairs(source, handles, logged, yielder)?))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1549,15 +1527,14 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 });
         }
         self.declare(state, key, Kind::Collection, || Ok(Vec::new()))?;
-        let logged = state.logged.get_mut(key);
-        let ops = match &logged {
+        let ops = match state.logged.get(key) {
             Some(logged) => {
                 element_ops::<P>(key, &logged.elements, &self.runtime.yielder_under_lock())?
             }
             None => Vec::new(),
         };
-        if let Some(logged) = logged {
-            mem::take(&mut logged.elements).drop_ticking(&self.runtime.yielder_under_lock());
+        if let Some(elements) = state.logged.take_elements(key) {
+            elements.drop_ticking(&self.runtime.yielder_under_lock());
         }
         let keyed = KeyedCollection::new(&self.runtime);
         let rows = Arc::new(KeyedRows {
@@ -1760,11 +1737,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 }
 
-/// A keyed binding's snapshot `Insert`s in rank order, each pair encoded
-/// as it is pulled: the pairs at a logged rank in the order the index
-/// listed them, merged with those at [`UNLOGGED_RANK`] ranked by the
-/// fingerprint of their encoding, the rank a reload gives them.
-struct RankMerge<'a, K, V, C, P>
+/// A bound keyed collection's live pairs, read under the index epoch
+/// their handles were listed at.
+struct LivePairs<'a, K, V, C, P>
 where
     K: 'static,
     V: Value + Hash + Eq,
@@ -1773,77 +1748,28 @@ where
 {
     binding: &'a KeyedBinding<K, V, C, P>,
     epoch: u64,
-    logged: std::iter::Peekable<std::vec::IntoIter<PairHandle>>,
-    /// The rank of the pair `logged` peeks at, once read.
-    logged_rank: Option<u128>,
-    unlogged: std::iter::Peekable<std::vec::IntoIter<(u128, PairHandle)>>,
-    failed: bool,
 }
 
-impl<K, V, C, P> RankMerge<'_, K, V, C, P>
+impl<K, V, C, P> PairRows for LivePairs<'_, K, V, C, P>
 where
     K: Value + Hash + Eq,
     V: Value + Hash + Eq,
     C: Cells,
     P: Pair<K, V> + PersistValue,
 {
-    fn next_handle(&mut self) -> Result<Option<PairHandle>> {
-        let take_logged = match (self.unlogged.peek(), self.logged.peek()) {
-            (_, None) => false,
-            (None, Some(_)) => true,
-            (Some(&(fp, _)), Some(&handle)) => {
-                let rank = match self.logged_rank {
-                    Some(rank) => rank,
-                    None => {
-                        let keyed = &self.binding.keyed;
-                        let rank = keyed
-                            .with_pair(self.epoch, handle, |_, rank| rank)
-                            .ok_or_else(|| self.binding.bypassed())?;
-                        *self.logged_rank.insert(rank)
-                    }
-                };
-                rank <= fp
-            }
-        };
-        Ok(if take_logged {
-            self.logged_rank = None;
-            self.logged.next()
-        } else {
-            self.unlogged.next().map(|(_, handle)| handle)
-        })
+    type Pair = P;
+    type Row = PairHandle;
+
+    fn key(&self) -> &str {
+        &self.binding.key
     }
 
-    fn next_record(&mut self) -> Result<Option<Record>> {
-        let Some(handle) = self.next_handle()? else {
-            return Ok(None);
-        };
-        let binding = self.binding;
-        let element = binding
+    /// Fails with [`Error::Bypassed`] when the index changed since the
+    /// handles were listed.
+    fn with_pair<R>(&self, row: PairHandle, f: impl FnOnce(&P, u128) -> R) -> Result<R> {
+        self.binding
             .keyed
-            .with_pair(self.epoch, handle, |pair, _| encode(&binding.key, pair))
-            .ok_or_else(|| binding.bypassed())??;
-        Ok(Some(Record::Insert {
-            key: binding.key.clone(),
-            element,
-        }))
-    }
-}
-
-impl<K, V, C, P> Iterator for RankMerge<'_, K, V, C, P>
-where
-    K: Value + Hash + Eq,
-    V: Value + Hash + Eq,
-    C: Cells,
-    P: Pair<K, V> + PersistValue,
-{
-    type Item = Result<Record>;
-
-    fn next(&mut self) -> Option<Result<Record>> {
-        if self.failed {
-            return None;
-        }
-        let next = self.next_record();
-        self.failed = next.is_err();
-        next.transpose()
+            .with_pair(self.epoch, row, f)
+            .ok_or_else(|| self.binding.bypassed())
     }
 }

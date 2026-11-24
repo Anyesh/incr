@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
-use std::ops::{Bound, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use incr_core::lock_order::{LockKind, Ordered};
@@ -41,6 +41,7 @@ pub(crate) mod keyed;
 #[path = "keyed_tests.rs"]
 mod keyed_tests;
 mod logged;
+mod rows;
 mod scope;
 #[cfg(test)]
 #[path = "scope_tests.rs"]
@@ -217,7 +218,7 @@ pub struct Batch<'s, C: Cells, B: Backend> {
 /// ```
 pub struct Store<C: Cells, B: Backend> {
     runtime: Runtime<C>,
-    backend: B,
+    backend: Arc<B>,
     options: Options,
     state: Mutex<State<C>>,
     holder: Holder,
@@ -481,7 +482,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         runtime.set_yield_hook(options.yield_hook.clone());
         let store = Store {
             runtime,
-            backend,
+            backend: Arc::new(backend),
             options,
             state: Mutex::new(State {
                 applied: Position::ZERO,
@@ -723,7 +724,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         state.bound.remove(&key);
         if let Some(elements) = held.filter(|elements| !elements.is_empty()) {
-            state.logged.entry(key).or_default().elements = elements;
+            state.logged.get_or_default(key).elements = elements;
         }
         Ok(())
     }
@@ -811,8 +812,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.reconcile_snapshot(&mut state)?;
         Ok(state
             .logged
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .map(|(key, _)| key)
+            .keys_from(prefix)
             .take_while(|key| key.starts_with(prefix))
             .filter(|key| !state.bound.contains_key(*key))
             .cloned()
@@ -1573,7 +1573,7 @@ impl<C: Cells> Iterator for SnapshotFold<'_, C> {
                         return Some(Err(e));
                     }
                     None => {
-                        if !*pulled && self.state.logged.contains_key(*key) {
+                        if !*pulled && self.state.logged.contains_key(key) {
                             self.forgotten.push((*key).to_owned());
                         }
                         self.current = None;

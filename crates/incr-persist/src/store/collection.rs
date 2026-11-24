@@ -16,6 +16,7 @@ use super::after_lock::AfterLock;
 use super::binding::{decode, encode, Binding, Folded};
 use super::dep_index::{fp_of, DepFp, DepIndex, DepMap, FpSource, Fps, PanicGuard, Registered};
 use super::logged::{ElementOp, Elements, LoggedKey};
+use super::rows::{element_fingerprint, fold_elements, ElementRows, Fingerprints};
 use super::{Batch, KeyRef, PersistValue, State, Store};
 use crate::value_context::{enter_value_scope, hold};
 use crate::{Backend, Error, Kind, Position, Record, Result, ValueScope};
@@ -260,8 +261,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 });
         }
         self.declare(state, key, Kind::Collection, || Ok(Vec::new()))?;
-        let logged = state.logged.get_mut(key);
-        let elements = match &logged {
+        let elements = match state.logged.get(key) {
             Some(logged) => decode_elements::<T>(
                 key,
                 &logged.elements,
@@ -270,9 +270,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             )?,
             None => HashMap::new(),
         };
-        if let Some(logged) = logged {
-            logged.elements = Elements::default();
-        }
+        drop(state.logged.take_elements(key));
         let plan = Converge {
             current: HashMap::new(),
             target: elements,
@@ -497,63 +495,25 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         Ok(encoded)
     }
 
-    /// A snapshot's order of the distinct elements: by the high 64 bits of
-    /// each one's encoding's fingerprint, ties by the encodings themselves,
-    /// so every process lists the same elements in the same order. Keeps
-    /// 16 bytes per element rather than its encoding, which the caller
-    /// makes again as it yields.
-    fn ranked_slots(&self, yielder: &Yielder<'_>) -> Result<(ElementsStamp, Vec<ElementSlot>)> {
-        let mut slots = Vec::new();
+    /// The distinct elements as [`fold_elements`] reads them, under the
+    /// stamp their slots were read at, with their fingerprints.
+    fn element_rows(
+        &self,
+        yielder: &Yielder<'_>,
+    ) -> Result<(LiveElements<'_, T, C>, Fingerprints<ElementSlot>)> {
+        let mut fingerprints = Vec::new();
         let stamp = self.collection.visit_elements(|slot, value, _| {
             yielder.tick();
-            let element = encode(&self.key, value)?;
-            slots.push(((fp_of(&element) >> 64) as u64, slot));
+            fingerprints.push((element_fingerprint(&self.key, value)?, slot));
             Ok::<(), Error>(())
         })?;
-        slots.sort_unstable_by_key(|&(fp, _)| fp);
-        let mut at = 0;
-        while at < slots.len() {
-            yielder.tick();
-            let run = slots[at..]
-                .iter()
-                .take_while(|&&(fp, _)| fp == slots[at].0)
-                .count();
-            if run > 1 {
-                let mut tied = slots[at..at + run]
-                    .iter()
-                    .map(|&(fp, slot)| Ok((self.encode_slot(stamp, slot)?.0, fp, slot)))
-                    .collect::<Result<Vec<_>>>()?;
-                tied.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                for (into, (_, fp, slot)) in slots[at..at + run].iter_mut().zip(tied) {
-                    *into = (fp, slot);
-                }
-            }
-            at += run;
-        }
-        Ok((stamp, slots.into_iter().map(|(_, slot)| slot).collect()))
-    }
-
-    /// The encoding of the element at `slot` and its multiplicity. Fails
-    /// with [`Error::Bypassed`] when the collection changed since `stamp`,
-    /// which only a write around the store can do while the store is
-    /// locked.
-    fn encode_slot(&self, stamp: ElementsStamp, slot: ElementSlot) -> Result<(Vec<u8>, usize)> {
-        self.collection
-            .with_element(stamp, slot, |value, count| {
-                encode(&self.key, value).map(|element| (element, count))
-            })
-            .unwrap_or_else(|| {
-                Err(Error::Bypassed {
-                    key: self.key.clone(),
-                })
-            })
-    }
-
-    fn insert(&self, element: Vec<u8>) -> Record {
-        Record::Insert {
-            key: self.key.clone(),
-            element,
-        }
+        Ok((
+            LiveElements {
+                binding: self,
+                stamp,
+            },
+            fingerprints,
+        ))
     }
 
     /// Brings the collection to exactly `target`, stored values included,
@@ -785,43 +745,13 @@ where
         logged: Option<&'a LoggedKey>,
         yielder: &Yielder<'_>,
     ) -> Result<Folded<'a>> {
-        let (stamp, slots) = self.ranked_slots(yielder)?;
-        let has_value = logged.is_some_and(|logged| logged.value.is_some());
-        if slots.is_empty() && !has_value {
-            return Ok(Box::new(std::iter::empty()));
-        }
-        let head = logged.map(|logged| logged.iter_records(&self.key).map(Ok));
-        let mut slots = slots.into_iter();
-        let mut repeat: Option<(Vec<u8>, usize)> = None;
-        let mut failed = false;
-        let elements = std::iter::from_fn(move || {
-            if failed {
-                return None;
-            }
-            if let Some((element, left)) = &mut repeat {
-                *left -= 1;
-                let element = if *left == 0 {
-                    repeat.take().map(|(element, _)| element)?
-                } else {
-                    element.clone()
-                };
-                return Some(Ok(self.insert(element)));
-            }
-            let slot = slots.next()?;
-            match self.encode_slot(stamp, slot) {
-                Ok((element, count)) => {
-                    if count > 1 {
-                        repeat = Some((element.clone(), count - 1));
-                    }
-                    Some(Ok(self.insert(element)))
-                }
-                Err(e) => {
-                    failed = true;
-                    Some(Err(e))
-                }
-            }
-        });
-        Ok(Box::new(head.into_iter().flatten().chain(elements)))
+        let (source, fingerprints) = self.element_rows(yielder)?;
+        Ok(Box::new(fold_elements(
+            source,
+            fingerprints,
+            logged,
+            yielder,
+        )?))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -893,4 +823,36 @@ fn decode_elements<T: Hash + Eq + DeserializeOwned + Send + 'static>(
         Ok(())
     })?;
     Ok(counts)
+}
+
+/// A bound collection's live elements, read under the stamp their slots
+/// were listed at.
+struct LiveElements<'a, T: Value + Hash + Eq, C: Cells> {
+    binding: &'a CollectionBinding<T, C>,
+    stamp: ElementsStamp,
+}
+
+impl<T, C> ElementRows for LiveElements<'_, T, C>
+where
+    T: Value + Hash + Eq + Serialize,
+    C: Cells,
+{
+    type Element = T;
+    type Row = ElementSlot;
+
+    fn key(&self) -> &str {
+        &self.binding.key
+    }
+
+    /// Fails with [`Error::Bypassed`] when the collection changed since
+    /// the slots were listed, which only a write around the store can do
+    /// while the store is locked.
+    fn with_element<R>(&self, row: ElementSlot, f: impl FnOnce(&T, usize) -> R) -> Result<R> {
+        self.binding
+            .collection
+            .with_element(self.stamp, row, f)
+            .ok_or_else(|| Error::Bypassed {
+                key: self.binding.key.clone(),
+            })
+    }
 }
