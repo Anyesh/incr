@@ -319,9 +319,11 @@ impl Wake {
     }
 
     /// Lets the next compute that finds the trigger reached wake the
-    /// thread.
+    /// thread. A swap, not a store: when it reads a compute's
+    /// [`Self::due_once`], the thread's next unsaved count sees that
+    /// compute's.
     pub(crate) fn arm(&self) {
-        self.armed.store(true, Ordering::Release);
+        self.armed.swap(true, Ordering::AcqRel);
     }
 
     /// [`Self::due`] once per [`Self::arm`].
