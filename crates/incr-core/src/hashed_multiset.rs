@@ -18,6 +18,9 @@ use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
 use std::slice;
+use std::time::{Duration, Instant};
+
+use crate::capture::{self, Capture, CaptureStep};
 
 use crate::yield_hook::{NoTicks, Ticks};
 
@@ -141,6 +144,7 @@ pub(crate) struct HashedMultiset<T> {
     /// How many times entries moved, which a write whose user `Eq` panics
     /// after reserving can do without changing any element.
     rehashes: u64,
+    capture: Option<Box<Capture<(T, usize)>>>,
 }
 
 /// Where one change lands, as found by [`HashedMultiset::locate`]. Valid
@@ -177,6 +181,7 @@ impl<T> HashedMultiset<T> {
             len: 0,
             growth_left: 0,
             rehashes: 0,
+            capture: None,
         }
     }
 
@@ -255,29 +260,96 @@ impl<T> HashedMultiset<T> {
             }
             capacity
         };
-        let mask = capacity - 1;
         let mut table = Table::new(capacity);
-        let (ctrl, entries) = table.parts_mut();
-        let (old_ctrl, old_entries) = self.table.parts_mut();
-        for (old_c, old_e) in old_ctrl.iter_mut().zip(old_entries.iter()) {
-            if *old_c & FULL == 0 {
-                continue;
+        match self.capture.as_deref_mut() {
+            None => move_entries(&mut self.table, &mut table, yielder, |_, _| {}),
+            Some(capture) => {
+                let mut moved = vec![usize::MAX; self.table.capacity];
+                move_entries(&mut self.table, &mut table, yielder, |old, new| {
+                    moved[old] = new
+                });
+                capture.rehashed(capacity, &moved);
             }
-            yielder.tick();
-            // SAFETY: the slot is full. Marking it empty right away hands
-            // ownership to the new table, so the old one never drops it.
-            let entry = unsafe { old_e.assume_init_read() };
-            let c = mem::replace(old_c, EMPTY);
-            let mut j = entry.hash as usize & mask;
-            while ctrl[j] != EMPTY {
-                j = (j + 1) & mask;
-            }
-            ctrl[j] = c;
-            entries[j].write(entry);
         }
         self.table = table;
         self.rehashes += 1;
         self.growth_left = load_limit(capacity) - self.len;
+    }
+
+    /// Installs a capture of every element with its count as of now.
+    /// Panics if one is installed already.
+    pub(crate) fn begin_capture(&mut self) {
+        assert!(
+            self.capture.is_none(),
+            "incr-core: a capture is already installed"
+        );
+        self.capture = Some(Capture::new(self.table.capacity));
+    }
+
+    /// Clones the unsettled entries from the capture's cursor on, at least
+    /// one `unit` of slots and until `budget` since `start` has passed.
+    /// Returns where the scan stopped and what it cloned, or `None` with
+    /// no capture installed. Runs user `Clone`.
+    pub(crate) fn capture_scan(
+        &self,
+        unit: usize,
+        start: Instant,
+        budget: Duration,
+    ) -> Option<(usize, Vec<(T, usize)>)>
+    where
+        T: Clone,
+    {
+        let capture = self.capture.as_deref()?;
+        let (ctrl, entries) = (self.table.ctrl(), self.table.entries());
+        let mut run = Vec::new();
+        let end = capture::scan(capture.cursor(), ctrl.len(), unit, start, budget, |i| {
+            if ctrl[i] & FULL != 0 && !capture.settled(i) {
+                // SAFETY: the slot is full, so its entry is initialised.
+                let e = unsafe { entries[i].assume_init_ref() };
+                run.push((e.value.clone(), e.count));
+            }
+        });
+        Some((end, run))
+    }
+
+    /// Adds a [`Self::capture_scan`] run that ended at `end`, made against
+    /// the elements as they are now, and hands over what the capture took
+    /// since the last step, removing it once it is done.
+    pub(crate) fn capture_advance(
+        &mut self,
+        end: usize,
+        run: Vec<(T, usize)>,
+    ) -> CaptureStep<(T, usize)> {
+        let Some(capture) = self.capture.as_deref_mut() else {
+            panic!("incr-core: no capture is installed");
+        };
+        capture.advance(end, run);
+        self.capture_drain()
+    }
+
+    /// Hands over what the capture took since the last step, removing it
+    /// once it is done; an empty finished step without one.
+    pub(crate) fn capture_drain(&mut self) -> CaptureStep<(T, usize)> {
+        let step = match self.capture.as_deref_mut() {
+            Some(capture) => capture.drain(self.table.capacity),
+            None => CaptureStep {
+                rows: Vec::new(),
+                done: true,
+            },
+        };
+        if step.done {
+            self.capture = None;
+        }
+        step
+    }
+
+    /// Removes the capture, handing back what it took for the caller to
+    /// drop.
+    pub(crate) fn end_capture(&mut self) -> Vec<(T, usize)> {
+        self.capture
+            .take()
+            .map(|capture| (*capture).into_rows())
+            .unwrap_or_default()
     }
 
     /// Index of the entry equal to `value`, which must hash to `hash`.
@@ -389,17 +461,74 @@ impl<T> HashedMultiset<T> {
     }
 
     fn increment(&mut self, i: usize) {
+        capture::check_settled(&self.capture, i);
         self.entry_mut(i).count += 1;
     }
 
     fn swap_value(&mut self, i: usize, new: T) -> T {
+        capture::check_settled(&self.capture, i);
         mem::replace(&mut self.entry_mut(i).value, new)
+    }
+
+    #[inline]
+    pub(crate) fn capture_installed(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Settles the live entry at `i` for an installed capture, cloning its
+    /// value and count into it unless it took them already. Runs user
+    /// `Clone`; call it before the write that changes the entry.
+    #[inline]
+    pub(crate) fn settle(&mut self, i: usize)
+    where
+        T: Clone,
+    {
+        if self.capture.is_some() {
+            self.settle_slow(i);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn settle_slow(&mut self, i: usize)
+    where
+        T: Clone,
+    {
+        let Some(capture) = self.capture.as_deref_mut() else {
+            return;
+        };
+        if capture.settled(i) {
+            return;
+        }
+        assert!(
+            self.table.ctrl()[i] & FULL != 0,
+            "incr-core: multiset index {i} is not a live entry"
+        );
+        // SAFETY: checked full just above.
+        let e = unsafe { self.table.entries()[i].assume_init_ref() };
+        let content = (e.value.clone(), e.count);
+        capture.take(i, [content]);
+    }
+
+    /// [`Self::find`] that settles the entry it finds, for a write that
+    /// changes it next.
+    pub(crate) fn find_settling(&mut self, hash: u64, value: &T) -> Option<usize>
+    where
+        T: PartialEq + Clone,
+    {
+        let found = self.find(hash, value);
+        if let Some(i) = found {
+            self.settle(i);
+        }
+        found
     }
 
     /// Decrement the count at `i`, removing the entry and handing its
     /// value back (for the caller to drop) when the count reaches zero.
     /// Runs no user code.
+    #[inline]
     pub(crate) fn decrement_or_remove(&mut self, i: usize) -> Option<T> {
+        capture::check_settled(&self.capture, i);
         let entry = self.entry_mut(i);
         if entry.count > 1 {
             entry.count -= 1;
@@ -424,6 +553,7 @@ impl<T> HashedMultiset<T> {
 
     /// Insert `value`, which no entry equals, with count 1 at `i`, the
     /// free slot its lookup returned. Requires a prior `reserve(1)`.
+    #[inline]
     fn insert_absent(&mut self, hash: u64, i: usize, value: T) {
         assert!(
             self.growth_left > 0,
@@ -444,6 +574,7 @@ impl<T> HashedMultiset<T> {
         });
         ctrl[i] = tag(hash);
         self.len += 1;
+        capture::settle_free(&mut self.capture, i);
     }
 
     /// Insert `value` with count 1 at the first free slot of its probe
@@ -467,29 +598,41 @@ impl<T> HashedMultiset<T> {
 
     /// Locate one change: removing one occurrence of `remove` and adding
     /// one occurrence of `add`, each given with its hash. Reserves room
-    /// for the add, then runs the lookups (user `Eq`). Changes no
-    /// element, so a panic here leaves the multiset as it was.
+    /// for the add, then runs the lookups (user `Eq`) and settles the
+    /// entries found (user `Clone`). Changes no element, so a panic here
+    /// leaves the multiset as it was.
     pub(crate) fn locate(&mut self, remove: Option<(u64, &T)>, add: Option<(u64, &T)>) -> Located
     where
-        T: PartialEq,
+        T: PartialEq + Clone,
     {
         if add.is_some() {
             self.reserve(1);
         }
         let remove = remove.and_then(|(hash, value)| self.find(hash, value));
         let add = add.map(|(hash, value)| self.locate_one(hash, value));
+        if let Some(i) = remove {
+            self.settle(i);
+        }
+        if let Some(AddAt::Existing(i)) = add {
+            self.settle(i);
+        }
         Located { remove, add }
     }
 
     /// Locate one added occurrence of `value`: reserves room, then runs
-    /// the lookup (user `Eq`). Changes no element.
+    /// the lookup (user `Eq`) and settles the entry found (user `Clone`).
+    /// Changes no element.
     #[inline]
     pub(crate) fn locate_add(&mut self, hash: u64, value: &T) -> AddAt
     where
-        T: PartialEq,
+        T: PartialEq + Clone,
     {
         self.reserve(1);
-        self.locate_one(hash, value)
+        let at = self.locate_one(hash, value);
+        if let AddAt::Existing(i) = at {
+            self.settle(i);
+        }
+        at
     }
 
     /// Add one occurrence at `at`. Runs no user code. Hands `value` back
@@ -544,6 +687,38 @@ impl<T> HashedMultiset<T> {
     }
 }
 
+/// Moves every entry of `old` into `new`, an empty table, by its stored
+/// hash, leaving `old` with no full slot, and reports each move as (old
+/// slot, new slot), ticking `yielder` per move. Runs no user code.
+#[inline(always)]
+fn move_entries<T>(
+    old: &mut Table<T>,
+    new: &mut Table<T>,
+    yielder: &impl Ticks,
+    mut moved: impl FnMut(usize, usize),
+) {
+    let (ctrl, entries) = new.parts_mut();
+    let mask = ctrl.len() - 1;
+    let (old_ctrl, old_entries) = old.parts_mut();
+    for (at, (old_c, old_e)) in old_ctrl.iter_mut().zip(old_entries.iter()).enumerate() {
+        if *old_c & FULL == 0 {
+            continue;
+        }
+        yielder.tick();
+        // SAFETY: the slot is full. Marking it empty right away hands
+        // ownership to the new table, so the old one never drops it.
+        let entry = unsafe { old_e.assume_init_read() };
+        let c = mem::replace(old_c, EMPTY);
+        let mut j = entry.hash as usize & mask;
+        while ctrl[j] != EMPTY {
+            j = (j + 1) & mask;
+        }
+        ctrl[j] = c;
+        entries[j].write(entry);
+        moved(at, j);
+    }
+}
+
 impl<T> Default for HashedMultiset<T> {
     fn default() -> Self {
         Self::new()
@@ -573,7 +748,7 @@ mod tests {
 
     /// Equal by `key` only, so which copy the table keeps is observable
     /// through `id`. The boxed id lets Miri catch a double drop or a leak.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct V {
         key: u8,
         id: Box<u32>,
@@ -836,6 +1011,30 @@ mod tests {
         assert_eq!(set.table.ctrl()[home], TOMBSTONE);
         assert!(set.find(hash(hashing, 6), &v(6, 0)).is_some());
         assert!(set.find(hash(hashing, 3), &v(3, 0)).is_some());
+    }
+
+    #[test]
+    fn a_write_that_skips_the_settling_lookup_panics_under_a_capture() {
+        let mut set = HashedMultiset::new();
+        for _ in 0..2 {
+            let at = set.locate_add(7, &v(1, 1));
+            let _ = set.add(at, v(1, 1));
+        }
+        set.begin_capture();
+        let i = set.find(7, &v(1, 0)).expect("held");
+        let text = |r: std::thread::Result<()>| {
+            let err = r.expect_err("the write panics");
+            err.downcast_ref::<String>().cloned().unwrap_or_default()
+        };
+        let increment = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = set.add(AddAt::Existing(i), v(1, 2));
+        }));
+        assert!(text(increment).contains("before the capture took it"));
+        let decrement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = set.decrement_or_remove(i);
+        }));
+        assert!(text(decrement).contains("before the capture took it"));
+        assert_eq!(set.count(i), 2);
     }
 
     #[test]

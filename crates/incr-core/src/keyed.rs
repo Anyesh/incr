@@ -23,7 +23,9 @@ use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
+use crate::capture::{self, Capture, CaptureStep, CAPTURE_UNIT};
 use crate::cells::Cells;
 use crate::collection::{Change, Displaced, IncrCollection, StagedBatch};
 use crate::dep_stack::DepStack;
@@ -258,6 +260,7 @@ pub struct KeyTable<P, R> {
     /// The key-set partitionings registered with
     /// [`KeyedCollection::key_partitions`], changed with each commit.
     parts: Vec<Box<dyn PartSink<P>>>,
+    capture: Option<Box<Capture<(P, R)>>>,
 }
 
 impl<P, R: Ord + Copy> KeyTable<P, R> {
@@ -269,6 +272,7 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
             growth_left: 0,
             spilled_bytes: 0,
             parts: Vec::new(),
+            capture: None,
         }
     }
 
@@ -381,6 +385,9 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
             }
         }
         self.growth_left = load_limit(capacity) - self.keys;
+        if let Some(capture) = self.capture.as_deref_mut() {
+            capture.rehashed(capacity, &moved);
+        }
         moved
     }
 
@@ -407,6 +414,7 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     /// `reserve`.
     fn insert(&mut self, hash: u64, pairs: Few<(P, R)>) {
         let j = self.free_slot(hash);
+        capture::settle_free(&mut self.capture, j);
         if matches!(self.slots[j], Slot::Empty) {
             assert!(
                 self.growth_left > 0,
@@ -420,6 +428,7 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     }
 
     fn replace(&mut self, i: usize, pairs: Few<(P, R)>) -> Few<(P, R)> {
+        capture::check_settled(&self.capture, i);
         self.count_in(&pairs);
         let Slot::Full(b) = &mut self.slots[i] else {
             panic!("incr-core: key table slot {i} is not live");
@@ -430,6 +439,7 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     }
 
     fn remove(&mut self, i: usize) -> Few<(P, R)> {
+        capture::check_settled(&self.capture, i);
         let next = (i + 1) & (self.slots.len() - 1);
         let free = if matches!(self.slots[next], Slot::Empty) {
             self.growth_left += 1;
@@ -445,6 +455,21 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
         b.pairs
     }
 
+    /// Hands the capture the bucket clones a stage took, before the
+    /// commit changes those slots; a clone of a slot the capture has taken
+    /// meanwhile goes to `dropped`.
+    #[cold]
+    #[inline(never)]
+    fn install_taken(&mut self, taken: &mut Vec<(usize, Vec<(P, R)>)>, dropped: &mut Vec<(P, R)>) {
+        for (slot, pairs) in taken.drain(..) {
+            let unused = match self.capture.as_deref_mut() {
+                Some(capture) => capture.take(slot, pairs),
+                None => Some(pairs),
+            };
+            dropped.extend(unused.into_iter().flatten());
+        }
+    }
+
     /// Makes the table hold what `stage` staged, running no user code.
     /// `stage` must have been staged against this table as it is now.
     /// Returns the pairs it let go, for the caller to drop once user
@@ -454,7 +479,13 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
         stage: &mut KeyStage<K, V, P, R>,
         yielder: &impl Ticks,
     ) -> Vec<(P, R)> {
-        let KeyStage { keys, fresh, .. } = stage;
+        let KeyStage {
+            keys, fresh, taken, ..
+        } = stage;
+        let mut dropped = Vec::new();
+        if !taken.is_empty() {
+            self.install_taken(taken, &mut dropped);
+        }
         let added = keys
             .iter()
             .inspect(|_| yielder.tick())
@@ -466,7 +497,6 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
                 *slot = moved[*slot];
             }
         }
-        let mut dropped = Vec::new();
         for k in keys.iter().filter(|k| !k.untouched()) {
             yielder.tick();
             let mut held: Vec<Option<(P, R)>> = match k.slot {
@@ -613,6 +643,9 @@ pub(crate) struct KeyStage<K, V, P, R> {
     keys: Vec<StagedKey<K>>,
     by_hash: HashMap<u64, Few<usize>, FxBuildHasher>,
     fresh: Vec<Option<(P, R)>>,
+    /// The held bucket of each staged key with a slot the table's capture
+    /// has not taken, cloned before the commit changes it.
+    taken: Vec<(usize, Vec<(P, R)>)>,
     epoch: u64,
     counts: KeyCounts,
     changed: Vec<K>,
@@ -636,6 +669,7 @@ where
             keys: Vec::new(),
             by_hash: HashMap::default(),
             fresh: Vec::new(),
+            taken: Vec::new(),
             epoch: 0,
             counts: KeyCounts::default(),
             changed: Vec::new(),
@@ -866,6 +900,30 @@ where
         self.keys.iter().all(StagedKey::untouched)
     }
 
+    /// Clones, as value code, the held bucket of each key this stage
+    /// changes that `table`'s capture has not taken yet.
+    #[inline(always)]
+    fn clone_untaken(&mut self, table: &KeyTable<P, R>) {
+        if table.capture.is_some() {
+            self.clone_untaken_slow(table);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn clone_untaken_slow(&mut self, table: &KeyTable<P, R>) {
+        let Some(capture) = table.capture.as_deref() else {
+            return;
+        };
+        for k in &self.keys {
+            if let Some(slot) = k.slot {
+                if !k.untouched() && !capture.settled(slot) {
+                    self.taken.push((slot, table.bucket(slot).pairs().to_vec()));
+                }
+            }
+        }
+    }
+
     /// The keys that go from holding no pair to holding one or back.
     fn flips<'a>(&'a self, table: &'a KeyTable<P, R>, yielder: &impl Ticks) -> Vec<Flip<'a, P>> {
         let mut flips = Vec::new();
@@ -927,6 +985,8 @@ where
         keep.keys.extend(self.changed);
         keep.keys.extend(self.spare);
         keep.pairs.extend(self.fresh.into_iter().flatten());
+        keep.pairs
+            .extend(self.taken.into_iter().flat_map(|(_, pairs)| pairs));
         keep.ops.extend(self.journal.into_iter().flatten());
     }
 
@@ -1492,6 +1552,7 @@ where
                 stage.epoch = C::u64_load_relaxed(&index.epoch);
                 value_code::run(|| {
                     stage_ops(&mut stage, &table, &index.hasher, &yielder);
+                    stage.clone_untaken(&table);
                     let changes = stage.log_changes(&table, &ticks);
                     let plans = if table.parts.is_empty() {
                         Vec::new()
@@ -2222,6 +2283,100 @@ where
                 .flat_map(|(_, b)| b.pairs().iter().cloned())
                 .collect()
         })
+    }
+
+    /// Starts a capture of every held pair with its rank as of now, which
+    /// [`Self::capture_step`] hands over while writes go on: a write first
+    /// clones each bucket it changes into the capture. Advances the epoch.
+    ///
+    /// Panics under a `Shared` runtime, from value code, and if a capture
+    /// is installed already.
+    pub fn begin_capture(&self) {
+        assert!(
+            C::SINGLE_THREADED,
+            "incr-core: a capture needs a Local runtime"
+        );
+        refuse_value_code();
+        let mut table = self.index.table.write();
+        assert!(
+            table.capture.is_none(),
+            "incr-core: a capture is already installed"
+        );
+        table.capture = Some(Capture::new(table.slots.len()));
+        let epoch = C::u64_load_relaxed(&self.index.epoch);
+        C::u64_store_release(&self.index.epoch, epoch + 1);
+    }
+
+    /// Copies held pairs into the capture for about `budget` (at least
+    /// one unit of table slots, as value code under the read guard) and
+    /// hands over what the capture took since the last step. Once `done`,
+    /// the capture is removed; without one installed, returns an empty
+    /// finished step.
+    pub fn capture_step(&self, budget: Duration) -> CaptureStep<(P, R)> {
+        self.capture_step_by(budget, CAPTURE_UNIT)
+    }
+
+    pub(crate) fn capture_step_by(&self, budget: Duration, unit: usize) -> CaptureStep<(P, R)> {
+        refuse_value_code();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        let start = Instant::now();
+        let (epoch, end, run) = {
+            let table = self.index.table.read();
+            let Some(capture) = table.capture.as_deref() else {
+                return CaptureStep {
+                    rows: Vec::new(),
+                    done: true,
+                };
+            };
+            let epoch = C::u64_load_relaxed(&self.index.epoch);
+            let mut run = Vec::new();
+            let end = value_code::run(|| {
+                let from = capture.cursor();
+                capture::scan(from, table.slots.len(), unit, start, budget, |i| {
+                    if let Slot::Full(b) = &table.slots[i] {
+                        if !capture.settled(i) {
+                            run.extend(b.pairs().iter().cloned());
+                        }
+                    }
+                })
+            });
+            (epoch, end, run)
+        };
+        let mut table = self.index.table.write();
+        let current = C::u64_load_relaxed(&self.index.epoch) == epoch;
+        let capacity = table.slots.len();
+        let (step, stale) = match table.capture.as_deref_mut() {
+            Some(capture) if current => {
+                capture.advance(end, run);
+                (capture.drain(capacity), Vec::new())
+            }
+            Some(capture) => (capture.drain(capacity), run),
+            None => (
+                CaptureStep {
+                    rows: Vec::new(),
+                    done: true,
+                },
+                run,
+            ),
+        };
+        if step.done {
+            table.capture = None;
+        }
+        drop(table);
+        drop(stale);
+        step
+    }
+
+    /// Removes the capture, if one is installed, and drops what it took.
+    pub fn end_capture(&self) {
+        refuse_value_code();
+        let capture = self.index.table.write().capture.take();
+        drop(capture);
+    }
+
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn capture_installed(&self) -> bool {
+        self.index.table.read().capture.is_some()
     }
 }
 

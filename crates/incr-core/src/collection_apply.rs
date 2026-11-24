@@ -38,6 +38,15 @@ struct Member<'a, T> {
     group: usize,
 }
 
+impl<T> Clone for Member<'_, T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value,
+            group: self.group,
+        }
+    }
+}
+
 impl<T: PartialEq> PartialEq for Member<'_, T> {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
@@ -248,6 +257,13 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
                 yielder.tick();
                 if p.at.is_some() {
                     p.at = find(&self.elements, group);
+                }
+            }
+        }
+        if self.elements.capture_installed() {
+            for p in plan.iter().filter(|p| p.inserts > 0 || p.deletes > 0) {
+                if let Some(at) = p.at {
+                    self.elements.settle(at);
                 }
             }
         }

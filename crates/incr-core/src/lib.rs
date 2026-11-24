@@ -21,6 +21,7 @@ pub mod arena;
 mod arena_registry;
 mod attempt;
 mod bits;
+mod capture;
 pub mod cells;
 mod changes;
 mod children;
@@ -77,6 +78,7 @@ pub mod walk_ring;
 mod yield_hook;
 
 pub use arena::PrimitiveArena;
+pub use capture::CaptureStep;
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use collection::{
     Change, CollectionLog, Delta, ElementSlot, ElementsStamp, GroupedCollection, IncrCollection,

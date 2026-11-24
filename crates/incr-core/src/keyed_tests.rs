@@ -1919,3 +1919,90 @@ fn registering_partitions_finishes_when_a_commit_lands_after_every_optimistic_bu
         "registration must finish and match the keys while a commit follows each optimistic build"
     );
 }
+
+#[test]
+fn a_key_table_write_that_skips_the_stage_clone_panics_under_a_capture() {
+    let mut table = KeyTable::<(u8, u8), u8>::new();
+    table.reserve(1);
+    table.insert(7, few_of(vec![((1, 2), 0)]));
+    let slot = table.buckets().next().expect("a bucket").0;
+    table.capture = Some(Capture::new(table.slots.len()));
+    let replace = catch_unwind(AssertUnwindSafe(|| {
+        table.replace(slot, few_of(vec![((1, 3), 0)]));
+    }));
+    assert!(panic_text(replace.expect_err("replace panics")).contains("before the capture took it"));
+    let remove = catch_unwind(AssertUnwindSafe(|| {
+        table.remove(slot);
+    }));
+    assert!(panic_text(remove.expect_err("remove panics")).contains("before the capture took it"));
+}
+
+/// Changes every pair mid-capture across a growing rehash and then a
+/// same-size one, with the scan stopped part-way through each table.
+#[test]
+fn keyed_capture_survives_both_rehashes_mid_scan() {
+    use crate::capture::tests::{clump_tombstones, v, V};
+    let rt = Runtime::<crate::Local>::new();
+    let kc = KeyedCollection::<V, u8, crate::Local>::new(&rt);
+    let rows = |kc: &KeyedCollection<V, u8, crate::Local>| {
+        sorted(
+            kc.ranked_pairs()
+                .into_iter()
+                .map(|((k, r), ())| ((k.key, k.id), r))
+                .collect(),
+        )
+    };
+    for k in 0..20 {
+        kc.upsert(&rt, v(k, u32::from(k)), k);
+    }
+    kc.begin_capture();
+    let begin = rows(&kc);
+    let mut got = kc.capture_step_by(Duration::ZERO, 5).rows;
+    let capacity = kc.index.table.read().slots.len();
+    let ops: Vec<PairOp<(V, u8), ()>> = (0..5)
+        .map(|k| PairOp::Remove((v(k, 0), k), ()))
+        .chain((5..10).map(|k| PairOp::Insert((v(k, 0), k + 1), ())))
+        .chain((241..246).map(|k| PairOp::Insert((v(k, 0), 0), ())))
+        .collect();
+    kc.apply_pairs_with(&rt, ops, &mut (), None);
+    let regrown = kc.index.table.read().slots.len();
+    assert!(
+        regrown > capacity,
+        "the write that changes keys grows the table"
+    );
+    let added = clump_tombstones(
+        |k| {
+            kc.upsert(&rt, v(k, 0), 0);
+        },
+        |k| {
+            kc.remove(&rt, &v(k, 0));
+        },
+    );
+    let grown = kc.index.table.read().slots.len();
+    assert!(grown > regrown, "the clump grows the table");
+    got.extend(kc.capture_step_by(Duration::ZERO, 7).rows);
+    let growth_left = kc.index.table.read().growth_left;
+    let ops: Vec<PairOp<(V, u8), ()>> = (10..15)
+        .map(|k| PairOp::Remove((v(k, 0), k), ()))
+        .chain((15..20).map(|k| PairOp::Insert((v(k, 0), k + 2), ())))
+        .chain(added.into_iter().map(|k| PairOp::Insert((v(k, 0), 0), ())))
+        .collect();
+    kc.apply_pairs_with(&rt, ops, &mut (), None);
+    let table = kc.index.table.read();
+    assert!(table.growth_left > growth_left, "the write rehashes");
+    assert_eq!(table.slots.len(), grown, "at the same size");
+    drop(table);
+    loop {
+        let step = kc.capture_step_by(Duration::ZERO, 4);
+        got.extend(step.rows);
+        if step.done {
+            break;
+        }
+    }
+    let got: Vec<_> = got
+        .into_iter()
+        .map(|((k, r), ())| ((k.key, k.id), r))
+        .collect();
+    assert_eq!(sorted(got), begin);
+    assert!(!kc.capture_installed());
+}
