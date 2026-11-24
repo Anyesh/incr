@@ -125,7 +125,9 @@ impl Backend for MemoryBackend {
     }
 
     /// Pulls every record without the log's lock, so a panicking pull
-    /// leaves the lock unpoisoned, then publishes under it.
+    /// leaves the lock unpoisoned, then publishes under it. The replaced
+    /// snapshot and the dropped log prefix are freed after the lock is
+    /// released.
     fn compact_streamed(
         &self,
         upto: Position,
@@ -143,10 +145,17 @@ impl Backend for MemoryBackend {
             });
         }
         let keep_from = log.index_after(upto);
-        log.records.drain(..keep_from);
-        log.snapshot = Some((upto, folded));
+        let kept = log.records.split_off(keep_from);
+        let dropped = std::mem::replace(&mut log.records, kept);
+        let replaced = log.snapshot.replace((upto, folded));
         log.generation += 1;
+        drop(log);
+        drop((dropped, replaced));
         Ok(())
+    }
+
+    fn concurrent_compaction(&self) -> bool {
+        true
     }
 
     fn conditional_append(&self) -> Option<&dyn ConditionalAppend> {

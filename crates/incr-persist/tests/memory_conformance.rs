@@ -1,5 +1,5 @@
 use incr_persist::conformance::Harness;
-use incr_persist::MemoryBackend;
+use incr_persist::{Backend, MemoryBackend};
 
 struct MemoryHarness;
 
@@ -28,8 +28,12 @@ incr_persist::backend_conformance!(MemoryHarness);
 
 #[test]
 fn default_is_a_writable_handle_like_new() {
-    use incr_persist::Backend;
     let backend = MemoryBackend::default();
     assert!(backend.writable());
     backend.append(&[]).unwrap();
+}
+
+#[test]
+fn the_memory_backend_declares_concurrent_compaction() {
+    assert!(MemoryBackend::new().concurrent_compaction());
 }
