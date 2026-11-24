@@ -625,6 +625,29 @@ fn an_edit_after_the_commit_and_before_the_next_poll_settles_nothing() {
 }
 
 #[test]
+fn a_flight_cancelled_after_the_commit_keeps_its_generation_without_its_finish() {
+    let fx = Fx::open(&MemoryBackend::new(), MemoryMemo::new());
+    for k in 0..100 {
+        fx.leaf(k);
+    }
+    let flight = fx.memo.begin_checkpoint().unwrap();
+    fx.step_until(&flight, |fx| fx.stage() == Some("sealed"));
+    fx.wait_worker();
+    flight.cancel();
+    assert_eq!(fx.memo.checkpoint().unwrap().fresh_written, 100);
+    assert_eq!(
+        fx.memo.stats().checkpoints,
+        2,
+        "the flight's generation counts"
+    );
+    assert_eq!(unsaved_is_exact(&fx), 0);
+    assert!(matches!(
+        flight.poll(&fx.memo, Duration::ZERO),
+        Err(Error::Cancelled)
+    ));
+}
+
+#[test]
 fn an_edit_between_finish_slices_runs_no_finish_work() {
     let options = MemoOptions::new(BuildId::Fixed(0x24c)).checkpoint_after_entries(1);
     let fx = Fx::with(&MemoryBackend::new(), MemoryMemo::new(), options);
