@@ -319,6 +319,10 @@ impl MemoBackend for MemoryMemo {
         Ok(generation)
     }
 
+    fn concurrent_compaction(&self) -> bool {
+        true
+    }
+
     fn remove_generation(&self, generation: GenId) -> Result<()> {
         let removed = {
             let mut state = lock(&self.state);

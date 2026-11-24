@@ -16,7 +16,6 @@ mod backend;
 pub mod conformance;
 mod error;
 mod file;
-#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 mod flight;
 mod flock;
 pub mod memo;

@@ -132,7 +132,7 @@ impl<C: MemoCells> MemoBuilder<C> {
             catalog,
             tables,
             store.value_scope(),
-            Box::new(backend),
+            Arc::new(backend),
             deps,
             rt.create_table(),
             self.options.max_bytes,
@@ -167,6 +167,10 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
 
     pub fn runtime(&self) -> &Runtime<C> {
         self.store.runtime()
+    }
+
+    pub(crate) fn core(&self) -> &CoreRef<C> {
+        &self.core
     }
 
     /// `table`'s node for `key`: the live one, or one restored from the
@@ -209,7 +213,7 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
     /// `max_bytes`. Writes nothing, and reports
     /// [`CheckpointStats::unchanged`], when no entry computed since it was
     /// last saved can be saved. `Err(Busy)` if another handle is
-    /// checkpointing.
+    /// checkpointing, or a flight is open.
     pub fn checkpoint(&self) -> Result<CheckpointStats> {
         self.core.checkpoint(self.runtime())
     }
@@ -217,13 +221,14 @@ impl<C: MemoCells, B: Backend> Memo<C, B> {
     /// [`Self::checkpoint`] when
     /// [`MemoOptions::checkpoint_after_entries`](super::MemoOptions::checkpoint_after_entries)
     /// entries are unsaved; `Ok(None)` otherwise, and always when no
-    /// trigger is set. For after a write or a read-only rebuild, so the
-    /// stall lands where the caller chooses.
+    /// trigger is set, and while a [`Self::begin_checkpoint`] flight is
+    /// open. For after a write or a read-only rebuild, so the stall lands
+    /// where the caller chooses.
     pub fn checkpoint_if_due(&self) -> Result<Option<CheckpointStats>> {
         if in_value_code() {
             return Err(Error::Reentrant);
         }
-        if !self.core.checkpoint_due() {
+        if self.core.flight_open() || !self.core.checkpoint_due() {
             return Ok(None);
         }
         self.checkpoint().map(Some)

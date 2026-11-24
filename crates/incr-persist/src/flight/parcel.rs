@@ -30,6 +30,7 @@ impl<T> Parcel<T> {
         self.items.is_empty()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn push(&mut self, item: T) {
         self.items.push_back(item);
     }

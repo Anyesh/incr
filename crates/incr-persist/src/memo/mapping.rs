@@ -11,8 +11,12 @@ use crate::Kind;
 /// What a live dep of a checkpointed entry stores as.
 pub(crate) enum LiveDep {
     Stored(StoredDep),
-    /// Not a store key or external, so a memo entry or nothing.
-    Query(ErasedIncr),
+    /// Not a store key or external, so a memo entry or nothing, with its
+    /// `changed_at` read in the same inspect batch as the dependent.
+    Query {
+        handle: ErasedIncr,
+        stamp: Option<u64>,
+    },
     /// A key that no fingerprint vouches for: untrusted after a panic, or
     /// an input whose `changed_at` has left its mapped stamp (a bypass).
     Unmapped,
@@ -72,7 +76,12 @@ pub(crate) fn map_live<C: Cells>(
     mapped
         .into_iter()
         .zip(deps)
-        .map(|(live, &dep)| live.unwrap_or(LiveDep::Query(dep)))
+        .map(|(live, &dep)| {
+            live.unwrap_or_else(|| LiveDep::Query {
+                handle: dep,
+                stamp: changed_at_erased(rt, dep),
+            })
+        })
         .collect()
 }
 

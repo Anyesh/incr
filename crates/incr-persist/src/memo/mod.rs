@@ -17,6 +17,7 @@ mod codec;
 pub mod conformance;
 mod dirty;
 mod file;
+mod flight;
 mod generation;
 mod handle;
 mod layers;
@@ -43,6 +44,7 @@ pub use checkpoint::{
 };
 pub use codec::*;
 pub use file::{FileMemo, FileMemoGuard};
+pub use flight::MemoCheckpoint;
 pub use generation::{Chain, GenId, Generation};
 pub use handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
 pub(crate) use memo_core::Wake;

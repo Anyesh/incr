@@ -438,6 +438,13 @@ impl MemoBackend for FileMemo {
         true
     }
 
+    /// A write pulls with no lock and publishes under the publish flock,
+    /// which no read takes; a read shares with it only the open-file
+    /// cache's lock, held for a lookup or an insert.
+    fn concurrent_compaction(&self) -> bool {
+        true
+    }
+
     fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
         'retry: loop {
             let Some((base, deltas)) = self.chain_state()? else {

@@ -65,9 +65,7 @@ impl Drop for ValueContextGuard {
 pub struct ValueScope {
     state: Arc<dyn Any + Send + Sync>,
     hold: Option<fn(&mut dyn FnMut())>,
-    #[cfg_attr(not(test), allow(dead_code))]
     idle: Option<fn(&mut dyn FnMut())>,
-    #[cfg_attr(not(test), allow(dead_code))]
     start: Option<fn(&mut dyn FnMut())>,
 }
 
@@ -140,14 +138,12 @@ pub(crate) fn hold(scope: Option<&ValueScope>, f: impl FnOnce()) {
 
 /// Runs `f`, incr-persist's own work with no value call, inside `scope`'s
 /// idle, or directly without one.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn idle(scope: Option<&ValueScope>, f: impl FnOnce()) {
     run_inside(scope.and_then(|scope| scope.idle), f, "idle");
 }
 
 /// Runs `f`, a checkpoint worker's body, inside `scope`'s worker start, or
 /// directly without one.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn start_worker(scope: Option<&ValueScope>, f: impl FnOnce()) {
     run_inside(scope.and_then(|scope| scope.start), f, "worker start");
 }

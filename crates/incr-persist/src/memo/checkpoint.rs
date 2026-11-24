@@ -9,7 +9,8 @@ use super::{
     decode_entry, fingerprint, key_hash, retag_frame, Chain, DeltaHeader, EncodedEntry, Entry,
     GenHeader, GenId, Generation, IndexItem, MemoBackend, StoredDep, TableDesc, Tombstone,
 };
-use crate::{Error, Result};
+use crate::flight::{Chunked, Control, Verdict};
+use crate::{Error, Result, ValueScope};
 use incr_core::Yielder;
 
 /// The most deltas a chain holds; the checkpoint that would add one more
@@ -154,7 +155,20 @@ pub fn write_checkpoint<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
 ) -> Result<Checkpointed> {
-    write_known(backend, input, &[])
+    write_known(backend, input, &[], None)
+}
+
+/// A test's hook that a full write's copier calls at each pull, on
+/// whichever thread writes.
+#[cfg(test)]
+pub(crate) static WRITE_PARK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// How a flight's worker hands a full generation's entries to the backend:
+/// through a [`Chunked`] adapter that pulls them inside the value scope's
+/// `idle` and hands out a cancel as an error.
+pub(crate) struct Pulls {
+    pub(crate) control: Arc<Control>,
+    pub(crate) scope: Option<ValueScope>,
 }
 
 /// [`write_checkpoint`] given the layers the caller's index holds, which
@@ -163,8 +177,9 @@ pub(crate) fn write_known<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
     known: &[Arc<Generation>],
+    pulls: Option<&Pulls>,
 ) -> Result<Checkpointed> {
-    write_chain(backend, input, known, EncodedEntry::new)
+    write_chain(backend, input, known, EncodedEntry::new, pulls)
 }
 
 #[cfg(test)]
@@ -173,7 +188,7 @@ fn write_with<B: MemoBackend + ?Sized>(
     input: CheckpointInput,
     encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
 ) -> Result<Checkpointed> {
-    write_chain(backend, input, &[], encode)
+    write_chain(backend, input, &[], encode, None)
 }
 
 fn write_chain<B: MemoBackend + ?Sized>(
@@ -181,6 +196,7 @@ fn write_chain<B: MemoBackend + ?Sized>(
     input: CheckpointInput,
     known: &[Arc<Generation>],
     encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
+    pulls: Option<&Pulls>,
 ) -> Result<Checkpointed> {
     let _guard = backend.lock_checkpoint()?;
     let started = Instant::now();
@@ -223,6 +239,7 @@ fn write_chain<B: MemoBackend + ?Sized>(
         &next,
         encode,
         &mut probes,
+        pulls,
     )
 }
 
@@ -578,6 +595,7 @@ pub(crate) const STREAM_BATCH: usize = 256;
 /// that the next checkpoints have room for deltas, and down to `max_bytes`
 /// on one without. On a backend without deltas the new generation keeps a
 /// summary of its entries for the next full write.
+#[allow(clippy::too_many_arguments)]
 fn write_full<B: MemoBackend + ?Sized>(
     backend: &B,
     chain: Option<&Chain>,
@@ -586,6 +604,7 @@ fn write_full<B: MemoBackend + ?Sized>(
     next: &Next,
     encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
     probes: &mut Probes,
+    pulls: Option<&Pulls>,
 ) -> Result<Checkpointed> {
     let seq = next.seq;
     let mut stats = CheckpointStats::default();
@@ -699,7 +718,21 @@ fn write_full<B: MemoBackend + ?Sized>(
         .map(|chain| chain.layers().iter().map(|layer| layer.id()).collect())
         .unwrap_or_default();
     let tip = chain.map(|chain| chain.tip().id());
-    let generation = backend.write_generation_streamed(tip, next.id, &header, &mut copier)?;
+    let generation = match pulls {
+        None => backend.write_generation_streamed(tip, next.id, &header, &mut copier)?,
+        Some(pulls) => {
+            let control = Arc::clone(&pulls.control);
+            let mut records = Chunked::new(&mut copier, control, pulls.scope.clone());
+            let written = backend.write_generation_streamed(tip, next.id, &header, &mut records);
+            match records.finish(written).0 {
+                Verdict::Committed(generation) => generation,
+                Verdict::Truncated => return Err(Error::TruncatedWrite),
+                Verdict::Failed(error) => return Err(error),
+                Verdict::Cancelled => return Err(Error::Cancelled),
+                Verdict::Panicked(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+    };
     stats.corrupt += copier.corrupt;
     stats.oversized += copier.oversized;
     if !two_pass {
@@ -1144,6 +1177,10 @@ impl<B: MemoBackend + ?Sized, E: Fn(&Entry, u64) -> Result<EncodedEntry>> Iterat
     type Item = Result<EncodedEntry>;
 
     fn next(&mut self) -> Option<Result<EncodedEntry>> {
+        #[cfg(test)]
+        if let Some(park) = WRITE_PARK.get() {
+            park();
+        }
         self.yielder.tick();
         let next = self.pull();
         if let (Some(summing), Some(Ok(frame))) = (self.summing.as_mut(), &next) {

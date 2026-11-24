@@ -1,7 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -11,12 +12,13 @@ use incr_core::{Cells, ErasedIncr, Incr, Local, NodeTable, Runtime, Shared};
 
 use super::dirty::Dirty;
 
-use super::checkpoint::write_known;
+use super::checkpoint::{write_known, Pulls};
+use super::flight::Slot;
 use super::layers::{self, Live, Probe};
 use super::table_core::{ErasedTable, KeyPart};
 use super::{
-    key_hash, Chain, CheckpointInput, Checkpointed, Entry, GenId, Generation, IndexItem,
-    MemoBackend, TableDesc,
+    key_hash, Chain, CheckpointInput, CheckpointStats, Checkpointed, Entry, GenId, Generation,
+    IndexItem, MemoBackend, TableDesc,
 };
 use crate::store::dep_index::{DepIndex, External};
 use crate::value_context::{EncodeMismatch, ValueScope};
@@ -80,10 +82,16 @@ pub struct MemoStats {
 /// [`MemoBackend`] with its guard type erased.
 pub(crate) trait ErasedBackend: Send + Sync {
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>>;
-    /// `known` holds the layers this handle's index already loaded.
-    fn checkpoint(&self, input: CheckpointInput, known: &[Arc<Generation>])
-        -> Result<Checkpointed>;
+    /// `known` holds the layers this handle's index already loaded; a
+    /// flight's worker passes its `pulls`.
+    fn checkpoint(
+        &self,
+        input: CheckpointInput,
+        known: &[Arc<Generation>],
+        pulls: Option<&Pulls>,
+    ) -> Result<Checkpointed>;
     fn remove_generations(&self, generations: &[GenId]) -> Vec<GenId>;
+    fn concurrent_compaction(&self) -> bool;
 }
 
 impl<M: MemoBackend> ErasedBackend for M {
@@ -95,12 +103,17 @@ impl<M: MemoBackend> ErasedBackend for M {
         &self,
         input: CheckpointInput,
         known: &[Arc<Generation>],
+        pulls: Option<&Pulls>,
     ) -> Result<Checkpointed> {
-        write_known(self, input, known)
+        write_known(self, input, known, pulls)
     }
 
     fn remove_generations(&self, generations: &[GenId]) -> Vec<GenId> {
         MemoBackend::remove_generations(self, generations)
+    }
+
+    fn concurrent_compaction(&self) -> bool {
+        MemoBackend::concurrent_compaction(self)
     }
 }
 
@@ -199,6 +212,19 @@ pub(crate) struct MemoState {
 }
 
 impl MemoState {
+    /// Whether `seed_info` has doubled since checkpoints last pruned it.
+    pub(crate) fn prune_due(&self) -> bool {
+        self.seed_info.len() >= 2 * self.pruned_at.max(1024)
+    }
+
+    /// Counts a write the backend committed.
+    pub(crate) fn count_written(&mut self, written: &CheckpointStats) {
+        self.stats.checkpoints += 1;
+        self.stats.delta_checkpoints += u64::from(written.delta);
+        self.stats.compactions += u64::from(written.compacted);
+        self.stats.last_bytes_appended = written.bytes_appended;
+    }
+
     pub(crate) fn record_mismatch(&mut self, mismatch: EncodeMismatch) {
         if !self.mismatches.contains(&mismatch) {
             self.mismatches.push(mismatch);
@@ -214,12 +240,16 @@ pub(crate) struct MemoCore<C: MemoCells> {
     pub(crate) tables: Vec<Box<dyn ErasedTable<C>>>,
     /// The store's value scope, whose hold batches a checkpoint's encodes.
     pub(crate) scope: Option<ValueScope>,
-    pub(crate) backend: Box<dyn ErasedBackend>,
+    pub(crate) backend: Arc<dyn ErasedBackend>,
     pub(crate) deps: Arc<DepIndex>,
     externals: NodeTable<String, u128, C>,
     pub(crate) max_bytes: u64,
-    checkpoint: Mutex<()>,
+    /// The open flight, if any; held by a checkpoint for its whole run.
+    checkpoint: Mutex<Slot>,
     memo: Mutex<MemoState>,
+    /// Superseded generations a removal failed to remove, counted by
+    /// whichever thread removed them.
+    pub(crate) stale_generations: Arc<AtomicU64>,
     index: RwLock<Arc<IndexGen>>,
     pub(crate) dirty: Dirty,
     /// `MemoOptions::checkpoint_after_entries`.
@@ -514,7 +544,7 @@ impl<C: MemoCells> MemoCore<C> {
         catalog: Vec<TableDesc>,
         tables: Vec<Box<dyn ErasedTable<C>>>,
         scope: Option<ValueScope>,
-        backend: Box<dyn ErasedBackend>,
+        backend: Arc<dyn ErasedBackend>,
         deps: Arc<DepIndex>,
         externals: NodeTable<String, u128, C>,
         max_bytes: u64,
@@ -531,8 +561,9 @@ impl<C: MemoCells> MemoCore<C> {
             deps,
             externals,
             max_bytes,
-            checkpoint: Mutex::new(()),
+            checkpoint: Mutex::default(),
             memo: Mutex::new(MemoState::default()),
+            stale_generations: Arc::default(),
             index: RwLock::new(Arc::new(index)),
             dirty: Dirty::new(),
             trigger,
@@ -543,7 +574,7 @@ impl<C: MemoCells> MemoCore<C> {
     // Poisoning is ignored on all three: a restore that unwinds part-way
     // leaves only seeded entries, which were verified, and cold ones, and
     // `seed_info` is written only after a seed succeeds.
-    pub(crate) fn lock_checkpoint(&self) -> Ordered<MutexGuard<'_, ()>> {
+    pub(crate) fn lock_checkpoint(&self) -> Ordered<MutexGuard<'_, Slot>> {
         Ordered::take(LockKind::MemoCheckpoint, || {
             self.checkpoint
                 .lock()
@@ -600,6 +631,7 @@ impl<C: MemoCells> MemoCore<C> {
         stats.chain_depth = index.depth() as u64;
         stats.chain_bytes = index.chain_bytes;
         stats.unsaved_entries = self.dirty.unsaved();
+        stats.stale_generations = self.stale_generations.load(Relaxed);
         stats
     }
 

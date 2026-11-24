@@ -4,7 +4,13 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use super::{CheckpointPark, CHECKPOINT_PARK, KEYS_TOUCHED};
+use incr_core::{ErasedIncr, Local, Runtime, Yielder};
+
+use super::{fresh, CheckpointPark, Seed, Seeds, CHECKPOINT_PARK, KEYS_TOUCHED};
+use crate::flight::Parcel;
+use crate::memo::mapping::LiveDep;
+use crate::memo::table_core::{Encoded, Snap};
+use crate::memo::{fingerprint, Entry, StoredDep};
 use crate::memo::{BuildId, Memo, MemoBuilder, MemoOptions, MemoTable, MemoryMemo};
 use crate::{Backend, MemoryBackend, Options, PersistedKeyed, Position, Shared, Store};
 
@@ -168,4 +174,75 @@ fn a_keyed_write_parked_against_an_inspected_entry_never_stores_a_newer_row_fp()
 #[test]
 fn a_keyed_write_landing_before_the_encode_never_stores_a_newer_row_fp() {
     a_keyed_write_racing_a_checkpoint_never_stores_a_newer_row_fp(CheckpointPark::Snapshotted);
+}
+
+fn snap(handle: ErasedIncr, stamp: u64, deps: Vec<LiveDep>, byte: u8) -> Snap {
+    Snap {
+        table: 0,
+        handle,
+        mark: 1,
+        stamp,
+        seeded: None,
+        key: Arc::new(Encoded(vec![byte])),
+        deps,
+        in_group: false,
+        value: Box::new(Encoded(vec![byte; 4])),
+    }
+}
+
+fn query_fp(entry: &Entry) -> u128 {
+    match &entry.deps[..] {
+        [StoredDep::Query { fp, .. }] => *fp,
+        deps => panic!("one query dep expected, found {}", deps.len()),
+    }
+}
+
+/// A query dep maps to its node's snap when the snap was inspected at the
+/// stamp the dep recorded, else to its seed when the seed holds at that
+/// stamp, else to nothing; a snap wins over a seed at the same stamp.
+#[test]
+fn a_query_dep_maps_to_the_snap_or_the_seed_at_its_recorded_stamp() {
+    let rt = Runtime::<Local>::new();
+    let h: Vec<ErasedIncr> = (0..5_u64).map(|i| rt.create_input(i).erase()).collect();
+    let on = |stamp| LiveDep::Query {
+        handle: h[0],
+        stamp: Some(stamp),
+    };
+    let seed = |stamp| Seed {
+        fp: 77,
+        stamp,
+        table: 0,
+        key: vec![0],
+    };
+    let snaps = vec![
+        snap(h[0], 5, Vec::new(), 0),
+        snap(h[1], 9, vec![on(5)], 1),
+        snap(h[2], 9, vec![on(3)], 2),
+        snap(h[3], 9, vec![on(4)], 3),
+    ];
+    let seeds: Seeds = [(h[0], seed(3))].into_iter().collect();
+    let found = fresh(
+        Parcel::new(snaps, None),
+        &seeds,
+        &|_, _, _| None,
+        &mut Vec::new(),
+        &Yielder::ambient(),
+    );
+    assert_eq!(found.unsaveable, 1, "the dep at stamp 4 maps to nothing");
+    assert_eq!(found.entries.len(), 3);
+    assert_eq!(query_fp(&found.entries[1]), fingerprint(&[0; 4]));
+    assert!(found.origin[1].clean.is_empty());
+    assert_eq!(query_fp(&found.entries[2]), 77);
+    assert_eq!(found.origin[2].clean.len(), 1);
+
+    let snaps = vec![snap(h[0], 5, Vec::new(), 0), snap(h[1], 9, vec![on(5)], 1)];
+    let seeds: Seeds = [(h[0], seed(5))].into_iter().collect();
+    let found = fresh(
+        Parcel::new(snaps, None),
+        &seeds,
+        &|_, _, _| None,
+        &mut Vec::new(),
+        &Yielder::ambient(),
+    );
+    assert_eq!(query_fp(&found.entries[1]), fingerprint(&[0; 4]));
 }

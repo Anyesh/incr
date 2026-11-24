@@ -52,10 +52,12 @@ impl Control {
         self.cancelled.load(Ordering::Acquire) || self.abandoned.load(Ordering::Acquire)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn abandoned(&self) -> bool {
         self.abandoned.load(Ordering::Acquire)
     }
@@ -80,6 +82,17 @@ impl Control {
 /// The part of a flight its handle holds. Dropping it abandons the flight.
 pub(crate) struct FlightToken {
     control: Arc<Control>,
+}
+
+impl FlightToken {
+    /// Whether this is the token of the flight `control` steers.
+    pub(crate) fn is_of(&self, control: &Control) -> bool {
+        std::ptr::eq(&*self.control, control)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.control.cancel();
+    }
 }
 
 impl Drop for FlightToken {
@@ -148,12 +161,23 @@ impl<M, T> Flight<M, T> {
         self.control.cancel();
     }
 
-    pub(crate) fn control(&self) -> &Control {
+    pub(crate) fn control(&self) -> &Arc<Control> {
         &self.control
     }
 
     pub(crate) fn has_verdict(&self) -> bool {
         self.posted.ready.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn posted_committed(&self) -> bool {
+        matches!(
+            *self
+                .posted
+                .verdict
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(Verdict::Committed(_))
+        )
     }
 
     /// The worker's verdict once posted, taken: a second call returns

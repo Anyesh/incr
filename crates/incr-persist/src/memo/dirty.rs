@@ -9,7 +9,7 @@ use incr_core::ErasedIncr;
 
 use super::table_core::{Encoded, KeyPart};
 
-const SHARDS: usize = 16;
+pub(crate) const SHARDS: usize = 16;
 
 /// What [`Dirty::carry`] did with an entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,30 +148,54 @@ impl Dirty {
         dead: &mut Vec<KeyPart>,
     ) -> Vec<Record> {
         let mut shards = self.all();
+        self.start();
+        let attempt = self.attempt.load(Relaxed);
+        let mut out = Vec::new();
+        for shard in shards.iter_mut() {
+            copy_marks(shard, attempt, &alive, dead, &mut out);
+        }
+        out.sort_unstable_by_key(|record| (record.table, record.mark));
+        out
+    }
+
+    /// Starts a checkpoint attempt without copying it: the entries whose
+    /// mark is at or below the attempt's are its, and
+    /// [`Self::take_shard`] copies them a shard at a time.
+    pub(crate) fn begin(&self) {
+        let _shards = self.all();
+        self.start();
+    }
+
+    /// [`Self::attempt`] for the attempt's entries of shard `shard`, below
+    /// [`SHARDS`]. Entries computed since the attempt began are left for
+    /// the next one.
+    pub(crate) fn take_shard(
+        &self,
+        shard: usize,
+        alive: impl Fn(ErasedIncr) -> bool,
+        dead: &mut Vec<KeyPart>,
+    ) -> Vec<Record> {
+        let mut guard = Ordered::take(LockKind::MemoDirty, || {
+            self.shards[shard]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        });
+        let attempt = self.attempt.load(Relaxed);
+        let mut out = Vec::new();
+        copy_marks(&mut guard, attempt, &alive, dead, &mut out);
+        out.sort_unstable_by_key(|record| (record.table, record.mark));
+        out
+    }
+
+    /// Moves the counters to a new attempt; the caller holds every shard
+    /// lock.
+    fn start(&self) {
         let (previous, attempt) = (self.previous.load(Relaxed), self.attempt.load(Relaxed));
         self.undo.0.store(previous, Relaxed);
         self.undo.1.store(attempt, Relaxed);
         self.previous.store(attempt, Relaxed);
         self.attempt.store(self.marks.load(Relaxed), Relaxed);
         self.unsaved.store(0, Relaxed);
-        let mut out = Vec::new();
-        for shard in shards.iter_mut() {
-            shard.marks.retain(|&handle, marked| {
-                alive(handle) || {
-                    dead.push(Arc::clone(&marked.key));
-                    false
-                }
-            });
-            shard.carried.retain(|&handle| alive(handle));
-            out.extend(shard.marks.iter().map(|(&handle, marked)| Record {
-                table: marked.table,
-                handle,
-                mark: marked.mark,
-                key: Arc::clone(&marked.key),
-            }));
-        }
-        out.sort_unstable_by_key(|record| (record.table, record.mark));
-        out
     }
 
     /// Takes back the latest attempt, which saved nothing: every entry
@@ -255,6 +279,48 @@ impl Dirty {
     pub(crate) fn unsaved(&self) -> u64 {
         self.unsaved.load(Relaxed)
     }
+
+    /// The entries whose mark is above the attempt's, which `unsaved`
+    /// equals.
+    #[cfg(test)]
+    pub(crate) fn above_attempt(&self) -> u64 {
+        let attempt = self.attempt.load(Relaxed);
+        self.all()
+            .iter()
+            .flat_map(|shard| shard.marks.values())
+            .filter(|marked| marked.mark > attempt)
+            .count() as u64
+    }
+}
+
+/// Removes from `shard` the entries at or below `attempt` that `alive`
+/// refuses, their keys to `dead`, and copies the rest of them to `out`.
+fn copy_marks(
+    shard: &mut Shard,
+    attempt: u64,
+    alive: &impl Fn(ErasedIncr) -> bool,
+    dead: &mut Vec<KeyPart>,
+    out: &mut Vec<Record>,
+) {
+    shard.marks.retain(|&handle, marked| {
+        marked.mark > attempt || alive(handle) || {
+            dead.push(Arc::clone(&marked.key));
+            false
+        }
+    });
+    shard.carried.retain(|&handle| alive(handle));
+    out.extend(
+        shard
+            .marks
+            .iter()
+            .filter(|(_, marked)| marked.mark <= attempt)
+            .map(|(&handle, marked)| Record {
+                table: marked.table,
+                handle,
+                mark: marked.mark,
+                key: Arc::clone(&marked.key),
+            }),
+    );
 }
 
 #[cfg(test)]
