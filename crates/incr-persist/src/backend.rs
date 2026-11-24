@@ -151,6 +151,19 @@ pub trait Backend: Send + Sync {
     /// `false` for a read-only open, on which `append` and `compact` fail.
     fn writable(&self) -> bool;
 
+    /// Whether [`compact_streamed`](Self::compact_streamed) may run on
+    /// another thread while `append`, `append_at`, `sync`, `read_from`,
+    /// `snapshot_id` and `load_snapshot` are called on this handle, taking
+    /// no lock while it pulls `records` that those calls take. A checkpoint
+    /// that compacts on a worker thread refuses a backend returning `false`,
+    /// the default, with
+    /// [`Error::ConcurrentCompactionUnsupported`](crate::Error::ConcurrentCompactionUnsupported):
+    /// a caller blocked in `append` and a worker that holds the backend's
+    /// lock while its pull waits for a lock the caller holds would deadlock.
+    fn concurrent_compaction(&self) -> bool {
+        false
+    }
+
     /// This handle's [`ConditionalAppend`], or `None` for a backend that
     /// does not offer one. A store's staged batch is refused on a backend
     /// returning `None`.

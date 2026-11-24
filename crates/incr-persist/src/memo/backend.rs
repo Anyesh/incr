@@ -170,6 +170,18 @@ pub trait MemoBackend: Send + Sync {
         false
     }
 
+    /// Whether a checkpoint's calls (`lock_checkpoint`, `load`,
+    /// `load_chain`, `read_entries`, `write_generation_streamed`,
+    /// `write_delta` and `remove_generations`) may run on another thread
+    /// while `read_entry` is called on this handle, taking no lock that
+    /// `read_entry` takes while they pull or write. A memo checkpoint that
+    /// writes on a worker thread refuses a backend returning `false`, the
+    /// default, with
+    /// [`Error::ConcurrentCompactionUnsupported`](crate::Error::ConcurrentCompactionUnsupported).
+    fn concurrent_compaction(&self) -> bool {
+        false
+    }
+
     /// Loads the current chain, oldest layer first: the base, then each
     /// delta on the one before it up to the tip, or `None` when no
     /// generation was ever written. Each layer is what `write_delta` or

@@ -12,7 +12,9 @@
 //! tested by each backend itself.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
 use crate::{Backend, ConditionalAppend, Error, Kind, Position, ReadOutcome, Record, SnapshotId};
 
@@ -86,6 +88,7 @@ macro_rules! backend_conformance {
             streamed_compaction_matches_compact,
             failed_streamed_compaction_changes_nothing,
             default_streamed_compaction_goes_through_compact,
+            declared_concurrent_compaction_lets_other_calls_through,
         );
     };
     (@cases $harness:expr; $($case:ident),+ $(,)?) => {
@@ -1029,6 +1032,75 @@ pub fn default_streamed_compaction_goes_through_compact<H: Harness>(mut h: H) {
         &|backend, upto, records| Unstreamed(backend).compact_streamed(upto, records);
     check_streamed_matches_compact(&mut h, unstreamed);
     check_failed_stream_changes_nothing(&mut h, unstreamed);
+}
+
+/// A backend whose `concurrent_compaction` is `true` lets `append`,
+/// `append_at`, `sync`, `read_from`, `snapshot_id` and `load_snapshot`
+/// through on another thread while its `compact_streamed` pulls, and keeps
+/// what they appended above `upto`. Skipped for a backend that returns
+/// `false`.
+pub fn declared_concurrent_compaction_lets_other_calls_through<H: Harness>(mut h: H)
+where
+    H::Backend: 'static,
+{
+    let log = h.new_log();
+    let backend = Arc::new(h.open(&log));
+    if !backend.concurrent_compaction() {
+        return;
+    }
+    let upto = backend.append(&[declare("a"), set("a", 1)]).unwrap();
+    let other = Arc::clone(&backend);
+    let mut pulls = 0;
+    let mut records = std::iter::from_fn(|| {
+        pulls += 1;
+        match pulls {
+            1 => Some(Ok(declare("a"))),
+            2 => {
+                calls_beside_a_compaction(&other, upto);
+                Some(Ok(set("a", 1)))
+            }
+            _ => None,
+        }
+    });
+    backend.compact_streamed(upto, &mut records).unwrap();
+    let later: Vec<Record> = read_all(&*backend, upto)
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect();
+    let expected = if backend.conditional_append().is_some() {
+        vec![set("a", 2), set("a", 3)]
+    } else {
+        vec![set("a", 2)]
+    };
+    assert_eq!(
+        later, expected,
+        "appends beside a compaction must stay in the log"
+    );
+}
+
+fn calls_beside_a_compaction<B: Backend + 'static>(backend: &Arc<B>, upto: Position) {
+    let backend = Arc::clone(backend);
+    let (done, finished) = mpsc::channel();
+    thread::spawn(move || {
+        let tail = backend.append(&[set("a", 2)]).unwrap();
+        if let Some(conditional) = backend.conditional_append() {
+            conditional.append_at(tail, &[set("a", 3)]).unwrap();
+        }
+        backend.sync(Position(u64::MAX)).unwrap();
+        backend.read_from(upto, &mut Vec::new()).unwrap();
+        backend.snapshot_id().unwrap();
+        backend.load_snapshot().unwrap();
+        done.send(()).unwrap();
+    });
+    match finished.recv_timeout(Duration::from_secs(30)) {
+        Ok(()) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("a backend declaring concurrent_compaction blocked another call while it pulled")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("a call beside a concurrent compaction failed")
+        }
+    }
 }
 
 /// A backend without its own `compact_streamed`, so the trait's default

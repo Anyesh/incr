@@ -65,11 +65,20 @@ impl Drop for ValueContextGuard {
 pub struct ValueScope {
     state: Arc<dyn Any + Send + Sync>,
     hold: Option<fn(&mut dyn FnMut())>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    idle: Option<fn(&mut dyn FnMut())>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    start: Option<fn(&mut dyn FnMut())>,
 }
 
 impl ValueScope {
     pub fn new<T: Any + Send + Sync>(state: Arc<T>) -> Self {
-        ValueScope { state, hold: None }
+        ValueScope {
+            state,
+            hold: None,
+            idle: None,
+            start: None,
+        }
     }
 
     /// This scope with `hold`, which runs a batch of value calls (clones,
@@ -90,6 +99,33 @@ impl ValueScope {
         }
     }
 
+    /// This scope with `idle`, the inverse of `hold`: it runs a stretch of
+    /// incr-persist's own work that makes no value call having given up
+    /// whatever `hold` takes, so other threads can take it meanwhile. A
+    /// checkpoint worker runs its pulls inside it while a backend that
+    /// holds that lock waits for the next record; a `hold` inside the
+    /// stretch takes the lock again for its batch. `idle` must call its
+    /// argument exactly once, on the calling thread.
+    pub fn idling(self, idle: fn(&mut dyn FnMut())) -> Self {
+        ValueScope {
+            idle: Some(idle),
+            ..self
+        }
+    }
+
+    /// This scope with `start`, which runs the whole life of a checkpoint
+    /// worker thread. incr-persist spawns the thread, makes this scope
+    /// current on it and calls `start` once with the worker's body, so a
+    /// binding can keep per-thread state for the worker's whole life and run
+    /// the body without whatever `hold` takes. `start` must call its
+    /// argument exactly once, on the calling thread.
+    pub fn starting_workers(self, start: fn(&mut dyn FnMut())) -> Self {
+        ValueScope {
+            start: Some(start),
+            ..self
+        }
+    }
+
     /// The state this scope was created with, if it is a `T`.
     pub fn downcast<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         Arc::clone(&self.state).downcast().ok()
@@ -99,19 +135,37 @@ impl ValueScope {
 /// Runs `f`, a batch of value calls that waits for no store or memo lock,
 /// inside `scope`'s hold, or directly without one.
 pub(crate) fn hold(scope: Option<&ValueScope>, f: impl FnOnce()) {
+    run_inside(scope.and_then(|scope| scope.hold), f, "hold");
+}
+
+/// Runs `f`, incr-persist's own work with no value call, inside `scope`'s
+/// idle, or directly without one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn idle(scope: Option<&ValueScope>, f: impl FnOnce()) {
+    run_inside(scope.and_then(|scope| scope.idle), f, "idle");
+}
+
+/// Runs `f`, a checkpoint worker's body, inside `scope`'s worker start, or
+/// directly without one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn start_worker(scope: Option<&ValueScope>, f: impl FnOnce()) {
+    run_inside(scope.and_then(|scope| scope.start), f, "worker start");
+}
+
+fn run_inside(wrapper: Option<fn(&mut dyn FnMut())>, f: impl FnOnce(), name: &str) {
     let mut f = Some(f);
-    let mut batch = || {
+    let mut run = || {
         if let Some(f) = f.take() {
             f();
         }
     };
-    match scope.and_then(|scope| scope.hold) {
-        Some(hold) => hold(&mut batch),
-        None => batch(),
+    match wrapper {
+        Some(wrapper) => wrapper(&mut run),
+        None => run(),
     }
     assert!(
         f.is_none(),
-        "incr-persist: a value scope's hold did not run its batch"
+        "incr-persist: a value scope's {name} did not run its argument"
     );
 }
 
