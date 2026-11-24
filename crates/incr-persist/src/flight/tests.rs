@@ -42,6 +42,17 @@ fn the_worker_gets_every_message_and_posts_its_verdict() {
 }
 
 #[test]
+fn the_token_names_the_worker_thread() {
+    let (flight, token) =
+        Flight::<(), _>::start(None, |_| Verdict::Committed(thread::current().id())).unwrap();
+    assert!(flight.wait(LONG));
+    match flight.take_verdict() {
+        Some(Verdict::Committed(worker)) => assert_eq!(token.worker(), Some(worker)),
+        _ => panic!("expected a committed verdict"),
+    }
+}
+
+#[test]
 fn wait_with_a_timeout_returns_false_before_the_verdict() {
     let (flight, _token) = Flight::start(None, summing).unwrap();
     assert!(!flight.wait(Some(Duration::from_millis(20))));
@@ -142,6 +153,26 @@ fn panicking_start(_: &mut dyn FnMut()) {
 }
 
 fn skipping_start(_: &mut dyn FnMut()) {}
+
+fn panicking_after_start(f: &mut dyn FnMut()) {
+    f();
+    panic!("start panicked after the body");
+}
+
+#[test]
+fn a_start_that_panics_after_the_body_posts_its_panic() {
+    let scope = ValueScope::new(Arc::new(())).starting_workers(panicking_after_start);
+    let (flight, _token) =
+        Flight::<(), ()>::start(Some(scope), |_| Verdict::Committed(())).unwrap();
+    assert!(flight.wait(LONG));
+    match flight.take_verdict() {
+        Some(Verdict::Panicked(payload)) => assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"start panicked after the body")
+        ),
+        _ => panic!("expected the start's panic"),
+    }
+}
 
 #[test]
 fn a_start_that_panics_or_skips_the_body_posts_a_panic() {

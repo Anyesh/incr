@@ -16,6 +16,7 @@ use incr_core::Local;
 use incr_python_persist::binding::{Carry, CoreStore, Detached, PyBinding};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use pyo3::wrap_pyfunction;
 
 pub(crate) use classes::{PyMemoTable, PyOverlay};
 
@@ -87,7 +88,40 @@ mod classes {
         binding = LocalBinding,
         runtime = PyRuntime,
         module = "incr.persist",
-        flags = [unsendable]
+        flags = [unsendable],
+        store_methods = {
+            /// Starts a checkpoint that runs as a flight and returns its
+            /// `PendingCheckpoint`: each `poll` copies the store's tables for
+            /// about its budget, and a worker thread folds, encodes and writes
+            /// the snapshot while writes go on. Refuses what `checkpoint()`
+            /// refuses, and raises `PersistError` for a backend whose class
+            /// does not set `concurrent_compaction = True` or has no
+            /// `compact_streamed`. Until the flight ends, `checkpoint()` and
+            /// `begin_checkpoint()` raise `Busy` and the automatic checkpoint
+            /// waits.
+            fn begin_checkpoint(
+                slf: &Bound<'_, Self>,
+            ) -> PyResult<incr_python_persist::flight::PendingCheckpoint> {
+                incr_python_persist::flight::begin_store::<LocalBinding, Self>(slf)
+            }
+        },
+        memo_methods = {
+            /// Starts a memo checkpoint that runs as a flight and returns its
+            /// `PendingCheckpoint`: each `poll` inspects entries for about its
+            /// budget, a worker thread encodes and writes the generation, and
+            /// the polls after it finish the entries it wrote; `result()`
+            /// returns what `checkpoint()` returns. Raises `PersistError` for
+            /// a memo backend whose class does not set
+            /// `concurrent_compaction = True` or has no
+            /// `write_generation_streamed`. Until the flight ends,
+            /// `checkpoint()` and `begin_checkpoint()` raise `Busy` and the
+            /// automatic checkpoint waits.
+            fn begin_checkpoint(
+                slf: &Bound<'_, Self>,
+            ) -> PyResult<incr_python_persist::flight::PendingCheckpoint> {
+                incr_python_persist::flight::begin_memo::<LocalBinding, Self>(slf)
+            }
+        }
     );
 }
 
@@ -121,6 +155,23 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<classes::PyMemoTable>()?;
     module.add_class::<classes::PyStore>()?;
     module.add_class::<classes::PyBatch>()?;
+    module.add_class::<incr_python_persist::flight::PendingCheckpoint>()?;
+    let join = wrap_pyfunction!(
+        incr_python_persist::flight::_join_checkpoint_workers,
+        &module
+    )?;
+    module.add_function(join.clone())?;
+    py.import("atexit")?.call_method1("register", (join,))?;
+    #[cfg(feature = "gil-checks")]
+    {
+        let checks = PyModule::new(py, "_gil_checks")?;
+        incr_python_protocol::gil::checks::register(&checks)?;
+        checks.add_function(wrap_pyfunction!(
+            incr_python_persist::flight::_set_memo_frame_limit,
+            &checks
+        )?)?;
+        module.add_submodule(&checks)?;
+    }
     #[cfg(feature = "conformance")]
     conformance::register_conformance(&module)?;
     incr_python_persist::codec::install_hook::<Exceptions>();

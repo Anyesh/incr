@@ -12,6 +12,7 @@ doc = false
 
 [features]
 persist = ["dep:serde"]
+gil-checks = []
 
 [dependencies]
 incr-core = { workspace = true, features = ["yield-hook"] }

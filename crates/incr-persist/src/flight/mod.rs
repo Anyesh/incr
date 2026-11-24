@@ -93,6 +93,10 @@ impl FlightToken {
     pub(crate) fn cancel(&self) {
         self.control.cancel();
     }
+
+    pub(crate) fn worker(&self) -> Option<std::thread::ThreadId> {
+        self.control.worker.get().map(Thread::id)
+    }
 }
 
 impl Drop for FlightToken {
@@ -317,8 +321,8 @@ fn run_worker<M, T>(
         });
     }));
     match (verdict, started) {
-        (Some(verdict), _) => verdict,
-        (None, Err(payload)) => Verdict::Panicked(payload),
+        (_, Err(payload)) => Verdict::Panicked(payload),
+        (Some(verdict), Ok(())) => verdict,
         (None, Ok(())) => unreachable!("start_worker returns only after its argument ran"),
     }
 }

@@ -28,6 +28,8 @@ TOUCHED_INCR_CLASSES = (
 )
 
 SKIPPED_MEMBERS = {"__module__", "__dict__", "__weakref__", "__doc__"}
+# Exists only on a wheel built with the gil-checks feature.
+BUILD_ONLY_MODULES = {"_gil_checks"}
 
 
 def _signature(obj):
@@ -77,7 +79,7 @@ def _function(obj):
 def _surface():
     surface = {}
     for name in sorted(dir(incr.persist)):
-        if name.startswith("__"):
+        if name.startswith("__") or name in BUILD_ONLY_MODULES:
             continue
         obj = getattr(incr.persist, name)
         key = f"incr.persist.{name}"

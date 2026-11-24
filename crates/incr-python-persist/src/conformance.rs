@@ -14,8 +14,11 @@ use std::panic::{self, AssertUnwindSafe};
 
 use incr_persist::conformance::{self as store_cases, Harness};
 use incr_persist::memo::conformance::{self as memo_cases, MemoHarness};
+use incr_persist::memo::{encode_delta_header, encode_header, DeltaHeader, GenHeader, GenId};
+use incr_python_protocol::gil;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyFrozenSet, PyList, PyTuple};
 
 use crate::backend::PyBackend;
 use crate::memo_backend::PyMemoBackend;
@@ -25,7 +28,8 @@ struct StoreFactory<E>(Py<PyAny>, PhantomData<fn() -> E>);
 
 impl<E> StoreFactory<E> {
     fn call(&self, method: &str, arg: Option<&Py<PyAny>>) -> Py<PyAny> {
-        Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.call");
+        gil::enter(&SITE, |py| {
             let factory = self.0.bind(py);
             let result = match arg {
                 Some(arg) => factory.call_method1(method, (arg.bind(py),)),
@@ -52,12 +56,14 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
 
     fn open_read_only(&mut self, log: &Self::Log) -> Option<PyBackend<E>> {
         let handle = self.call("open_read_only", Some(log));
-        let none = Python::attach(|py| handle.is_none(py));
+        static SITE: gil::Site = gil::Site::caller("conformance.is_none");
+        let none = gil::enter(&SITE, |py| handle.is_none(py));
         (!none).then(|| wrap(handle))
     }
 
     fn multi_writer(&self) -> bool {
-        Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.multi_writer");
+        gil::enter(&SITE, |py| {
             self.0
                 .bind(py)
                 .call_method0("multi_writer")
@@ -67,7 +73,8 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
     }
 
     fn fence(&mut self, log: &Self::Log) -> bool {
-        let has_fence = Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.has_fence");
+        let has_fence = gil::enter(&SITE, |py| {
             self.0
                 .bind(py)
                 .hasattr("fence")
@@ -81,7 +88,8 @@ impl<E: PersistExceptions> Harness for StoreFactory<E> {
 }
 
 fn wrap<E: PersistExceptions>(handle: Py<PyAny>) -> PyBackend<E> {
-    Python::attach(|py| {
+    static SITE: gil::Site = gil::Site::caller("conformance.wrap");
+    gil::enter(&SITE, |py| {
         PyBackend::new(py, handle)
             .unwrap_or_else(|e| panic!("looking up the handle's append_at raised: {e}"))
     })
@@ -103,7 +111,8 @@ impl<E: PersistExceptions> MemoHarness for MemoFactory<E> {
     }
 
     fn exclusive_lock(&self) -> bool {
-        Python::attach(|py| {
+        static SITE: gil::Site = gil::Site::caller("conformance.exclusive_lock");
+        gil::enter(&SITE, |py| {
             self.0
                  .0
                 .bind(py)
@@ -155,6 +164,7 @@ fn store_table<E: PersistExceptions>() -> Vec<Case> {
         streamed_compaction_matches_compact,
         failed_streamed_compaction_changes_nothing,
         default_streamed_compaction_goes_through_compact,
+        declared_concurrent_compaction_lets_other_calls_through,
     )
 }
 
@@ -163,7 +173,7 @@ fn memo_harness<E: PersistExceptions>(factory: Py<PyAny>) -> MemoFactory<E> {
 }
 
 fn memo_table<E: PersistExceptions>() -> Vec<Case> {
-    case_table!(
+    let mut cases: Vec<Case> = case_table!(
         memo_cases,
         memo_harness,
         fresh_store_loads_nothing,
@@ -183,7 +193,130 @@ fn memo_table<E: PersistExceptions>() -> Vec<Case> {
         stale_delta_is_not_returned,
         compaction_drops_the_chain,
         read_entries_matches_read_entry,
-    )
+        declared_concurrent_compaction_lets_reads_through,
+    );
+    cases.push((
+        "declared_returns_are_new_lists",
+        declared_returns_are_new_lists,
+    ));
+    cases
+}
+
+/// A memo backend whose class declares `concurrent_compaction` returns a
+/// new `list` it keeps no reference to from `write_generation_streamed`,
+/// `write_delta`, `load`, each `load_chain` layer's items and
+/// `read_entries`. Checks nothing on a backend without the flag.
+fn declared_returns_are_new_lists(factory: Py<PyAny>) {
+    static SITE: gil::Site = gil::Site::caller("conformance.returns");
+    gil::enter(&SITE, |py| {
+        fn call<'py>(
+            object: &Bound<'py, PyAny>,
+            method: &str,
+            args: Bound<'py, PyTuple>,
+        ) -> Bound<'py, PyAny> {
+            object
+                .call_method1(method, args)
+                .unwrap_or_else(|e| panic!("{method} raised: {e}"))
+        }
+        let factory = factory.bind(py);
+        let store = call(factory, "new_store", PyTuple::empty(py));
+        let backend = call(factory, "open", PyTuple::new(py, [store]).unwrap());
+        if !crate::backend::declares_concurrent(&backend).unwrap() {
+            return;
+        }
+        let header = |seq| GenHeader {
+            build: 1,
+            seq,
+            tables: Vec::new(),
+        };
+        let base_header = PyBytes::new(py, &encode_header(&header(1)).unwrap());
+        let frames = PyList::new(
+            py,
+            [
+                (0u32, 7u64, PyBytes::new(py, b"seven")),
+                (0, 8, PyBytes::new(py, b"eight")),
+            ],
+        )
+        .unwrap();
+        let args = (None::<u64>, 1u64, base_header, frames.try_iter().unwrap());
+        let items = call(
+            &backend,
+            "write_generation_streamed",
+            args.into_pyobject(py).unwrap(),
+        );
+        assert_fresh_list(&items, "write_generation_streamed");
+        let asked = items.downcast::<PyList>().unwrap().to_owned();
+        let read = call(
+            &backend,
+            "read_entries",
+            (1u64, asked).into_pyobject(py).unwrap(),
+        );
+        assert_fresh_list(&read, "read_entries");
+        let loaded = call(&backend, "load", PyTuple::empty(py));
+        let (_, _, loaded_items) = loaded
+            .extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>, Bound<'_, PyAny>)>()
+            .expect("load returned (generation, header, items)");
+        drop(loaded);
+        assert_fresh_list(&loaded_items, "load");
+        if !backend.hasattr("write_delta").unwrap() || !backend.hasattr("load_chain").unwrap() {
+            return;
+        }
+        let delta = DeltaHeader {
+            header: header(2),
+            base: GenId(1),
+            parent: GenId(1),
+        };
+        let delta_header = PyBytes::new(py, &encode_delta_header(&delta).unwrap());
+        let entries = PyList::new(py, [(0u32, 9u64, PyBytes::new(py, b"nine"))]).unwrap();
+        let tombstones = PyList::new(py, [(0u32, 7u64)]).unwrap();
+        let args = (1u64, 2u64, delta_header, entries, tombstones);
+        let written = call(&backend, "write_delta", args.into_pyobject(py).unwrap());
+        assert_fresh_list(&written, "write_delta");
+        let chain = if backend
+            .getattr("load_chain")
+            .and_then(|method| {
+                py.import("inspect")?
+                    .call_method1("signature", (method,))?
+                    .getattr("parameters")?
+                    .len()
+            })
+            .is_ok_and(|parameters| parameters == 1)
+        {
+            let known = PyFrozenSet::empty(py).unwrap();
+            call(&backend, "load_chain", PyTuple::new(py, [known]).unwrap())
+        } else {
+            call(&backend, "load_chain", PyTuple::empty(py))
+        };
+        let layers = chain
+            .try_iter()
+            .unwrap()
+            .map(|layer| layer.unwrap())
+            .collect::<Vec<_>>();
+        drop(chain);
+        for layer in layers {
+            let (_, _, layer_items) = layer
+                .extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>, Bound<'_, PyAny>)>()
+                .expect("load_chain returned (generation, header, items) layers");
+            drop(layer);
+            assert_fresh_list(&layer_items, "load_chain");
+        }
+    });
+}
+
+fn assert_fresh_list(returned: &Bound<'_, PyAny>, method: &str) {
+    assert!(
+        returned.is_exact_instance_of::<PyList>(),
+        "{method} returned a {}, not a list",
+        returned
+            .get_type()
+            .name()
+            .map_or_else(|_| "?".to_owned(), |name| name.to_string())
+    );
+    assert_eq!(
+        returned.get_refcnt(),
+        1,
+        "{method} returned a list it keeps a reference to"
+    );
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -204,6 +337,14 @@ pub fn table<E: PersistExceptions>(kind: &str) -> PyResult<Vec<Case>> {
     }
 }
 
+/// A case's own waits inside a pull, which a Python backend runs holding
+/// the GIL, give the GIL up as a checkpoint worker's pulls do.
+fn case_idle(f: &mut dyn FnMut()) {
+    // SAFETY: the cases' waits hold no Python object; a backend call inside
+    // one enters the gate again.
+    unsafe { gil::release_held(f) };
+}
+
 /// Runs each case on a fresh handle to `factory` with the GIL released, so
 /// the cases' own threads can attach, until one fails if `stop` is set.
 /// Returns each case run mapped to `None` on a pass or the panic message.
@@ -213,10 +354,14 @@ fn run(
     factory: &Py<PyAny>,
     stop: bool,
 ) -> Vec<(&'static str, Option<String>)> {
-    py.detach(|| {
+    gil::release(py, || {
         let mut outcomes = Vec::with_capacity(cases.len());
         for (name, case) in cases {
-            let handle = Python::attach(|py| factory.clone_ref(py));
+            static SITE: gil::Site = gil::Site::caller("conformance.run_handle");
+            let handle = gil::enter(&SITE, |py| factory.clone_ref(py));
+            let _scope = incr_persist::enter_value_scope(
+                incr_persist::ValueScope::new(std::sync::Arc::new(())).idling(case_idle),
+            );
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| case(handle)));
             let failed = outcome.is_err();
             outcomes.push((name, outcome.err().map(panic_message)));

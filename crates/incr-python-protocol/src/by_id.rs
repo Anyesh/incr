@@ -39,7 +39,7 @@ impl TypedNode {
     /// when the read closes a cycle that leaves the node without a value.
     pub fn try_value<C: Cells>(self, rt: &Runtime<C>) -> Option<Py<PyAny>> {
         match self {
-            Self::Py(node) => rt.try_get(node).ok().map(|v| v.0),
+            Self::Py(node) => rt.try_get(node).ok().map(PyValue::into_inner),
             Self::Count(node) => rt.try_get(node).ok().map(count_to_py),
             Self::Pair(node) => rt.try_get(node).ok().map(pair_to_py),
         }
@@ -49,7 +49,10 @@ impl TypedNode {
     /// pair natively, a Python value by reference.
     pub fn kept_value<C: Cells>(self, rt: &Runtime<C>) -> StepValue<Py<PyAny>> {
         let value = match self {
-            Self::Py(node) => rt.try_get(node).ok().map(|v| StepValue::Ref(v.0)),
+            Self::Py(node) => rt
+                .try_get(node)
+                .ok()
+                .map(|v| StepValue::Ref(v.into_inner())),
             Self::Count(node) => rt.try_get(node).ok().map(StepValue::Count),
             Self::Pair(node) => rt.try_get(node).ok().map(|(a, b)| StepValue::Pair(a, b)),
         };
@@ -64,7 +67,7 @@ impl TypedNode {
         match self {
             Self::Py(node) => {
                 let (value, trace, capture) = rt.get_traced_retaining(node);
-                (value.0, trace, capture)
+                (value.into_inner(), trace, capture)
             }
             Self::Count(node) => {
                 let (value, trace, capture) = rt.get_traced_retaining(node);
@@ -151,7 +154,7 @@ pub fn snapshot_values<C: Cells>(
     let qs: Vec<Incr<PyValue>> = pys.iter().map(|(_, q)| *q).collect();
     let seen = inspect_many(rt, &qs, hold_values, &mut bag);
     for ((index, _), seen) in pys.iter().zip(seen) {
-        out[*index] = seen.map(|seen| seen.value.0);
+        out[*index] = seen.map(|seen| seen.value.into_inner());
     }
     for ((index, _), seen) in counts.iter().zip(read_plain(rt, &counts, &mut bag)) {
         out[*index] = seen.map(count_to_py);

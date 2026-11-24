@@ -123,6 +123,12 @@ impl StoreCheckpoint {
     pub fn cancel(&self) {
         self.token.cancel();
     }
+
+    /// The id of the flight's worker thread, for a binding that keeps
+    /// per-thread state such as the exception a value codec raised there.
+    pub fn worker(&self) -> Option<std::thread::ThreadId> {
+        self.token.worker()
+    }
 }
 
 /// A store's checkpoint flight, if one is open, and how the last one ended

@@ -316,11 +316,34 @@ pub fn decode_index(frame: &[u8]) -> Result<Vec<IndexItem>> {
 pub(super) fn frame_word(body_len: usize) -> Result<u32> {
     FRAME_HEADER_LEN
         .checked_add(body_len)
+        .filter(|&len| len <= frame_limit())
         .and_then(|len| u32::try_from(len).ok())
         .map(|_| body_len as u32)
         .ok_or(Error::FrameTooLarge {
             len: (body_len as u64).saturating_add(FRAME_HEADER_LEN as u64),
         })
+}
+
+#[cfg(feature = "frame-limit")]
+static FRAME_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Sets the longest frame a memo checkpoint writes, `None` for the `u32`
+/// limit alone, so a test can make an entry oversized without 4 GiB of
+/// data. Process-wide.
+#[cfg(feature = "frame-limit")]
+pub fn set_frame_limit(limit: Option<usize>) {
+    FRAME_LIMIT.store(
+        limit.unwrap_or(usize::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn frame_limit() -> usize {
+    #[cfg(feature = "frame-limit")]
+    return FRAME_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "frame-limit"))]
+    usize::MAX
 }
 
 pub(super) fn frame_bytes(body: &[u8]) -> Result<Vec<u8>> {

@@ -340,8 +340,10 @@ SHARED_CALL = re.compile(
 # Accessors that take no engine entry, and the `OnceLock` holding the memo.
 SHARED_ALLOWED = {"runtime", "get", "set", "into_inner", "take_encode_mismatches"}
 # A binding entry, and the crate's own wrappers around one.
-SHARED_ENTRY = re.compile(r"\bB::(?:write|read)\(|\b(?:self|core)\.(?:write|stage)\(")
-SHARED_WRAPPERS = {"write", "stage"}
+SHARED_ENTRY = re.compile(
+    r"\bB::(?:write|read)\(|\b(?:self|core)\.(?:write|stage)\(|\bstore_call\(|\b\w+\s*\.run_memo_call\("
+)
+SHARED_WRAPPERS = {"write", "stage", "store_call", "run_memo_call"}
 # Functions that run inside a query, where the engine entry is already open.
 IN_QUERY = {"value_of"}
 
@@ -355,7 +357,7 @@ def shared_violations(text):
     entry, and the crate's wrappers that do not enter through the binding."""
     text = without_strings(text)
     spans = [
-        (m.end() - 1, matching(text, m.end() - 1, "(", ")"))
+        (m.start(), matching(text, m.end() - 1, "(", ")"))
         for m in SHARED_ENTRY.finditer(text)
     ]
     problems = []
@@ -374,7 +376,7 @@ def shared_violations(text):
     return problems
 
 
-SHARED_SOURCES = ["store.rs", "keyed.rs", "memo.rs", "batch.rs", "scope.rs"]
+SHARED_SOURCES = ["store.rs", "keyed.rs", "memo.rs", "batch.rs", "scope.rs", "flight.rs"]
 
 
 @pytest.mark.parametrize("source", SHARED_SOURCES)
@@ -407,8 +409,12 @@ def test_the_shared_scan_covers_the_files_that_reach_the_store():
             "fn write(&self, f: F) -> R { f(&self.store) }",
             "write does not enter through B",
         ),
+        (
+            "fn store_call(&self, f: F) -> R { f(&self.store) }",
+            "store_call does not enter through B",
+        ),
     ],
-    ids=["store-method", "store-argument", "wrapper-without-entry"],
+    ids=["store-method", "store-argument", "wrapper-without-entry", "flight-wrapper-without-entry"],
 )
 def test_the_shared_scan_rejects_a_violation(body, problem):
     problems = shared_violations(f"impl<B: PyBinding> StoreCore<B> {{\n    {body}\n}}\n")

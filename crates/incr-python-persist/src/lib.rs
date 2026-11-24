@@ -13,6 +13,7 @@ pub mod classes;
 pub mod codec;
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod flight;
 pub mod keyed;
 mod lent;
 pub mod memo;

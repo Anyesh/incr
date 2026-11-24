@@ -14,6 +14,7 @@ doc = false
 
 [features]
 conformance = ["incr-persist/backend-tests", "incr-python-persist/conformance"]
+gil-checks = ["incr-python-persist/gil-checks", "incr-python-protocol/gil-checks"]
 
 [dependencies]
 incr_compute = { package = "incr-compute", version = "=0.2.0-beta.12", path = "../incr-compute" }

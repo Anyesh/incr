@@ -12,6 +12,7 @@ use incr_persist::{
     Durability, Input, Options, PendingWrite, PersistedCollection, PersistedKeyed, Store,
     StoreStats,
 };
+use incr_python_protocol::gil;
 use incr_python_protocol::gil_yield::{check_gil_yield_ms, gil_yield_hook};
 use incr_python_protocol::{PyKey, PyPair, PyValue};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -158,7 +159,7 @@ impl<B: PyBinding> StoreCore<B> {
     pub fn declare_lock(&self, py: Python<'_>) -> PyResult<Declaring<'_>> {
         let lock = &self.declaring;
         let me = std::thread::current().id();
-        let taken = py.detach(|| {
+        let taken = gil::release(py, || {
             let mut holder = lock.holder.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
                 match *holder {

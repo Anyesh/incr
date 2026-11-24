@@ -315,7 +315,7 @@ impl PyKeyedCollection {
             IndexOf::Plain(keyed) => keyed.row(&key),
             IndexOf::Persisted(persisted) => persisted.row(&key),
         })?;
-        Ok(row.map(|row| row.0))
+        Ok(row.map(|row| row.into_inner()))
     }
 
     fn __contains__(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<bool> {
@@ -340,7 +340,7 @@ impl PyKeyedCollection {
             IndexOf::Plain(keyed) => keyed.keys(),
             IndexOf::Persisted(persisted) => persisted.keys(),
         })?;
-        PyList::new(py, keys.into_iter().map(|key| key.0))
+        PyList::new(py, keys.into_iter().map(|key| key.into_inner()))
     }
 
     /// A new list of the held `(key, row)` tuples, in no particular order.
@@ -350,7 +350,7 @@ impl PyKeyedCollection {
             IndexOf::Plain(keyed) => keyed.items(),
             IndexOf::Persisted(persisted) => persisted.items(),
         })?;
-        PyList::new(py, items.into_iter().map(|pair| pair.0))
+        PyList::new(py, items.into_iter().map(|pair| pair.into_inner()))
     }
 
     #[getter]
