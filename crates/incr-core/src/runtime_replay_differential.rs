@@ -10944,6 +10944,23 @@ fn a_doomed_run_leaves_a_lower_delivery_for_its_retry() {
     });
 }
 
+/// 0x6a274b2198db4cd1: query 11's member run is doomed while query 4's
+/// walk of query 20 is under it, after that walk memoized 20, 21 and 17.
+/// The pop of the member run's virtual frame resumes the episode with the
+/// same member run, whose resumed walk computes 17, so 17's read of 20 must
+/// compute it directly as the unbounded run's does, not walk it and land
+/// query 7, which the unbounded run never lands in that operation.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_resumed_member_run_keeps_the_memo_of_the_frames_above_it() {
+    const SEED: u64 = 0x6a27_4b21_98db_4cd1;
+    let case = all_replayable(gen_case(SEED, false, false));
+    quiet(|| {
+        differential::<Local>(&case, SEED);
+        differential::<Shared>(&case, SEED);
+    });
+}
+
 /// [`differential`] for a case whose byte budget's cut points move with
 /// frame sizes: the bounded run dooms the reads `dooms` names, as
 /// `(reader slot, read slot, depth)` in order, under a byte budget no read

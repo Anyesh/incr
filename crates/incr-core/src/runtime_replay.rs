@@ -4681,6 +4681,10 @@ impl<C: Cells> Runtime<C> {
                     .unwrap()
                     .push(cycle_impl::EpisodeSeen::of(&ep, Some(queued_above)));
             }
+            // The episode resumes with this frame's member run, which
+            // retries the frame and the retried frames above it, so it reads
+            // their memo entries as the unbounded run's frames do.
+            taint_memo::restore(std::mem::take(kept));
             let (root, cidx) = (ep.root, ep.cidx);
             let mut bag = Deferred::new();
             let end = catch_unwind(AssertUnwindSafe(|| self.run_episode(ep, &mut bag)));
