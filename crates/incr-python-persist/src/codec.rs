@@ -233,12 +233,16 @@ fn python_hold(f: &mut dyn FnMut()) {
 /// Runs `f`, incr-persist's own work with no value call, with the GIL
 /// released on a checkpoint worker inside the gate.
 fn python_idle(f: &mut dyn FnMut()) {
-    gil::idle(f);
+    // SAFETY: incr-persist passes its own work, which holds no Python
+    // object; a value call inside it enters the gate again.
+    unsafe { gil::idle(f) };
 }
 
 /// Runs `f`, a wait for a checkpoint worker, with the GIL released.
 fn python_wait(f: &mut dyn FnMut()) {
-    gil::release_held(f);
+    // SAFETY: incr-persist passes a wait on its flight, which holds no
+    // Python object.
+    unsafe { gil::release_held(f) };
 }
 
 fn active<E: PersistExceptions>() -> Result<Arc<Registry<E>>, String> {

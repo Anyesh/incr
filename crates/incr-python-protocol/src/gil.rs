@@ -18,6 +18,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use pyo3::marker::Ungil;
 use pyo3::prelude::*;
 use pyo3::types::{PyFrozenSet, PyList, PyTuple};
 
@@ -348,7 +349,7 @@ pub fn tick(py: Python<'_>) {
 /// Runs `f`, incr's own Rust reached from a Python frame, released on a
 /// worker and in place on any other thread. An [`enter`] inside it
 /// acquires for real and releases on its return.
-pub fn leave<R>(py: Python<'_>, f: impl FnOnce() -> R) -> R {
+pub fn leave<R: Ungil>(py: Python<'_>, f: impl Ungil + FnOnce() -> R) -> R {
     if on_worker() {
         released(py, f)
     } else {
@@ -359,7 +360,12 @@ pub fn leave<R>(py: Python<'_>, f: impl FnOnce() -> R) -> R {
 /// [`leave`] for a caller with no `Python` token: on a worker holding the
 /// GIL through the gate it releases around `f`, and otherwise runs `f` in
 /// place.
-pub fn idle(f: impl FnOnce()) {
+///
+/// # Safety
+///
+/// `f` must not use a Python object or token it captured: PyO3 cannot
+/// check a `dyn` closure for that.
+pub unsafe fn idle(f: &mut dyn FnMut()) {
     if on_worker() && WORKER.with(|w| w.depth.get()) > 0 {
         Python::attach(|py| released(py, f));
     } else {
@@ -369,12 +375,16 @@ pub fn idle(f: impl FnOnce()) {
 
 /// Runs `f`, a caller's wait for a worker, with the GIL released on any
 /// thread. `f` must not touch Python.
-pub fn release<R>(py: Python<'_>, f: impl FnOnce() -> R) -> R {
+pub fn release<R: Ungil>(py: Python<'_>, f: impl Ungil + FnOnce() -> R) -> R {
     released(py, f)
 }
 
 /// [`release`] for a caller that holds the GIL but has no token.
-pub fn release_held(f: impl FnOnce()) {
+///
+/// # Safety
+///
+/// As for [`idle`].
+pub unsafe fn release_held(f: &mut dyn FnMut()) {
     Python::attach(|py| released(py, f));
 }
 

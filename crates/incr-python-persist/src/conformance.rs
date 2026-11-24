@@ -340,7 +340,9 @@ pub fn table<E: PersistExceptions>(kind: &str) -> PyResult<Vec<Case>> {
 /// A case's own waits inside a pull, which a Python backend runs holding
 /// the GIL, give the GIL up as a checkpoint worker's pulls do.
 fn case_idle(f: &mut dyn FnMut()) {
-    gil::release_held(f);
+    // SAFETY: the cases' waits hold no Python object; a backend call inside
+    // one enters the gate again.
+    unsafe { gil::release_held(f) };
 }
 
 /// Runs each case on a fresh handle to `factory` with the GIL released, so
