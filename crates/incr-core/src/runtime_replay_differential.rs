@@ -10749,6 +10749,21 @@ fn a_failure_over_a_dirty_dep_over_an_open_frame_flips_as_unbounded() {
     }
 }
 
+/// 0x30ef23403195b0ba: query 9 lands Failed over the Dirty 14, whose dep 15
+/// is an open frame of the cycle through 9 unbounded and New bounded, where
+/// a doomed attempt that wrote it was discarded. 15 lands Dirty in both, so
+/// the set at op 11, whose walk stops below 15, must flag 9 in both.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failure_over_a_dirty_dep_over_a_discarded_frame_flips_as_unbounded() {
+    const SEED: u64 = 0x30ef_2340_3195_b0ba;
+    let case = gen_case(SEED, false, false);
+    quiet(|| {
+        differential::<Local>(&case, SEED);
+        differential::<Shared>(&case, SEED);
+    });
+}
+
 /// Each serial order of the two-thread cases of seeds
 /// `REPLAY_FROM..REPLAY_SCAN` (or the hex seeds in `SEEDS_FILE`), run
 /// unbounded, against [`fresh_read`]: the two-thread differential takes
