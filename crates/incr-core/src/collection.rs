@@ -1074,9 +1074,17 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         drop(rows);
     }
 
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn capture_installed(&self) -> bool {
+    /// Whether a capture is installed.
+    pub fn capture_installed(&self) -> bool {
         self.log.read().elements.capture_installed()
+    }
+
+    /// The number of distinct elements the log holds now, read without
+    /// forcing `version_node` or recording a dependency.
+    pub fn distinct_len(&self) -> usize {
+        value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        self.log.read().elements.len()
     }
 
     /// Current elements, with multiset duplicates expanded. Forces

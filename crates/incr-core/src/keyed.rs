@@ -2374,8 +2374,8 @@ where
         drop(capture);
     }
 
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn capture_installed(&self) -> bool {
+    /// Whether a capture is installed.
+    pub fn capture_installed(&self) -> bool {
         self.index.table.read().capture.is_some()
     }
 }
