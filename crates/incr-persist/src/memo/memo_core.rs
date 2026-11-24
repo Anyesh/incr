@@ -381,17 +381,15 @@ impl Wake {
         self.lock().landing.take()
     }
 
-    /// Waits until a checkpoint is due or `every` has passed
+    /// Waits until a checkpoint is due or `deadline` has passed
     /// ([`Woke::Due`]), a checkpoint left new entries landing, a stop, or
     /// `poll` returns `true`. It calls `poll` after [`FIRST_POLL`], then
-    /// at gaps doubling up to [`LAST_POLL`]. `None` for `every` waits
-    /// without an interval.
+    /// at gaps doubling up to [`LAST_POLL`].
     pub(crate) fn wait(
         &self,
-        every: Option<Duration>,
+        deadline: Option<Instant>,
         mut poll: Option<&mut dyn FnMut() -> bool>,
     ) -> Woke {
-        let deadline = every.map(|every| Instant::now() + every);
         let mut gap = FIRST_POLL;
         let mut waking = self.lock();
         loop {
@@ -489,10 +487,21 @@ impl Landing {
         self.entries.iter().filter(|&&(_, counted)| counted).count() as u64
     }
 
-    /// Drops the entries `landed` accepts: whether there were any.
-    pub(crate) fn drop_landed(&mut self, landed: impl Fn(ErasedIncr) -> bool) -> bool {
+    /// Drops the entries `landed` accepts, handing those the checkpoint
+    /// did not count to `uncounted`: whether there were any.
+    pub(crate) fn drop_landed(
+        &mut self,
+        landed: impl Fn(ErasedIncr) -> bool,
+        mut uncounted: impl FnMut(ErasedIncr),
+    ) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|&(handle, _)| !landed(handle));
+        self.entries.retain(|&(handle, counted)| {
+            let dropped = landed(handle);
+            if dropped && !counted {
+                uncounted(handle);
+            }
+            !dropped
+        });
         self.entries.len() < before
     }
 }

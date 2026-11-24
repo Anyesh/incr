@@ -3,7 +3,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use incr_core::persist_hooks::is_clean;
 use incr_core::{check_value_code, in_value_code, Incr, Runtime, Shared};
@@ -284,6 +284,7 @@ impl AutoCheckpoint {
             let mut failed = false;
             let rt = store.runtime();
             let mut landing = Landing::default();
+            let mut since = Instant::now();
             loop {
                 core.wake.arm();
                 if let Some(new) = core.wake.take_landing() {
@@ -301,13 +302,21 @@ impl AutoCheckpoint {
                     core.wake.due_once();
                 }
                 let polls = !failed && core.trigger.is_some() && !landing.is_empty();
-                let mut poll = || landing.drop_landed(|handle| is_clean(rt, handle));
+                let mut poll = || {
+                    landing.drop_landed(
+                        |handle| is_clean(rt, handle),
+                        |handle| core.dirty.landed(handle),
+                    )
+                };
                 let poll = polls.then_some(&mut poll as &mut dyn FnMut() -> bool);
-                match core.wake.wait(every, poll) {
+                match core.wake.wait(every.map(|every| since + every), poll) {
                     Woke::Stop => return,
                     Woke::Replaced => continue,
                     Woke::Landed if !core.checkpoint_due() => continue,
-                    Woke::Due if core.dirty.unsaved() == 0 => continue,
+                    Woke::Due if core.dirty.unsaved() == 0 => {
+                        since = Instant::now();
+                        continue;
+                    }
                     Woke::Due | Woke::Landed => {}
                 }
                 // A panic in a key's or value's code fails this checkpoint,
@@ -327,6 +336,7 @@ impl AutoCheckpoint {
                     }
                     Ok(Err(_)) | Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
                 }
+                since = Instant::now();
             }
         });
         AutoCheckpoint { wake, deps, thread }

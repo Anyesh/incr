@@ -218,6 +218,21 @@ impl Dirty {
         Carried::Counted
     }
 
+    /// Counts again an entry an attempt carried after an earlier attempt
+    /// had, now that it landed, if it was not computed since: its landing
+    /// is what lets a checkpoint save it.
+    pub(crate) fn landed(&self, handle: ErasedIncr) {
+        let mut shard = self.shard(handle);
+        let Shard { marks, carried } = &mut *shard;
+        if !carried.contains(&handle) {
+            return;
+        }
+        if let Some(current) = marks.get_mut(&handle) {
+            current.mark = self.marks.fetch_add(1, Relaxed) + 1;
+            self.unsaved.fetch_add(1, Relaxed);
+        }
+    }
+
     /// `handle` reached the backend as of `mark`; a later compute keeps it.
     /// Returns the removed entry's key, which may be the last reference to
     /// a user key, for the caller to drop outside its locks.
@@ -321,6 +336,27 @@ mod tests {
         let marks = dirty.attempt(|_| true, &mut Vec::new());
         assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Counted);
         assert_eq!(dirty.unsaved(), 1);
+    }
+
+    #[test]
+    fn an_entry_carried_twice_counts_once_more_when_it_lands() {
+        let (_rt, h) = handles(2);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        dirty.computed(0, h[1], &key());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        dirty.carry(&mark(&marks, h[0]));
+        dirty.carry(&mark(&marks, h[1]));
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Before);
+        assert_eq!(dirty.carry(&mark(&marks, h[1])), Carried::Before);
+        dirty.computed(0, h[1], &key());
+        assert_eq!(dirty.unsaved(), 1);
+        dirty.landed(h[0]);
+        dirty.landed(h[1]);
+        assert_eq!(dirty.unsaved(), 2);
+        dirty.failed();
+        assert_eq!(dirty.unsaved(), 2);
     }
 
     #[test]

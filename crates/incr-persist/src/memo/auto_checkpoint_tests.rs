@@ -59,6 +59,17 @@ impl World {
         }
     }
 
+    fn wait_for_entries(&self, n: u64) {
+        let deadline = Instant::now() + TIMEOUT;
+        while self.memo.stats().entries < n {
+            assert!(
+                Instant::now() < deadline,
+                "the entry was not saved after it landed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn assert_saved_without_errors(&self, entries: u64) {
         let stats = self.memo.stats();
         assert_eq!(
@@ -161,14 +172,7 @@ fn an_entry_that_lands_after_its_woken_checkpoint_is_saved() {
     );
     release.send(()).unwrap();
     assert_eq!(reader.join().unwrap(), 1);
-    let deadline = Instant::now() + TIMEOUT;
-    while w.memo.stats().entries < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "the entry was not saved after it landed"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    w.wait_for_entries(1);
     w.assert_saved_without_errors(1);
 }
 
@@ -197,4 +201,21 @@ fn a_carried_entry_that_lands_below_the_trigger_waits_for_more_computes() {
     w.read(3);
     w.read(4);
     w.wait_for_checkpoints(2);
+}
+
+/// A second checkpoint before a carried entry lands carries it without
+/// counting it again, so its landing must count it for the trigger.
+#[test]
+fn an_entry_carried_twice_is_saved_when_it_lands() {
+    let w = Arc::new(open(1));
+    assert!(w.memo.core.wake.wait_until_blocked(TIMEOUT));
+    let (release, reader) = park_read(&w, 0);
+    assert!(w.memo.core.wake.wait_until_blocked(TIMEOUT));
+    assert!(w.memo.checkpoint().unwrap().unchanged);
+    assert!(w.memo.core.wake.wait_until_blocked(TIMEOUT));
+    assert_eq!(w.memo.stats().unsaved_entries, 0);
+    release.send(()).unwrap();
+    assert_eq!(reader.join().unwrap(), 1);
+    w.wait_for_entries(1);
+    w.assert_saved_without_errors(1);
 }
