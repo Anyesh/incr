@@ -248,7 +248,9 @@ pub fn enter<R>(site: &'static Site, f: impl for<'py> FnOnce(Python<'py>) -> R) 
             f(py)
         });
     }
-    WORKER.with(|w| check_drops(w.drops.get()));
+    if !thread::panicking() {
+        WORKER.with(|w| check_drops(w.drops.get()));
+    }
     space_from_last_gap();
     Python::attach(|py| {
         let _held = Held::begin(site);
@@ -712,5 +714,53 @@ pub mod checks {
         module.add_function(wrap_pyfunction!(_gil_probe_start, module)?)?;
         module.add_function(wrap_pyfunction!(_gil_probe_stop, module)?)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "gil-checks"))]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::Arc;
+
+    struct EntersOnDrop;
+
+    impl Drop for EntersOnDrop {
+        fn drop(&mut self) {
+            static SITE: Site = Site::one("test.enters_on_drop");
+            enter(&SITE, |_| ());
+        }
+    }
+
+    fn message(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn an_entry_while_unwinding_over_the_drop_count_lets_the_first_panic_through() {
+        Python::initialize();
+        let caught = Arc::new(Mutex::new(None));
+        let inside = Arc::clone(&caught);
+        let worker = thread::spawn(move || {
+            run_worker(&mut || {
+                for _ in 0..=MAX_RELEASED_DROPS {
+                    note_value_drop();
+                }
+                let unwound = catch_unwind(AssertUnwindSafe(|| {
+                    let _entry = EntersOnDrop;
+                    panic!("the first panic");
+                }));
+                *inside.lock().unwrap() = unwound.err().map(|payload| message(&*payload));
+            });
+        });
+        let exit = worker
+            .join()
+            .expect_err("the worker's exit reports the drops");
+        assert_eq!(caught.lock().unwrap().as_deref(), Some("the first panic"));
+        assert!(message(&*exit).contains("dropped"), "{}", message(&*exit));
     }
 }
