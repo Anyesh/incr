@@ -16,7 +16,8 @@ use crate::cycle::{CycleStrategy, QueryOpts};
 use crate::handle::{ErasedIncr, Incr};
 use crate::persist_hooks::{
     changed_at, changed_at_erased, frame_doomed, get_or_insert_query_seeded, inspect, inspect_many,
-    pending_handle, probe_unchecked, seed_base, seed_query, Deferred, Reuse, SeedDep, SeedError,
+    is_clean, pending_handle, probe_unchecked, seed_base, seed_query, Deferred, Reuse, SeedDep,
+    SeedError,
 };
 use crate::reclaim_probe::{self, RetireSite};
 use crate::state::NodeState;
@@ -58,6 +59,7 @@ both!(
     table_seeds_only_a_node_it_creates,
     a_panicking_seed_hook_leaves_no_node,
     changed_at_erased_refuses_dead_and_foreign_handles,
+    is_clean_follows_a_query_and_refuses_dead_and_foreign_handles,
     a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle,
     a_seeded_hit_leaves_its_key_and_closure_in_the_bag,
     a_seeded_type_fallback_miss_needs_the_types_fallback,
@@ -703,6 +705,28 @@ fn changed_at_erased_refuses_dead_and_foreign_handles<C: Cells>() {
     let recycled = rt.create_input(3_u64);
     assert_eq!(recycled.slot(), x.slot());
     assert_eq!(changed_at_erased(&rt, x.erase()), None);
+}
+
+fn is_clean_follows_a_query_and_refuses_dead_and_foreign_handles<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let other = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    let q = rt.create_query(move |rt: &Runtime<C>| rt.get(x) + 1);
+    assert!(!is_clean(&rt, q.erase()));
+    assert_eq!(rt.get(q), 2);
+    assert!(is_clean(&rt, q.erase()));
+    assert!(!is_clean(&other, q.erase()));
+    rt.set(x, 2);
+    assert!(!is_clean(&rt, q.erase()));
+    assert_eq!(rt.get(q), 3);
+    assert!(is_clean(&rt, q.erase()));
+    let gone = rt.create_input(4_u64);
+    rt.delete_node(gone);
+    assert!(!is_clean(&rt, gone.erase()));
+    let recycled = rt.create_input(5_u64);
+    assert_eq!(recycled.slot(), gone.slot());
+    assert!(is_clean(&rt, recycled.erase()));
+    assert!(!is_clean(&rt, gone.erase()));
 }
 
 /// A speculative run stashes `q` and lands it back New; a seed then lands

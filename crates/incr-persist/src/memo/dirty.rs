@@ -11,6 +11,18 @@ use super::table_core::{Encoded, KeyPart};
 
 const SHARDS: usize = 16;
 
+/// What [`Dirty::carry`] did with an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Carried {
+    /// Not carried: computed again since the attempt, or not computed
+    /// since the attempt before.
+    No,
+    /// Carried and counted unsaved again.
+    Counted,
+    /// Carried by an earlier attempt and not computed since.
+    Before,
+}
+
 /// A dirty entry as an attempt copies it.
 #[derive(Clone)]
 pub(crate) struct Record {
@@ -185,20 +197,42 @@ impl Dirty {
     /// not inspect, if it computed since the attempt before: its compute
     /// may not have landed yet. Once per compute, so an entry left stale
     /// is not counted at every attempt.
-    pub(crate) fn carry(&self, record: &Record) {
+    pub(crate) fn carry(&self, record: &Record) -> Carried {
         let mut shard = self.shard(record.handle);
         let Shard { marks, carried } = &mut *shard;
         let Some(current) = marks
             .get_mut(&record.handle)
             .filter(|marked| marked.mark == record.mark)
         else {
-            return;
+            return Carried::No;
         };
-        if record.mark <= self.previous.load(Relaxed) || !carried.insert(record.handle) {
-            return;
+        if carried.contains(&record.handle) {
+            return Carried::Before;
         }
+        if record.mark <= self.previous.load(Relaxed) {
+            return Carried::No;
+        }
+        carried.insert(record.handle);
         current.mark = self.marks.fetch_add(1, Relaxed) + 1;
         self.unsaved.fetch_add(1, Relaxed);
+        Carried::Counted
+    }
+
+    /// Counts as unsaved a dirty entry that landed with no compute, unless
+    /// something counted it since the attempt began: an attempt that
+    /// carried it again did not, and its landing is what lets a
+    /// checkpoint save it.
+    pub(crate) fn landed(&self, handle: ErasedIncr) {
+        let mut shard = self.shard(handle);
+        let attempt = self.attempt.load(Relaxed);
+        if let Some(current) = shard
+            .marks
+            .get_mut(&handle)
+            .filter(|marked| marked.mark <= attempt)
+        {
+            current.mark = self.marks.fetch_add(1, Relaxed) + 1;
+            self.unsaved.fetch_add(1, Relaxed);
+        }
     }
 
     /// `handle` reached the backend as of `mark`; a later compute keeps it.
@@ -294,15 +328,52 @@ mod tests {
         dirty.computed(0, h[0], &key());
         dirty.evicted(0, h[1], Vec::new());
         let marks = dirty.attempt(|_| true, &mut Vec::new());
-        dirty.carry(&mark(&marks, h[0]));
-        dirty.carry(&mark(&marks, h[1]));
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Counted);
+        assert_eq!(dirty.carry(&mark(&marks, h[1])), Carried::No);
         assert_eq!(dirty.unsaved(), 1);
         let marks = dirty.attempt(|_| true, &mut Vec::new());
-        dirty.carry(&mark(&marks, h[0]));
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Before);
         assert_eq!(dirty.unsaved(), 0);
         dirty.computed(0, h[0], &key());
         let marks = dirty.attempt(|_| true, &mut Vec::new());
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Counted);
+        assert_eq!(dirty.unsaved(), 1);
+    }
+
+    #[test]
+    fn an_entry_carried_twice_counts_once_more_when_it_lands() {
+        let (_rt, h) = handles(2);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        dirty.computed(0, h[1], &key());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
         dirty.carry(&mark(&marks, h[0]));
+        dirty.carry(&mark(&marks, h[1]));
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Before);
+        assert_eq!(dirty.carry(&mark(&marks, h[1])), Carried::Before);
+        dirty.computed(0, h[1], &key());
+        assert_eq!(dirty.unsaved(), 1);
+        dirty.landed(h[0]);
+        dirty.landed(h[1]);
+        assert_eq!(dirty.unsaved(), 2);
+        dirty.failed();
+        assert_eq!(dirty.unsaved(), 2);
+    }
+
+    #[test]
+    fn a_landing_counts_an_entry_once_per_attempt() {
+        let (_rt, h) = handles(1);
+        let dirty = Dirty::new();
+        dirty.computed(0, h[0], &key());
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        dirty.carry(&mark(&marks, h[0]));
+        dirty.landed(h[0]);
+        assert_eq!(dirty.unsaved(), 1);
+        let marks = dirty.attempt(|_| true, &mut Vec::new());
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Before);
+        dirty.landed(h[0]);
+        dirty.landed(h[0]);
         assert_eq!(dirty.unsaved(), 1);
     }
 
@@ -312,11 +383,11 @@ mod tests {
         let dirty = Dirty::new();
         dirty.computed(0, h[0], &key());
         let marks = dirty.attempt(|_| true, &mut Vec::new());
-        dirty.carry(&mark(&marks, h[0]));
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Counted);
         dirty.failed();
         assert_eq!(dirty.unsaved(), 1);
         let marks = dirty.attempt(|_| true, &mut Vec::new());
-        dirty.carry(&mark(&marks, h[0]));
+        assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Counted);
         assert_eq!(dirty.unsaved(), 1);
     }
 }

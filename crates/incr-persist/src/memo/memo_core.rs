@@ -258,10 +258,17 @@ impl Default for Wake {
 struct Waking {
     stop: bool,
     due: bool,
+    /// What a checkpoint since the thread's last [`Wake::take_landing`]
+    /// left landing.
+    landing: Option<Landing>,
     #[cfg(test)]
     dues: u64,
     #[cfg(test)]
     held_skips: u64,
+    #[cfg(test)]
+    blocked: bool,
+    #[cfg(test)]
+    landings: u64,
 }
 
 impl Wake {
@@ -305,6 +312,30 @@ impl Wake {
         waking.held_skips >= n
     }
 
+    /// Waits up to `timeout` until the thread is blocked with nothing
+    /// due: whether it is.
+    #[cfg(test)]
+    pub(crate) fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        let waking = self.lock();
+        let (waking, _) = self
+            .cond
+            .wait_timeout_while(waking, timeout, |w| !w.blocked || w.due)
+            .unwrap_or_else(PoisonError::into_inner);
+        waking.blocked && !waking.due
+    }
+
+    /// Waits up to `timeout` until [`Self::wait`] found a carried entry
+    /// landed `n` times: whether it did.
+    #[cfg(test)]
+    pub(crate) fn wait_for_landings(&self, n: u64, timeout: Duration) -> bool {
+        let waking = self.lock();
+        let (waking, _) = self
+            .cond
+            .wait_timeout_while(waking, timeout, |w| w.landings < n)
+            .unwrap_or_else(PoisonError::into_inner);
+        waking.landings >= n
+    }
+
     /// Records a checkpoint skipped for an open staged batch or unlogged
     /// scope, for [`Self::resume`].
     pub(crate) fn skip(&self) {
@@ -319,9 +350,11 @@ impl Wake {
     }
 
     /// Lets the next compute that finds the trigger reached wake the
-    /// thread.
+    /// thread. A swap, not a store: when it reads a compute's
+    /// [`Self::due_once`], the thread's next unsaved count sees that
+    /// compute's.
     pub(crate) fn arm(&self) {
-        self.armed.store(true, Ordering::Release);
+        self.armed.swap(true, Ordering::AcqRel);
     }
 
     /// [`Self::due`] once per [`Self::arm`].
@@ -336,34 +369,140 @@ impl Wake {
         self.cond.notify_all();
     }
 
-    /// Waits until a checkpoint is due, `every` has passed, or a stop:
-    /// `true` for a stop. `None` waits without an interval.
-    pub(crate) fn wait(&self, every: Option<Duration>) -> bool {
-        let deadline = every.map(|every| Instant::now() + every);
+    /// Hands the thread what a checkpoint left landing, replacing what an
+    /// earlier one left.
+    pub(crate) fn await_landing(&self, landing: Landing) {
+        self.lock().landing = Some(landing);
+        self.cond.notify_all();
+    }
+
+    /// What a checkpoint left landing since the last call, if one ran.
+    pub(crate) fn take_landing(&self) -> Option<Landing> {
+        self.lock().landing.take()
+    }
+
+    /// Waits until a checkpoint is due or `deadline` has passed
+    /// ([`Woke::Due`]), a checkpoint left new entries landing, a stop, or
+    /// `poll` returns `true`. It calls `poll` after [`FIRST_POLL`], then
+    /// at gaps doubling up to [`LAST_POLL`].
+    pub(crate) fn wait(
+        &self,
+        deadline: Option<Instant>,
+        mut poll: Option<&mut dyn FnMut() -> bool>,
+    ) -> Woke {
+        let mut gap = FIRST_POLL;
         let mut waking = self.lock();
         loop {
             if waking.stop {
-                return true;
+                return Woke::Stop;
             }
             if std::mem::take(&mut waking.due) {
-                return false;
+                return Woke::Due;
             }
-            waking = match deadline {
+            if waking.landing.is_some() {
+                return Woke::Replaced;
+            }
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| deadline <= now) {
+                return Woke::Due;
+            }
+            let until = match (deadline, poll.is_some()) {
+                (Some(deadline), true) => Some(deadline.min(now + gap)),
+                (None, true) => Some(now + gap),
+                (deadline, false) => deadline,
+            };
+            #[cfg(test)]
+            {
+                waking.blocked = true;
+                self.cond.notify_all();
+            }
+            waking = match until {
                 None => self
                     .cond
                     .wait(waking)
                     .unwrap_or_else(PoisonError::into_inner),
-                Some(deadline) => {
-                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                        return false;
-                    };
+                Some(until) => {
                     self.cond
-                        .wait_timeout(waking, left)
+                        .wait_timeout(waking, until.saturating_duration_since(now))
                         .unwrap_or_else(PoisonError::into_inner)
                         .0
                 }
             };
+            #[cfg(test)]
+            {
+                waking.blocked = false;
+            }
+            if let Some(poll) = poll.as_mut() {
+                if Instant::now() >= now + gap {
+                    drop(waking);
+                    let landed = poll();
+                    waking = self.lock();
+                    if landed {
+                        #[cfg(test)]
+                        {
+                            waking.landings += 1;
+                            self.cond.notify_all();
+                        }
+                        return Woke::Landed;
+                    }
+                    gap = (gap * 2).min(LAST_POLL);
+                }
+            }
         }
+    }
+}
+
+/// Why [`Wake::wait`] returned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Woke {
+    Stop,
+    Due,
+    /// A checkpoint left new entries landing.
+    Replaced,
+    /// `poll` found an entry landed.
+    Landed,
+}
+
+const FIRST_POLL: Duration = Duration::from_millis(1);
+const LAST_POLL: Duration = Duration::from_secs(1);
+
+/// The entries a checkpoint carried and could not take, each with whether
+/// it counted that entry unsaved: no compute reports their landing.
+#[derive(Default)]
+pub(crate) struct Landing {
+    entries: Vec<(ErasedIncr, bool)>,
+}
+
+impl Landing {
+    pub(crate) fn push(&mut self, handle: ErasedIncr, counted: bool) {
+        self.entries.push((handle, counted));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// How many of the entries the checkpoint counted unsaved.
+    pub(crate) fn counted(&self) -> u64 {
+        self.entries.iter().filter(|&&(_, counted)| counted).count() as u64
+    }
+
+    /// Drops the entries `landed` accepts, handing those the checkpoint
+    /// did not count to `uncounted`: whether there were any.
+    pub(crate) fn drop_landed(
+        &mut self,
+        landed: impl Fn(ErasedIncr) -> bool,
+        mut uncounted: impl FnMut(ErasedIncr),
+    ) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|&(handle, counted)| {
+            let dropped = landed(handle);
+            if dropped && !counted {
+                uncounted(handle);
+            }
+            !dropped
+        });
+        self.entries.len() < before
     }
 }
 
@@ -421,7 +560,8 @@ impl<C: MemoCells> MemoCore<C> {
     /// Records that `table`'s entry `handle` computed, and wakes the
     /// automatic-checkpoint thread when a checkpoint is due. A count that
     /// reached the trigger without a compute, carried or left by a failed
-    /// checkpoint, wakes it at the next compute.
+    /// checkpoint, wakes it at the next compute; a carried entry's landing
+    /// also wakes it when that leaves a checkpoint due.
     pub(crate) fn computed(&self, table: u32, handle: ErasedIncr, key: &KeyPart) {
         let unsaved = self.dirty.computed(table, handle, key);
         self.reached(unsaved);
@@ -441,8 +581,14 @@ impl<C: MemoCells> MemoCore<C> {
 
     /// Whether `checkpoint_after_entries` entries are unsaved.
     pub(crate) fn checkpoint_due(&self) -> bool {
+        self.checkpoint_due_besides(0)
+    }
+
+    /// [`Self::checkpoint_due`] leaving out `carried` of the unsaved
+    /// entries.
+    pub(crate) fn checkpoint_due_besides(&self, carried: u64) -> bool {
         self.trigger
-            .is_some_and(|trigger| self.dirty.unsaved() >= trigger)
+            .is_some_and(|trigger| self.dirty.unsaved().saturating_sub(carried) >= trigger)
     }
 
     /// The stats with what the backend holds and lacks now.
