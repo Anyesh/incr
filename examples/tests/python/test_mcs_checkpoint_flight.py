@@ -383,3 +383,29 @@ def test_a_memo_handle_dropped_on_a_second_thread_lets_checkpoint_run():
             assert time.monotonic() < deadline
             time.sleep(0.005)
     assert memo.stats()["unsaved_entries"] == 0
+
+
+class DecodeRefusing(JsonCodec):
+    def decode(self, data):
+        value = json.loads(data)
+        if value == 7 * 7 + 7:
+            raise LookupError("refused 56")
+        return value
+
+
+@pytest.mark.parametrize("flight", [False, True], ids=["checkpoint", "flight"])
+def test_a_mismatch_names_the_codecs_exception_as_its_cause(flight):
+    store = persist.Store.open(persist.MemoryBackend(), build_id="b1")
+    base = store.input("base", 7, JsonCodec())
+    table = store.memo_table(
+        "sq", 1, JsonCodec(), DecodeRefusing(), lambda ctx, k: k * k + ctx.get(base)
+    )
+    memo = store.open_memo(persist.MemoryMemo())
+    for k in range(20):
+        store.runtime.get(memo.get_or_insert(table, k))
+    with pytest.raises(ValueError, match="round-trip") as raised:
+        if flight:
+            poll_to_end(memo.begin_checkpoint())
+        else:
+            memo.checkpoint()
+    assert isinstance(raised.value.__cause__, LookupError)

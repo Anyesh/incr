@@ -624,10 +624,13 @@ where
             })
         })?;
         let on_worker = worker.and_then(|worker| core.registry().take_failure_of(worker));
-        let cause = core.registry().take_failure();
-        let done = match (done, on_worker) {
+        let on_caller = core.registry().take_failure();
+        let (done, on_worker) = match (done, on_worker) {
             (Err(_), Some(raised)) => return Err(raised),
-            (done, _) => done.map_err(|error| crate::persist_error::<B::Exceptions>(py, error))?,
+            (done, on_worker) => (
+                done.map_err(|error| crate::persist_error::<B::Exceptions>(py, error))?,
+                on_worker,
+            ),
         };
         if saved(&done) {
             self.auto().retry_above = None;
@@ -644,7 +647,7 @@ where
                 })
                 .collect::<Vec<_>>();
             let err = PyValueError::new_err(mismatch_message(&tables));
-            err.set_cause(py, cause);
+            err.set_cause(py, on_worker.or(on_caller));
             return Err(err);
         }
         Ok(done)
