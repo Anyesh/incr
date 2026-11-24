@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -11,7 +12,7 @@ use super::{
 };
 use crate::{
     Backend, ConditionalAppend, Error, FileBackend, Kind, Local, MemoryBackend, Position,
-    ReadOutcome, Record, Result, SnapshotId,
+    ReadOutcome, Record, Result, SnapshotId, ValueScope,
 };
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -73,15 +74,25 @@ fn on_worker() -> bool {
     std::thread::current().name() == Some("incr-checkpoint")
 }
 
+/// A gate that a [`Wrap`] opens when the store asks for its snapshot id
+/// once armed.
+#[derive(Default)]
+struct Asked {
+    armed: AtomicBool,
+    gate: Gate,
+}
+
 /// A [`MemoryBackend`] whose compaction may wait at a gate, on a checkpoint
 /// worker only, or pull as a test says, which may decline concurrent
-/// compaction, and whose reads may stop at a position.
+/// compaction, whose reads may stop at a position, and which may tell when
+/// the store asks for its snapshot id.
 struct Wrap {
     inner: MemoryBackend,
     concurrent: bool,
     gate: Option<Arc<Gate>>,
     pull: Option<Box<Pull>>,
     read_upto: Option<Arc<AtomicU64>>,
+    asked: Option<Arc<Asked>>,
 }
 
 impl Wrap {
@@ -92,6 +103,7 @@ impl Wrap {
             gate: None,
             pull: None,
             read_upto: None,
+            asked: None,
         }
     }
 
@@ -139,6 +151,11 @@ impl Backend for Wrap {
     }
 
     fn snapshot_id(&self) -> Result<Option<SnapshotId>> {
+        if let Some(asked) = self.asked.as_ref().filter(|_| !on_worker()) {
+            if asked.armed.load(Ordering::SeqCst) {
+                asked.gate.open();
+            }
+        }
         self.inner.snapshot_id()
     }
 
@@ -1283,41 +1300,68 @@ fn second_store_checkpoint_above_upto_then_declares_a_forgotten_key() {
     assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
 }
 
-/// A flight whose backend parks after its commit until the test lets it
-/// return; `meet` runs in between, while a thread lets the backend go
-/// after a while. `meet` must wait for the verdict and settle the flight
-/// as adopted.
+thread_local! {
+    /// How many times this thread entered [`counted_wait`].
+    static WAITS: Cell<u32> = const { Cell::new(0) };
+    /// A gate [`counted_wait`] opens before it waits.
+    static WAIT_OPENS: RefCell<Option<Arc<Gate>>> = const { RefCell::new(None) };
+}
+
+/// A value scope's `wait` that counts its entries on this thread and opens
+/// the gate in [`WAIT_OPENS`] before it waits.
+fn counted_wait(wait: &mut dyn FnMut()) {
+    WAITS.set(WAITS.get() + 1);
+    WAIT_OPENS.with(|gate| {
+        if let Some(gate) = &*gate.borrow() {
+            gate.open();
+        }
+    });
+    wait();
+}
+
+fn counting_waits() -> Options {
+    Options {
+        value_scope: Some(ValueScope::new(Arc::new(())).waiting(counted_wait)),
+        ..Options::default()
+    }
+}
+
+/// A flight whose backend parks after its commit until the call `meet`
+/// makes asks for the backend's snapshot id. `meet` must wait for the
+/// verdict inside the value scope's `wait` and settle the flight as
+/// adopted.
 fn a_reconcile_meeting_own_waits_and_adopts(meet: impl FnOnce(&Fx<Wrap>)) {
     let log = MemoryBackend::new();
     let committed = Arc::new(Gate::default());
-    let go = Arc::new(Gate::default());
+    let asked = Arc::new(Asked::default());
     let backend = {
-        let (committed, go) = (Arc::clone(&committed), Arc::clone(&go));
-        Wrap::pulling(&log, move |inner, upto, records| {
-            let done = inner.compact_streamed(upto, records);
-            committed.open();
-            go.wait();
-            done
-        })
+        let (committed, asked) = (Arc::clone(&committed), Arc::clone(&asked));
+        Wrap {
+            asked: Some(Arc::clone(&asked)),
+            ..Wrap::pulling(&log, move |inner, upto, records| {
+                let done = inner.compact_streamed(upto, records);
+                committed.open();
+                asked.gate.wait();
+                done
+            })
+        }
     };
-    let fx = Fx::over(&log, backend, Options::default());
+    let fx = Fx::over(&log, backend, counting_waits());
     fx.populate(50);
     let begun = fx.store.stats().unwrap().position;
     let flight = fx.begin();
     assert!(!flight.poll(&fx.store, WAIT).unwrap());
     committed.wait();
-    let release = {
-        let go = Arc::clone(&go);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            go.open();
-        })
-    };
+    asked.armed.store(true, Ordering::SeqCst);
+    WAITS.set(0);
     meet(&fx);
-    assert!(*go.open.lock().unwrap(), "the call waited for the backend");
-    release.join().unwrap();
+    assert_eq!(WAITS.get(), 1, "the call waited inside the scope's wait");
+    assert_eq!(
+        fx.store.stats().unwrap().snapshot_position,
+        begun,
+        "the call waited for the verdict and settled it"
+    );
     assert_eq!(flight.result(&fx.store, Some(WAIT)).unwrap(), Some(begun));
-    assert_eq!(fx.store.stats().unwrap().snapshot_position, begun);
     fx.store.set(fx.x, 3).unwrap();
     fx.store.checkpoint().unwrap();
     assert_eq!(reopened(&fx.log), reopened_of(&fx));
@@ -1335,6 +1379,21 @@ fn reconcile_wait_a_declare_meeting_own_adopts() {
     a_reconcile_meeting_own_waits_and_adopts(|fx| {
         fx.store.input::<u32>("idle", IDLE).unwrap();
     });
+}
+
+#[test]
+fn result_waits_for_the_worker_inside_the_scope_wait() {
+    let log = MemoryBackend::new();
+    let gate = Arc::new(Gate::default());
+    let fx = Fx::over(&log, Wrap::gated(&log, &gate), counting_waits());
+    fx.populate(50);
+    let flight = fx.begin();
+    WAITS.set(0);
+    WAIT_OPENS.set(Some(Arc::clone(&gate)));
+    let at = flight.result(&fx.store, Some(WAIT));
+    WAIT_OPENS.set(None);
+    assert!(WAITS.get() > 0, "result waited inside the scope's wait");
+    assert!(matches!(at, Ok(Some(_))), "{at:?}");
 }
 
 const SEEDS: [u64; 4] = [1, 7, 42, 1009];
@@ -1488,7 +1547,8 @@ fn poll_until<B: Backend + 'static>(fx: &Fx<B>, flight: &StoreCheckpoint, reache
 /// applied across polls and the rest while its worker waits at `at`,
 /// given half the snapshot's records; the snapshot is a blocking
 /// checkpoint's at begin and a reopen equals a store that never
-/// checkpointed.
+/// checkpointed. The script declares nothing at the committed park, where a
+/// declare waits for the verdict; the `reconcile_wait_*` tests cover that.
 fn parked_with_edits(at: fn(u64) -> StorePark) {
     let before = |fx: &Fx<MemoryBackend>| fx.populate(SCRIPT_ROWS);
     let half = half_of(before);

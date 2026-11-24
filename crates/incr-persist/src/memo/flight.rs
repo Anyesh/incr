@@ -25,7 +25,7 @@ use super::table_core::{KeyPart, Snap};
 use super::{CheckpointInput, CheckpointStats, Checkpointed, GenId, TableDesc};
 use crate::backend::Backend;
 use crate::flight::{Control, Flight, FlightToken, Inbox, Parcel, Verdict};
-use crate::value_context::{EncodeMismatch, ValueScope};
+use crate::value_context::{wait_released, EncodeMismatch, ValueScope};
 use crate::{Error, Result};
 
 /// Slots a prune moves, or written entries a finish applies, between two
@@ -360,7 +360,9 @@ impl<C: MemoCells> CoreRef<C> {
                 },
             };
             if matches!(flight.stage, Stage::Sealed) {
-                flight.flight.wait(left);
+                wait_released(self.scope.as_ref(), || {
+                    flight.flight.wait(left);
+                });
             }
         }
     }

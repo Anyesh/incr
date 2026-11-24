@@ -21,7 +21,7 @@ use super::logged::{Declared, LoggedKey};
 use super::rows::RowBatch;
 use super::{fold_logged, Locked, State, Store, TRUNCATED};
 use crate::flight::{Chunked, Control, Flight, FlightToken, Inbox, Verdict, Waiter};
-use crate::value_context::idle;
+use crate::value_context::wait_released;
 use crate::{Backend, Error, Kind, Position, Record, Result, SnapshotId, ValueScope};
 
 /// How long [`StoreCheckpoint::result`] polls before it looks at the clock
@@ -73,8 +73,9 @@ pub struct StoreCheckpoint {
 impl StoreCheckpoint {
     /// Hands the worker what the captures take for about `budget`, plus
     /// one unit of table slots, and settles the flight once the worker's
-    /// verdict is in. `Ok(true)` once the snapshot is committed and
-    /// adopted; the worker's error or [`Error::Cancelled`] once it is not
+    /// verdict is in. `Ok(true)` once the snapshot is committed, adopted
+    /// or, when a `Declare` applied since begin differs from the live one,
+    /// left for the store's next reconcile; the worker's error or [`Error::Cancelled`] once it is not
     /// going to be, and [`Error::Corrupt`], poisoning the store, when the
     /// backend returned before it pulled the whole snapshot.
     pub fn poll<B: Backend + 'static>(
@@ -85,9 +86,10 @@ impl StoreCheckpoint {
         store.poll_flight(&self.token, budget)
     }
 
-    /// Polls until the flight ends and returns the position its snapshot
-    /// covers, or `Ok(None)` once `timeout` passes with the flight still
-    /// open. Waits for the worker without the store's lock.
+    /// Polls until the flight ends and returns the position its committed
+    /// snapshot covers, or `Ok(None)` once `timeout` passes with the flight
+    /// still open. Waits for the worker without the store's lock, inside
+    /// the value scope's `wait`.
     pub fn result<B: Backend + 'static>(
         &self,
         store: &Store<Local, B>,
@@ -106,7 +108,9 @@ impl StoreCheckpoint {
                 },
             };
             if let Some(waiter) = store.idle_flight_waiter(&self.token)? {
-                waiter.wait(left);
+                wait_released(store.value_scope().as_ref(), || {
+                    waiter.wait(left);
+                });
             }
         }
     }
@@ -419,7 +423,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// Settles an open flight whose snapshot id is `id` and whose fold the
     /// backend pulled to its end, once its verdict is in, and returns
     /// whether there was one. Such a backend is in the flight's commit
-    /// step, so the wait runs inside the value scope's `idle`; an `id` met
+    /// step, so the wait runs inside the value scope's `wait`; an `id` met
     /// before the end was pulled is another writer's.
     pub(super) fn settle_committing(&self, state: &mut State<C>, id: SnapshotId) -> Result<bool> {
         let Some(flight) = state
@@ -431,7 +435,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             return Ok(false);
         };
         let waiter = flight.flight.waiter();
-        idle(flight.scope.as_ref(), || {
+        wait_released(flight.scope.as_ref(), || {
             waiter.wait(None);
         });
         self.settle_flight(state)?;

@@ -66,6 +66,7 @@ pub struct ValueScope {
     state: Arc<dyn Any + Send + Sync>,
     hold: Option<fn(&mut dyn FnMut())>,
     idle: Option<fn(&mut dyn FnMut())>,
+    wait: Option<fn(&mut dyn FnMut())>,
     start: Option<fn(&mut dyn FnMut())>,
 }
 
@@ -75,6 +76,7 @@ impl ValueScope {
             state,
             hold: None,
             idle: None,
+            wait: None,
             start: None,
         }
     }
@@ -111,6 +113,21 @@ impl ValueScope {
         }
     }
 
+    /// This scope with `wait`, which runs a blocking wait for a checkpoint
+    /// worker on the thread that owns the store or memo, possibly while
+    /// incr-persist holds its own locks there, such as a store's lock
+    /// across the wait for a worker that is committing. Unlike `idle`, it
+    /// must give up whatever the worker may need to finish, whatever thread
+    /// it runs on, since the worker waits for that while this thread waits
+    /// for the worker; the Python bindings release the GIL. `wait` must
+    /// call its argument exactly once, on the calling thread.
+    pub fn waiting(self, wait: fn(&mut dyn FnMut())) -> Self {
+        ValueScope {
+            wait: Some(wait),
+            ..self
+        }
+    }
+
     /// This scope with `start`, which runs the whole life of a checkpoint
     /// worker thread. incr-persist spawns the thread, makes this scope
     /// current on it and calls `start` once with the worker's body, so a
@@ -140,6 +157,12 @@ pub(crate) fn hold(scope: Option<&ValueScope>, f: impl FnOnce()) {
 /// idle, or directly without one.
 pub(crate) fn idle(scope: Option<&ValueScope>, f: impl FnOnce()) {
     run_inside(scope.and_then(|scope| scope.idle), f, "idle");
+}
+
+/// Runs `f`, a caller's blocking wait for a checkpoint worker, inside
+/// `scope`'s wait, or directly without one.
+pub(crate) fn wait_released(scope: Option<&ValueScope>, f: impl FnOnce()) {
+    run_inside(scope.and_then(|scope| scope.wait), f, "wait");
 }
 
 /// Runs `f`, a checkpoint worker's body, inside `scope`'s worker start, or
