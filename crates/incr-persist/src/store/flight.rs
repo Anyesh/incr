@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use incr_core::{Cells, Local, Yielder};
 
+use super::after_lock::AfterLock;
 use super::binding::Folded;
 use super::logged::LoggedKey;
 use super::rows::RowBatch;
@@ -166,10 +167,18 @@ impl<C: Cells> State<C> {
         };
         flight.flight.cancel();
         self.end_captures(&flight);
-        self.flight.ended = Some(Ended {
+        self.set_ended(Some(Ended {
             control: Arc::clone(flight.flight.control()),
             outcome,
-        });
+        }));
+    }
+
+    /// Replaces how the last flight ended; a panic payload the replaced
+    /// one still holds drops after the lock.
+    fn set_ended(&mut self, ended: Option<Ended>) {
+        if let Some(replaced) = mem::replace(&mut self.flight.ended, ended) {
+            self.after.push(replaced);
+        }
     }
 
     /// [`Self::abort_flight`] for a store being poisoned.
@@ -185,7 +194,7 @@ impl<C: Cells> State<C> {
     fn end_captures(&self, flight: &StoreFlight) {
         for table in &flight.tables {
             if let Some(binding) = self.bindings.get(&table.binding) {
-                binding.end_capture();
+                binding.end_capture(&self.after);
             }
         }
     }
@@ -195,7 +204,10 @@ impl<C: Cells> State<C> {
     /// the binding goes.
     pub(super) fn finish_capture(&mut self, id: u32) {
         let State {
-            flight, bindings, ..
+            flight,
+            bindings,
+            after,
+            ..
         } = self;
         let Some(flight) = &mut flight.open else {
             return;
@@ -209,9 +221,9 @@ impl<C: Cells> State<C> {
         };
         let binding = &bindings[&id];
         loop {
-            let (rows, done) = binding.capture_step(SLICE, flight.scope.clone());
+            let (rows, done) = binding.capture_step(SLICE, flight.scope.clone(), after);
             if let Some(rows) = rows {
-                flight.flight.send(ToWorker::Rows(table.job, rows));
+                send(&flight.flight, ToWorker::Rows(table.job, rows), after);
             }
             if done {
                 break;
@@ -241,20 +253,20 @@ impl<C: Cells, B: Backend> Store<C, B> {
             }
             Verdict::Truncated => {
                 state.poison();
-                state.flight.ended = Some(Ended {
+                state.set_ended(Some(Ended {
                     control: Arc::clone(flight.flight.control()),
                     outcome: Outcome::Reported,
-                });
+                }));
                 return Err(Error::Corrupt(TRUNCATED));
             }
             Verdict::Failed(error) => Outcome::Failed(error),
             Verdict::Cancelled => Outcome::Failed(Error::Cancelled),
             Verdict::Panicked(payload) => Outcome::Panicked(payload),
         };
-        state.flight.ended = Some(Ended {
+        state.set_ended(Some(Ended {
             control: Arc::clone(flight.flight.control()),
             outcome,
-        });
+        }));
         Ok(false)
     }
 
@@ -399,7 +411,7 @@ impl<B: Backend + 'static> Store<Local, B> {
             Ok(started) => started,
             Err(error) => {
                 for table in &tables {
-                    state.bindings[&table.binding].end_capture();
+                    state.bindings[&table.binding].end_capture(&state.after);
                 }
                 return Err(error);
             }
@@ -415,7 +427,7 @@ impl<B: Backend + 'static> Store<Local, B> {
             forgotten,
             scope,
         });
-        state.flight.ended = None;
+        state.set_ended(None);
         Ok(StoreCheckpoint { token, upto })
     }
 
@@ -447,7 +459,10 @@ impl<B: Backend + 'static> Store<Local, B> {
 /// once every table is done.
 fn capture_slice(state: &mut State<Local>, deadline: Instant) {
     let State {
-        flight, bindings, ..
+        flight,
+        bindings,
+        after,
+        ..
     } = state;
     let flight = flight.open.as_mut().expect("an open flight");
     if flight.flight.control().stopped() {
@@ -455,15 +470,15 @@ fn capture_slice(state: &mut State<Local>, deadline: Instant) {
     }
     while !flight.sealed {
         let Some(table) = flight.tables.get_mut(flight.next) else {
-            flight.flight.send(ToWorker::Seal);
+            send(&flight.flight, ToWorker::Seal, after);
             flight.sealed = true;
             return;
         };
         if let Some(binding) = bindings.get(&table.binding).filter(|_| !table.done) {
             let left = deadline.saturating_duration_since(Instant::now());
-            let (rows, done) = binding.capture_step(left, flight.scope.clone());
+            let (rows, done) = binding.capture_step(left, flight.scope.clone(), after);
             if let Some(rows) = rows {
-                flight.flight.send(ToWorker::Rows(table.job, rows));
+                send(&flight.flight, ToWorker::Rows(table.job, rows), after);
             }
             table.done = done;
         } else {
@@ -475,6 +490,14 @@ fn capture_slice(state: &mut State<Local>, deadline: Instant) {
         if Instant::now() >= deadline {
             return;
         }
+    }
+}
+
+/// Sends `message` to `flight`'s worker; one the stopped worker no longer
+/// takes drops after the lock.
+fn send(flight: &Flight<ToWorker, Vec<usize>>, message: ToWorker, after: &AfterLock) {
+    if let Some(unsent) = flight.send(message) {
+        after.push(unsent);
     }
 }
 

@@ -141,17 +141,20 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
 
     /// Hands over what the capture took during about `budget`, at least
     /// one unit of table slots, and whether it is done, which removes the
-    /// capture. Without a capture, nothing and done.
+    /// capture. Without a capture, nothing and done. Rows the step
+    /// discarded go to `bag`.
     fn capture_step(
         &self,
         _budget: Duration,
         _scope: Option<ValueScope>,
+        _bag: &AfterLock,
     ) -> (Option<Box<dyn RowBatch>>, bool) {
         (None, true)
     }
 
-    /// Removes the capture, if one is installed.
-    fn end_capture(&self) {}
+    /// Removes the capture, if one is installed, moving what it took to
+    /// `bag`.
+    fn end_capture(&self, _bag: &AfterLock) {}
 
     #[cfg(test)]
     fn capture_installed(&self) -> bool {

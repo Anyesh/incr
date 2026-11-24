@@ -1502,15 +1502,17 @@ where
         &self,
         budget: Duration,
         scope: Option<ValueScope>,
+        bag: &AfterLock,
     ) -> (Option<Box<dyn RowBatch>>, bool) {
         let step = self.keyed.capture_step(budget);
+        bag.push_vec(step.discarded);
         let rows = (!step.rows.is_empty())
             .then(|| Box::new(PairBatch(Parcel::new(step.rows, scope))) as Box<dyn RowBatch>);
         (rows, step.done)
     }
 
-    fn end_capture(&self) {
-        self.keyed.end_capture();
+    fn end_capture(&self, bag: &AfterLock) {
+        bag.push_vec(self.keyed.end_capture());
     }
 
     #[cfg(test)]

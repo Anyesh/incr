@@ -1101,10 +1101,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if self.holder.is_current() {
             self.holder.request_poison();
         } else {
-            self.state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .poison();
+            let mut drained = self.drained();
+            let mut state = Ordered::take(LockKind::Store, || {
+                self.state.lock().unwrap_or_else(PoisonError::into_inner)
+            });
+            state.poison();
+            drained.take_from(&state.after);
         }
     }
 

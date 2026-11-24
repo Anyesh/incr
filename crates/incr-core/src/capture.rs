@@ -24,6 +24,10 @@ pub struct CaptureStep<T> {
     /// Whether the capture is finished: every slot was taken and the
     /// table no longer keeps capture state.
     pub done: bool,
+    /// Content a scan cloned that is not part of the capture, because a
+    /// write changed the table between the scan and the step. Handed over
+    /// so that its values drop where the caller drops them.
+    pub discarded: Vec<T>,
 }
 
 pub(crate) struct Capture<O> {
@@ -98,6 +102,7 @@ impl<O> Capture<O> {
         CaptureStep {
             rows: std::mem::take(&mut self.out),
             done: self.cursor >= capacity,
+            discarded: Vec::new(),
         }
     }
 

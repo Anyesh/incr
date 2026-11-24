@@ -335,6 +335,7 @@ impl<T> HashedMultiset<T> {
             None => CaptureStep {
                 rows: Vec::new(),
                 done: true,
+                discarded: Vec::new(),
             },
         };
         if step.done {

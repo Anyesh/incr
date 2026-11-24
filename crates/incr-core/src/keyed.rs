@@ -244,6 +244,10 @@ enum Slot<P, R> {
 /// (partitioning, partition hash) pairs.
 type PartSlots = Vec<(usize, u64)>;
 
+/// A keyed capture scan: the index epoch it ran at, the slot it stopped
+/// at, and the pairs it cloned.
+type KeyedScan<O> = (u64, usize, Vec<O>);
+
 /// The table behind a [`KeyIndex`]: one bucket per key, found by the key's
 /// hash, holding that key's pairs with their ranks. Open addressing with
 /// stored hashes, as `HashedMultiset`: only a lookup runs user code, only
@@ -2319,59 +2323,77 @@ where
     pub(crate) fn capture_step_by(&self, budget: Duration, unit: usize) -> CaptureStep<(P, R)> {
         refuse_value_code();
         crate::dep_stack::unrecorded_lookup::<C>();
+        match self.capture_scan(budget, unit) {
+            Some(scan) => self.capture_settle(scan),
+            None => CaptureStep {
+                rows: Vec::new(),
+                done: true,
+                discarded: Vec::new(),
+            },
+        }
+    }
+
+    /// The scan half of [`Self::capture_step`], under the read guard: the
+    /// epoch it ran at, where it stopped and what it cloned, or `None`
+    /// with no capture installed.
+    pub(crate) fn capture_scan(&self, budget: Duration, unit: usize) -> Option<KeyedScan<(P, R)>> {
         let start = Instant::now();
-        let (epoch, end, run) = {
-            let table = self.index.table.read();
-            let Some(capture) = table.capture.as_deref() else {
-                return CaptureStep {
-                    rows: Vec::new(),
-                    done: true,
-                };
-            };
-            let epoch = C::u64_load_relaxed(&self.index.epoch);
-            let mut run = Vec::new();
-            let end = value_code::run(|| {
-                let from = capture.cursor();
-                capture::scan(from, table.slots.len(), unit, start, budget, |i| {
-                    if let Slot::Full(b) = &table.slots[i] {
-                        if !capture.settled(i) {
-                            run.extend(b.pairs().iter().cloned());
-                        }
+        let table = self.index.table.read();
+        let capture = table.capture.as_deref()?;
+        let epoch = C::u64_load_relaxed(&self.index.epoch);
+        let mut run = Vec::new();
+        let end = value_code::run(|| {
+            let from = capture.cursor();
+            capture::scan(from, table.slots.len(), unit, start, budget, |i| {
+                if let Slot::Full(b) = &table.slots[i] {
+                    if !capture.settled(i) {
+                        run.extend(b.pairs().iter().cloned());
                     }
-                })
-            });
-            (epoch, end, run)
-        };
+                }
+            })
+        });
+        Some((epoch, end, run))
+    }
+
+    /// The write half of [`Self::capture_step`]: adds `scan` to the
+    /// capture unless a write moved the epoch since, and hands over what
+    /// the capture took.
+    pub(crate) fn capture_settle(
+        &self,
+        (epoch, end, run): KeyedScan<(P, R)>,
+    ) -> CaptureStep<(P, R)> {
         let mut table = self.index.table.write();
         let current = C::u64_load_relaxed(&self.index.epoch) == epoch;
         let capacity = table.slots.len();
-        let (step, stale) = match table.capture.as_deref_mut() {
+        let step = match table.capture.as_deref_mut() {
             Some(capture) if current => {
                 capture.advance(end, run);
-                (capture.drain(capacity), Vec::new())
+                capture.drain(capacity)
             }
-            Some(capture) => (capture.drain(capacity), run),
-            None => (
-                CaptureStep {
-                    rows: Vec::new(),
-                    done: true,
-                },
-                run,
-            ),
+            Some(capture) => CaptureStep {
+                discarded: run,
+                ..capture.drain(capacity)
+            },
+            None => CaptureStep {
+                rows: Vec::new(),
+                done: true,
+                discarded: run,
+            },
         };
         if step.done {
             table.capture = None;
         }
         drop(table);
-        drop(stale);
         step
     }
 
-    /// Removes the capture, if one is installed, and drops what it took.
-    pub fn end_capture(&self) {
+    /// Removes the capture, if one is installed, and hands back what it
+    /// took and had not handed over, for the caller to drop.
+    #[must_use = "the capture's pairs drop where the returned Vec does"]
+    pub fn end_capture(&self) -> Vec<(P, R)> {
         refuse_value_code();
         let capture = self.index.table.write().capture.take();
-        drop(capture);
+        capture.map_or_else(Vec::new, |capture| (*capture).into_rows())
     }
 
     /// Whether a capture is installed.

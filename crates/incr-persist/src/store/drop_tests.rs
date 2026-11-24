@@ -8,7 +8,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::keyed_tests::{Probed, PROBED};
-use super::{Input, Options, PendingWrite, PersistedCollection, PersistedKeyed, Store};
+use super::{
+    Input, Options, PendingWrite, PersistedCollection, PersistedKeyed, Store, StoreCheckpoint,
+};
 use crate::{Backend, Cells, Error, Local, MemoryBackend, Shared};
 
 macro_rules! local_and_shared {
@@ -373,4 +375,114 @@ fn another_thread_waits_for_a_store_call_and_succeeds() {
     let handle = waiter.recv().unwrap();
     assert!(started.load(Ordering::SeqCst));
     assert_eq!(handle.join().unwrap().unwrap(), at);
+}
+
+const VERDICT: Duration = Duration::from_secs(20);
+
+type CapturedFlight = (
+    Store<Local, MemoryBackend>,
+    PersistedCollection<Probed, Local>,
+    PersistedKeyed<u32, Probed, Local>,
+    StoreCheckpoint,
+);
+
+/// A Local store over `log` with a plain and a keyed collection of `Probed`
+/// values, in flight with pre-images of both in their captures: the
+/// writes after begin change every element and pair begin captured.
+fn captured_flight(log: &MemoryBackend) -> CapturedFlight {
+    let a = open::<Local, _>(log.clone());
+    let col: PersistedCollection<Probed, Local> = a.collection("c").unwrap();
+    let kr: PersistedKeyed<u32, Probed, Local> = a.keyed_collection("k").unwrap();
+    col.insert(&a, p("c1")).unwrap();
+    col.insert(&a, p("c2")).unwrap();
+    a.upsert(&kr, 1, p("r1")).unwrap();
+    a.upsert(&kr, 2, p("r2")).unwrap();
+    PROBED.set((0, 0));
+    let flight = a.begin_checkpoint().unwrap();
+    assert!(a.capture_installed());
+    col.delete(&a, &p("c1")).unwrap();
+    col.delete(&a, &p("c2")).unwrap();
+    a.remove(&kr, &1).unwrap();
+    a.remove(&kr, &2).unwrap();
+    (a, col, kr, flight)
+}
+
+fn assert_no_drop_under_a_lock() {
+    let (all, under) = PROBED.get();
+    assert!(all > 0, "the flight dropped no Probed value");
+    assert_eq!(under, 0, "{under} of {all} drops ran under a lock");
+}
+
+#[test]
+fn a_flight_settled_after_its_commit_by_a_write_drops_no_row_under_a_lock() {
+    let log = MemoryBackend::new();
+    let (a, col, kr, flight) = captured_flight(&log);
+    assert!(!flight.poll(&a, VERDICT).unwrap());
+    assert!(a.wait_flight_verdict(VERDICT));
+    a.upsert(&kr, 3, p("r3")).unwrap();
+    col.insert(&a, p("c3")).unwrap();
+    assert!(flight.poll(&a, Duration::ZERO).unwrap());
+    drop((a, flight));
+    assert_no_drop_under_a_lock();
+}
+
+#[test]
+fn a_cancelled_flight_settled_by_a_write_drops_no_row_under_a_lock() {
+    let log = MemoryBackend::new();
+    let (a, _col, kr, flight) = captured_flight(&log);
+    flight.cancel();
+    assert!(a.wait_flight_verdict(VERDICT));
+    a.upsert(&kr, 3, p("r3")).unwrap();
+    assert!(!a.capture_installed());
+    assert!(matches!(
+        flight.poll(&a, Duration::ZERO),
+        Err(Error::Cancelled)
+    ));
+    drop((a, flight));
+    assert_no_drop_under_a_lock();
+}
+
+#[test]
+fn a_flight_ended_by_a_poison_drops_no_row_under_a_lock() {
+    let log = MemoryBackend::new();
+    let (a, _col, _kr, flight) = captured_flight(&log);
+    drop(a.unlogged_scope().unwrap());
+    assert!(matches!(a.stats(), Err(Error::Poisoned)));
+    assert!(!a.capture_installed());
+    assert_no_drop_under_a_lock();
+    drop((a, flight));
+}
+
+#[test]
+fn a_flight_ended_by_a_rebuild_drops_no_row_under_a_lock() {
+    let log = MemoryBackend::new();
+    let (a, _col, _kr, flight) = captured_flight(&log);
+    let b = open::<Local, _>(log.clone());
+    let x: Input<u32> = b.input("x", 0).unwrap();
+    b.set(x, 1).unwrap();
+    b.checkpoint().unwrap();
+    a.refresh().unwrap();
+    assert!(!a.capture_installed());
+    assert!(matches!(
+        flight.poll(&a, Duration::ZERO),
+        Err(Error::Cancelled)
+    ));
+    drop((a, b, flight));
+    assert_no_drop_under_a_lock();
+}
+
+#[test]
+fn an_undeclare_mid_flight_drops_no_row_under_a_lock() {
+    let log = MemoryBackend::new();
+    let (a, col, kr, flight) = captured_flight(&log);
+    a.undeclare(&kr).unwrap();
+    flight.cancel();
+    assert!(a.wait_flight_verdict(VERDICT));
+    a.undeclare(&col).unwrap();
+    assert!(matches!(
+        flight.poll(&a, Duration::ZERO),
+        Err(Error::Cancelled)
+    ));
+    drop((a, flight));
+    assert_no_drop_under_a_lock();
 }

@@ -1453,6 +1453,7 @@
 16	capture::tests::plain_capture_survives_both_rehashes_mid_scan
 2	capture::tests::ending_a_capture_removes_it_and_its_rows
 1	capture::tests::a_shared_collection_refuses_a_capture
+1	capture::tests::a_stale_scan_run_drops_with_the_step
 0	hashed_multiset::tests::a_write_that_skips_the_settling_lookup_panics_under_a_capture
 0	keyed::tests::a_key_table_write_that_skips_the_stage_clone_panics_under_a_capture
 62	keyed::tests::keyed_capture_survives_both_rehashes_mid_scan

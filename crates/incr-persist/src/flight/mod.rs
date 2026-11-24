@@ -150,10 +150,14 @@ impl<M: Send + 'static, T: Send + 'static> Flight<M, T> {
 
 impl<M, T> Flight<M, T> {
     /// Hands `message` to the worker. Once the worker has stopped, the
-    /// message is dropped here instead.
-    pub(crate) fn send(&self, message: M) {
-        if self.outbox.send(message).is_ok() {
-            self.control.wake();
+    /// message comes back instead.
+    pub(crate) fn send(&self, message: M) -> Option<M> {
+        match self.outbox.send(message) {
+            Ok(()) => {
+                self.control.wake();
+                None
+            }
+            Err(unsent) => Some(unsent.0),
         }
     }
 
