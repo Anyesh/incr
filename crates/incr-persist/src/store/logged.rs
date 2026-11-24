@@ -400,9 +400,27 @@ impl LoggedKeys {
         None
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn shared(&self, key: &str) -> Option<Arc<LoggedKey>> {
         self.0.get(key).cloned()
+    }
+
+    /// Folds a `Delete` of `key`, which keeps only its `Declare`, without
+    /// copying an entry a holder of [`Self::shared`] keeps.
+    fn delete(&mut self, key: &str) {
+        let Some(logged) = self.0.get_mut(key) else {
+            return;
+        };
+        match &logged.declared {
+            None => {
+                self.0.remove(key);
+            }
+            Some(declared) => {
+                *logged = Arc::new(LoggedKey {
+                    declared: Some(declared.clone()),
+                    ..LoggedKey::default()
+                });
+            }
+        }
     }
 
     pub fn insert(&mut self, key: String, logged: LoggedKey) {
@@ -442,6 +460,11 @@ impl Index<&str> for LoggedKeys {
 /// of a key without a `Declare` does, so the key stops counting as known.
 pub(crate) fn fold(keys: &mut LoggedKeys, mut record: Record) {
     let key = take_key(&mut record);
+    match record {
+        Record::Delete { .. } => return keys.delete(&key),
+        Record::Forget { .. } => return keys.remove(&key),
+        _ => {}
+    }
     if let Some(logged) = keys.get_mut(&key) {
         logged.apply(record);
         if logged.is_empty() {
