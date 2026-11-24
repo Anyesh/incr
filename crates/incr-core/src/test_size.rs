@@ -5,6 +5,9 @@
 /// `full`, or a reduced size when `INCR_TEST_REDUCED` is set (the TSan job
 /// sets it). The reduced size keeps at least 1,000 nodes, or `full` if that
 /// is smaller, so each test still reaches the depth its mechanism needs.
+/// A test that recurses once per node must take its size from here: TSan's
+/// shadow stack holds 64Ki calls per thread and does not check its end, so
+/// a deeper stack corrupts TSan's memory and a later test crashes.
 pub(crate) fn test_size(full: usize) -> usize {
     if std::env::var_os("INCR_TEST_REDUCED").is_some() {
         reduced(full)
