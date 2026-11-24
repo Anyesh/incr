@@ -1174,12 +1174,14 @@ fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
 }
 
 fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
-    let sizes: &[usize] = if cfg!(miri) {
-        &[8]
+    let sizes = if cfg!(miri) {
+        vec![8]
     } else {
-        &[1000, 2000, 4000]
+        let mut sizes = [1000, 2000, 4000].map(crate::test_size::test_size).to_vec();
+        sizes.dedup();
+        sizes
     };
-    for &n in sizes {
+    for n in sizes {
         let n = scaled(n);
         let (first, work) = contained_chain::<C>(frames, n);
         assert!(
@@ -1270,7 +1272,11 @@ fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, 
 }
 
 fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
-    let n = scaled(if cfg!(miri) { 8 } else { 4000 });
+    let n = scaled(if cfg!(miri) {
+        8
+    } else {
+        crate::test_size::test_size(4000)
+    });
     let (first, second, pushes) = panicking_chain_path_steps::<C>(frames, n);
     assert!(
         first <= 8 * n as u64 && second <= 8 * n as u64,
