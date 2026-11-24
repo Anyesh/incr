@@ -62,6 +62,7 @@ fn a_waiter_takes_over_only_a_flight_that_stays_open() {
     }
     assert!(!leave_flight());
     enter_flight();
+    let opened = std::time::Instant::now();
     for _ in 0..STUCK_AFTER {
         assert!(
             !a.wound_if_stuck(claim(1), &mut patience),
@@ -69,7 +70,7 @@ fn a_waiter_takes_over_only_a_flight_that_stays_open() {
         );
     }
     assert!(
-        !a.wound_if_stuck(claim(1), &mut patience),
+        !a.wound_if_stuck(claim(1), &mut patience) || opened.elapsed() >= STUCK_FOR,
         "open for under STUCK_FOR"
     );
     std::thread::sleep(STUCK_FOR);
@@ -130,7 +131,9 @@ fn a_discard_the_engine_raises_again_is_back_in_flight() {
 /// A waiter's take-over attempts on `a`'s attempt through `4 * STUCK_FOR`
 /// on a thread of its own, after `first` registers what it waits on and
 /// holds: whether it took the attempt over, and how often the wound order
-/// refused it.
+/// refused it. It stops at a take-over, a refusal, or once its patience
+/// has counted `4 * STUCK_AFTER` checks over `4 * STUCK_FOR`, so a waiter
+/// descheduled under load still reaches the wound decision.
 fn take_over_from(
     a: &Attempt,
     rt: crate::handle::RuntimeId,
@@ -140,17 +143,29 @@ fn take_over_from(
     std::thread::spawn(move || {
         let _waiting = first(rt);
         let mut patience = Patience::default();
-        let until = std::time::Instant::now() + 4 * STUCK_FOR;
+        let mut checks = 0;
+        let mut refused = 0;
+        let mut counting_since = None;
         let took = loop {
+            // Judged before the check, whose patience then counts at least
+            // this much outside time.
+            let due = counting_since.is_some_and(|since: std::time::Instant| {
+                checks > 4 * STUCK_AFTER && since.elapsed() >= 4 * STUCK_FOR
+            });
             if a.wound_if_stuck((rt, 1), &mut patience) {
                 break true;
             }
-            if std::time::Instant::now() >= until {
+            checks += 1;
+            refused += crate::waits::take_refusals();
+            if checks == 2 {
+                counting_since = Some(std::time::Instant::now());
+            }
+            if refused > 0 || due {
                 break false;
             }
             std::thread::yield_now();
         };
-        (took, crate::waits::take_refusals())
+        (took, refused + crate::waits::take_refusals())
     })
     .join()
     .unwrap()

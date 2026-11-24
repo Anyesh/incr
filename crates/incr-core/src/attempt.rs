@@ -338,7 +338,7 @@ impl Attempt {
             return true;
         }
         #[cfg(all(test, not(loom)))]
-        let parked_holder = w & IN_FLIGHT == 0 && self.word.parked.load(Ordering::Acquire) != 0;
+        let parked_holder = self.word.parked.load(Ordering::Acquire) != 0;
         #[cfg(any(not(test), loom))]
         let parked_holder = false;
         if w & (IN_FLIGHT | HOLDING) == 0 || parked_holder {
