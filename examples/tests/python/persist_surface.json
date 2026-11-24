@@ -815,6 +815,11 @@
   ],
   "doc": "An open memo: `memo.get_or_insert(table, key)` gives an entry's node, and\n`memo.checkpoint()` writes the live entries to the backend.",
   "members": {
+   "begin_checkpoint": {
+    "doc": "Starts a memo checkpoint that runs as a flight and returns its\n`PendingCheckpoint`: each `poll` inspects entries for about its\nbudget, a worker thread encodes and writes the generation, and\nthe polls after it finish the entries it wrote; `result()`\nreturns what `checkpoint()` returns. Raises `PersistError` for\na memo backend whose class does not set\n`concurrent_compaction = True` or has no\n`write_generation_streamed`. Until the flight ends,\n`checkpoint()` and `begin_checkpoint()` raise `Busy` and the\nautomatic checkpoint waits.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
    "checkpoint": {
     "doc": "Writes every live entry whose dependencies are persisted to the\nbackend, as a delta on the current chain or as a new full\ngeneration, and returns a dict: the counts `written`, `unkept`,\n`merged`, `corrupt`, `evicted`, `oversized` and `unchanged`; `delta`\n(a delta was written), `fresh_written` (entries computed since the\nlast checkpoint that it wrote), `tombstones`, `bytes_appended`,\n`chain_depth` (deltas on the chain afterwards) and `compacted` (a\nfull write replaced a chain holding deltas); and `times`, the\nnanoseconds of the `snapshot`, `merge` and `write` steps as\n`snapshot_ns`, `merge_ns` and `write_ns`. Raises\n`Busy` when another handle is checkpointing. Raises `ValueError`\nnaming the table when an entry's key or value did not round-trip\nthrough its codec: the generation was still written, without that\nentry, which is recomputed on the next run. Raises `PersistError`,\nwriting nothing, while an `apply=\"on_write\"` batch or an overlay is\nopen. That refusal is best effort: a batch or scope another thread\nopens after the check is seen by the snapshot, and the content\nfingerprints stored with each entry keep a restore correct.",
     "kind": "method_descriptor",
@@ -887,6 +892,10 @@
     "kind": "method_descriptor",
     "signature": "(self, /, upto, records)"
    },
+   "concurrent_compaction": {
+    "doc": "Returns True when the argument is true, False otherwise.\nThe builtins True and False are the only two instances of the class bool.\nThe class bool is a subclass of the class int, and cannot be subclassed.",
+    "kind": "bool"
+   },
    "load_snapshot": {
     "doc": null,
     "kind": "method_descriptor",
@@ -930,6 +939,10 @@
     "doc": "Create and return a new object.  See help(type) for accurate signature.",
     "kind": "builtin_function_or_method",
     "signature": "(*args, **kwargs)"
+   },
+   "concurrent_compaction": {
+    "doc": "Returns True when the argument is true, False otherwise.\nThe builtins True and False are the only two instances of the class bool.\nThe class bool is a subclass of the class int, and cannot be subclassed.",
+    "kind": "bool"
    },
    "load": {
     "doc": null,
@@ -993,6 +1006,40 @@
   },
   "signature": "()"
  },
+ "incr.persist.PendingCheckpoint": {
+  "bases": [
+   "object"
+  ],
+  "doc": "A checkpoint in flight. `poll(budget_seconds=0.05)` copies for about\nthe budget on this thread and returns `True` once the checkpoint is\ncommitted and finished, raising what failed it (`PersistError` once it\nwas cancelled); `result(timeout=None)` drives it to the end, waiting for\nthe worker with the GIL released, and returns what `checkpoint()`\nreturns, raising `TimeoutError` with the flight still open when the\ntimeout passes; `cancel()` stops a flight that has not committed.\n`poll`, `result`, `cancel` and leaving a `with` block raise\n`RuntimeError` on any thread but the one that began the flight. Leaving\na `with` block, or freeing the handle, abandons the flight: the store\nor memo ends it on its own once the worker has stopped, and until then\n`checkpoint()` raises `Busy`.",
+  "members": {
+   "__enter__": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "__exit__": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, *_exc)"
+   },
+   "cancel": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
+   },
+   "poll": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, budget_seconds=0.05)"
+   },
+   "result": {
+    "doc": null,
+    "kind": "method_descriptor",
+    "signature": "(self, /, timeout=None)"
+   }
+  },
+  "signature": "()"
+ },
  "incr.persist.PersistError": {
   "bases": [
    "RuntimeError"
@@ -1019,6 +1066,11 @@
     "doc": "Starts a batch of `b.set`, `b.insert`, `b.delete`, `b.replace`,\n`b.upsert`, `b.remove` and `b.reconcile`, appended to the log as\none run, so a restore sees all of them or none.\n\n`apply=\"on_exit\"` (the default) collects the writes and appends and\napplies them on leaving the block; a block that raises writes\nnothing, and reads inside it see the values from before it.\n\n`apply=\"on_write\"` applies each write at once, so reads inside the\nblock see it (on a Shared runtime other threads read it too, before\nthe run lands), and appends the run on leaving the block with the\nbackend's `append_at`, right after the position the store had\napplied; a backend without `append_at` refuses it with\n`PersistError`. Entering catches up with the log and runs a due\n`auto_checkpoint_records` checkpoint, so none falls between the\nbatch's records. Until the run lands every other store call that\nwrites, declares, refreshes or checkpoints, a memo checkpoint and a\nsecond batch raise `PersistError`. If the append raises, the block\nraises it and the batch keeps its run: `b.retry()` appends it again\nand lands it at most once. A block that raises, or a batch dropped\nbefore its run lands, poisons the store, since the runtime holds\nwrites the log never receives: every later store call raises\n`PersistError` and the way out is to close the store and open the\nlog again. A backend that fences this writer keeps raising, so its\nway out is the same.",
     "kind": "method_descriptor",
     "signature": "(self, /, apply='on_exit')"
+   },
+   "begin_checkpoint": {
+    "doc": "Starts a checkpoint that runs as a flight and returns its\n`PendingCheckpoint`: each `poll` copies the store's tables for\nabout its budget, and a worker thread folds, encodes and writes\nthe snapshot while writes go on. Refuses what `checkpoint()`\nrefuses, and raises `PersistError` for a backend whose class\ndoes not set `concurrent_compaction = True` or has no\n`compact_streamed`. Until the flight ends, `checkpoint()` and\n`begin_checkpoint()` raise `Busy` and the automatic checkpoint\nwaits.",
+    "kind": "method_descriptor",
+    "signature": "(self, /)"
    },
    "checkpoint": {
     "doc": "Folds the log into a snapshot, compacting it, and returns the\nposition the snapshot covers.",
@@ -1132,6 +1184,10 @@
  "incr.persist._conformance_cases": {
   "doc": null,
   "signature": "(kind)"
+ },
+ "incr.persist._join_checkpoint_workers": {
+  "doc": "Cancels every checkpoint flight still running and waits, with the GIL\nreleased, for each worker thread to end. Registered with `atexit`.",
+  "signature": "()"
  },
  "incr.persist.conformance.ConformanceFailure": {
   "doc": "A backend failed a conformance case; `case` names it.",
