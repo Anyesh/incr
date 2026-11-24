@@ -160,7 +160,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             park(StagedPark::Landed);
             for (position, record) in (after.0 + 1..).map(Position).zip(run) {
                 state.applied = position;
-                state.since_checkpoint += 1;
+                state.count_applied();
                 state.notify(position, record, Origin::Local);
             }
         }

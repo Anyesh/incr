@@ -66,6 +66,7 @@ pub struct ValueScope {
     state: Arc<dyn Any + Send + Sync>,
     hold: Option<fn(&mut dyn FnMut())>,
     idle: Option<fn(&mut dyn FnMut())>,
+    wait: Option<fn(&mut dyn FnMut())>,
     start: Option<fn(&mut dyn FnMut())>,
 }
 
@@ -75,6 +76,7 @@ impl ValueScope {
             state,
             hold: None,
             idle: None,
+            wait: None,
             start: None,
         }
     }
@@ -111,6 +113,21 @@ impl ValueScope {
         }
     }
 
+    /// This scope with `wait`, which runs a blocking wait for a checkpoint
+    /// worker on the thread that owns the store or memo, possibly while
+    /// incr-persist holds its own locks there, such as a store's lock
+    /// across the wait for a worker that is committing. Unlike `idle`, it
+    /// must give up whatever the worker may need to finish, whatever thread
+    /// it runs on, since the worker waits for that while this thread waits
+    /// for the worker; the Python bindings release the GIL. `wait` must
+    /// call its argument exactly once, on the calling thread.
+    pub fn waiting(self, wait: fn(&mut dyn FnMut())) -> Self {
+        ValueScope {
+            wait: Some(wait),
+            ..self
+        }
+    }
+
     /// This scope with `start`, which runs the whole life of a checkpoint
     /// worker thread. incr-persist spawns the thread, makes this scope
     /// current on it and calls `start` once with the worker's body, so a
@@ -140,6 +157,12 @@ pub(crate) fn hold(scope: Option<&ValueScope>, f: impl FnOnce()) {
 /// idle, or directly without one.
 pub(crate) fn idle(scope: Option<&ValueScope>, f: impl FnOnce()) {
     run_inside(scope.and_then(|scope| scope.idle), f, "idle");
+}
+
+/// Runs `f`, a caller's blocking wait for a checkpoint worker, inside
+/// `scope`'s wait, or directly without one.
+pub(crate) fn wait_released(scope: Option<&ValueScope>, f: impl FnOnce()) {
+    run_inside(scope.and_then(|scope| scope.wait), f, "wait");
 }
 
 /// Runs `f`, a checkpoint worker's body, inside `scope`'s worker start, or
@@ -210,6 +233,85 @@ pub(crate) fn in_memo<R>(table: &str, part: MemoPart, f: impl FnOnce() -> R) -> 
         part,
     });
     f()
+}
+
+#[cfg(test)]
+pub(crate) mod wait_probe {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::ValueScope;
+
+    /// How long a worker lets a caller that entered the wait stay there
+    /// before it records whether the caller still is.
+    const SETTLE: Duration = Duration::from_millis(20);
+
+    /// Whether a caller is inside [`counting_waits`]'s `wait`, and what a
+    /// checkpoint worker saw of that when it let itself finish.
+    #[derive(Default)]
+    pub(crate) struct WaitProbe {
+        inside: AtomicBool,
+        seen: Mutex<Option<bool>>,
+    }
+
+    impl WaitProbe {
+        /// On the worker, before it finishes: waits up to `timeout` for the
+        /// caller to enter the wait, then records whether it is still inside
+        /// [`SETTLE`] later. Only the first call records.
+        pub(crate) fn record(&self, timeout: Duration) {
+            if self.seen().is_some() {
+                return;
+            }
+            let started = Instant::now();
+            while !self.inside.load(SeqCst) && started.elapsed() < timeout {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(SETTLE);
+            *self.seen.lock().unwrap() = Some(self.inside.load(SeqCst));
+        }
+
+        pub(crate) fn seen(&self) -> Option<bool> {
+            *self.seen.lock().unwrap()
+        }
+    }
+
+    thread_local! {
+        static WAITS: Cell<u32> = const { Cell::new(0) };
+        static PROBE: RefCell<Option<Arc<WaitProbe>>> = const { RefCell::new(None) };
+    }
+
+    fn counted_wait(wait: &mut dyn FnMut()) {
+        WAITS.set(WAITS.get() + 1);
+        let probe = PROBE.with(|probe| probe.borrow().clone());
+        if let Some(probe) = &probe {
+            probe.inside.store(true, SeqCst);
+        }
+        wait();
+        if let Some(probe) = &probe {
+            probe.inside.store(false, SeqCst);
+        }
+    }
+
+    /// A value scope whose `wait` counts its entries on the calling thread
+    /// and marks the probe [`watch`] set there inside while its argument
+    /// runs.
+    pub(crate) fn counting_waits() -> ValueScope {
+        ValueScope::new(Arc::new(())).waiting(counted_wait)
+    }
+
+    /// Resets this thread's wait count and makes `probe` the one its waits
+    /// mark.
+    pub(crate) fn watch(probe: Option<Arc<WaitProbe>>) {
+        WAITS.set(0);
+        PROBE.set(probe);
+    }
+
+    pub(crate) fn waits() -> u32 {
+        WAITS.get()
+    }
 }
 
 #[cfg(test)]

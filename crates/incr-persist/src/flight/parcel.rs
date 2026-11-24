@@ -35,6 +35,10 @@ impl<T> Parcel<T> {
         self.items.push_back(item);
     }
 
+    pub(crate) fn get(&self, at: usize) -> Option<&T> {
+        self.items.get(at)
+    }
+
     /// Moves every value of `other` to the end of this parcel.
     pub(crate) fn append(&mut self, mut other: Parcel<T>) {
         self.items.append(&mut other.items);

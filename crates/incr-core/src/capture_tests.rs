@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
@@ -403,8 +404,8 @@ fn ending_a_capture_removes_it_and_its_rows() {
     kc.begin_capture();
     col.delete(&rt, &v(3, 0));
     kc.remove(&rt, &v(3, 0));
-    col.end_capture();
-    kc.end_capture();
+    assert_eq!(col.end_capture().len(), 1, "the delete settled one element");
+    assert_eq!(kc.end_capture().len(), 1, "the remove settled one pair");
     assert!(!col.capture_installed());
     assert!(!kc.capture_installed());
     let empty = col.capture_step(Duration::ZERO);
@@ -423,4 +424,44 @@ fn ending_a_capture_removes_it_and_its_rows() {
 fn a_shared_collection_refuses_a_capture() {
     let rt = Runtime::<crate::Shared>::new();
     rt.create_collection::<V>().begin_capture();
+}
+
+thread_local! {
+    static DROPS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Counted(u8);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        DROPS.set(DROPS.get() + 1);
+    }
+}
+
+/// A write between a step's scan and its settle makes the scan's run
+/// stale: the step hands it over for the caller to drop instead of
+/// dropping it under the table's lock.
+#[test]
+fn a_stale_scan_run_drops_with_the_step() {
+    let rt = Runtime::<Local>::new();
+    let col: IncrCollection<Counted, Local> = rt.create_collection();
+    let kc = KeyedCollection::<Counted, u8, Local, (Counted, u8), u128>::new(&rt);
+    for k in 0..4 {
+        col.insert(&rt, Counted(k));
+        kc.upsert(&rt, Counted(k), 1);
+    }
+    col.begin_capture();
+    kc.begin_capture();
+    let plain = col.capture_scan(Duration::MAX, 64);
+    let keyed = kc.capture_scan(Duration::MAX, 64);
+    col.insert(&rt, Counted(9));
+    kc.upsert(&rt, Counted(9), 1);
+    let before = DROPS.get();
+    let plain = col.capture_settle(plain);
+    let keyed = kc.capture_settle(keyed.expect("a capture is installed"));
+    assert_eq!(DROPS.get(), before, "a settle dropped its stale run");
+    assert!(!plain.done && !keyed.done);
+    drop((plain, keyed));
+    assert_eq!(DROPS.get(), before + 8, "the steps hand both runs over");
 }

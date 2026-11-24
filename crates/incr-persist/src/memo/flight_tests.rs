@@ -10,6 +10,7 @@ use crate::memo::{
     BuildId, Chain, CheckpointStats, DeltaHeader, EncodedEntry, GenHeader, GenId, Generation,
     IndexItem, Memo, MemoBackend, MemoBuilder, MemoOptions, MemoTable, MemoryMemo, Tombstone,
 };
+use crate::value_context::wait_probe::{self, WaitProbe};
 use crate::{Error, Input, Local, MemoryBackend, Options, Result, Store};
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -30,10 +31,19 @@ impl Fx {
         Fx::with(log, backend, MemoOptions::new(BuildId::Fixed(0x24c)))
     }
 
+    fn with(log: &MemoryBackend, backend: impl MemoBackend + 'static, options: MemoOptions) -> Fx {
+        Fx::with_store(log, backend, options, Options::default())
+    }
+
     // A memo opens over an `Arc` of its store, a Local one included.
     #[allow(clippy::arc_with_non_send_sync)]
-    fn with(log: &MemoryBackend, backend: impl MemoBackend + 'static, options: MemoOptions) -> Fx {
-        let store = Arc::new(Store::<Local, _>::open(log.clone(), Options::default()).unwrap());
+    fn with_store(
+        log: &MemoryBackend,
+        backend: impl MemoBackend + 'static,
+        options: MemoOptions,
+        store_options: Options,
+    ) -> Fx {
+        let store = Arc::new(Store::<Local, _>::open(log.clone(), store_options).unwrap());
         let y = store.input("y", 1_u64).unwrap();
         let w = store.input("w", 0_u64).unwrap();
         let (yh, wh) = (y.handle(), w.handle());
@@ -436,11 +446,14 @@ fn a_flight_abandoned_in_the_middle_of_the_prune_loses_no_seed() {
     assert_eq!(live_seeds(&fx), 5_000);
 }
 
-/// Fails its writes while `failing` is set.
+/// Fails its writes while `failing` is set; with a `probe`, its first write
+/// records there whether the caller waits for it inside the value scope's
+/// `wait`.
 #[derive(Clone)]
 struct Failing {
     inner: MemoryMemo,
     failing: Arc<AtomicBool>,
+    probe: Option<Arc<WaitProbe>>,
     flagged: bool,
 }
 
@@ -449,11 +462,15 @@ impl Failing {
         Failing {
             inner: MemoryMemo::new(),
             failing: Arc::new(AtomicBool::new(true)),
+            probe: None,
             flagged: true,
         }
     }
 
     fn check(&self) -> Result<()> {
+        if let Some(probe) = &self.probe {
+            probe.record(WAIT);
+        }
         if self.failing.load(SeqCst) {
             Err(Error::ReadOnly)
         } else {
@@ -776,6 +793,41 @@ fn a_backend_that_stops_pulling_early_fails_the_flight() {
     ));
     assert_eq!(fx.memo.stats().unsaved_entries, 100);
     assert!(fx.stage().is_none());
+}
+
+#[test]
+fn result_waits_for_the_worker_inside_the_scope_wait() {
+    let probe = Arc::new(WaitProbe::default());
+    let backend = Failing {
+        probe: Some(Arc::clone(&probe)),
+        ..Failing::new()
+    };
+    backend.failing.store(false, SeqCst);
+    let store_options = Options {
+        value_scope: Some(wait_probe::counting_waits()),
+        ..Options::default()
+    };
+    let fx = Fx::with_store(
+        &MemoryBackend::new(),
+        backend,
+        MemoOptions::new(BuildId::Fixed(0x24c)),
+        store_options,
+    );
+    for k in 0..100 {
+        fx.leaf(k);
+    }
+    let flight = fx.memo.begin_checkpoint().unwrap();
+    wait_probe::watch(Some(Arc::clone(&probe)));
+    let stats = flight.result(&fx.memo, Some(WAIT));
+    let waits = wait_probe::waits();
+    wait_probe::watch(None);
+    assert!(waits > 0, "result entered the scope's wait");
+    assert_eq!(
+        probe.seen(),
+        Some(true),
+        "the worker finished while result waited inside the scope's wait"
+    );
+    assert!(matches!(stats, Ok(Some(_))), "{stats:?}");
 }
 
 #[test]

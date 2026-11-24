@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ops::{Bound, Index};
+use std::sync::Arc;
 
 use crate::{Kind, Record};
 use incr_core::Yielder;
@@ -357,14 +359,112 @@ pub(crate) fn changes_between(
     false
 }
 
-/// Every key the log knows, by name.
-pub(crate) type LoggedKeys = BTreeMap<String, LoggedKey>;
+/// Every key the log knows, by name. Entries are shared, so a holder of
+/// [`LoggedKeys::shared`] keeps the entry as it was: every change goes
+/// through [`Arc::make_mut`], which copies an entry only while it is
+/// shared.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LoggedKeys(BTreeMap<String, Arc<LoggedKey>>);
+
+impl LoggedKeys {
+    pub fn new() -> Self {
+        LoggedKeys(BTreeMap::new())
+    }
+
+    pub fn get(&self, key: &str) -> Option<&LoggedKey> {
+        self.0.get(key).map(|logged| &**logged)
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut LoggedKey> {
+        self.0.get_mut(key).map(Arc::make_mut)
+    }
+
+    /// The entry for `key`, a default one inserted when there is none.
+    pub fn get_or_default(&mut self, key: String) -> &mut LoggedKey {
+        Arc::make_mut(self.0.entry(key).or_default())
+    }
+
+    /// Empties `key`'s elements and returns them, or, while a holder of
+    /// [`Self::shared`] keeps the entry, gives the key a copy without
+    /// them and returns `None`, so the elements are never copied.
+    pub fn take_elements(&mut self, key: &str) -> Option<Elements> {
+        let logged = self.0.get_mut(key)?;
+        if let Some(logged) = Arc::get_mut(logged) {
+            return Some(std::mem::take(&mut logged.elements));
+        }
+        *logged = Arc::new(LoggedKey {
+            declared: logged.declared.clone(),
+            value: logged.value.clone(),
+            elements: Elements::default(),
+        });
+        None
+    }
+
+    pub(crate) fn shared(&self, key: &str) -> Option<Arc<LoggedKey>> {
+        self.0.get(key).cloned()
+    }
+
+    /// Folds a `Delete` of `key`, which keeps only its `Declare`, without
+    /// copying an entry a holder of [`Self::shared`] keeps.
+    fn delete(&mut self, key: &str) {
+        let Some(logged) = self.0.get_mut(key) else {
+            return;
+        };
+        if logged.declared.is_none() {
+            self.0.remove(key);
+        } else if let Some(unshared) = Arc::get_mut(logged) {
+            unshared.value = None;
+            unshared.elements = Elements::default();
+        } else {
+            *logged = Arc::new(LoggedKey {
+                declared: logged.declared.clone(),
+                ..LoggedKey::default()
+            });
+        }
+    }
+
+    pub fn insert(&mut self, key: String, logged: LoggedKey) {
+        self.0.insert(key, Arc::new(logged));
+    }
+
+    pub fn remove(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
+
+    /// The keys from `first` on, in order.
+    pub fn keys_from<'a>(&'a self, first: &str) -> impl Iterator<Item = &'a String> {
+        self.0
+            .range::<str, _>((Bound::Included(first), Bound::Unbounded))
+            .map(|(key, _)| key)
+    }
+}
+
+impl Index<&str> for LoggedKeys {
+    type Output = LoggedKey;
+
+    fn index(&self, key: &str) -> &LoggedKey {
+        &self.0[key]
+    }
+}
 
 /// Folds `record` into the entry for its key, creating the entry if needed
 /// and dropping it when the record leaves it holding nothing, as a `Delete`
 /// of a key without a `Declare` does, so the key stops counting as known.
 pub(crate) fn fold(keys: &mut LoggedKeys, mut record: Record) {
     let key = take_key(&mut record);
+    match record {
+        Record::Delete { .. } => return keys.delete(&key),
+        Record::Forget { .. } => return keys.remove(&key),
+        _ => {}
+    }
     if let Some(logged) = keys.get_mut(&key) {
         logged.apply(record);
         if logged.is_empty() {
@@ -428,6 +528,47 @@ mod tests {
         assert_eq!(keys["k"].current(), Some(&[9][..]));
         fold(&mut keys, Record::Delete { key: "k".into() });
         assert_eq!(keys["k"].current(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn a_shared_entry_keeps_its_state_through_later_folds() {
+        let mut keys = LoggedKeys::new();
+        fold(&mut keys, insert(1));
+        let shared = keys.shared("c").unwrap();
+        fold(&mut keys, insert(2));
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert_eq!(live(&shared.elements), [(vec![1], 1)]);
+        assert!(!keys.contains_key("c"));
+    }
+
+    #[test]
+    fn a_delete_keeps_the_declare_whether_or_not_the_entry_is_shared() {
+        let mut keys = LoggedKeys::new();
+        fold(
+            &mut keys,
+            Record::Declare {
+                key: "c".into(),
+                kind: Kind::Collection,
+                default: Vec::new(),
+            },
+        );
+        fold(&mut keys, insert(1));
+        let shared = keys.shared("c").unwrap();
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert_eq!(live(&shared.elements), [(vec![1], 1)]);
+        assert!(live(&keys["c"].elements).is_empty());
+        assert_eq!(keys["c"].declared, shared.declared);
+        drop(shared);
+        fold(&mut keys, insert(2));
+        let before = Arc::as_ptr(&keys.shared("c").unwrap());
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert!(live(&keys["c"].elements).is_empty());
+        assert!(keys["c"].declared.is_some());
+        assert_eq!(
+            Arc::as_ptr(&keys.shared("c").unwrap()),
+            before,
+            "an unshared entry is cleared in place"
+        );
     }
 
     #[test]
@@ -539,12 +680,12 @@ mod tests {
                 element: vec![5],
             },
         );
-        assert!(keys.is_empty());
+        assert!(keys.keys().next().is_none());
         fold(&mut keys, insert(1));
         fold(&mut keys, Record::Delete { key: "c".into() });
-        assert!(keys.is_empty());
+        assert!(keys.keys().next().is_none());
         fold(&mut keys, Record::Delete { key: "c".into() });
-        assert!(keys.is_empty());
+        assert!(keys.keys().next().is_none());
     }
 
     fn folded(records: &[Record]) -> LoggedKey {
@@ -552,7 +693,7 @@ mod tests {
         for record in records {
             fold(&mut keys, record.clone());
         }
-        keys.remove("c").unwrap_or_default()
+        keys.get("c").cloned().unwrap_or_default()
     }
 
     // Folding the reported changes over the old state must reach the new

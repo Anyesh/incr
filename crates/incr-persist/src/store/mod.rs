@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
-use std::ops::{Bound, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use incr_core::lock_order::{LockKind, Ordered};
@@ -22,6 +22,7 @@ use dep_index::{fp_of, DepFp, DepIndex, Registered};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
 pub use collection::PersistedCollection;
+pub use flight::StoreCheckpoint;
 pub use keyed::{PendingWrite, PersistedKeyed};
 pub use scope::UnloggedScope;
 pub use staged::StagedBatch;
@@ -36,11 +37,16 @@ mod dep_index_tests;
 #[cfg(test)]
 #[path = "drop_tests.rs"]
 mod drop_tests;
+mod flight;
+#[cfg(test)]
+#[path = "flight_tests.rs"]
+mod flight_tests;
 pub(crate) mod keyed;
 #[cfg(test)]
 #[path = "keyed_tests.rs"]
 mod keyed_tests;
 mod logged;
+mod rows;
 mod scope;
 #[cfg(test)]
 #[path = "scope_tests.rs"]
@@ -217,7 +223,7 @@ pub struct Batch<'s, C: Cells, B: Backend> {
 /// ```
 pub struct Store<C: Cells, B: Backend> {
     runtime: Runtime<C>,
-    backend: B,
+    backend: Arc<B>,
     options: Options,
     state: Mutex<State<C>>,
     holder: Holder,
@@ -287,6 +293,7 @@ struct State<C: Cells> {
     deps: Option<Arc<DepIndex>>,
     /// Empty whenever the mutex is free.
     after: AfterLock,
+    flight: flight::Slot,
 }
 
 impl<T: 'static> Input<T> {
@@ -385,6 +392,7 @@ impl<C: Cells> State<C> {
     /// flag a staged batch left: nothing will commit.
     fn poison(&mut self) {
         self.poisoned = true;
+        self.abort_flight_poisoned();
         if let Some(deps) = &self.deps {
             deps.set_poisoned();
             if self.staged {
@@ -392,6 +400,13 @@ impl<C: Cells> State<C> {
             }
         }
         self.staged = false;
+    }
+
+    /// Counts a record applied since the last checkpoint, and since an
+    /// open flight began.
+    fn count_applied(&mut self) {
+        self.since_checkpoint += 1;
+        self.flight.count_applied();
     }
 
     /// Fails while an unlogged scope or a staged batch is open, during
@@ -481,7 +496,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         runtime.set_yield_hook(options.yield_hook.clone());
         let store = Store {
             runtime,
-            backend,
+            backend: Arc::new(backend),
             options,
             state: Mutex::new(State {
                 applied: Position::ZERO,
@@ -499,6 +514,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 next_subscription: 0,
                 deps: None,
                 after: AfterLock::default(),
+                flight: flight::Slot::default(),
             }),
             holder: Holder::default(),
         };
@@ -699,6 +715,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let Some(id) = state.binding_id(&target)? else {
             return Ok(());
         };
+        state.finish_capture(id);
         let binding = &state.bindings[&id];
         let key = binding.key().to_owned();
         let held = binding.unbind(&self.runtime, &state.after)?;
@@ -723,7 +740,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         state.bound.remove(&key);
         if let Some(elements) = held.filter(|elements| !elements.is_empty()) {
-            state.logged.entry(key).or_default().elements = elements;
+            state.logged.get_or_default(key).elements = elements;
         }
         Ok(())
     }
@@ -811,8 +828,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.reconcile_snapshot(&mut state)?;
         Ok(state
             .logged
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .map(|(key, _)| key)
+            .keys_from(prefix)
             .take_while(|key| key.starts_with(prefix))
             .filter(|key| !state.bound.contains_key(*key))
             .cloned()
@@ -877,7 +893,20 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// the store.
     pub fn checkpoint(&self) -> Result<Position> {
         let mut state = self.state()?;
+        if self.settle_flight(&mut state)? {
+            return Err(Error::Busy);
+        }
         self.checkpoint_locked(&mut state)
+    }
+
+    /// Whether any bound collection holds a capture.
+    #[cfg(test)]
+    pub(crate) fn capture_installed(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .bindings
+            .values()
+            .any(|binding| binding.capture_installed())
     }
 
     /// Where the store stands in its log, without reading the backend.
@@ -911,10 +940,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 (Err(e), Pulled::Failed) => return Err(e),
                 (Ok(()), Pulled::Truncated | Pulled::Failed) => {
                     state.poison();
-                    return Err(Error::Corrupt(
-                        "the backend's compact_streamed returned Ok after a failed pull or before \
-                         the last record, so its snapshot may be truncated",
-                    ));
+                    return Err(Error::Corrupt(TRUNCATED));
                 }
                 (Err(e), _) => Err(e),
             };
@@ -992,7 +1018,18 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let mut caught_up = false;
         let declared = loop {
             if let Some(declared) = state.logged.get(key).and_then(|k| k.declared.as_ref()) {
-                break declared.clone();
+                if declared.kind != kind || !state.flight.wants_declare(key) {
+                    break declared.clone();
+                }
+                // An open flight's snapshot forgets this Declare, so the
+                // log after it needs one for the key being bound.
+                let record = Record::Declare {
+                    key: key.to_owned(),
+                    kind,
+                    default: declared.default.clone(),
+                };
+                self.write(state, vec![record])?;
+                continue;
             }
             // Another writer may have declared the key since this store last
             // read the log; appending without looking would add a redundant
@@ -1075,10 +1112,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if self.holder.is_current() {
             self.holder.request_poison();
         } else {
-            self.state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .poison();
+            let mut drained = self.drained();
+            let mut state = Ordered::take(LockKind::Store, || {
+                self.state.lock().unwrap_or_else(PoisonError::into_inner)
+            });
+            state.poison();
+            drained.take_from(&state.after);
         }
     }
 
@@ -1125,6 +1164,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// Runs [`Store::checkpoint`] when [`Options::auto_checkpoint_records`]
     /// is due, before anything is appended.
     fn checkpoint_if_due(&self, state: &mut State<C>) -> Result<()> {
+        if self.settle_flight(state)? {
+            return Ok(());
+        }
+        if state.flight.reconcile_asked() {
+            self.reconcile_snapshot(state)?;
+        }
         match self.options.auto_checkpoint_records {
             Some(threshold) if state.since_checkpoint >= threshold => {
                 self.checkpoint_locked(state).map(drop)
@@ -1229,7 +1274,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let notice = (!state.subscribers.is_empty()).then(|| record.clone());
         self.apply(state, record)?;
         state.applied = position;
-        state.since_checkpoint += 1;
+        state.count_applied();
         if let Some(record) = notice {
             state.notify(position, &record, origin);
         }
@@ -1251,6 +1296,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// as [`Origin::Snapshot`] records. A snapshot beyond `applied` is left
     /// to `catch_up`, which crosses it.
     fn reconcile_snapshot(&self, state: &mut State<C>) -> Result<()> {
+        self.settle_flight(state)?;
         state.refuse_in_scope()?;
         loop {
             let Some(id) = self
@@ -1258,8 +1304,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 .snapshot_id()?
                 .filter(|id| Some(*id) != state.snapshot && id.position <= state.applied)
             else {
+                state.flight.reconciled();
                 return Ok(());
             };
+            if self.settle_committing(state, id)? {
+                continue;
+            }
             let loaded = self.backend.load_snapshot()?;
             let mut later = Vec::new();
             let outcome = self.backend.read_from(id.position, &mut later)?;
@@ -1317,6 +1367,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
+        if let Record::Declare { key, kind, default } = &record {
+            state.flight.note_declare(key, *kind, default);
+        }
         if let Some(&id) = state.bound.get(record.key()) {
             let binding = bound_binding(&mut state.bindings, id);
             let deps = state.deps.as_deref();
@@ -1363,6 +1416,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         at: Position,
         records: impl IntoIterator<Item = Record>,
     ) -> Result<()> {
+        state.abort_flight_rebuilt();
         let mut logged = LoggedKeys::new();
         let yielder = self.runtime.yielder_under_lock();
         for record in records {
@@ -1487,6 +1541,18 @@ fn delete_record<C: Cells>(state: &State<C>, key: &KeyRef<'_>) -> Result<Record>
     })
 }
 
+const TRUNCATED: &str = "the backend's compact_streamed returned Ok after a failed pull or \
+                         before the last record, so its snapshot may be truncated";
+
+/// The snapshot records of a key no collection binding holds: nothing for
+/// one at its logged default.
+fn fold_logged<'a>(key: &'a str, logged: Option<&'a LoggedKey>) -> Folded<'a> {
+    match logged {
+        Some(logged) if !logged.at_default() => Box::new(logged.iter_records(key).map(Ok)),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
 /// The snapshot of everything a store applied so far, folded key by key in
 /// key order as the backend pulls it, gathering the keys it forgets: those
 /// the log knows but that fold to nothing. Stops after the first `Err`.
@@ -1548,10 +1614,7 @@ impl<'a, C: Cells> SnapshotFold<'a, C> {
         let logged = self.state.logged.get(key);
         Ok(match self.state.bound.get(key) {
             Some(&id) => self.state.bindings[&id].fold(logged, &self.yielder)?,
-            None => match logged {
-                Some(logged) if !logged.at_default() => Box::new(logged.iter_records(key).map(Ok)),
-                _ => Box::new(std::iter::empty()),
-            },
+            None => fold_logged(key, logged),
         })
     }
 }
@@ -1573,7 +1636,7 @@ impl<C: Cells> Iterator for SnapshotFold<'_, C> {
                         return Some(Err(e));
                     }
                     None => {
-                        if !*pulled && self.state.logged.contains_key(*key) {
+                        if !*pulled && self.state.logged.contains_key(key) {
                             self.forgotten.push((*key).to_owned());
                         }
                         self.current = None;

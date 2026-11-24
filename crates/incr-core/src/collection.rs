@@ -137,6 +137,10 @@ const COMPACT_EVERY: usize = if cfg!(miri) { 128 } else { 1024 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ElementSlot(u32);
 
+/// A plain capture scan: the elements' stamp it ran at, the slot it
+/// stopped at, and the elements it cloned with their multiplicities.
+type PlainScan<T> = (ElementsStamp, (usize, Vec<(T, usize)>));
+
 /// When the slots [`IncrCollection::visit_elements`] passed were read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ElementsStamp {
@@ -1045,38 +1049,59 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     pub(crate) fn capture_step_by(&self, budget: Duration, unit: usize) -> CaptureStep<(T, usize)> {
         value_code::check();
         crate::dep_stack::unrecorded_lookup::<C>();
+        let scan = self.capture_scan(budget, unit);
+        self.capture_settle(scan)
+    }
+
+    /// The scan half of [`Self::capture_step`], under the read guard: the
+    /// elements' stamp it ran at, where it stopped and what it cloned, or
+    /// `None` with no capture installed.
+    pub(crate) fn capture_scan(&self, budget: Duration, unit: usize) -> Option<PlainScan<T>> {
         let start = Instant::now();
-        let scanned = {
-            let log = self.log.read();
-            value_code::run(|| {
-                log.elements
-                    .capture_scan(unit, start, budget)
-                    .map(|scan| (log.stamp(), scan))
-            })
-        };
+        let log = self.log.read();
+        value_code::run(|| {
+            log.elements
+                .capture_scan(unit, start, budget)
+                .map(|scan| (log.stamp(), scan))
+        })
+    }
+
+    /// The write half of [`Self::capture_step`]: adds `scan` to the
+    /// capture unless a write changed the elements since, and hands over
+    /// what the capture took.
+    pub(crate) fn capture_settle(&self, scan: Option<PlainScan<T>>) -> CaptureStep<(T, usize)> {
         let mut log = self.log.write();
-        let (step, stale) = match scanned {
+        match scan {
             Some((stamp, (end, run))) if log.stamp() == stamp => {
-                (log.elements.capture_advance(end, run), Vec::new())
+                log.elements.capture_advance(end, run)
             }
-            Some((_, (_, run))) => (log.elements.capture_drain(), run),
-            None => (log.elements.capture_drain(), Vec::new()),
-        };
-        drop(log);
-        drop(stale);
-        step
+            Some((_, (_, run))) => CaptureStep {
+                discarded: run,
+                ..log.elements.capture_drain()
+            },
+            None => log.elements.capture_drain(),
+        }
     }
 
-    /// Removes the capture, if one is installed, and drops what it took.
-    pub fn end_capture(&self) {
+    /// Removes the capture, if one is installed, and hands back what it
+    /// took and had not handed over, for the caller to drop.
+    #[must_use = "the capture's elements drop where the returned Vec does"]
+    pub fn end_capture(&self) -> Vec<(T, usize)> {
         value_code::check();
-        let rows = self.log.write().elements.end_capture();
-        drop(rows);
+        self.log.write().elements.end_capture()
     }
 
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn capture_installed(&self) -> bool {
+    /// Whether a capture is installed.
+    pub fn capture_installed(&self) -> bool {
         self.log.read().elements.capture_installed()
+    }
+
+    /// The number of distinct elements the log holds now, read without
+    /// forcing `version_node` or recording a dependency.
+    pub fn distinct_len(&self) -> usize {
+        value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
+        self.log.read().elements.len()
     }
 
     /// Current elements, with multiset duplicates expanded. Forces
