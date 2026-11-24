@@ -4233,7 +4233,7 @@ impl<C: Cells> Runtime<C> {
                 // keeps its memo entries: a read of the retry that takes a
                 // delivery skips the walk that made them. Its pop runs nothing
                 // that reads them, since only a held frame, never New or
-                // Dirty, gets a stand-in run with its own entries.
+                // Dirty, gets a stand-in run.
                 let node = self.nodes.get(v.node);
                 let retried = v.ep.is_none()
                     && matches!(
@@ -4681,6 +4681,10 @@ impl<C: Cells> Runtime<C> {
                     .unwrap()
                     .push(cycle_impl::EpisodeSeen::of(&ep, Some(queued_above)));
             }
+            // The episode resumes with this frame's member run, which
+            // retries the frame and the retried frames above it, so it reads
+            // their memo entries as the unbounded run's frames do.
+            taint_memo::restore(std::mem::take(kept));
             let (root, cidx) = (ep.root, ep.cidx);
             let mut bag = Deferred::new();
             let end = catch_unwind(AssertUnwindSafe(|| self.run_episode(ep, &mut bag)));
@@ -4702,14 +4706,11 @@ impl<C: Cells> Runtime<C> {
             ));
             self.retry_deliveries(id, v.node, v.generation, v.cidx);
             // The run finishes the frame's doomed run, so it owns what that
-            // run deferred, and its reads see the frame's own memo entries,
-            // which the unbounded run's frame keeps until it pops.
+            // run deferred, and its reads see the memo entries of the frame
+            // and of the retried frames above it, whose direct computes it
+            // runs, as the unbounded run's frames keep them until they pop.
             self.own_deferred(v.cidx, v.node);
-            let (own, above) = std::mem::take(kept)
-                .into_iter()
-                .partition(|&(_, owner)| owner == v.cidx + 1);
-            *kept = above;
-            taint_memo::restore(own);
+            taint_memo::restore(std::mem::take(kept));
             let since = replay::take_mark();
             let ran = {
                 let _speculating = v.spec.then(|| replay::Speculating::enter(self.runtime_id));
