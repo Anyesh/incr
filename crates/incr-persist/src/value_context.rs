@@ -236,6 +236,85 @@ pub(crate) fn in_memo<R>(table: &str, part: MemoPart, f: impl FnOnce() -> R) -> 
 }
 
 #[cfg(test)]
+pub(crate) mod wait_probe {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::ValueScope;
+
+    /// How long a worker lets a caller that entered the wait stay there
+    /// before it records whether the caller still is.
+    const SETTLE: Duration = Duration::from_millis(20);
+
+    /// Whether a caller is inside [`counting_waits`]'s `wait`, and what a
+    /// checkpoint worker saw of that when it let itself finish.
+    #[derive(Default)]
+    pub(crate) struct WaitProbe {
+        inside: AtomicBool,
+        seen: Mutex<Option<bool>>,
+    }
+
+    impl WaitProbe {
+        /// On the worker, before it finishes: waits up to `timeout` for the
+        /// caller to enter the wait, then records whether it is still inside
+        /// [`SETTLE`] later. Only the first call records.
+        pub(crate) fn record(&self, timeout: Duration) {
+            if self.seen().is_some() {
+                return;
+            }
+            let started = Instant::now();
+            while !self.inside.load(SeqCst) && started.elapsed() < timeout {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(SETTLE);
+            *self.seen.lock().unwrap() = Some(self.inside.load(SeqCst));
+        }
+
+        pub(crate) fn seen(&self) -> Option<bool> {
+            *self.seen.lock().unwrap()
+        }
+    }
+
+    thread_local! {
+        static WAITS: Cell<u32> = const { Cell::new(0) };
+        static PROBE: RefCell<Option<Arc<WaitProbe>>> = const { RefCell::new(None) };
+    }
+
+    fn counted_wait(wait: &mut dyn FnMut()) {
+        WAITS.set(WAITS.get() + 1);
+        let probe = PROBE.with(|probe| probe.borrow().clone());
+        if let Some(probe) = &probe {
+            probe.inside.store(true, SeqCst);
+        }
+        wait();
+        if let Some(probe) = &probe {
+            probe.inside.store(false, SeqCst);
+        }
+    }
+
+    /// A value scope whose `wait` counts its entries on the calling thread
+    /// and marks the probe [`watch`] set there inside while its argument
+    /// runs.
+    pub(crate) fn counting_waits() -> ValueScope {
+        ValueScope::new(Arc::new(())).waiting(counted_wait)
+    }
+
+    /// Resets this thread's wait count and makes `probe` the one its waits
+    /// mark.
+    pub(crate) fn watch(probe: Option<Arc<WaitProbe>>) {
+        WAITS.set(0);
+        PROBE.set(probe);
+    }
+
+    pub(crate) fn waits() -> u32 {
+        WAITS.get()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

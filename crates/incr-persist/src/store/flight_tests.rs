@@ -1,4 +1,3 @@
-use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -10,9 +9,10 @@ use super::logged::LoggedKey;
 use super::{
     Durability, Input, Options, PersistedCollection, PersistedKeyed, Store, StoreCheckpoint,
 };
+use crate::value_context::wait_probe::{self, WaitProbe};
 use crate::{
     Backend, ConditionalAppend, Error, FileBackend, Kind, Local, MemoryBackend, Position,
-    ReadOutcome, Record, Result, SnapshotId, ValueScope,
+    ReadOutcome, Record, Result, SnapshotId,
 };
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -1300,48 +1300,32 @@ fn second_store_checkpoint_above_upto_then_declares_a_forgotten_key() {
     assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
 }
 
-thread_local! {
-    /// How many times this thread entered [`counted_wait`].
-    static WAITS: Cell<u32> = const { Cell::new(0) };
-    /// A gate [`counted_wait`] opens before it waits.
-    static WAIT_OPENS: RefCell<Option<Arc<Gate>>> = const { RefCell::new(None) };
-}
-
-/// A value scope's `wait` that counts its entries on this thread and opens
-/// the gate in [`WAIT_OPENS`] before it waits.
-fn counted_wait(wait: &mut dyn FnMut()) {
-    WAITS.set(WAITS.get() + 1);
-    WAIT_OPENS.with(|gate| {
-        if let Some(gate) = &*gate.borrow() {
-            gate.open();
-        }
-    });
-    wait();
-}
-
 fn counting_waits() -> Options {
     Options {
-        value_scope: Some(ValueScope::new(Arc::new(())).waiting(counted_wait)),
+        value_scope: Some(wait_probe::counting_waits()),
         ..Options::default()
     }
 }
 
 /// A flight whose backend parks after its commit until the call `meet`
-/// makes asks for the backend's snapshot id. `meet` must wait for the
-/// verdict inside the value scope's `wait` and settle the flight as
-/// adopted.
+/// makes asks for the backend's snapshot id, then until that call waits
+/// inside the value scope's `wait`. `meet` must wait for the verdict there
+/// and settle the flight as adopted.
 fn a_reconcile_meeting_own_waits_and_adopts(meet: impl FnOnce(&Fx<Wrap>)) {
     let log = MemoryBackend::new();
     let committed = Arc::new(Gate::default());
     let asked = Arc::new(Asked::default());
+    let probe = Arc::new(WaitProbe::default());
     let backend = {
         let (committed, asked) = (Arc::clone(&committed), Arc::clone(&asked));
+        let probe = Arc::clone(&probe);
         Wrap {
             asked: Some(Arc::clone(&asked)),
             ..Wrap::pulling(&log, move |inner, upto, records| {
                 let done = inner.compact_streamed(upto, records);
                 committed.open();
                 asked.gate.wait();
+                probe.record(GATE_TIMEOUT);
                 done
             })
         }
@@ -1353,9 +1337,16 @@ fn a_reconcile_meeting_own_waits_and_adopts(meet: impl FnOnce(&Fx<Wrap>)) {
     assert!(!flight.poll(&fx.store, WAIT).unwrap());
     committed.wait();
     asked.armed.store(true, Ordering::SeqCst);
-    WAITS.set(0);
+    wait_probe::watch(Some(Arc::clone(&probe)));
     meet(&fx);
-    assert_eq!(WAITS.get(), 1, "the call waited inside the scope's wait");
+    let waits = wait_probe::waits();
+    wait_probe::watch(None);
+    assert_eq!(waits, 1, "the call entered the scope's wait once");
+    assert_eq!(
+        probe.seen(),
+        Some(true),
+        "the worker finished while the call waited inside the scope's wait"
+    );
     assert_eq!(
         fx.store.stats().unwrap().snapshot_position,
         begun,
@@ -1384,15 +1375,27 @@ fn reconcile_wait_a_declare_meeting_own_adopts() {
 #[test]
 fn result_waits_for_the_worker_inside_the_scope_wait() {
     let log = MemoryBackend::new();
-    let gate = Arc::new(Gate::default());
-    let fx = Fx::over(&log, Wrap::gated(&log, &gate), counting_waits());
+    let probe = Arc::new(WaitProbe::default());
+    let backend = {
+        let probe = Arc::clone(&probe);
+        Wrap::pulling(&log, move |inner, upto, records| {
+            probe.record(GATE_TIMEOUT);
+            inner.compact_streamed(upto, records)
+        })
+    };
+    let fx = Fx::over(&log, backend, counting_waits());
     fx.populate(50);
     let flight = fx.begin();
-    WAITS.set(0);
-    WAIT_OPENS.set(Some(Arc::clone(&gate)));
+    wait_probe::watch(Some(Arc::clone(&probe)));
     let at = flight.result(&fx.store, Some(WAIT));
-    WAIT_OPENS.set(None);
-    assert!(WAITS.get() > 0, "result waited inside the scope's wait");
+    let waits = wait_probe::waits();
+    wait_probe::watch(None);
+    assert!(waits > 0, "result entered the scope's wait");
+    assert_eq!(
+        probe.seen(),
+        Some(true),
+        "the worker finished while result waited inside the scope's wait"
+    );
     assert!(matches!(at, Ok(Some(_))), "{at:?}");
 }
 

@@ -1,4 +1,3 @@
-use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use std::thread;
@@ -11,7 +10,8 @@ use crate::memo::{
     BuildId, Chain, CheckpointStats, DeltaHeader, EncodedEntry, GenHeader, GenId, Generation,
     IndexItem, Memo, MemoBackend, MemoBuilder, MemoOptions, MemoTable, MemoryMemo, Tombstone,
 };
-use crate::{Error, Input, Local, MemoryBackend, Options, Result, Store, ValueScope};
+use crate::value_context::wait_probe::{self, WaitProbe};
+use crate::{Error, Input, Local, MemoryBackend, Options, Result, Store};
 
 const WAIT: Duration = Duration::from_secs(20);
 
@@ -446,13 +446,14 @@ fn a_flight_abandoned_in_the_middle_of_the_prune_loses_no_seed() {
     assert_eq!(live_seeds(&fx), 5_000);
 }
 
-/// Fails its writes while `failing` is set, and holds them while `held` is,
-/// for at most [`WAIT`].
+/// Fails its writes while `failing` is set; with a `probe`, its first write
+/// records there whether the caller waits for it inside the value scope's
+/// `wait`.
 #[derive(Clone)]
 struct Failing {
     inner: MemoryMemo,
     failing: Arc<AtomicBool>,
-    held: Arc<AtomicBool>,
+    probe: Option<Arc<WaitProbe>>,
     flagged: bool,
 }
 
@@ -461,15 +462,14 @@ impl Failing {
         Failing {
             inner: MemoryMemo::new(),
             failing: Arc::new(AtomicBool::new(true)),
-            held: Arc::new(AtomicBool::new(false)),
+            probe: None,
             flagged: true,
         }
     }
 
     fn check(&self) -> Result<()> {
-        let started = Instant::now();
-        while self.held.load(SeqCst) && started.elapsed() < WAIT {
-            thread::sleep(Duration::from_millis(1));
+        if let Some(probe) = &self.probe {
+            probe.record(WAIT);
         }
         if self.failing.load(SeqCst) {
             Err(Error::ReadOnly)
@@ -795,37 +795,21 @@ fn a_backend_that_stops_pulling_early_fails_the_flight() {
     assert!(fx.stage().is_none());
 }
 
-thread_local! {
-    /// How many times this thread entered [`counted_wait`].
-    static WAITS: Cell<u32> = const { Cell::new(0) };
-    /// A flag [`counted_wait`] clears before it waits.
-    static WAIT_CLEARS: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
-}
-
-/// A value scope's `wait` that counts its entries on this thread and
-/// clears the flag in [`WAIT_CLEARS`] before it waits.
-fn counted_wait(wait: &mut dyn FnMut()) {
-    WAITS.set(WAITS.get() + 1);
-    WAIT_CLEARS.with(|held| {
-        if let Some(held) = &*held.borrow() {
-            held.store(false, SeqCst);
-        }
-    });
-    wait();
-}
-
 #[test]
 fn result_waits_for_the_worker_inside_the_scope_wait() {
-    let backend = Failing::new();
+    let probe = Arc::new(WaitProbe::default());
+    let backend = Failing {
+        probe: Some(Arc::clone(&probe)),
+        ..Failing::new()
+    };
     backend.failing.store(false, SeqCst);
-    backend.held.store(true, SeqCst);
     let store_options = Options {
-        value_scope: Some(ValueScope::new(Arc::new(())).waiting(counted_wait)),
+        value_scope: Some(wait_probe::counting_waits()),
         ..Options::default()
     };
     let fx = Fx::with_store(
         &MemoryBackend::new(),
-        backend.clone(),
+        backend,
         MemoOptions::new(BuildId::Fixed(0x24c)),
         store_options,
     );
@@ -833,11 +817,16 @@ fn result_waits_for_the_worker_inside_the_scope_wait() {
         fx.leaf(k);
     }
     let flight = fx.memo.begin_checkpoint().unwrap();
-    WAITS.set(0);
-    WAIT_CLEARS.set(Some(Arc::clone(&backend.held)));
+    wait_probe::watch(Some(Arc::clone(&probe)));
     let stats = flight.result(&fx.memo, Some(WAIT));
-    WAIT_CLEARS.set(None);
-    assert!(WAITS.get() > 0, "result waited inside the scope's wait");
+    let waits = wait_probe::waits();
+    wait_probe::watch(None);
+    assert!(waits > 0, "result entered the scope's wait");
+    assert_eq!(
+        probe.seen(),
+        Some(true),
+        "the worker finished while result waited inside the scope's wait"
+    );
     assert!(matches!(stats, Ok(Some(_))), "{stats:?}");
 }
 
