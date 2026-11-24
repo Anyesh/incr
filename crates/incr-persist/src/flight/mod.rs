@@ -93,6 +93,10 @@ impl FlightToken {
     pub(crate) fn cancel(&self) {
         self.control.cancel();
     }
+
+    pub(crate) fn worker(&self) -> Option<std::thread::ThreadId> {
+        self.control.worker.get().map(Thread::id)
+    }
 }
 
 impl Drop for FlightToken {

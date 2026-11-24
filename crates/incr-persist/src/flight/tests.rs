@@ -42,6 +42,17 @@ fn the_worker_gets_every_message_and_posts_its_verdict() {
 }
 
 #[test]
+fn the_token_names_the_worker_thread() {
+    let (flight, token) =
+        Flight::<(), _>::start(None, |_| Verdict::Committed(thread::current().id())).unwrap();
+    assert!(flight.wait(LONG));
+    match flight.take_verdict() {
+        Some(Verdict::Committed(worker)) => assert_eq!(token.worker(), Some(worker)),
+        _ => panic!("expected a committed verdict"),
+    }
+}
+
+#[test]
 fn wait_with_a_timeout_returns_false_before_the_verdict() {
     let (flight, _token) = Flight::start(None, summing).unwrap();
     assert!(!flight.wait(Some(Duration::from_millis(20))));
