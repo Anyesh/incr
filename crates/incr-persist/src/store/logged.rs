@@ -410,16 +410,16 @@ impl LoggedKeys {
         let Some(logged) = self.0.get_mut(key) else {
             return;
         };
-        match &logged.declared {
-            None => {
-                self.0.remove(key);
-            }
-            Some(declared) => {
-                *logged = Arc::new(LoggedKey {
-                    declared: Some(declared.clone()),
-                    ..LoggedKey::default()
-                });
-            }
+        if logged.declared.is_none() {
+            self.0.remove(key);
+        } else if let Some(unshared) = Arc::get_mut(logged) {
+            unshared.value = None;
+            unshared.elements = Elements::default();
+        } else {
+            *logged = Arc::new(LoggedKey {
+                declared: logged.declared.clone(),
+                ..LoggedKey::default()
+            });
         }
     }
 
@@ -539,6 +539,36 @@ mod tests {
         fold(&mut keys, Record::Delete { key: "c".into() });
         assert_eq!(live(&shared.elements), [(vec![1], 1)]);
         assert!(!keys.contains_key("c"));
+    }
+
+    #[test]
+    fn a_delete_keeps_the_declare_whether_or_not_the_entry_is_shared() {
+        let mut keys = LoggedKeys::new();
+        fold(
+            &mut keys,
+            Record::Declare {
+                key: "c".into(),
+                kind: Kind::Collection,
+                default: Vec::new(),
+            },
+        );
+        fold(&mut keys, insert(1));
+        let shared = keys.shared("c").unwrap();
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert_eq!(live(&shared.elements), [(vec![1], 1)]);
+        assert!(live(&keys["c"].elements).is_empty());
+        assert_eq!(keys["c"].declared, shared.declared);
+        drop(shared);
+        fold(&mut keys, insert(2));
+        let before = Arc::as_ptr(&keys.shared("c").unwrap());
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert!(live(&keys["c"].elements).is_empty());
+        assert!(keys["c"].declared.is_some());
+        assert_eq!(
+            Arc::as_ptr(&keys.shared("c").unwrap()),
+            before,
+            "an unshared entry is cleared in place"
+        );
     }
 
     #[test]
