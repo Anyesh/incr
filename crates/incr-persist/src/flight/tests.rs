@@ -143,6 +143,26 @@ fn panicking_start(_: &mut dyn FnMut()) {
 
 fn skipping_start(_: &mut dyn FnMut()) {}
 
+fn panicking_after_start(f: &mut dyn FnMut()) {
+    f();
+    panic!("start panicked after the body");
+}
+
+#[test]
+fn a_start_that_panics_after_the_body_posts_its_panic() {
+    let scope = ValueScope::new(Arc::new(())).starting_workers(panicking_after_start);
+    let (flight, _token) =
+        Flight::<(), ()>::start(Some(scope), |_| Verdict::Committed(())).unwrap();
+    assert!(flight.wait(LONG));
+    match flight.take_verdict() {
+        Some(Verdict::Panicked(payload)) => assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"start panicked after the body")
+        ),
+        _ => panic!("expected the start's panic"),
+    }
+}
+
 #[test]
 fn a_start_that_panics_or_skips_the_body_posts_a_panic() {
     for start in [panicking_start as fn(&mut dyn FnMut()), skipping_start] {

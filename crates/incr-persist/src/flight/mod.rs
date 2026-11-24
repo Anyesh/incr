@@ -317,8 +317,8 @@ fn run_worker<M, T>(
         });
     }));
     match (verdict, started) {
-        (Some(verdict), _) => verdict,
-        (None, Err(payload)) => Verdict::Panicked(payload),
+        (_, Err(payload)) => Verdict::Panicked(payload),
+        (Some(verdict), Ok(())) => verdict,
         (None, Ok(())) => unreachable!("start_worker returns only after its argument ran"),
     }
 }
