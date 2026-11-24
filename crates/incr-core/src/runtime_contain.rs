@@ -847,11 +847,16 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A node below a noted dep that a later walk may stop at: Dirty, or
-    /// still Computing, which a budget's unwind lands Dirty before the
-    /// unbounded run's landing does, so the scans of both agree (0x9593).
+    /// one its own landing may leave Dirty with no walk passing it. That is
+    /// one still Computing, which a budget's unwind lands Dirty before the
+    /// unbounded run's landing does (0x9593), or New, which a discarded
+    /// attempt lands where the unbounded run's frame is still Computing
+    /// (0x30ef23403195b0ba), so the scans of both agree.
     fn stops_walks(&self, dep: NodeId) -> bool {
-        state::load::<C>(self.nodes.get(dep.0).state_cell()) == NodeState::Computing
-            || self.left_past(dep)
+        matches!(
+            state::load::<C>(self.nodes.get(dep.0).state_cell()),
+            NodeState::Computing | NodeState::New
+        ) || self.left_past(dep)
     }
 
     /// Recounts the bits only while few slots are noted, so a take stays
