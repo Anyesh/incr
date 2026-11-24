@@ -329,9 +329,18 @@ fn plain_capture_survives_both_rehashes_mid_scan() {
     let bytes = |col: &Plain| col.log.read().elements.heap_bytes();
     let rehashes = |col: &Plain| col.log.read().elements.rehashes();
     let small = bytes(&col);
-    for k in 0..10 {
-        col.replace(&rt, Some(&v(k, 0)), v(k, 1000));
-    }
+    col.apply(
+        &rt,
+        (0..5)
+            .map(|k| Change::Delete(v(k, 0)))
+            .chain((5..10).map(|k| Change::Insert(v(k, 0))))
+            .chain((241..246).map(|k| Change::Insert(v(k, 0)))),
+    );
+    let regrown = bytes(&col);
+    assert!(
+        regrown > small,
+        "the batch that changes keys grows the table"
+    );
     let added = clump_tombstones(
         |k| col.insert(&rt, v(k, 0)),
         |k| {
@@ -339,19 +348,22 @@ fn plain_capture_survives_both_rehashes_mid_scan() {
         },
     );
     let grown = bytes(&col);
-    assert!(grown > small, "the clump grows the table");
+    assert!(grown > regrown, "the clump grows the table");
     step(
         &mut taken,
         col.capture_step_by(Duration::ZERO, 7),
         plain_row,
     );
     let before = rehashes(&col);
-    col.apply(&rt, added.into_iter().map(|k| Change::Insert(v(k, 0))));
+    col.apply(
+        &rt,
+        (10..15)
+            .map(|k| Change::Delete(v(k, 0)))
+            .chain((15..20).map(|k| Change::Insert(v(k, 0))))
+            .chain(added.into_iter().map(|k| Change::Insert(v(k, 0)))),
+    );
     assert_eq!(rehashes(&col), before + 1, "the batch rehashes");
     assert_eq!(bytes(&col), grown, "at the same size");
-    for k in 10..20 {
-        col.replace(&rt, Some(&v(k, 0)), v(k, 1000));
-    }
     while taken.is_some() {
         step(
             &mut taken,

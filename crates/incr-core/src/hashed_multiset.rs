@@ -470,8 +470,6 @@ impl<T> HashedMultiset<T> {
         mem::replace(&mut self.entry_mut(i).value, new)
     }
 
-    /// Whether a capture is installed, so writes must settle the entries
-    /// they change first.
     #[inline]
     pub(crate) fn capture_installed(&self) -> bool {
         self.capture.is_some()
