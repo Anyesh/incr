@@ -149,12 +149,14 @@ impl<C: MemoCells> CoreRef<C> {
                     .inspect(|_| yielder.tick())
                     .map(|snap| snap.handle)
                     .collect();
+                let mut landing = Vec::new();
                 for record in &dirty {
                     yielder.tick();
-                    if !taken.contains(&record.handle) {
-                        self.dirty.carry(record);
+                    if !taken.contains(&record.handle) && self.dirty.carry(record) {
+                        landing.push(record.handle);
                     }
                 }
+                self.wake.await_landing(landing);
             }
             let dirty: HashSet<ErasedIncr> = dirty
                 .iter()

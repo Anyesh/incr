@@ -174,6 +174,14 @@ pub(crate) trait ErasedTable<C: MemoCells> {
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs on a compute's thread after it recorded its entry dirty and
+    /// before the engine lands the node.
+    pub(crate) static COMPUTED_PARK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
     pub(crate) index: u32,
     pub(crate) name: Arc<str>,
@@ -212,6 +220,12 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
             };
             if let Some(handle) = handle {
                 core.computed(index, handle, &part);
+                #[cfg(test)]
+                COMPUTED_PARK.with(|hook| {
+                    if let Some(hook) = &*hook.borrow() {
+                        hook();
+                    }
+                });
             }
             value
         }

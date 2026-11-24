@@ -3,10 +3,11 @@
 //! closes, with no further compute, and a close after no skip wakes
 //! nothing.
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::Memo;
+use crate::memo::table_core::COMPUTED_PARK;
 use crate::memo::{BuildId, MemoBuilder, MemoOptions, MemoTable, MemoryMemo};
 use crate::{Input, MemoryBackend, Options, Shared, Store};
 
@@ -123,4 +124,43 @@ fn a_close_resumes_a_skip_once() {
     batch.commit().unwrap();
     assert_eq!(w.memo.core.wake.dues(), dues);
     assert_eq!(w.memo.stats().checkpoints, 1);
+}
+
+/// The trigger wakes the thread from inside the compute that reached it,
+/// before the engine lands the node, so the woken checkpoint cannot save
+/// that entry. The thread must checkpoint again once the node lands, with
+/// no further compute.
+#[test]
+fn an_entry_that_lands_after_its_woken_checkpoint_is_saved() {
+    let w = Arc::new(open(1));
+    assert!(w.memo.core.wake.wait_until_blocked(TIMEOUT));
+    let (parked_tx, parked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reader = {
+        let w = Arc::clone(&w);
+        std::thread::spawn(move || {
+            let release_rx = Mutex::new(release_rx);
+            COMPUTED_PARK.set(Some(Box::new(move || {
+                parked_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            })));
+            w.read(0)
+        })
+    };
+    parked_rx.recv_timeout(TIMEOUT).unwrap();
+    assert!(
+        w.memo.core.wake.wait_until_blocked(TIMEOUT),
+        "the woken thread never went back to waiting"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(reader.join().unwrap(), 1);
+    let deadline = Instant::now() + TIMEOUT;
+    while w.memo.stats().entries < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the entry was not saved after it landed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    w.assert_saved_without_errors(1);
 }

@@ -258,10 +258,15 @@ impl Default for Wake {
 struct Waking {
     stop: bool,
     due: bool,
+    /// The entries the latest checkpoint carried and could not take: no
+    /// compute reports their landing, so [`Wake::wait`] polls for it.
+    landing: Vec<ErasedIncr>,
     #[cfg(test)]
     dues: u64,
     #[cfg(test)]
     held_skips: u64,
+    #[cfg(test)]
+    blocked: bool,
 }
 
 impl Wake {
@@ -305,6 +310,18 @@ impl Wake {
         waking.held_skips >= n
     }
 
+    /// Waits up to `timeout` until the thread is blocked with nothing
+    /// due: whether it is.
+    #[cfg(test)]
+    pub(crate) fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        let waking = self.lock();
+        let (waking, _) = self
+            .cond
+            .wait_timeout_while(waking, timeout, |w| !w.blocked || w.due)
+            .unwrap_or_else(PoisonError::into_inner);
+        waking.blocked && !waking.due
+    }
+
     /// Records a checkpoint skipped for an open staged batch or unlogged
     /// scope, for [`Self::resume`].
     pub(crate) fn skip(&self) {
@@ -326,6 +343,17 @@ impl Wake {
         self.armed.swap(true, Ordering::AcqRel);
     }
 
+    /// Replaces the entries [`Self::wait`] polls for.
+    pub(crate) fn await_landing(&self, landing: Vec<ErasedIncr>) {
+        let mut waking = self.lock();
+        let wake = !landing.is_empty();
+        waking.landing = landing;
+        drop(waking);
+        if wake {
+            self.cond.notify_all();
+        }
+    }
+
     /// [`Self::due`] once per [`Self::arm`].
     pub(crate) fn due_once(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
@@ -338,36 +366,79 @@ impl Wake {
         self.cond.notify_all();
     }
 
-    /// Waits until a checkpoint is due, `every` has passed, or a stop:
-    /// `true` for a stop. `None` waits without an interval.
-    pub(crate) fn wait(&self, every: Option<Duration>) -> bool {
+    /// Waits until a checkpoint is due or `every` has passed
+    /// ([`Woke::Due`]), a stop, or, with `landed`, it finds one of the
+    /// entries the latest checkpoint carried landed. It polls those after
+    /// [`FIRST_POLL`], then at gaps doubling up to [`LAST_POLL`]. `None`
+    /// for `every` waits without an interval.
+    pub(crate) fn wait(
+        &self,
+        every: Option<Duration>,
+        landed: Option<&dyn Fn(ErasedIncr) -> bool>,
+    ) -> Woke {
         let deadline = every.map(|every| Instant::now() + every);
+        let mut gap = FIRST_POLL;
         let mut waking = self.lock();
         loop {
             if waking.stop {
-                return true;
+                return Woke::Stop;
             }
             if std::mem::take(&mut waking.due) {
-                return false;
+                return Woke::Due;
             }
-            waking = match deadline {
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| deadline <= now) {
+                return Woke::Due;
+            }
+            let poll = landed.filter(|_| !waking.landing.is_empty());
+            let until = match (deadline, poll.is_some()) {
+                (deadline, true) => Some(deadline.map_or(now + gap, |d| d.min(now + gap))),
+                (deadline, false) => deadline,
+            };
+            #[cfg(test)]
+            {
+                waking.blocked = true;
+                self.cond.notify_all();
+            }
+            waking = match until {
                 None => self
                     .cond
                     .wait(waking)
                     .unwrap_or_else(PoisonError::into_inner),
-                Some(deadline) => {
-                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                        return false;
-                    };
+                Some(until) => {
                     self.cond
-                        .wait_timeout(waking, left)
+                        .wait_timeout(waking, until.saturating_duration_since(now))
                         .unwrap_or_else(PoisonError::into_inner)
                         .0
                 }
             };
+            #[cfg(test)]
+            {
+                waking.blocked = false;
+            }
+            if let Some(landed) = poll {
+                if Instant::now() >= now + gap {
+                    if waking.landing.iter().any(|&handle| landed(handle)) {
+                        return Woke::Landed;
+                    }
+                    gap = (gap * 2).min(LAST_POLL);
+                }
+            }
         }
     }
 }
+
+/// Why [`Wake::wait`] returned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Woke {
+    Stop,
+    Due,
+    /// An entry the latest checkpoint carried landed.
+    Landed,
+}
+
+const FIRST_POLL: Duration = Duration::from_millis(1);
+const LAST_POLL: Duration = Duration::from_secs(1);
 
 impl<C: MemoCells> MemoCore<C> {
     #[allow(clippy::too_many_arguments)]
@@ -423,7 +494,8 @@ impl<C: MemoCells> MemoCore<C> {
     /// Records that `table`'s entry `handle` computed, and wakes the
     /// automatic-checkpoint thread when a checkpoint is due. A count that
     /// reached the trigger without a compute, carried or left by a failed
-    /// checkpoint, wakes it at the next compute.
+    /// checkpoint, wakes it at the next compute; a carried entry's landing
+    /// also wakes it, see [`Wake::wait`].
     pub(crate) fn computed(&self, table: u32, handle: ErasedIncr, key: &KeyPart) {
         let unsaved = self.dirty.computed(table, handle, key);
         self.reached(unsaved);
