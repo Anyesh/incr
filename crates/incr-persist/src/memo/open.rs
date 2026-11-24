@@ -6,10 +6,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use incr_core::persist_hooks::is_clean;
-use incr_core::{check_value_code, in_value_code, ErasedIncr, Incr, Runtime, Shared};
+use incr_core::{check_value_code, in_value_code, Incr, Runtime, Shared};
 
 use super::handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
-use super::memo_core::{CoreRef, IndexGen, MemoCells, MemoCore, MemoStats, Wake, Woke};
+use super::memo_core::{CoreRef, IndexGen, Landing, MemoCells, MemoCore, MemoStats, Wake, Woke};
 use super::options::MemoOptions;
 use super::table_core::{ErasedTable, TableCore};
 use super::{Chain, CheckpointStats, GenId, Generation, MemoBackend, TableDesc};
@@ -283,22 +283,30 @@ impl AutoCheckpoint {
             let _scope = store.enter_value_scope();
             let mut failed = false;
             let rt = store.runtime();
-            let landed = |handle: ErasedIncr| is_clean(rt, handle);
+            let mut landing = Landing::default();
             loop {
                 core.wake.arm();
+                if let Some(new) = core.wake.take_landing() {
+                    landing = new;
+                }
                 // Computes that reached the trigger while the thread was
-                // unarmed did not wake it, and an entry a checkpoint carried
-                // because its compute had not landed reports no landing.
-                // After a failure the next compute wakes it instead, so a
-                // lasting error does not spin; after a skip for an open
-                // staged batch or unlogged scope, the close of the last one
-                // does too.
-                if !failed && core.checkpoint_due() {
+                // unarmed did not wake it. Entries a checkpoint carried
+                // because they had not landed are left out: another
+                // checkpoint before they land cannot save them, and their
+                // landing, which no compute reports, is polled for instead.
+                // After a failure the next compute wakes it, so a lasting
+                // error does not spin; after a skip for an open staged batch
+                // or unlogged scope, the close of the last one does too.
+                if !failed && core.checkpoint_due_besides(landing.counted()) {
                     core.wake.due_once();
                 }
-                let poll: Option<&dyn Fn(ErasedIncr) -> bool> = (!failed).then_some(&landed);
+                let polls = !failed && core.trigger.is_some() && !landing.is_empty();
+                let mut poll = || landing.drop_landed(|handle| is_clean(rt, handle));
+                let poll = polls.then_some(&mut poll as &mut dyn FnMut() -> bool);
                 match core.wake.wait(every, poll) {
                     Woke::Stop => return,
+                    Woke::Replaced => continue,
+                    Woke::Landed if !core.checkpoint_due() => continue,
                     Woke::Due if core.dirty.unsaved() == 0 => continue,
                     Woke::Due | Woke::Landed => {}
                 }

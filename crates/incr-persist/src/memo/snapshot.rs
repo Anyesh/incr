@@ -10,9 +10,9 @@ use incr_core::persist_hooks::{changed_at_erased, Deferred};
 use incr_core::{in_value_code, ErasedIncr, Runtime, Yielder};
 
 use super::checkpoint::Fate;
-use super::dirty::Record;
+use super::dirty::{Carried, Record};
 use super::mapping::LiveDep;
-use super::memo_core::{CoreRef, IndexGen, MemoCells};
+use super::memo_core::{CoreRef, IndexGen, Landing, MemoCells};
 use super::table_core::Snap;
 use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, StoredDep, VALUE_BATCH};
 use crate::value_context::{hold, EncodeMismatch, ValueScope};
@@ -149,11 +149,16 @@ impl<C: MemoCells> CoreRef<C> {
                     .inspect(|_| yielder.tick())
                     .map(|snap| snap.handle)
                     .collect();
-                let mut landing = Vec::new();
+                let mut landing = Landing::default();
                 for record in &dirty {
                     yielder.tick();
-                    if !taken.contains(&record.handle) && self.dirty.carry(record) {
-                        landing.push(record.handle);
+                    if taken.contains(&record.handle) {
+                        continue;
+                    }
+                    match self.dirty.carry(record) {
+                        Carried::No => {}
+                        Carried::Counted => landing.push(record.handle, true),
+                        Carried::Before => landing.push(record.handle, false),
                     }
                 }
                 self.wake.await_landing(landing);

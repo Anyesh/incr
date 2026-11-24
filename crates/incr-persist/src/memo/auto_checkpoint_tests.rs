@@ -126,6 +126,26 @@ fn a_close_resumes_a_skip_once() {
     assert_eq!(w.memo.stats().checkpoints, 1);
 }
 
+/// Parks `w.read(k)` on a thread after its compute recorded the entry
+/// dirty and before the node lands; the returned sender releases it.
+fn park_read(w: &Arc<World>, k: u32) -> (mpsc::Sender<()>, std::thread::JoinHandle<u64>) {
+    let (parked_tx, parked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reader = {
+        let w = Arc::clone(w);
+        std::thread::spawn(move || {
+            let release_rx = Mutex::new(release_rx);
+            COMPUTED_PARK.set(Some(Box::new(move || {
+                parked_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            })));
+            w.read(k)
+        })
+    };
+    parked_rx.recv_timeout(TIMEOUT).unwrap();
+    (release_tx, reader)
+}
+
 /// The trigger wakes the thread from inside the compute that reached it,
 /// before the engine lands the node, so the woken checkpoint cannot save
 /// that entry. The thread must checkpoint again once the node lands, with
@@ -134,25 +154,12 @@ fn a_close_resumes_a_skip_once() {
 fn an_entry_that_lands_after_its_woken_checkpoint_is_saved() {
     let w = Arc::new(open(1));
     assert!(w.memo.core.wake.wait_until_blocked(TIMEOUT));
-    let (parked_tx, parked_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel::<()>();
-    let reader = {
-        let w = Arc::clone(&w);
-        std::thread::spawn(move || {
-            let release_rx = Mutex::new(release_rx);
-            COMPUTED_PARK.set(Some(Box::new(move || {
-                parked_tx.send(()).unwrap();
-                release_rx.lock().unwrap().recv().unwrap();
-            })));
-            w.read(0)
-        })
-    };
-    parked_rx.recv_timeout(TIMEOUT).unwrap();
+    let (release, reader) = park_read(&w, 0);
     assert!(
         w.memo.core.wake.wait_until_blocked(TIMEOUT),
         "the woken thread never went back to waiting"
     );
-    release_tx.send(()).unwrap();
+    release.send(()).unwrap();
     assert_eq!(reader.join().unwrap(), 1);
     let deadline = Instant::now() + TIMEOUT;
     while w.memo.stats().entries < 1 {
@@ -163,4 +170,31 @@ fn an_entry_that_lands_after_its_woken_checkpoint_is_saved() {
         std::thread::sleep(Duration::from_millis(5));
     }
     w.assert_saved_without_errors(1);
+}
+
+/// A carried entry that lands with fewer than the trigger's entries
+/// unsaved stays unsaved: its landing alone runs no checkpoint.
+#[test]
+fn a_carried_entry_that_lands_below_the_trigger_waits_for_more_computes() {
+    let w = Arc::new(open(3));
+    w.read(0);
+    w.read(1);
+    let (release, reader) = park_read(&w, 2);
+    assert!(w.memo.core.wake.wait_until_blocked(TIMEOUT));
+    w.wait_for_checkpoints(1);
+    release.send(()).unwrap();
+    assert_eq!(reader.join().unwrap(), 3);
+    assert!(
+        w.memo.core.wake.wait_for_landings(1, TIMEOUT),
+        "the thread never saw the carried entry land"
+    );
+    assert!(w.memo.core.wake.wait_until_blocked(TIMEOUT));
+    let stats = w.memo.stats();
+    assert_eq!(
+        (stats.checkpoints, stats.entries, stats.unsaved_entries),
+        (1, 2, 1)
+    );
+    w.read(3);
+    w.read(4);
+    w.wait_for_checkpoints(2);
 }
