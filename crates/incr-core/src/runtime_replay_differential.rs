@@ -1970,6 +1970,9 @@ struct Serial<'a> {
     logs: Mutex<HashMap<u64, Vec<Vec<Eval>>>>,
     per_read: Mutex<PerRead>,
     cycles: Mutex<CycleReads>,
+    /// Each order's unbounded run with its walks switching to exact mode
+    /// at another count, by that count.
+    shifted: Mutex<HashMap<u32, HashMap<u64, Trace>>>,
 }
 
 impl<'a> Serial<'a> {
@@ -1981,6 +1984,7 @@ impl<'a> Serial<'a> {
             logs: Mutex::new(HashMap::new()),
             per_read: Mutex::new(PerRead::new()),
             cycles: Mutex::new(CycleReads::new()),
+            shifted: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2427,6 +2431,7 @@ impl<'a> Serial<'a> {
     /// `at_overlap` stopped the run with a `verdict` that holds.
     fn check(&self, label: &str, got: &Trace, verdict: Option<Result<(), String>>) {
         match verdict {
+            None if self.matches_near_switch(label, got) => {}
             None => assert_serial_with(
                 self.case,
                 self.phases,
@@ -2447,6 +2452,42 @@ impl<'a> Serial<'a> {
                 )
             }
         }
+    }
+
+    /// Whether `got` is an order's unbounded run with its walks switching
+    /// to exact mode at a count within the case's query count of
+    /// `EXACT_MODE_AT`, while none is at `EXACT_MODE_AT` itself. Switch
+    /// seeds count as equal when a nearby phase matches (the exact-switch
+    /// ruling), and nodes another thread's read settles leave a walk fewer
+    /// first visits before its switch.
+    fn matches_near_switch(&self, label: &str, got: &Trace) -> bool {
+        let (per_read, cycles) = (self.per_read.lock().unwrap(), self.cycles.lock().unwrap());
+        let found = |wants: &mut HashMap<u64, Trace>, label: &str| {
+            !(orders(
+                self.case,
+                self.phases,
+                wants,
+                got,
+                label,
+                true,
+                false,
+                &per_read,
+                &cycles,
+            )
+            .0
+            .is_empty())
+        };
+        if found(&mut self.wants.lock().unwrap(), label) {
+            return false;
+        }
+        let at = super::EXACT_MODE_AT_HERE.with(std::cell::Cell::get);
+        let window = (self.case.queries + self.case.queries2) as u32;
+        (1..=window).flat_map(|d| [at - d, at + d]).any(|shifted| {
+            let mut all = self.shifted.lock().unwrap();
+            let wants = all.entry(shifted).or_default();
+            let _at = SwitchAt::set(shifted);
+            found(wants, &format!("{label}, switching at {shifted}"))
+        })
     }
 
     /// One two-thread run, `rig` as [`run_two_until`] takes it, checked.
@@ -2476,6 +2517,21 @@ impl<'a> Serial<'a> {
             )
         });
         self.check(label, &got, verdict.into_inner().unwrap());
+    }
+}
+
+/// This thread's walks switching to exact mode at a count, until dropped.
+struct SwitchAt(u32);
+
+impl SwitchAt {
+    fn set(at: u32) -> Self {
+        SwitchAt(super::EXACT_MODE_AT_HERE.replace(at))
+    }
+}
+
+impl Drop for SwitchAt {
+    fn drop(&mut self) {
+        super::EXACT_MODE_AT_HERE.set(self.0);
     }
 }
 
@@ -3158,6 +3214,81 @@ fn seed_c1c333d3_two_threads_match_an_order() {
             assert!(
                 waits.load(SeqCst),
                 "op 3's walk never waited on 16 under op 2's claim"
+            );
+        }
+    });
+}
+
+/// 0xe8215650877e6693's last phase, thread 0's `TryGet(6)` held at its
+/// walk's visit of 7 until thread 1's `TryGet(2)` claims 5. Thread 0 has
+/// cleaned 23, 21 and 18 by then, so thread 1's walk makes three fewer
+/// first visits before it switches to exact mode and enters the cycle
+/// at 5, as a serial `TryGet(2)` does when its walk switches at 4093.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_e8215650_two_threads_match_an_order_at_a_nearby_switch() {
+    let seed = 0xe821_5650_877e_6693;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let last = phases.len() - 1;
+    let serial = Serial::new(&case, &phases);
+    quiet(|| {
+        for _ in 0..4 {
+            let flag = || Arc::new(AtomicBool::new(false));
+            let (cleaned, claimed, waited, forced) = (flag(), flag(), flag(), flag());
+            let rig = |live: &Live<Shared>| {
+                let (cleaned, claimed, waited, forced, world) = (
+                    cleaned.clone(),
+                    claimed.clone(),
+                    waited.clone(),
+                    forced.clone(),
+                    live.world.clone(),
+                );
+                let until = |flag: &AtomicBool| {
+                    let begun = std::time::Instant::now();
+                    while !flag.load(SeqCst) && begun.elapsed() < std::time::Duration::from_secs(10)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    flag.swap(true, SeqCst)
+                };
+                let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                    let Some(t) = TWO_THREAD.with(std::cell::Cell::get) else {
+                        return;
+                    };
+                    if TWO_PHASE.with(std::cell::Cell::get) != last {
+                        return;
+                    }
+                    let n = |x: usize| NodeId(world.handle(0, x).erased().slot());
+                    match (t, p) {
+                        (0, ParkPoint::AfterWalkClaim(x)) if x == n(18) => {
+                            cleaned.store(true, SeqCst);
+                        }
+                        (1, ParkPoint::AfterWalkClaim(x)) if x == n(5) => {
+                            claimed.store(true, SeqCst);
+                        }
+                        (1, ParkPoint::BeforeVisit(_)) => {
+                            until(&cleaned);
+                        }
+                        (0, ParkPoint::BeforeVisit(x))
+                            if x == n(7) && !waited.swap(true, SeqCst) =>
+                        {
+                            forced.store(until(&claimed), SeqCst);
+                        }
+                        _ => {}
+                    }
+                });
+                assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+            };
+            serial.differential(
+                "0xe8215650877e6693, 5 claimed under 7's visit",
+                None,
+                0,
+                &rig,
+            );
+            assert!(
+                forced.load(SeqCst),
+                "thread 1's walk never claimed 5 while thread 0's waited at 7"
             );
         }
     });

@@ -745,6 +745,26 @@ const EXACT_MODE_AT: u32 = 4096;
 #[cfg(loom)]
 const EXACT_MODE_AT: u32 = 8;
 
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// The first visits after which this thread's walks switch to exact
+    /// mode, for an oracle that judges a read at another switch phase.
+    pub(crate) static EXACT_MODE_AT_HERE: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(EXACT_MODE_AT) };
+}
+
+#[inline(always)]
+fn exact_mode_at() -> u32 {
+    #[cfg(all(test, not(loom)))]
+    {
+        EXACT_MODE_AT_HERE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(all(test, not(loom))))]
+    {
+        EXACT_MODE_AT
+    }
+}
+
 /// Root restarts a read's walk takes for other threads' releases before it
 /// goes on with its plan. Another thread can release in every plan, as a
 /// budgeted read discarding a doomed cycle's rounds does, and a read that
@@ -1289,7 +1309,7 @@ impl Walk {
             generation,
         });
         self.first_visits += 1;
-        if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
+        if self.visited.is_some() || self.first_visits == exact_mode_at() {
             self.visit_exact(id);
         }
     }
