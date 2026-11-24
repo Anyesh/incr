@@ -10915,6 +10915,21 @@ fn all_replayable(mut case: Case) -> Case {
     case
 }
 
+/// 0x9921: the episode rooted at query 2 defers at its landing end, as the
+/// unbounded run's does, after which 2's frame is over; the bounded run ran
+/// 2's closure once more, which read 3's landing-pass value and landed
+/// query 8, a node the unbounded run never computes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_deferred_episode_root_runs_no_more_than_unbounded() {
+    const SEED: u64 = 0x9921;
+    let case = gen_case(SEED, false, false);
+    quiet(|| {
+        differential::<Local>(&case, SEED);
+        differential::<Shared>(&case, SEED);
+    });
+}
+
 /// 0x44f9: a doomed member run took a delivery a lower level made for its
 /// first read; its retry must take it again, or that read gets the cycle
 /// outcome and the run lands query 13, which the unbounded run never reads.

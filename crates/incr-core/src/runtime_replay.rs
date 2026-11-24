@@ -136,6 +136,10 @@ enum VPop {
     /// The run of the frame at the popped position ended: no retry
     /// computes it again.
     Finished(u32, Ended),
+    /// The episode rooted at the node deferred to a lower root, which
+    /// ended the run of the root's frame with the root held, as the native
+    /// pop's: the root's entry, if this pop is at its position, is done.
+    Deferred(u32),
 }
 
 /// How the run of a popped frame ended.
@@ -4261,7 +4265,7 @@ impl<C: Cells> Runtime<C> {
                     self.tarjan_pop(id, &v, &mut kept)
                 };
                 match popped {
-                    VPop::Next | VPop::Left => {
+                    VPop::Next | VPop::Left | VPop::Deferred(_) => {
                         if retried && !kept.is_empty() {
                             taint_memo::restore(kept);
                         }
@@ -4269,6 +4273,23 @@ impl<C: Cells> Runtime<C> {
                             self.rest_unowed_reservation(v.node, v.generation);
                         }
                         popped_frames.push((v.clone(), false));
+                        if let VPop::Deferred(root) = popped {
+                            let boundary = replay::with(|c| {
+                                c.iter()
+                                    .find(|x| x.id == id)
+                                    .expect("incr-core: a running context is open")
+                                    .boundary
+                            });
+                            let generation = self.nodes.get(root).generation();
+                            if v.cidx == boundary + level
+                                && (entry.node, entry.generation) == (root, generation)
+                            {
+                                match self.held_entry_done(id, level, boundary) {
+                                    Some(computed) => return computed,
+                                    None => continue 'entries,
+                                }
+                            }
+                        }
                     }
                     VPop::Dissolved(root) => {
                         let generation = self.nodes.get(root).generation();
@@ -4395,15 +4416,8 @@ impl<C: Cells> Runtime<C> {
                         }
                     }
                 }
-                replay::with(|c| {
-                    if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                        x.pop_entry(level);
-                        x.claims.retain(|&(l, _)| l < level);
-                    }
-                });
-                if level == 0 {
-                    self.close_context(id, boundary);
-                    return Computed::Deferred;
+                if let Some(computed) = self.held_entry_done(id, level, boundary) {
+                    return computed;
                 }
                 continue;
             }
@@ -4827,6 +4841,7 @@ impl<C: Cells> Runtime<C> {
             PopEnd::Landed => VPop::Finished(root.0, Ended::Landed),
             PopEnd::Contained => VPop::Finished(root.0, Ended::Contained),
             PopEnd::Dissolved => VPop::Dissolved(root.0),
+            PopEnd::Deferred => VPop::Deferred(root.0),
             _ => VPop::Next,
         };
         if let PopEnd::Dissolved = end {
@@ -5773,6 +5788,21 @@ impl<C: Cells> Runtime<C> {
         }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(payload)
+    }
+
+    /// The held entry at `level` is done, its run over and its node held
+    /// for the root of its cycle to land: `Deferred` if it is the target.
+    fn held_entry_done(&self, id: u64, level: u32, boundary: u32) -> Option<Computed> {
+        replay::with(|c| {
+            if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                x.pop_entry(level);
+                x.claims.retain(|&(l, _)| l < level);
+            }
+        });
+        (level == 0).then(|| {
+            self.close_context(id, boundary);
+            Computed::Deferred
+        })
     }
 
     /// A virtual frame's pop at position `v.cidx` finished the run of the
