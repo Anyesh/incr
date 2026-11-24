@@ -23,6 +23,59 @@ thread_local! {
     pub(crate) static DIVERT_EVERY_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Dooms a test names, for a case whose byte budget's cut points move
+/// with frame sizes: each is a read as `(reader slot, read slot, depth)`,
+/// doomed as an over-budget read is when it comes first in the list.
+pub(crate) mod doom_schedule {
+    #[cfg(test)]
+    thread_local! {
+        static DOOMS: std::cell::RefCell<std::collections::VecDeque<(u32, u32, u32)>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+
+    /// Runs `f` with `dooms` scheduled, returning how many it left untaken.
+    #[cfg(test)]
+    #[cfg_attr(loom, allow(dead_code))]
+    pub(crate) fn with<R>(dooms: &[(u32, u32, u32)], f: impl FnOnce() -> R) -> (R, usize) {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                DOOMS.with(|d| d.borrow_mut().clear());
+            }
+        }
+        DOOMS.with(|d| *d.borrow_mut() = dooms.iter().copied().collect());
+        let _clear = Clear;
+        let r = f();
+        (r, DOOMS.with(|d| d.borrow().len()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn due(reader: u32, read: u32, depth: u32) -> bool {
+        DOOMS.with(|d| d.borrow().front() == Some(&(reader, read, depth)))
+    }
+
+    /// The read was doomed: a doom scheduled for it is spent.
+    #[cfg(test)]
+    pub(super) fn taken(reader: u32, read: u32, depth: u32) {
+        DOOMS.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.front() == Some(&(reader, read, depth)) {
+                d.pop_front();
+            }
+        });
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn due(_: u32, _: u32, _: u32) -> bool {
+        false
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn taken(_: u32, _: u32, _: u32) {}
+}
+
 /// What the doom point saw, for tests.
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -1790,11 +1843,13 @@ impl<C: Cells> Runtime<C> {
                         return ControlFlow::Break(read);
                     }
                 }
-                if self.over_budget(f.depth)
+                if (self.over_budget(f.depth)
+                    || doom_schedule::due(f.node.0, handle.slot(), f.depth))
                     && !self.undoomable(ctl, f.depth)
                     && self.replayable(f.node.0)
                     && self.placeholder::<T>().is_some()
                 {
+                    doom_schedule::taken(f.node.0, handle.slot(), f.depth);
                     mode |= ARMED;
                 }
             }
@@ -4272,6 +4327,7 @@ impl<C: Cells> Runtime<C> {
                 if !buffered {
                     let cidx = boundary + level;
                     self.retry_deliveries(id, entry.node, entry.generation, cidx);
+                    let since = replay::take_mark();
                     let ran = {
                         // Its frames sit above `cidx`, as an entry's run's do:
                         // at a lower position a panic among them releases
@@ -4289,6 +4345,7 @@ impl<C: Cells> Runtime<C> {
                         self.runtime_id,
                         cidx,
                         matches!(ran, Ok(None)),
+                        since,
                     ));
                     if !matches!(ran, Ok(None)) {
                         self.end_deliveries(id, entry.node, entry.generation, cidx);
@@ -4371,6 +4428,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             let placement = self.dep_stack.place_next_at(at, level > 0);
+            let since = replay::take_mark();
             let ran = {
                 let _speculating = entry
                     .spec
@@ -4416,11 +4474,10 @@ impl<C: Cells> Runtime<C> {
             if matches!(ran, Ok(Computed::Discarded)) && dropped.is_none() {
                 replay::with(|c| {
                     if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                        let own = x.pending.of_frame(entry.node, entry.generation, at);
-                        for i in x.pending.of_maker(level).into_iter().chain(own) {
+                        x.rearm_doomed(level, at, since);
+                        for i in x.pending.of_frame(entry.node, entry.generation, at) {
                             x.pending.set_taken(i, false);
                         }
-                        x.directs.rearm_maker(level);
                         x.directs.rearm_frame((entry.node, entry.generation, at));
                     }
                 });
@@ -4625,11 +4682,17 @@ impl<C: Cells> Runtime<C> {
                 .partition(|&(_, owner)| owner == v.cidx + 1);
             *kept = above;
             taint_memo::restore(own);
+            let since = replay::take_mark();
             let ran = {
                 let _speculating = v.spec.then(|| replay::Speculating::enter(self.runtime_id));
                 self.member_run(v.node, v.cidx, true, v.walked, true)
             };
-            drop(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
+            drop(replay::run_ended(
+                rt,
+                v.cidx,
+                matches!(ran, Ok(None)),
+                since,
+            ));
             match ran {
                 Ok(Some(l)) => {
                     self.end_deliveries(id, v.node, v.generation, v.cidx);
