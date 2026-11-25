@@ -23,8 +23,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyFrozenSet, PyList, PyTuple};
 
 /// The shortest stretch off the GIL that lets a waiting thread take it.
-/// A bare release and reacquire hands nothing over.
-pub const GAP: Duration = Duration::from_micros(50);
+/// A bare release and reacquire hands nothing over, and a waiter woken by
+/// the release often needs more than 50 us to run.
+pub const GAP: Duration = Duration::from_micros(200);
 /// How long a worker holds the GIL, between ticks, before its next tick or
 /// entry first spends a [`GAP`] off it.
 pub const STRETCH: Duration = Duration::from_millis(2);
