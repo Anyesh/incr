@@ -265,6 +265,8 @@ pub struct KeyTable<P, R> {
     /// [`KeyedCollection::key_partitions`], changed with each commit.
     parts: Vec<Box<dyn PartSink<P>>>,
     capture: Option<Box<Capture<(P, R)>>>,
+    #[cfg(test)]
+    scanned: usize,
 }
 
 impl<P, R: Ord + Copy> KeyTable<P, R> {
@@ -277,7 +279,16 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
             spilled_bytes: 0,
             parts: Vec::new(),
             capture: None,
+            #[cfg(test)]
+            scanned: 0,
         }
+    }
+
+    /// The slots `reserve` has scanned for buckets to move, over the
+    /// table's life.
+    #[cfg(test)]
+    fn scanned(&self) -> usize {
+        self.scanned
     }
 
     /// A plan per partitioning for `flips`, run as value code against the
@@ -380,6 +391,10 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
                 .take(capacity)
                 .collect(),
         );
+        #[cfg(test)]
+        {
+            self.scanned += old.len();
+        }
         let mut moved = vec![usize::MAX; old.len()];
         for (at, slot) in old.into_iter().enumerate() {
             if let Slot::Full(b) = slot {

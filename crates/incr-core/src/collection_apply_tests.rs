@@ -563,3 +563,57 @@ fn local_a_rehash_left_by_a_panicking_write_invalidates_element_slots() {
 fn shared_a_rehash_left_by_a_panicking_write_invalidates_element_slots() {
     a_rehash_left_by_a_panicking_write_invalidates_element_slots::<Shared>();
 }
+
+/// Runs `write`, which adds `added` distinct elements, and asserts that the
+/// multiset scanned at most `8 * added + 256` slots for it.
+fn assert_scan_bound(c: &IncrCollection<u64, Local>, added: usize, write: impl FnOnce()) {
+    let before = c.log.read().elements.scanned();
+    write();
+    let scanned = c.log.read().elements.scanned() - before;
+    assert!(
+        scanned <= 8 * added + 256,
+        "the multiset scanned {scanned} slots in a write adding {added} elements to {} held",
+        c.distinct_len() - added,
+    );
+}
+
+#[test]
+fn growth_scans_a_bounded_number_of_slots_per_insert() {
+    let rt = Runtime::<Local>::new();
+    let c = rt.create_collection::<u64>();
+    let values = if cfg!(miri) { 800 } else { 300_000 };
+    for v in 0..values {
+        assert_scan_bound(&c, 1, || c.insert(&rt, v));
+    }
+    assert_eq!(c.distinct_len(), values as usize);
+}
+
+#[test]
+fn a_batch_scans_slots_in_proportion_to_the_elements_it_adds() {
+    let rt = Runtime::<Local>::new();
+    let c = rt.create_collection::<u64>();
+    let (held, added) = if cfg!(miri) {
+        (600, 400)
+    } else {
+        (150_000, 100_000)
+    };
+    let (held, added) = (held as u64, added as u64);
+    assert_scan_bound(&c, held as usize, || c.extend(&rt, 0..held));
+    assert_scan_bound(&c, added as usize, || c.extend(&rt, held..held + added));
+    assert_eq!(c.distinct_len(), (held + added) as usize);
+}
+
+#[test]
+fn single_inserts_after_a_batch_that_fills_a_doubled_table_stay_bounded() {
+    let rt = Runtime::<Local>::new();
+    let c = rt.create_collection::<u64>();
+    assert_scan_bound(&c, 384, || c.extend(&rt, 0..384));
+    assert_scan_bound(&c, 384, || c.extend(&rt, 384..768));
+    for v in 768..1_200 {
+        assert_scan_bound(&c, 1, || c.insert(&rt, v));
+    }
+    assert_eq!(c.distinct_len(), 1_200);
+    let mut held = c.values(&rt).to_vec();
+    held.sort_unstable();
+    assert_eq!(held, (0..1_200).collect::<Vec<u64>>());
+}

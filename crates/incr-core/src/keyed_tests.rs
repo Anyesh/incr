@@ -2006,3 +2006,72 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
     assert_eq!(sorted(got), begin);
     assert!(!kc.capture_installed());
 }
+
+type Grown = KeyedCollection<u64, u64, crate::Local>;
+
+/// The slots the key table and the pairs multiset have scanned for entries
+/// to move.
+fn scanned(kc: &Grown) -> [usize; 2] {
+    let keys = kc.index.table.read().scanned();
+    let pairs = kc.pairs.log.read().elements.scanned();
+    [keys, pairs]
+}
+
+/// Runs `write`, which adds `added` keys, and asserts that neither table
+/// scanned more than `8 * added + 256` slots for it.
+fn assert_scan_bound(kc: &Grown, added: usize, write: impl FnOnce()) {
+    let before = scanned(kc);
+    write();
+    let after = scanned(kc);
+    for (table, (before, after)) in ["key table", "pairs multiset"]
+        .iter()
+        .zip(before.iter().zip(after))
+    {
+        assert!(
+            after - before <= 8 * added + 256,
+            "the {table} scanned {} slots in a write adding {added} keys to {} held",
+            after - before,
+            kc.len() - added,
+        );
+    }
+}
+
+#[test]
+fn growth_scans_a_bounded_number_of_slots_per_write() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let keys = if cfg!(miri) { 800 } else { 300_000 };
+    for k in 0..keys {
+        assert_scan_bound(&kc, 1, || drop(kc.upsert(&rt, k, k)));
+    }
+    assert_eq!(kc.len(), keys as usize);
+}
+
+#[test]
+fn a_batch_scans_slots_in_proportion_to_the_keys_it_adds() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let (held, added) = if cfg!(miri) {
+        (600, 400)
+    } else {
+        (150_000, 100_000)
+    };
+    let rows = |n: usize| (0..n as u64).map(|k| (k, k));
+    assert_scan_bound(&kc, held, || drop(kc.reconcile(&rt, rows(held))));
+    assert_scan_bound(&kc, added, || drop(kc.reconcile(&rt, rows(held + added))));
+    assert_eq!(kc.len(), held + added);
+}
+
+#[test]
+fn single_writes_after_a_batch_that_fills_a_doubled_table_stay_bounded() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let rows = |n: u64| (0..n).map(|k| (k, k));
+    assert_scan_bound(&kc, 384, || drop(kc.reconcile(&rt, rows(384))));
+    assert_scan_bound(&kc, 384, || drop(kc.reconcile(&rt, rows(768))));
+    for k in 768..1_200 {
+        assert_scan_bound(&kc, 1, || drop(kc.upsert(&rt, k, k)));
+    }
+    assert_eq!(kc.len(), 1_200);
+    assert!((0..1_200).all(|k| kc.row(&k) == Some(k)));
+}

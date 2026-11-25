@@ -145,6 +145,8 @@ pub(crate) struct HashedMultiset<T> {
     /// after reserving can do without changing any element.
     rehashes: u64,
     capture: Option<Box<Capture<(T, usize)>>>,
+    #[cfg(test)]
+    scanned: usize,
 }
 
 /// Where one change lands, as found by [`HashedMultiset::locate`]. Valid
@@ -182,7 +184,16 @@ impl<T> HashedMultiset<T> {
             growth_left: 0,
             rehashes: 0,
             capture: None,
+            #[cfg(test)]
+            scanned: 0,
         }
+    }
+
+    /// The slots `reserve` has scanned for entries to move, over the
+    /// multiset's life.
+    #[cfg(test)]
+    pub(crate) fn scanned(&self) -> usize {
+        self.scanned
     }
 
     /// Number of distinct elements.
@@ -261,6 +272,10 @@ impl<T> HashedMultiset<T> {
             capacity
         };
         let mut table = Table::new(capacity);
+        #[cfg(test)]
+        {
+            self.scanned += self.table.capacity;
+        }
         match self.capture.as_deref_mut() {
             None => move_entries(&mut self.table, &mut table, yielder, |_, _| {}),
             Some(capture) => {
