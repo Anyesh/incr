@@ -281,11 +281,32 @@ impl<P, R> Storage for Slots<P, R> {
         self.as_mut_slice()[k].take(TOMBSTONE)
     }
 
-    fn place(&mut self, bucket: Bucket<P, R>) -> (usize, bool) {
-        let slot = self.free_slot(bucket.hash);
-        let reused = !self.is_empty_slot(slot);
-        self.put(slot, bucket);
-        (slot, reused)
+    #[inline(never)]
+    fn move_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        into: &mut Self,
+        mut moved: impl FnMut(usize, usize),
+    ) -> (usize, usize) {
+        let (mut count, mut reused) = (0, 0);
+        let new = into.as_mut_slice();
+        let mask = new.len() - 1;
+        for (k, slot) in self.as_mut_slice()[from..to].iter_mut().enumerate() {
+            let Some(bucket) = slot.take(TOMBSTONE) else {
+                continue;
+            };
+            let mut j = bucket.hash.0 as usize & mask;
+            while new[j].is_full() {
+                j = (j + 1) & mask;
+            }
+            reused += usize::from(new[j].hash == TOMBSTONE);
+            new[j].pairs.write(bucket.pairs);
+            new[j].hash = bucket.hash.0;
+            count += 1;
+            moved(from + k, j);
+        }
+        (count, reused)
     }
 
     fn drop_entries(&mut self, from: usize) {

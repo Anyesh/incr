@@ -21,6 +21,22 @@ pub(crate) fn alloc_zeroed(layout: Layout) -> NonNull<u8> {
     NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout))
 }
 
+/// A block of `layout`, which must not be zero-sized, whose bytes from
+/// `from` on are zero. [`dealloc`] and [`release`] take it as they take
+/// one from [`alloc_zeroed`].
+pub(crate) fn alloc_zeroed_from(layout: Layout, from: usize) -> NonNull<u8> {
+    debug_assert!(layout.size() != 0 && from <= layout.size());
+    if sys::maps(layout) {
+        return sys::map(layout);
+    }
+    // SAFETY: the size is not zero.
+    let ptr = unsafe { alloc::alloc(layout) };
+    let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+    // SAFETY: bytes `from..layout.size()` lie inside the block.
+    unsafe { ptr.add(from).write_bytes(0, layout.size() - from) };
+    ptr
+}
+
 /// # Safety
 /// `ptr` must come from [`alloc_zeroed`] with this `layout` and not have
 /// been passed here before.

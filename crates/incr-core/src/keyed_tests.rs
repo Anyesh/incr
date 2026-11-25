@@ -1982,7 +1982,7 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
     let grown = kc.index.table.read().store.table.capacity();
     assert!(grown > regrown, "the clump grows the table");
     got.extend(kc.capture_step_by(Duration::ZERO, 7).rows);
-    let growth_left = kc.index.table.read().store.growth_left;
+    let growth_left = kc.index.table.read().store.room();
     let ops: Vec<PairOp<(V, u8), ()>> = (10..15)
         .map(|k| PairOp::Remove((v(k, 0), k), ()))
         .chain((15..20).map(|k| PairOp::Insert((v(k, 0), k + 2), ())))
@@ -1990,7 +1990,7 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
         .collect();
     kc.apply_pairs_with(&rt, ops, &mut (), None);
     let table = kc.index.table.read();
-    assert!(table.store.growth_left > growth_left, "the write rehashes");
+    assert!(table.store.room() > growth_left, "the write rehashes");
     assert_eq!(table.store.table.capacity(), grown, "at the same size");
     drop(table);
     loop {

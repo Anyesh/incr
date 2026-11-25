@@ -58,6 +58,7 @@ fn step_slots() -> usize {
     }
 }
 const MIN_CAPACITY: usize = 8;
+const MIGRATING: usize = 1 << (usize::BITS - 1);
 
 pub(crate) fn load_limit(capacity: usize) -> usize {
     capacity / 4 * 3
@@ -77,10 +78,18 @@ pub(crate) trait Storage {
     /// slot.
     fn take(&mut self, k: usize) -> Option<Self::Entry>;
 
-    /// Stores `entry` in the first free slot of its probe run. Returns the
-    /// slot and whether it was a tombstone rather than never used.
-    /// Requires a never-used slot in the storage.
-    fn place(&mut self, entry: Self::Entry) -> (usize, bool);
+    /// Moves the entry of each full slot `k` in `from..to` into the first
+    /// free slot of its probe run in `into`, calling `moved(k, slot)`.
+    /// Leaves every slot of `from..to` free. Returns the entries moved and
+    /// how many of them landed on a tombstone rather than a never-used
+    /// slot. Requires a never-used slot in `into` after each move.
+    fn move_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        into: &mut Self,
+        moved: impl FnMut(usize, usize),
+    ) -> (usize, usize);
 
     /// Drops every entry from slot `from` on.
     fn drop_entries(&mut self, from: usize);
@@ -137,27 +146,24 @@ impl<S: Storage> Migration<S> {
         let base = table.capacity();
         let from = self.cursor;
         let end = from + budget.min(self.old.capacity() - from);
-        let mut stepped = Stepped {
+        let (moved, reused) = match (capture.as_deref_mut(), moves.as_deref_mut()) {
+            (None, None) => self.old.move_range(from, end, table, |_, _| yielder.tick()),
+            (mut capture, mut moves) => self.old.move_range(from, end, table, |k, to| {
+                yielder.tick();
+                if let Some(capture) = capture.as_deref_mut() {
+                    capture.moved(base + k, to);
+                }
+                if let Some(moves) = moves.as_deref_mut() {
+                    moves.push((base + k, to));
+                }
+            }),
+        };
+        let stepped = Stepped {
             #[cfg(test)]
             scanned: end - from,
-            moved: 0,
-            reused: 0,
+            moved,
+            reused,
         };
-        for k in from..end {
-            let Some(entry) = self.old.take(k) else {
-                continue;
-            };
-            yielder.tick();
-            let (to, reused) = table.place(entry);
-            if let Some(capture) = capture.as_deref_mut() {
-                capture.moved(base + k, to);
-            }
-            if let Some(moves) = moves.as_deref_mut() {
-                moves.push((base + k, to));
-            }
-            stepped.moved += 1;
-            stepped.reused += usize::from(reused);
-        }
         self.cursor = end;
         self.old.release(from, end);
         stepped
@@ -192,8 +198,10 @@ pub(crate) struct Growing<S: Storage> {
     pub(crate) table: S,
     /// How many never-used slots of `table` may still fill before `grow`
     /// has to run: its load limit, less its full and tombstone slots and
-    /// the entries still in the old storage.
-    pub(crate) growth_left: usize,
+    /// the entries still in the old storage. [`MIGRATING`] is set in it
+    /// exactly while `migration` is `Some`, so that one signed compare
+    /// answers [`Self::must_grow`].
+    growth_left: usize,
     migration: Option<Box<Migration<S>>>,
     #[cfg(test)]
     scanned: usize,
@@ -211,14 +219,46 @@ impl<S: Storage> Growing<S> {
     }
 
     /// Whether a `reserve` of `additional` has to call [`Self::grow`].
+    /// `additional` counts entries that fit in memory, so it is below
+    /// `isize::MAX`.
     #[inline]
     pub(crate) fn must_grow(&self, additional: usize) -> bool {
-        additional > self.growth_left || self.migration.is_some()
+        debug_assert!(additional <= isize::MAX as usize);
+        additional as isize > self.growth_left as isize
     }
 
     #[inline]
     pub(crate) fn migrating(&self) -> bool {
-        self.migration.is_some()
+        (self.growth_left as isize) < 0
+    }
+
+    /// How many never-used slots of `table` may still fill before `grow`
+    /// has to run.
+    #[inline]
+    pub(crate) fn room(&self) -> usize {
+        self.growth_left & !MIGRATING
+    }
+
+    /// Records an insert into a never-used slot of `table`. Requires room.
+    #[inline]
+    pub(crate) fn use_room(&mut self) {
+        debug_assert!(self.room() > 0);
+        self.growth_left -= 1;
+    }
+
+    /// Records `n` slots of `table` or of the old storage that no longer
+    /// count against the room.
+    #[inline]
+    pub(crate) fn give_room(&mut self, n: usize) {
+        self.growth_left += n;
+    }
+
+    fn set_migration(&mut self, migration: Option<Box<Migration<S>>>) {
+        self.growth_left = match migration {
+            Some(_) => self.growth_left | MIGRATING,
+            None => self.room(),
+        };
+        self.migration = migration;
     }
 
     pub(crate) fn old(&self) -> Option<Old<'_, S>> {
@@ -253,7 +293,7 @@ impl<S: Storage> Growing<S> {
     }
 
     fn count(&mut self, stepped: &Stepped) {
-        self.growth_left += stepped.reused;
+        self.give_room(stepped.reused);
         #[cfg(test)]
         {
             self.scanned += stepped.scanned;
@@ -278,23 +318,21 @@ impl<S: Storage> Growing<S> {
             .saturating_mul(additional)
             .saturating_add(step_slots());
         let mut changed = false;
+        let room = self.room();
         if let Some(migration) = self.migration.as_deref_mut() {
-            let budget = if additional > self.growth_left {
-                usize::MAX
-            } else {
-                pace
-            };
+            let budget = if additional > room { usize::MAX } else { pace };
             let stepped = moves.as_deref_mut().map(|moves| &mut moves.stepped);
             let stepped = migration.step(&mut self.table, budget, capture, stepped, yielder);
             changed = stepped.moved > 0;
-            if migration.done() {
-                self.migration = None;
+            let done = migration.done();
+            self.count(&stepped);
+            if done {
+                self.set_migration(None);
                 finish(capture);
                 changed = true;
             }
-            self.count(&stepped);
         }
-        if additional > self.growth_left {
+        if additional > self.room() {
             let capacity = next_capacity(self.table.capacity(), len, additional);
             let old = mem::replace(&mut self.table, S::zeroed(capacity));
             self.growth_left = load_limit(capacity) - len;
@@ -305,14 +343,18 @@ impl<S: Storage> Growing<S> {
                 moves.shift = capacity;
                 &mut moves.restepped
             });
-            let mut migration = Migration { old, cursor: 0 };
-            let stepped = migration.step(&mut self.table, pace, capture, restepped, yielder);
-            if migration.done() {
+            if len == 0 {
                 finish(capture);
             } else {
-                self.migration = Some(Box::new(migration));
+                let mut migration = Migration { old, cursor: 0 };
+                let stepped = migration.step(&mut self.table, pace, capture, restepped, yielder);
+                self.count(&stepped);
+                if migration.done() {
+                    finish(capture);
+                } else {
+                    self.set_migration(Some(Box::new(migration)));
+                }
             }
-            self.count(&stepped);
             changed = true;
         }
         changed

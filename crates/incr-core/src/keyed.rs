@@ -399,12 +399,13 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
 
     /// What `map` makes of each bucket, in table order.
     fn collect_buckets<T>(&self, mut map: impl FnMut(&Bucket<P, R>) -> T) -> Vec<T> {
-        let mut out: Vec<T> = self
-            .store
-            .table
-            .buckets(0, 0)
-            .map(|(_, bucket)| map(bucket))
-            .collect();
+        let mut out = Vec::with_capacity(self.keys);
+        out.extend(
+            self.store
+                .table
+                .buckets(0, 0)
+                .map(|(_, bucket)| map(bucket)),
+        );
         if self.store.migrating() {
             self.for_each_old_bucket(&mut |_, bucket| out.push(map(bucket)));
         }
@@ -454,10 +455,10 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
         capture::settle_free(&mut self.capture, j);
         if self.store.table.is_empty_slot(j) {
             assert!(
-                self.store.growth_left > 0,
+                self.store.room() > 0,
                 "incr-core: key table insert without a reserve"
             );
-            self.store.growth_left -= 1;
+            self.store.use_room();
         }
         self.count_in(&pairs);
         self.store.table.put(j, Bucket { hash, pairs });
@@ -490,7 +491,7 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
         let Some((b, emptied)) = removed else {
             panic!("incr-core: key table slot {i} is not live");
         };
-        self.store.growth_left += usize::from(emptied);
+        self.store.give_room(usize::from(emptied));
         self.keys -= 1;
         self.count_out(&b.pairs);
         b.pairs
