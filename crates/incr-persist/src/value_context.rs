@@ -91,7 +91,10 @@ impl ValueScope {
     /// `hold`, after releasing its lock; a `Drop` that calls a store from
     /// there must first release whatever `hold` took, as the Python
     /// bindings release the GIL, or it can deadlock against a store call
-    /// waiting for that lock.
+    /// waiting for that lock. A checkpoint thread also runs one empty
+    /// `hold`, holding no lock, after it dropped everything it owns, so a
+    /// binding that defers what a drop releases without its lock, as PyO3
+    /// queues a decref made without the GIL, can finish it there.
     pub fn holding(self, hold: fn(&mut dyn FnMut())) -> Self {
         ValueScope {
             hold: Some(hold),
@@ -151,6 +154,15 @@ impl ValueScope {
 /// inside `scope`'s hold, or directly without one.
 pub(crate) fn hold(scope: Option<&ValueScope>, f: impl FnOnce()) {
     run_inside(scope.and_then(|scope| scope.hold), f, "hold");
+}
+
+/// Drops `value` and `scope`, then runs an empty hold: what a thread owns
+/// last, such as the scope's last clone, may be all that keeps a value,
+/// and its drop is finished only inside the hold.
+pub(crate) fn drop_then_hold<T>(scope: Option<ValueScope>, value: T) {
+    let hold = scope.as_ref().and_then(|scope| scope.hold);
+    drop((value, scope));
+    run_inside(hold, || {}, "hold");
 }
 
 /// Runs `f`, incr-persist's own work with no value call, inside `scope`'s

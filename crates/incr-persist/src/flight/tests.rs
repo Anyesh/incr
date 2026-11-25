@@ -185,6 +185,61 @@ fn a_start_that_panics_or_skips_the_body_posts_a_panic() {
     }
 }
 
+static EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+fn event(name: &'static str) {
+    EVENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(name);
+}
+
+fn events() -> Vec<&'static str> {
+    EVENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn logging_hold(f: &mut dyn FnMut()) {
+    event("hold");
+    f();
+}
+
+struct Witness(&'static str);
+
+impl Drop for Witness {
+    fn drop(&mut self) {
+        event(self.0);
+    }
+}
+
+#[test]
+fn a_worker_holds_once_after_dropping_its_last_scope_and_an_unread_verdict() {
+    let scope = ValueScope::new(Arc::new(Witness("scope"))).holding(logging_hold);
+    let verdict = Witness("verdict");
+    let (go, gate) = mpsc::channel::<()>();
+    let (flight, token) = Flight::<(), _>::start(Some(scope), move |inbox| {
+        assert!(inbox.recv().is_none());
+        gate.recv().unwrap();
+        Verdict::Committed(verdict)
+    })
+    .unwrap();
+    drop(flight);
+    drop(token);
+    go.send(()).unwrap();
+    let deadline = Instant::now() + LONG.unwrap();
+    while events().len() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "no hold after the drops: {:?}",
+            events()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(events(), ["verdict", "scope", "hold"]);
+}
+
 #[test]
 fn joining_cancels_and_waits_for_running_workers() {
     let (flight, _token) = Flight::start(None, |inbox: Inbox<Message>| {
