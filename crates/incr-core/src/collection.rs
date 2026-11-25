@@ -409,14 +409,14 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             for value in target {
                 *wanted.entry(value).or_default() += 1;
             }
-            for (value, have) in self.elements.iter() {
+            self.elements.for_each(|value, have| {
                 let kept = wanted.get_mut(value).map_or(0, |want| {
                     let kept = have.min(*want);
                     *want -= kept;
                     kept
                 });
                 surplus.extend(std::iter::repeat_n(value, have - kept).cloned());
-            }
+            });
         });
         let mut version = None;
         for value in surplus {
@@ -450,18 +450,20 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     pub fn elements_vec(&self) -> Vec<T> {
         let mut out = Vec::with_capacity(self.len());
         value_code::run(|| {
-            for (val, count) in self.elements.iter() {
+            self.elements.for_each(|val, count| {
                 for _ in 0..count {
                     out.push(val.clone());
                 }
-            }
+            });
         });
         out
     }
 
     /// Number of live elements, with multiset duplicates counted.
     pub(crate) fn len(&self) -> usize {
-        self.elements.iter().map(|(_, count)| count).sum()
+        let mut len = 0;
+        self.elements.for_each(|_, count| len += count);
+        len
     }
 }
 
@@ -990,11 +992,11 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         crate::dep_stack::unrecorded_lookup::<C>();
         let log = self.log.read();
         value_code::run(|| {
-            for (slot, value, count) in log.elements.slots() {
+            log.elements.try_for_each_slot(|slot, value, count| {
                 let slot =
                     u32::try_from(slot).expect("incr-core: a multiset holds under 2^32 slots");
-                visit(ElementSlot(slot), value, count)?;
-            }
+                visit(ElementSlot(slot), value, count)
+            })?;
             Ok(log.stamp())
         })
     }

@@ -925,8 +925,9 @@ fn model_matches<C: Cells>() {
         failure_persistence: None,
         ..ProptestConfig::default()
     };
-    proptest!(config, |(steps in prop::collection::vec(step(), 1..12))| {
-        run_steps::<C>(steps);
+    let step_slots = prop_oneof![Just(1_usize), Just(256)];
+    proptest!(config, |(steps in prop::collection::vec(step(), 1..12), slots in step_slots)| {
+        crate::grow::with_step_slots(slots, || run_steps::<C>(steps));
     });
 }
 
@@ -1923,10 +1924,10 @@ fn registering_partitions_finishes_when_a_commit_lands_after_every_optimistic_bu
 #[test]
 fn a_key_table_write_that_skips_the_stage_clone_panics_under_a_capture() {
     let mut table = KeyTable::<(u8, u8), u8>::new();
-    table.reserve(1);
-    table.insert(7, few_of(vec![((1, 2), 0)]));
+    table.reserve(1, &NoTicks);
+    table.insert(BucketHash::new(7), few_of(vec![((1, 2), 0)]));
     let slot = table.buckets().next().expect("a bucket").0;
-    table.capture = Some(Capture::new(table.slots.len()));
+    table.capture = Some(Capture::new(table.store.table.capacity(), 0));
     let replace = catch_unwind(AssertUnwindSafe(|| {
         table.replace(slot, few_of(vec![((1, 3), 0)]));
     }));
@@ -1958,14 +1959,14 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
     kc.begin_capture();
     let begin = rows(&kc);
     let mut got = kc.capture_step_by(Duration::ZERO, 5).rows;
-    let capacity = kc.index.table.read().slots.len();
+    let capacity = kc.index.table.read().store.table.capacity();
     let ops: Vec<PairOp<(V, u8), ()>> = (0..5)
         .map(|k| PairOp::Remove((v(k, 0), k), ()))
         .chain((5..10).map(|k| PairOp::Insert((v(k, 0), k + 1), ())))
         .chain((241..246).map(|k| PairOp::Insert((v(k, 0), 0), ())))
         .collect();
     kc.apply_pairs_with(&rt, ops, &mut (), None);
-    let regrown = kc.index.table.read().slots.len();
+    let regrown = kc.index.table.read().store.table.capacity();
     assert!(
         regrown > capacity,
         "the write that changes keys grows the table"
@@ -1978,10 +1979,10 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
             kc.remove(&rt, &v(k, 0));
         },
     );
-    let grown = kc.index.table.read().slots.len();
+    let grown = kc.index.table.read().store.table.capacity();
     assert!(grown > regrown, "the clump grows the table");
     got.extend(kc.capture_step_by(Duration::ZERO, 7).rows);
-    let growth_left = kc.index.table.read().growth_left;
+    let growth_left = kc.index.table.read().store.room();
     let ops: Vec<PairOp<(V, u8), ()>> = (10..15)
         .map(|k| PairOp::Remove((v(k, 0), k), ()))
         .chain((15..20).map(|k| PairOp::Insert((v(k, 0), k + 2), ())))
@@ -1989,8 +1990,8 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
         .collect();
     kc.apply_pairs_with(&rt, ops, &mut (), None);
     let table = kc.index.table.read();
-    assert!(table.growth_left > growth_left, "the write rehashes");
-    assert_eq!(table.slots.len(), grown, "at the same size");
+    assert!(table.store.room() > growth_left, "the write rehashes");
+    assert_eq!(table.store.table.capacity(), grown, "at the same size");
     drop(table);
     loop {
         let step = kc.capture_step_by(Duration::ZERO, 4);
@@ -2005,4 +2006,116 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
         .collect();
     assert_eq!(sorted(got), begin);
     assert!(!kc.capture_installed());
+}
+
+type Grown = KeyedCollection<u64, u64, crate::Local>;
+
+/// The slots the key table and the pairs multiset have scanned for entries
+/// to move.
+fn scanned(kc: &Grown) -> [usize; 2] {
+    let keys = kc.index.table.read().scanned();
+    let pairs = kc.pairs.log.read().elements.scanned();
+    [keys, pairs]
+}
+
+/// Runs `write`, which adds `added` keys, and asserts that neither table
+/// scanned more than `8 * added + 256` slots for it.
+fn assert_scan_bound(kc: &Grown, added: usize, write: impl FnOnce()) {
+    let before = scanned(kc);
+    write();
+    let after = scanned(kc);
+    for (table, (before, after)) in ["key table", "pairs multiset"]
+        .iter()
+        .zip(before.iter().zip(after))
+    {
+        assert!(
+            after - before <= 8 * added + 256,
+            "the {table} scanned {} slots in a write adding {added} keys to {} held",
+            after - before,
+            kc.len() - added,
+        );
+    }
+}
+
+#[test]
+fn growth_scans_a_bounded_number_of_slots_per_write() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let keys = if cfg!(miri) { 800 } else { 300_000 };
+    for k in 0..keys {
+        assert_scan_bound(&kc, 1, || drop(kc.upsert(&rt, k, k)));
+    }
+    assert_eq!(kc.len(), keys as usize);
+}
+
+#[test]
+fn a_batch_scans_slots_in_proportion_to_the_keys_it_adds() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let (held, added) = if cfg!(miri) {
+        (600, 400)
+    } else {
+        (150_000, 100_000)
+    };
+    let rows = |n: usize| (0..n as u64).map(|k| (k, k));
+    assert_scan_bound(&kc, held, || drop(kc.reconcile(&rt, rows(held))));
+    assert_scan_bound(&kc, added, || drop(kc.reconcile(&rt, rows(held + added))));
+    assert_eq!(kc.len(), held + added);
+}
+
+#[test]
+fn single_writes_after_a_batch_that_fills_a_doubled_table_stay_bounded() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let rows = |n: u64| (0..n).map(|k| (k, k));
+    assert_scan_bound(&kc, 384, || drop(kc.reconcile(&rt, rows(384))));
+    assert_scan_bound(&kc, 384, || drop(kc.reconcile(&rt, rows(768))));
+    for k in 768..1_200 {
+        assert_scan_bound(&kc, 1, || drop(kc.upsert(&rt, k, k)));
+    }
+    assert_eq!(kc.len(), 1_200);
+    assert!((0..1_200).all(|k| kc.row(&k) == Some(k)));
+}
+
+/// Storage of this size is mapped and released page by page on Linux, and
+/// its migrations take hundreds of writes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn every_row_reads_back_through_the_migrations_of_a_large_table() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let mut model: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut checked_migrating = 0;
+    let check = |kc: &Grown, model: &BTreeMap<u64, u64>, upto: u64| {
+        for k in 0..=upto {
+            assert_eq!(kc.row(&k), model.get(&k).copied(), "row of {k} at {upto}");
+        }
+        let mut items = kc.items();
+        items.sort_unstable();
+        assert!(items
+            .iter()
+            .copied()
+            .eq(model.iter().map(|(k, v)| (*k, *v))));
+        let mut pairs = kc.pairs().values(&rt);
+        pairs.sort_unstable();
+        assert_eq!(pairs, items);
+    };
+    for k in 0..200_000_u64 {
+        kc.upsert(&rt, k, k);
+        model.insert(k, k);
+        if k % 3 == 0 {
+            kc.remove(&rt, &(k / 2));
+            model.remove(&(k / 2));
+        }
+        if k % 5 == 0 && model.contains_key(&(k / 3)) {
+            kc.upsert(&rt, k / 3, k);
+            model.insert(k / 3, k);
+        }
+        if k % 64 == 0 && kc.index.table.read().store.migrating() {
+            check(&kc, &model, k);
+            checked_migrating += 1;
+        }
+    }
+    check(&kc, &model, 200_000);
+    assert!(checked_migrating >= 4, "checked {checked_migrating} times");
 }

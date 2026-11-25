@@ -252,12 +252,10 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             .iter()
             .filter(|p| p.at.is_none() && p.inserts > 0)
             .count();
-        if self.elements.reserve_ticking(absent, yielder) {
-            for (p, group) in plan.iter_mut().zip(&batch.groups) {
+        if let Some(moves) = self.elements.reserve_moving(absent, yielder) {
+            for at in plan.iter_mut().filter_map(|p| p.at.as_mut()) {
                 yielder.tick();
-                if p.at.is_some() {
-                    p.at = find(&self.elements, group);
-                }
+                *at = moves.remap(*at);
             }
         }
         if self.elements.capture_installed() {

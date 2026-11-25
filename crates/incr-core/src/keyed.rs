@@ -31,6 +31,7 @@ use crate::collection::{Change, Displaced, IncrCollection, StagedBatch};
 use crate::dep_stack::DepStack;
 use crate::few::Few;
 use crate::fx::FxBuildHasher;
+use crate::grow::{Growing, Moves, Storage};
 use crate::handle::{ErasedIncr, Incr};
 use crate::lock_order::LockKind;
 use crate::locks::OrderedLock;
@@ -44,7 +45,9 @@ use crate::yield_hook::{with_ticks, NoTicks, Ticks, Yielder};
 use crate::yield_hook::{YieldHook, YIELD_EVERY};
 
 mod parts;
+mod slots;
 use parts::{Flip, PartSink, PartState};
+use slots::{Bucket, BucketHash, Slots};
 
 /// An element of a keyed collection's pair collection: a key and its row.
 ///
@@ -207,14 +210,11 @@ fn first_smallest<R: Ord + Copy>(ranks: impl Iterator<Item = R>) -> Option<usize
     ranks.enumerate().min_by_key(|(_, r)| *r).map(|(i, _)| i)
 }
 
-fn load_limit(capacity: usize) -> usize {
-    capacity / 4 * 3
-}
-
-struct Bucket<P, R> {
-    hash: u64,
-    /// Never empty while the bucket is in the table.
-    pairs: Few<(P, R)>,
+/// The index hash of `key`: the one hash of a key that the key table, a
+/// stage, the version inputs and the key partitions store and compare.
+#[inline]
+fn bucket_hash<K: Hash + ?Sized>(hasher: &RandomState, key: &K) -> BucketHash {
+    BucketHash::new(hasher.hash_one(key))
 }
 
 impl<P, R: Ord + Copy> Bucket<P, R> {
@@ -235,12 +235,6 @@ impl<P, R: Ord + Copy> Bucket<P, R> {
     }
 }
 
-enum Slot<P, R> {
-    Empty,
-    Tombstone,
-    Full(Bucket<P, R>),
-}
-
 /// (partitioning, partition hash) pairs.
 type PartSlots = Vec<(usize, u64)>;
 
@@ -251,15 +245,15 @@ type KeyedScan<O> = (u64, usize, Vec<O>);
 /// The table behind a [`KeyIndex`]: one bucket per key, found by the key's
 /// hash, holding that key's pairs with their ranks. Open addressing with
 /// stored hashes, as `HashedMultiset`: only a lookup runs user code, only
-/// `reserve` moves buckets, and removal leaves a tombstone unless no probe
-/// run passes through the slot.
+/// `reserve` moves buckets, a few per call while the table grows (see
+/// `crate::grow`), and removal leaves a tombstone unless no probe run
+/// passes through the slot.
 pub struct KeyTable<P, R> {
-    // Invariant: the capacity is zero or a power of two with at least one
-    // Empty slot, so every probe loop ends.
-    slots: Vec<Slot<P, R>>,
+    // Invariant: the table's capacity is zero or a power of two with at
+    // least one empty slot, so every probe loop ends.
+    store: Growing<Slots<P, R>>,
     keys: usize,
     pairs: usize,
-    growth_left: usize,
     spilled_bytes: usize,
     /// The key-set partitionings registered with
     /// [`KeyedCollection::key_partitions`], changed with each commit.
@@ -270,14 +264,20 @@ pub struct KeyTable<P, R> {
 impl<P, R: Ord + Copy> KeyTable<P, R> {
     fn new() -> Self {
         Self {
-            slots: Vec::new(),
+            store: Growing::new(Slots::empty()),
             keys: 0,
             pairs: 0,
-            growth_left: 0,
             spilled_bytes: 0,
             parts: Vec::new(),
             capture: None,
         }
+    }
+
+    /// The slots `reserve` has scanned for buckets to move, over the
+    /// table's life.
+    #[cfg(all(test, not(loom)))]
+    fn scanned(&self) -> usize {
+        self.store.scanned()
     }
 
     /// A plan per partitioning for `flips`, run as value code against the
@@ -307,101 +307,135 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
     }
 
     fn heap_bytes(&self) -> usize {
-        self.slots.capacity() * mem::size_of::<Slot<P, R>>() + self.spilled_bytes
+        Slots::<P, R>::heap_bytes(self.store.table.capacity() + self.store.old_capacity())
+            + self.spilled_bytes
     }
 
     /// The slot of the bucket with `hash` that `matches` accepts. Runs
     /// `matches` (user `Eq`) and changes nothing.
-    fn find(&self, hash: u64, mut matches: impl FnMut(&Bucket<P, R>) -> bool) -> Option<usize> {
-        if self.slots.is_empty() {
-            return None;
+    #[inline]
+    fn find(
+        &self,
+        hash: BucketHash,
+        mut matches: impl FnMut(&Bucket<P, R>) -> bool,
+    ) -> Option<usize> {
+        let found = self.store.table.find(hash, &mut matches);
+        if found.is_none() && self.store.migrating() {
+            return self.find_old(hash, matches);
         }
-        let mask = self.slots.len() - 1;
-        let mut i = hash as usize & mask;
-        loop {
-            match &self.slots[i] {
-                Slot::Empty => return None,
-                Slot::Full(b) if b.hash == hash && matches(b) => return Some(i),
-                Slot::Full(_) | Slot::Tombstone => {}
-            }
-            i = (i + 1) & mask;
-        }
+        found
     }
 
-    fn find_key<K, V>(&self, hash: u64, key: &K) -> Option<usize>
+    #[cold]
+    #[inline(never)]
+    fn find_old(
+        &self,
+        hash: BucketHash,
+        matches: impl FnMut(&Bucket<P, R>) -> bool,
+    ) -> Option<usize> {
+        let old = self.store.old()?;
+        Some(old.base + old.storage.find_from(old.cursor, hash, matches)?)
+    }
+
+    fn find_key<K, V>(&self, hash: BucketHash, key: &K) -> Option<usize>
     where
         P: Pair<K, V>,
     {
         self.find(hash, |b| b.first().key_eq(key))
     }
 
-    fn bucket(&self, i: usize) -> &Bucket<P, R> {
-        match &self.slots[i] {
-            Slot::Full(b) => b,
-            Slot::Empty | Slot::Tombstone => panic!("incr-core: key table slot {i} is not live"),
+    /// The bucket in slot `i` of either storage, or `None` for a free
+    /// slot.
+    fn live(&self, i: usize) -> Option<&Bucket<P, R>> {
+        match self.store.table.get(i) {
+            Some(slot) => slot.bucket(),
+            None => self.old_live(i),
         }
-    }
-
-    fn buckets(&self) -> impl Iterator<Item = (usize, &Bucket<P, R>)> {
-        self.slots.iter().enumerate().filter_map(|(i, s)| match s {
-            Slot::Full(b) => Some((i, b)),
-            Slot::Empty | Slot::Tombstone => None,
-        })
-    }
-
-    /// Makes room for `additional` more keys. Runs no user code. When it
-    /// rehashes, returns where each old slot's bucket moved.
-    fn reserve(&mut self, additional: usize) -> Option<Vec<usize>> {
-        (additional > self.growth_left).then(|| self.rehash(additional))
     }
 
     #[cold]
-    fn rehash(&mut self, additional: usize) -> Vec<usize> {
-        let need = self
-            .keys
-            .checked_add(additional)
-            .expect("incr-core: key table capacity overflow");
-        let limit = load_limit(self.slots.len());
-        let capacity = if need <= limit / 2 {
-            self.slots.len()
-        } else {
-            let need = need.max(limit + 1);
-            let mut capacity = 8_usize;
-            while load_limit(capacity) < need {
-                capacity = capacity
-                    .checked_mul(2)
-                    .expect("incr-core: key table capacity overflow");
-            }
-            capacity
-        };
-        let old = mem::replace(
-            &mut self.slots,
-            std::iter::repeat_with(|| Slot::Empty)
-                .take(capacity)
-                .collect(),
-        );
-        let mut moved = vec![usize::MAX; old.len()];
-        for (at, slot) in old.into_iter().enumerate() {
-            if let Slot::Full(b) = slot {
-                let j = self.free_slot(b.hash);
-                self.slots[j] = Slot::Full(b);
-                moved[at] = j;
-            }
-        }
-        self.growth_left = load_limit(capacity) - self.keys;
-        if let Some(capture) = self.capture.as_deref_mut() {
-            capture.rehashed(capacity, &moved);
-        }
-        moved
+    #[inline(never)]
+    fn old_live(&self, i: usize) -> Option<&Bucket<P, R>> {
+        let old = self.store.old()?;
+        old.storage.get(i - old.base)?.bucket()
     }
 
-    fn free_slot(&self, hash: u64) -> usize {
-        let mask = self.slots.len() - 1;
-        let mut i = hash as usize & mask;
-        while matches!(self.slots[i], Slot::Full(_)) {
-            i = (i + 1) & mask;
+    fn bucket(&self, i: usize) -> &Bucket<P, R> {
+        match self.live(i) {
+            Some(bucket) => bucket,
+            None => panic!("incr-core: key table slot {i} is not live"),
         }
-        i
+    }
+
+    /// Every bucket with its slot. [`Self::for_each_bucket`] and
+    /// [`Self::collect_buckets`] cost less per bucket.
+    fn buckets(&self) -> impl Iterator<Item = (usize, &Bucket<P, R>)> {
+        let old = self.store.old();
+        let old = old
+            .into_iter()
+            .flat_map(|old| old.storage.buckets(old.cursor, old.base));
+        self.store.table.buckets(0, 0).chain(old)
+    }
+
+    fn for_each_bucket<'a>(&'a self, mut visit: impl FnMut(usize, &'a Bucket<P, R>)) {
+        self.store
+            .table
+            .buckets(0, 0)
+            .for_each(|(slot, bucket)| visit(slot, bucket));
+        if self.store.migrating() {
+            self.for_each_old_bucket(&mut visit);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn for_each_old_bucket<'a>(&'a self, visit: &mut impl FnMut(usize, &'a Bucket<P, R>)) {
+        if let Some(old) = self.store.old() {
+            old.storage
+                .buckets(old.cursor, old.base)
+                .for_each(|(slot, bucket)| visit(slot, bucket));
+        }
+    }
+
+    /// What `map` makes of each bucket, in table order.
+    fn collect_buckets<T>(&self, mut map: impl FnMut(&Bucket<P, R>) -> T) -> Vec<T> {
+        let mut out = Vec::with_capacity(self.keys);
+        out.extend(
+            self.store
+                .table
+                .buckets(0, 0)
+                .map(|(_, bucket)| map(bucket)),
+        );
+        if self.store.migrating() {
+            self.for_each_old_bucket(&mut |_, bucket| out.push(map(bucket)));
+        }
+        out
+    }
+
+    /// Makes room for `additional` more keys and takes a step of a running
+    /// migration. Runs no user code. Returns where the buckets it moved
+    /// went, or `None` when no slot changed.
+    #[inline]
+    fn reserve(&mut self, additional: usize, yielder: &impl Ticks) -> Option<Moves> {
+        if !self.store.must_grow(additional) {
+            return None;
+        }
+        self.grow(additional, yielder)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, additional: usize, yielder: &impl Ticks) -> Option<Moves> {
+        let mut moves = Moves::default();
+        self.store
+            .grow(
+                self.keys,
+                additional,
+                &mut self.capture,
+                Some(&mut moves),
+                yielder,
+            )
+            .then_some(moves)
     }
 
     fn count_in(&mut self, pairs: &Few<(P, R)>) {
@@ -416,47 +450,69 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
 
     /// Adds a bucket for a key no bucket holds. Requires room from
     /// `reserve`.
-    fn insert(&mut self, hash: u64, pairs: Few<(P, R)>) {
-        let j = self.free_slot(hash);
+    fn insert(&mut self, hash: BucketHash, pairs: Few<(P, R)>) {
+        let j = self.store.table.free_slot(hash);
         capture::settle_free(&mut self.capture, j);
-        if matches!(self.slots[j], Slot::Empty) {
+        if self.store.table.is_empty_slot(j) {
             assert!(
-                self.growth_left > 0,
+                self.store.room() > 0,
                 "incr-core: key table insert without a reserve"
             );
-            self.growth_left -= 1;
+            self.store.use_room();
         }
         self.count_in(&pairs);
-        self.slots[j] = Slot::Full(Bucket { hash, pairs });
+        self.store.table.put(j, Bucket { hash, pairs });
         self.keys += 1;
     }
 
     fn replace(&mut self, i: usize, pairs: Few<(P, R)>) -> Few<(P, R)> {
         capture::check_settled(&self.capture, i);
         self.count_in(&pairs);
-        let Slot::Full(b) = &mut self.slots[i] else {
+        let held = if i < self.store.table.capacity() {
+            self.store.table.pairs_mut(i)
+        } else {
+            self.old_pairs_mut(i)
+        };
+        let Some(held) = held else {
             panic!("incr-core: key table slot {i} is not live");
         };
-        let old = mem::replace(&mut b.pairs, pairs);
+        let old = mem::replace(held, pairs);
         self.count_out(&old);
         old
     }
 
     fn remove(&mut self, i: usize) -> Few<(P, R)> {
         capture::check_settled(&self.capture, i);
-        let next = (i + 1) & (self.slots.len() - 1);
-        let free = if matches!(self.slots[next], Slot::Empty) {
-            self.growth_left += 1;
-            Slot::Empty
+        let removed = if i < self.store.table.capacity() {
+            self.store.table.remove(i)
         } else {
-            Slot::Tombstone
+            self.remove_old(i)
         };
-        let Slot::Full(b) = mem::replace(&mut self.slots[i], free) else {
+        let Some((b, emptied)) = removed else {
             panic!("incr-core: key table slot {i} is not live");
         };
+        self.store.give_room(usize::from(emptied));
         self.keys -= 1;
         self.count_out(&b.pairs);
         b.pairs
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn old_pairs_mut(&mut self, i: usize) -> Option<&mut Few<(P, R)>> {
+        let (old, k) = self.store.old_slot_mut(i);
+        old.pairs_mut(k)
+    }
+
+    /// Takes the bucket in old slot `i`, whose room in the table the
+    /// migration no longer needs. The slot always becomes a tombstone: the
+    /// old storage takes no insert, and a lookup in it relies on no slot
+    /// at or past the migration's cursor turning empty.
+    #[cold]
+    #[inline(never)]
+    fn remove_old(&mut self, i: usize) -> Option<(Bucket<P, R>, bool)> {
+        let (old, k) = self.store.old_slot_mut(i);
+        Some((old.take(k)?, true))
     }
 
     /// Hands the capture the bucket clones a stage took, before the
@@ -495,10 +551,10 @@ impl<P, R: Ord + Copy> KeyTable<P, R> {
             .inspect(|_| yielder.tick())
             .filter(|k| k.slot.is_none() && !k.now.is_empty())
             .count();
-        if let Some(moved) = self.reserve(added) {
+        if let Some(moves) = self.reserve(added, yielder) {
             for slot in keys.iter_mut().filter_map(|k| k.slot.as_mut()) {
                 yielder.tick();
-                *slot = moved[*slot];
+                *slot = moves.remap(*slot);
             }
         }
         for k in keys.iter().filter(|k| !k.untouched()) {
@@ -624,7 +680,7 @@ enum Src {
 }
 
 struct StagedKey<K> {
-    hash: u64,
+    hash: BucketHash,
     /// The held key object if the table holds the key, else the caller's.
     key: K,
     slot: Option<usize>,
@@ -706,8 +762,8 @@ where
         Some(Src::Held(table.bucket(slot).read_at()))
     }
 
-    fn staged(&self, hash: u64, key: &K) -> Option<usize> {
-        self.by_hash.get(&hash).and_then(|at| {
+    fn staged(&self, hash: BucketHash, key: &K) -> Option<usize> {
+        self.by_hash.get(&hash.get()).and_then(|at| {
             at.as_slice()
                 .iter()
                 .copied()
@@ -722,7 +778,7 @@ where
         self.by_hash.reserve(keys);
     }
 
-    fn locate(&mut self, table: &KeyTable<P, R>, hash: u64, key: &K) -> usize {
+    fn locate(&mut self, table: &KeyTable<P, R>, hash: BucketHash, key: &K) -> usize {
         if let Some(at) = self.staged(hash, key) {
             return at;
         }
@@ -745,7 +801,7 @@ where
 
     /// [`Self::locate`] for an owned key, which the stage keeps either
     /// way, so its `Drop` runs with the stage's.
-    fn locate_owned(&mut self, table: &KeyTable<P, R>, hash: u64, key: K) -> usize {
+    fn locate_owned(&mut self, table: &KeyTable<P, R>, hash: BucketHash, key: K) -> usize {
         if let Some(at) = self.staged(hash, &key) {
             self.spare.push(key);
             return at;
@@ -763,13 +819,13 @@ where
 
     fn push(&mut self, key: StagedKey<K>) -> usize {
         let at = self.keys.len();
-        self.by_hash.entry(key.hash).or_default().push(at);
+        self.by_hash.entry(key.hash.get()).or_default().push(at);
         self.keys.push(key);
         at
     }
 
     fn upsert(&mut self, table: &KeyTable<P, R>, hasher: &RandomState, key: &K, row: &V) {
-        let at = self.locate(table, hasher.hash_one(key), key);
+        let at = self.locate(table, bucket_hash(hasher, key), key);
         if let Some(src) = self.read(table, at) {
             if self.pair(table, at, src).0.row_eq(row) {
                 return;
@@ -781,7 +837,7 @@ where
     }
 
     fn remove(&mut self, table: &KeyTable<P, R>, hasher: &RandomState, key: &K) {
-        let at = self.locate(table, hasher.hash_one(key), key);
+        let at = self.locate(table, bucket_hash(hasher, key), key);
         self.keys[at].now.clear();
     }
 
@@ -793,7 +849,7 @@ where
             .inspect(|_| yielder.tick())
             .filter_map(|k| k.slot)
             .collect();
-        for (slot, b) in table.buckets() {
+        table.for_each_bucket(|slot, b| {
             yielder.tick();
             if !named.contains(&slot) {
                 self.push(StagedKey {
@@ -804,7 +860,7 @@ where
                     now: Vec::new(),
                 });
             }
-        }
+        });
     }
 
     /// Ends the staging of `upsert`, `remove` and `reconcile`: a key whose
@@ -836,7 +892,7 @@ where
             _ => return,
         }
         self.changed.push(self.keys[at].key.clone());
-        self.changed_hashes.push(self.keys[at].hash);
+        self.changed_hashes.push(self.keys[at].hash.get());
     }
 
     /// Stages `op` as the persisted binding replays it, counting it by
@@ -845,7 +901,7 @@ where
         let (PairOp::Insert(pair, rank) | PairOp::Remove(pair, rank)) = op;
         let mut state = hasher.build_hasher();
         pair.key_hash(&mut state);
-        let at = self.locate_owned(table, state.finish(), pair.key());
+        let at = self.locate_owned(table, BucketHash::new(state.finish()), pair.key());
         let before = self.read(table, at);
         match op {
             PairOp::Insert(..) => {
@@ -945,7 +1001,7 @@ where
             };
             flips.push(Flip {
                 pair: &self.pair(table, at, src).0,
-                hash: k.hash,
+                hash: k.hash.get(),
                 inserted,
             });
         }
@@ -1790,7 +1846,7 @@ where
         if !C::SINGLE_THREADED || !self.versions.any() {
             return false;
         }
-        let hash = value_code::run(|| self.index.hasher.hash_one(key));
+        let hash = value_code::run(|| bucket_hash(&self.index.hasher, key).get());
         let candidates: Vec<(u64, K, Incr<u64>)> = {
             let map = self.versions.map.read();
             value_code::run(|| {
@@ -1842,7 +1898,7 @@ where
         let table = self.index.table.read();
         value_code::run(|| {
             table
-                .find_key(self.index.hasher.hash_one(key), key)
+                .find_key(bucket_hash(&self.index.hasher, key), key)
                 .is_some()
         })
     }
@@ -1868,7 +1924,7 @@ where
         let table = self.index.table.read();
         value_code::run(|| {
             table
-                .find_key(self.index.hasher.hash_one(key), key)
+                .find_key(bucket_hash(&self.index.hasher, key), key)
                 .map(|s| table.bucket(s).read().0.row())
         })
     }
@@ -1890,7 +1946,7 @@ where
         };
         rt.get(handle);
         let table = self.index.table.read();
-        value_code::run(|| table.buckets().map(|(_, b)| b.first().key()).collect())
+        value_code::run(|| table.collect_buckets(|b| b.first().key()))
     }
 
     /// The membership input, if a read created one.
@@ -1960,7 +2016,7 @@ where
                 let state = value_code::run(|| {
                     PartState::<K, V, Q, P>::build(
                         Arc::clone(&f),
-                        table.buckets().map(|(_, b)| (b.hash, &b.read().0)),
+                        table.buckets().map(|(_, b)| (b.hash.get(), &b.read().0)),
                     )
                 });
                 (epoch, state)
@@ -1981,7 +2037,7 @@ where
         let state = value_code::run(|| {
             PartState::<K, V, Q, P>::build(
                 Arc::clone(&f),
-                table.buckets().map(|(_, b)| (b.hash, &b.read().0)),
+                table.buckets().map(|(_, b)| (b.hash.get(), &b.read().0)),
             )
         });
         let epoch = C::u64_load_relaxed(&self.index.epoch);
@@ -2073,7 +2129,7 @@ where
     /// `key`'s version input, if a read created one.
     pub fn version_input(&self, key: &K) -> Option<Incr<u64>> {
         refuse_value_code();
-        let hash = value_code::run(|| self.index.hasher.hash_one(key));
+        let hash = value_code::run(|| bucket_hash(&self.index.hasher, key).get());
         let map = self.versions.map.read();
         value_code::run(|| map.find(hash, key))
     }
@@ -2085,7 +2141,7 @@ where
         if let Some(handle) = self.version_input(key) {
             return handle;
         }
-        let hash = value_code::run(|| self.index.hasher.hash_one(key));
+        let hash = value_code::run(|| bucket_hash(&self.index.hasher, key).get());
         let mut map = self.versions.map.write();
         if let Some(handle) = value_code::run(|| map.find(hash, key)) {
             return handle;
@@ -2168,7 +2224,7 @@ where
             value_code::run(|| {
                 ranks.extend(keys.iter().map(|&key| {
                     table
-                        .find_key(self.index.hasher.hash_one(key), key)
+                        .find_key(bucket_hash(&self.index.hasher, key), key)
                         .map(|s| table.bucket(s).read().1)
                 }));
             });
@@ -2194,13 +2250,13 @@ where
     pub fn row(&self, key: &K) -> Option<V> {
         self.read(|table, hasher| {
             table
-                .find_key(hasher.hash_one(key), key)
+                .find_key(bucket_hash(hasher, key), key)
                 .map(|s| table.bucket(s).read().0.row())
         })
     }
 
     pub fn contains(&self, key: &K) -> bool {
-        self.read(|table, hasher| table.find_key(hasher.hash_one(key), key).is_some())
+        self.read(|table, hasher| table.find_key(bucket_hash(hasher, key), key).is_some())
     }
 
     /// The number of keys holding a row.
@@ -2214,12 +2270,12 @@ where
 
     /// A snapshot of the held keys, in no particular order.
     pub fn keys(&self) -> Vec<K> {
-        self.read(|table, _| table.buckets().map(|(_, b)| b.first().key()).collect())
+        self.read(|table, _| table.collect_buckets(|b| b.first().key()))
     }
 
     /// A snapshot of the pair read for each key, in no particular order.
     pub fn items(&self) -> Vec<P> {
-        self.read(|table, _| table.buckets().map(|(_, b)| b.read().0.clone()).collect())
+        self.read(|table, _| table.collect_buckets(|b| b.read().0.clone()))
     }
 
     pub fn epoch(&self) -> u64 {
@@ -2229,7 +2285,7 @@ where
     /// A copy of every pair held for `key`, with its rank, in bucket order.
     pub fn held_pairs(&self, key: &K) -> Vec<(P, R)> {
         self.read(
-            |table, hasher| match table.find_key(hasher.hash_one(key), key) {
+            |table, hasher| match table.find_key(bucket_hash(hasher, key), key) {
                 Some(s) => table.bucket(s).pairs().to_vec(),
                 None => Vec::new(),
             },
@@ -2244,7 +2300,7 @@ where
         crate::dep_stack::unrecorded_lookup::<C>();
         let table = self.index.table.read();
         let mut ranked = Vec::with_capacity(table.pairs);
-        for (slot, bucket) in table.buckets() {
+        table.for_each_bucket(|slot, bucket| {
             let slot = u32::try_from(slot).expect("incr-core: a key table holds under 2^32 slots");
             ranked.extend(bucket.pairs().iter().enumerate().map(|(at, pair)| {
                 let handle = PairHandle {
@@ -2253,7 +2309,7 @@ where
                 };
                 (pair.1, handle)
             }));
-        }
+        });
         ranked.sort_unstable_by_key(|&(rank, _)| rank);
         let handles = ranked.into_iter().map(|(_, handle)| handle).collect();
         (self.index.epoch(), handles)
@@ -2282,10 +2338,9 @@ where
     /// A copy of every pair held, with its rank, in no particular order.
     pub fn ranked_pairs(&self) -> Vec<(P, R)> {
         self.read(|table, _| {
-            table
-                .buckets()
-                .flat_map(|(_, b)| b.pairs().iter().cloned())
-                .collect()
+            let mut pairs = Vec::with_capacity(table.pairs);
+            table.for_each_bucket(|_, b| pairs.extend_from_slice(b.pairs()));
+            pairs
         })
     }
 
@@ -2306,7 +2361,10 @@ where
             table.capture.is_none(),
             "incr-core: a capture is already installed"
         );
-        table.capture = Some(Capture::new(table.slots.len()));
+        table.capture = Some(Capture::new(
+            table.store.table.capacity(),
+            table.store.old_capacity(),
+        ));
         let epoch = C::u64_load_relaxed(&self.index.epoch);
         C::u64_store_release(&self.index.epoch, epoch + 1);
     }
@@ -2343,9 +2401,11 @@ where
         let epoch = C::u64_load_relaxed(&self.index.epoch);
         let mut run = Vec::new();
         let end = value_code::run(|| {
-            let from = capture.cursor();
-            capture::scan(from, table.slots.len(), unit, start, budget, |i| {
-                if let Slot::Full(b) = &table.slots[i] {
+            let emptied = table.store.old().map_or(0, |old| old.cursor);
+            let from = capture.cursor().max(emptied);
+            capture::scan(from, capture.len(), unit, start, budget, |position| {
+                let i = capture.slot(position);
+                if let Some(b) = table.live(i) {
                     if !capture.settled(i) {
                         run.extend(b.pairs().iter().cloned());
                     }
@@ -2364,15 +2424,14 @@ where
     ) -> CaptureStep<(P, R)> {
         let mut table = self.index.table.write();
         let current = C::u64_load_relaxed(&self.index.epoch) == epoch;
-        let capacity = table.slots.len();
         let step = match table.capture.as_deref_mut() {
             Some(capture) if current => {
                 capture.advance(end, run);
-                capture.drain(capacity)
+                capture.drain()
             }
             Some(capture) => CaptureStep {
                 discarded: run,
-                ..capture.drain(capacity)
+                ..capture.drain()
             },
             None => CaptureStep {
                 rows: Vec::new(),

@@ -5,6 +5,7 @@ use std::time::Duration;
 use proptest::prelude::*;
 
 use crate::collection::Change;
+use crate::grow::with_step_slots;
 use crate::keyed::{KeyedCollection, PairOp, UNIDENTIFYING_RANK};
 use crate::{IncrCollection, Local, Runtime};
 
@@ -122,12 +123,12 @@ fn plain_step() -> impl Strategy<Value = PlainStep> {
 }
 
 fn plain_elements(col: &Plain) -> Vec<PlainRow> {
+    let mut rows = Vec::new();
     col.log
         .read()
         .elements
-        .iter()
-        .map(|(value, count)| plain_row((value.clone(), count)))
-        .collect()
+        .for_each(|value, count| rows.push(plain_row((value.clone(), count))));
+    rows
 }
 
 fn run_plain(steps: Vec<PlainStep>) {
@@ -287,6 +288,13 @@ fn run_keyed(steps: Vec<KeyedStep>) {
     assert!(!kc.capture_installed());
 }
 
+/// How many old slots a migration step scans before its four per key: few
+/// enough that a table of 16 slots takes several writes to migrate, or the
+/// shipped pace.
+fn step_slots() -> impl Strategy<Value = usize> {
+    prop_oneof![Just(1_usize), Just(3), Just(256)]
+}
+
 fn config() -> ProptestConfig {
     ProptestConfig {
         cases: if cfg!(miri) { 4 } else { 256 },
@@ -298,16 +306,22 @@ fn config() -> ProptestConfig {
 #[test]
 fn plain_capture_equals_the_elements_at_begin() {
     let len = if cfg!(miri) { 1..16 } else { 1..60 };
-    proptest!(config(), |(steps in prop::collection::vec(plain_step(), len.clone()))| {
-        run_plain(steps);
+    proptest!(config(), |(
+        steps in prop::collection::vec(plain_step(), len.clone()),
+        step_slots in step_slots(),
+    )| {
+        with_step_slots(step_slots, || run_plain(steps));
     });
 }
 
 #[test]
 fn keyed_capture_equals_the_pairs_at_begin() {
     let len = if cfg!(miri) { 1..16 } else { 1..60 };
-    proptest!(config(), |(steps in prop::collection::vec(keyed_step(), len.clone()))| {
-        run_keyed(steps);
+    proptest!(config(), |(
+        steps in prop::collection::vec(keyed_step(), len.clone()),
+        step_slots in step_slots(),
+    )| {
+        with_step_slots(step_slots, || run_keyed(steps));
     });
 }
 
