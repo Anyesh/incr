@@ -1,8 +1,8 @@
 """R24: how long a checkpoint worker keeps the GIL, measured from outside.
 
 A probe thread asks for the GIL every 200 us and records each wait and the
-part of it the thread spent runnable but not scheduled, and the gate
-records every worker hold of 1 ms or more with its site. The scenarios
+time the process's threads spent runnable but not scheduled during it, and
+the gate records every worker hold of 1 ms or more with its site. The scenarios
 drive store and memo flights with `poll` alone while both run, and every
 gate site declared for a worker has to be reached by one of them.
 
@@ -13,7 +13,7 @@ probe, and hold both bars: no probe wait reaches 10 ms once the caller's
 own polls and the collection passes are taken off, and no gate hold
 reaches 10 ms once the collection passes are taken off; every unbounded
 worker sequence site must also carry 100,000 elements in one call. A wait
-over the bar that the probe's own wait for a CPU would explain fails as
+over the bar that the threads' wait for a CPU would explain fails as
 inconclusive. A backend that keeps or wraps its returns costs one copy in
 a single hold, a known limit, so those scenarios report their figures
 without the bars. Set `INCR_GIL_PROBE_REPORT=<path>` to write the measured
@@ -105,7 +105,9 @@ class Passes:
 
 def probe(scenario, start, on_poll=None, expect=None, bars=True):
     """Runs the flight `start()` opens under the probe, polling with a 1 ms
-    sleep between calls until it settles and no worker is left. Returns the
+    sleep between calls until it settles, its handle is freed (which starts
+    a memo flight's removal of superseded generations) and no worker is
+    left. Returns the
     flight's result, or the exception it raised when `expect` names its
     type."""
     gc.collect()
@@ -136,10 +138,13 @@ def probe(scenario, start, on_poll=None, expect=None, bars=True):
                 outcome, done = error, True
             finally:
                 calls.append((asked, checks._gil_now_ns()))
+        asked = checks._gil_now_ns()
         if outcome is None:
             assert expect is None, f"{scenario}: the flight succeeded"
             outcome = pending.result()
-        while checks._gil_live_workers():
+        del pending
+        calls.append((asked, checks._gil_now_ns()))
+        while checks._checkpoint_workers_running():
             assert time.monotonic() < deadline, f"{scenario}: a worker outlived its flight"
             time.sleep(0.001)
         ended = checks._gil_now_ns()
@@ -195,7 +200,8 @@ def note(scenario, began, ended, calls, passes, waits, bars):
         if wait >= BAR_NS and wait - unscheduled < BAR_NS:
             FAILURES.append(
                 f"{scenario}: inconclusive, probe waited {wait / 1e6:.2f} ms of which "
-                f"{unscheduled / 1e6:.2f} ms it was runnable but not scheduled: the machine is busy"
+                f"{unscheduled / 1e6:.2f} ms the process's threads were runnable but not "
+                "scheduled: the machine is busy"
             )
         elif wait >= BAR_NS:
             FAILURES.append(f"{scenario}: probe waited {wait / 1e6:.2f} ms; gate holds {during}")
@@ -358,6 +364,9 @@ class Memo:
         return method
 
 
+FIRST_ITEM = (0, 0, 0, 1)
+
+
 class LoadChainWithoutKnown(Memo):
     def load_chain(self):
         return self.inner.load_chain(frozenset())
@@ -486,10 +495,12 @@ def test_memo_flights_from_a_full_generation_to_a_rewrite_over_its_deltas(varian
             backend.keep_generations = True
             stats = world.flight(f"{name}.rewrite_keeping_generations")
             assert not stats["delta"] and stats["merged"]
-            assert backend.kept
             backend.keep_generations = False
+            assert backend.kept
+            assert all(backend.inner.read_entry(g, FIRST_ITEM) for g in backend.kept)
             world.read(world.sq, world.fresh_keys(10))
             world.flight(f"{name}.stale_dropped")
+            assert not any(backend.inner.read_entry(g, FIRST_ITEM) for g in backend.kept)
     assert_bars(name)
 
 
@@ -549,7 +560,7 @@ def test_flight_time_under_a_busy_python_caller_is_reported():
 
 
 def test_every_worker_site_was_reached_on_a_worker():
-    if not REPORT:
+    if not REACHED:
         pytest.skip("no scenario ran")
     sites, _ = declared_sites()
     worker = {name: kind for name, (kind, _) in sites.items() if kind != "caller"}

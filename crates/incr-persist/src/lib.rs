@@ -29,7 +29,7 @@ mod value_context;
 pub use backend::{Backend, ConditionalAppend, Position, ReadOutcome, SnapshotId};
 pub use error::{Error, Result};
 pub use file::FileBackend;
-pub use flight::join_checkpoint_workers;
+pub use flight::{checkpoint_workers_running, join_checkpoint_workers};
 pub use incr_core::{Cells, Local, Shared};
 pub use memory::MemoryBackend;
 pub use record::{Kind, Record};

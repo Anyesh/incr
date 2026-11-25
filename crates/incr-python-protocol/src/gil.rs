@@ -703,8 +703,8 @@ pub mod checks {
     static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 
     /// Starts a thread that asks for the GIL, lets go at once and sleeps
-    /// `interval_us`, recording each request's start, its wait and the part
-    /// of the wait the thread spent runnable but not scheduled.
+    /// `interval_us`, recording each request's start, its wait and the time
+    /// the process's threads spent runnable but not scheduled during it.
     #[pyfunction]
     #[pyo3(signature = (interval_us=200))]
     fn _gil_probe_start(interval_us: u64) -> PyResult<()> {
@@ -747,13 +747,17 @@ pub mod checks {
         Ok(())
     }
 
-    /// Nanoseconds this thread has spent runnable but not scheduled, from
-    /// Linux's schedstat; 0 where it cannot be read.
+    /// Nanoseconds the process's threads have spent runnable but not
+    /// scheduled, from Linux's schedstat; 0 where it cannot be read.
     fn run_delay() -> u64 {
-        std::fs::read_to_string("/proc/thread-self/schedstat")
-            .ok()
-            .and_then(|stat| stat.split_whitespace().nth(1)?.parse().ok())
-            .unwrap_or(0)
+        let Ok(threads) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        threads
+            .flatten()
+            .filter_map(|thread| std::fs::read_to_string(thread.path().join("schedstat")).ok())
+            .filter_map(|stat| stat.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .sum()
     }
 
     /// Stops the probe and returns its `(asked_ns, waited_ns,

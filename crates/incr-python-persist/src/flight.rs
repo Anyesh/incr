@@ -304,6 +304,14 @@ pub fn _join_checkpoint_workers(py: Python<'_>) {
     gil::release(py, incr_persist::join_checkpoint_workers);
 }
 
+/// Checkpoint worker threads started and not yet ended, counted from
+/// their spawn.
+#[cfg(feature = "gil-checks")]
+#[pyfunction]
+pub fn _checkpoint_workers_running() -> usize {
+    incr_persist::checkpoint_workers_running()
+}
+
 /// Sets the longest memo frame a checkpoint writes, `None` for the format's
 /// own limit, so a test can make an entry oversized. Process-wide.
 #[cfg(feature = "gil-checks")]

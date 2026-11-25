@@ -353,6 +353,17 @@ pub fn join_checkpoint_workers() {
     join_registered(&WORKERS);
 }
 
+/// Checkpoint worker threads started and not yet ended, abandoned flights'
+/// included. A thread counts from its spawn, before it runs any code.
+pub fn checkpoint_workers_running() -> usize {
+    WORKERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|(_, worker)| !worker.is_finished())
+        .count()
+}
+
 fn join_registered(registry: &Mutex<Vec<Worker>>) {
     let workers = std::mem::take(&mut *registry.lock().unwrap_or_else(PoisonError::into_inner));
     for (control, _) in &workers {
