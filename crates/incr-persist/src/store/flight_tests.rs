@@ -780,6 +780,75 @@ fn capture_a_plain_rehash_mid_capture() {
     );
 }
 
+/// The distinct rows or elements that fill a table of 8,192 slots to its
+/// load limit: the next one starts a migration into 16,384 slots, which
+/// 32 single-key writes finish.
+const TABLE_FULL: u32 = 6_144;
+
+fn index_bytes(fx: &Fx<MemoryBackend>) -> usize {
+    let index = fx.rows.index_weak().upgrade().expect("the index is alive");
+    index.settled().1
+}
+
+/// Leaves the key table and the pairs' table six writes into a migration.
+fn half_migrated_rows(fx: &Fx<MemoryBackend>) {
+    for k in 0..TABLE_FULL {
+        fx.store.upsert(&fx.rows, k, format!("row{k}")).unwrap();
+    }
+    let one_table = index_bytes(fx);
+    for k in TABLE_FULL..TABLE_FULL + 6 {
+        fx.store.upsert(&fx.rows, k, format!("row{k}")).unwrap();
+    }
+    assert_eq!(
+        index_bytes(fx),
+        3 * one_table,
+        "the key table still holds its old storage"
+    );
+}
+
+#[test]
+fn capture_a_keyed_table_begun_mid_migration() {
+    fly_and_compare(half_migrated_rows, |fx, flight| {
+        poll(fx, flight);
+        for k in (0..5_000).step_by(500) {
+            fx.store.upsert(&fx.rows, k, format!("moved{k}")).unwrap();
+            fx.store.remove(&fx.rows, &(k + 1)).unwrap();
+        }
+        poll(fx, flight);
+        for k in 7_000..7_040 {
+            fx.store.upsert(&fx.rows, k, format!("row{k}")).unwrap();
+        }
+        poll(fx, flight);
+        fx.store.remove(&fx.rows, &4).unwrap();
+        fx.store.upsert(&fx.rows, 6_143, "last".to_owned()).unwrap();
+    });
+}
+
+#[test]
+fn capture_a_plain_table_begun_mid_migration() {
+    fly_and_compare(
+        |fx| {
+            for v in 0..TABLE_FULL + 6 {
+                fx.plain.insert(&fx.store, format!("p{v}")).unwrap();
+            }
+        },
+        |fx, flight| {
+            poll(fx, flight);
+            for v in (0..5_000).step_by(500) {
+                fx.plain.delete(&fx.store, &format!("p{v}")).unwrap();
+                fx.plain.insert(&fx.store, format!("p{}", v + 1)).unwrap();
+            }
+            poll(fx, flight);
+            for v in 7_000..7_040 {
+                fx.plain.insert(&fx.store, format!("p{v}")).unwrap();
+            }
+            poll(fx, flight);
+            fx.plain.delete(&fx.store, &"p4".to_owned()).unwrap();
+            fx.plain.insert(&fx.store, "p6143".to_owned()).unwrap();
+        },
+    );
+}
+
 #[test]
 fn capture_an_unlogged_scope_across_polls() {
     fly_and_compare(
