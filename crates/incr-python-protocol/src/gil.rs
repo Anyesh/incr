@@ -35,7 +35,8 @@ pub const STRETCH: Duration = Duration::from_millis(2);
 pub const MAX_RELEASED_DROPS: u64 = 64;
 /// Elements a sequence function converts between frees of a list slice.
 const SLICE: usize = 64;
-/// Stretches at least this long are kept for the probe's report.
+/// With `gil-checks`, stretches at least this long are kept for the probe's
+/// report; without it none are, since nothing would ever clear them.
 const LOGGED_HOLD: Duration = Duration::from_millis(1);
 
 /// What one entry through a site carries, declared where the site is.
@@ -140,7 +141,7 @@ impl Site {
     fn note_hold(&'static self, held: Duration, ended: Instant) {
         let nanos = nanos(held);
         self.longest.fetch_max(nanos, Ordering::Relaxed);
-        if held >= LOGGED_HOLD {
+        if cfg!(feature = "gil-checks") && held >= LOGGED_HOLD {
             let end = since_base(ended);
             HOLDS.lock().unwrap_or_else(PoisonError::into_inner).push((
                 end.saturating_sub(nanos),
@@ -882,5 +883,24 @@ mod tests {
                  the first"
             );
         });
+    }
+}
+
+#[cfg(all(test, not(feature = "gil-checks")))]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn a_build_without_gil_checks_keeps_no_record_of_worker_holds() {
+        static SITE: Site = Site::one("test.long_hold");
+        Python::initialize();
+        let mut body = || enter(&SITE, |_| thread::sleep(LOGGED_HOLD * 3));
+        thread::spawn(move || unsafe { run_worker(&mut body) })
+            .join()
+            .unwrap();
+        assert_eq!(
+            HOLDS.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            0
+        );
     }
 }
