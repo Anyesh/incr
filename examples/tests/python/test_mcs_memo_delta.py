@@ -2,6 +2,7 @@
 `known` argument of a Python backend's `load_chain`."""
 
 import json
+import time
 
 import incr.persist
 import incr_concurrent.persist
@@ -136,7 +137,15 @@ def test_checkpoint_if_due_carries_the_same_keys(persist):
     assert memo.checkpoint_if_due() is None
     store.runtime.get(memo.get_or_insert(table, 2))
     stats = memo.checkpoint_if_due()
-    assert set(stats) == CHECKPOINT_INTS | CHECKPOINT_BOOLS | {"times"}
+    if stats is None:
+        assert persist is not incr.persist, "only Shared's checkpoint thread runs it"
+        deadline = time.monotonic() + 60
+        while memo.stats()["entries"] == 0:
+            assert time.monotonic() < deadline, "the checkpoint thread did not save"
+            time.sleep(0.001)
+    else:
+        assert set(stats) == CHECKPOINT_INTS | CHECKPOINT_BOOLS | {"times"}
+    assert memo.stats()["unsaved_entries"] < 2
 
 
 def test_stats_follow_deltas_and_a_compaction(persist):
@@ -257,7 +266,8 @@ class ViewHeaders(DictDeltaMemo):
             return None
         kinds = [memoryview, bytearray]
         return [
-            (gen, kinds[i % 2](header), items) for i, (gen, header, items) in enumerate(layers)
+            (gen, kinds[i % 2](header), items)
+            for i, (gen, header, items) in enumerate(layers)
         ]
 
 
