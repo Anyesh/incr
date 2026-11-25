@@ -7,8 +7,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -109,12 +108,44 @@ impl Most {
     }
 }
 
-/// The reference memory backend, noting when the worker starts a write:
+/// The reference memory backend, whose writes can be held at their start:
 /// the caller has sealed by then and has nothing left to poll for.
 #[derive(Clone)]
 struct Writing {
     inner: MemoryMemo,
-    started: Arc<AtomicBool>,
+    hold: Arc<(Mutex<Hold>, Condvar)>,
+}
+
+#[derive(Default)]
+struct Hold {
+    held: bool,
+    started: bool,
+}
+
+impl Writing {
+    fn start(&self) {
+        let (hold, changed) = &*self.hold;
+        let mut hold = hold.lock().unwrap();
+        hold.started = true;
+        changed.notify_all();
+        while hold.held {
+            hold = changed.wait(hold).unwrap();
+        }
+    }
+
+    fn set_held(&self, held: bool) {
+        let (hold, changed) = &*self.hold;
+        let mut hold = hold.lock().unwrap();
+        hold.held = held;
+        if held {
+            hold.started = false;
+        }
+        changed.notify_all();
+    }
+
+    fn started(&self) -> bool {
+        self.hold.0.lock().unwrap().started
+    }
 }
 
 impl MemoBackend for Writing {
@@ -139,7 +170,7 @@ impl MemoBackend for Writing {
         header: &GenHeader,
         entries: &[EncodedEntry],
     ) -> Result<Generation> {
-        self.started.store(true, SeqCst);
+        self.start();
         self.inner.write_generation(base, id, header, entries)
     }
 
@@ -150,7 +181,7 @@ impl MemoBackend for Writing {
         header: &GenHeader,
         entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
     ) -> Result<Generation> {
-        self.started.store(true, SeqCst);
+        self.start();
         self.inner
             .write_generation_streamed(base, id, header, entries)
     }
@@ -179,7 +210,7 @@ impl MemoBackend for Writing {
         entries: &[EncodedEntry],
         tombstones: &[Tombstone],
     ) -> Result<Generation> {
-        self.started.store(true, SeqCst);
+        self.start();
         self.inner.write_delta(tip, id, header, entries, tombstones)
     }
 
@@ -217,7 +248,7 @@ impl Fx {
         });
         let backend = Writing {
             inner: MemoryMemo::new(),
-            started: Arc::new(AtomicBool::new(false)),
+            hold: Arc::default(),
         };
         let memo = builder.open(&store, backend.clone()).unwrap();
         Fx {
@@ -252,9 +283,15 @@ impl Fx {
         }
     }
 
-    /// Polls until `polled`, then waits without polling until `ready`,
-    /// cancels, and polls until the cancel settles.
-    fn cancel_when(&self, most: &mut Most, polled: impl Fn() -> bool, ready: impl Fn() -> bool) {
+    /// Polls until `polled`, then runs `stopped` and waits without polling
+    /// until `ready`, cancels, and polls until the cancel settles.
+    fn cancel_when(
+        &self,
+        most: &mut Most,
+        polled: impl Fn() -> bool,
+        stopped: impl Fn(),
+        ready: impl Fn() -> bool,
+    ) {
         let flight = self.memo.begin_checkpoint().unwrap();
         let deadline = Instant::now() + WAIT;
         while !polled() {
@@ -267,6 +304,7 @@ impl Fx {
                 "the flight never got ready to cancel"
             );
         }
+        stopped();
         while !ready() {
             assert!(Instant::now() < deadline, "the worker never committed");
             thread::sleep(Duration::from_millis(1));
@@ -303,17 +341,19 @@ fn every_memo_flight_poll_does_at_most_one_unit() {
     fx.cancel_when(
         &mut pruning,
         || polls.replace(polls.get() + 1) == 1,
+        || (),
         || true,
     );
     over.extend(pruning.within("cancelled while pruning"));
 
     fx.compute(2 * N..3 * N);
     let before = fx.tip();
-    fx.backend.started.store(false, SeqCst);
+    fx.backend.set_held(true);
     let mut committed = Most::default();
     fx.cancel_when(
         &mut committed,
-        || fx.backend.started.load(SeqCst),
+        || fx.backend.started(),
+        || fx.backend.set_held(false),
         || fx.tip() != before,
     );
     over.extend(committed.within("cancelled once committed"));
