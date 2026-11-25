@@ -12,7 +12,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::{self, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::node::NodeId;
 use crate::trace::{NodeTrace, PropagationTrace, StampPair, TraceAction};
@@ -460,7 +460,9 @@ impl Drop for KeptTrace {
         if self.header().refs.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
-        atomic::fence(Ordering::Acquire);
+        // A load, not a fence: ThreadSanitizer does not model fences and
+        // would report the free below as racing the other decrements.
+        self.header().refs.load(Ordering::Acquire);
         let at = self.offsets();
         let drop_ref = self.header().kind.drop;
         let base = self.ptr.as_ptr().cast::<u8>();
@@ -697,6 +699,38 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    /// Under ThreadSanitizer, which ignores a standalone Acquire fence,
+    /// this reports a race on the free unless the last drop acquires the
+    /// other drops' decrements through an access it can see.
+    #[test]
+    fn clones_dropped_at_once_free_the_trace_after_every_decrement() {
+        const THREADS: usize = 4;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        for _ in 0..8 {
+            let kept = KeptTrace::build(
+                0,
+                &five_steps(),
+                |_| 0,
+                |_, _| StepValue::Ref(Arc::new(CountDrop(Arc::clone(&dropped)))),
+            );
+            let start = Arc::new(std::sync::Barrier::new(THREADS));
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let (clone, start) = (kept.clone(), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        drop(clone);
+                    })
+                })
+                .collect();
+            drop(kept);
+            for thread in threads {
+                thread.join().unwrap();
+            }
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 8 * 5);
     }
 
     #[test]
