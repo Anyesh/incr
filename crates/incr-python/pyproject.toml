@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "incr-compute"
-version = "0.2.0b12"
+version = "0.2.0b14"
 description = "The fastest incremental computation engine for Python"
 requires-python = ">=3.10"
 license = "AGPL-3.0-only"
