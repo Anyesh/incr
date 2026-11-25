@@ -11,6 +11,7 @@ use std::ptr::NonNull;
 use std::slice;
 
 use crate::few::Few;
+use crate::grow::Storage;
 
 const EMPTY: u64 = 0;
 const TOMBSTONE: u64 = 1;
@@ -86,7 +87,7 @@ impl<P, R> Slot<P, R> {
 }
 
 /// `capacity` slots, zero or a power of two. Dropping it frees the memory
-/// but drops no bucket; the owner calls [`Self::drop_buckets`] first.
+/// but drops no bucket; [`Storage::drop_entries`] drops the live ones.
 pub(super) struct Slots<P, R> {
     ptr: NonNull<Slot<P, R>>,
     capacity: usize,
@@ -111,29 +112,14 @@ impl<P, R> Slots<P, R> {
         Layout::array::<Slot<P, R>>(capacity).expect("incr-core: key table capacity overflow")
     }
 
-    /// `capacity` empty slots. `capacity` must be a power of two.
-    pub(super) fn zeroed(capacity: usize) -> Self {
-        debug_assert!(capacity.is_power_of_two());
-        let layout = Self::layout(capacity);
-        // SAFETY: the size is not zero, because `capacity` is not and a
-        // slot holds a `u64`.
-        let Some(ptr) = NonNull::new(unsafe { alloc::alloc_zeroed(layout) }) else {
-            alloc::handle_alloc_error(layout)
-        };
-        Self {
-            ptr: ptr.cast(),
-            capacity,
-            _owns: PhantomData,
-        }
-    }
-
     #[inline]
     pub(super) fn capacity(&self) -> usize {
         self.capacity
     }
 
-    pub(super) fn heap_bytes(&self) -> usize {
-        self.capacity * mem::size_of::<Slot<P, R>>()
+    /// The bytes an array of `capacity` slots allocates.
+    pub(super) fn heap_bytes(capacity: usize) -> usize {
+        capacity * mem::size_of::<Slot<P, R>>()
     }
 
     #[inline]
@@ -195,13 +181,43 @@ impl<P, R> Slots<P, R> {
         }
     }
 
-    /// The buckets from slot `from` on, each with its slot.
+    /// The slot of the bucket with `hash` that `matches` accepts, in the
+    /// old storage of a migration whose cursor is `cursor`. The probe skips
+    /// the slots below the cursor, which hold no bucket and may read as
+    /// empty: the run from a bucket's home to its slot has no empty slot,
+    /// so none of the slots skipped could have ended the probe before it
+    /// reached a bucket at or past the cursor.
+    pub(super) fn find_from(
+        &self,
+        cursor: usize,
+        hash: BucketHash,
+        mut matches: impl FnMut(&Bucket<P, R>) -> bool,
+    ) -> Option<usize> {
+        let slots = self.as_slice();
+        let home = hash.0 as usize & (slots.len() - 1);
+        let wrapped = cursor..home.max(cursor);
+        (home.max(cursor)..slots.len())
+            .chain(wrapped)
+            .take_while(|&k| slots[k].hash != EMPTY)
+            .find(|&k| {
+                // SAFETY: a `BucketHash` is `FIRST_HASH` or more, so a slot
+                // storing one is full.
+                slots[k].hash == hash.0 && matches(unsafe { slots[k].full() })
+            })
+    }
+
+    /// The buckets from slot `from` on, each with its slot numbered from
+    /// `base`.
     #[inline]
-    pub(super) fn buckets(&self, from: usize) -> impl Iterator<Item = (usize, &Bucket<P, R>)> {
+    pub(super) fn buckets(
+        &self,
+        from: usize,
+        base: usize,
+    ) -> impl Iterator<Item = (usize, &Bucket<P, R>)> {
         self.as_slice()[from..]
             .iter()
             .enumerate()
-            .filter_map(move |(i, slot)| Some((from + i, slot.bucket()?)))
+            .filter_map(move |(k, slot)| Some((base + from + k, slot.bucket()?)))
     }
 
     /// The first free slot on the probe run of `hash`. Requires an empty
@@ -242,9 +258,42 @@ impl<P, R> Slots<P, R> {
         let bucket = slots[i].take(if emptied { EMPTY } else { TOMBSTONE })?;
         Some((bucket, emptied))
     }
+}
 
-    /// Drops every bucket from slot `from` on, leaving those slots free.
-    pub(super) fn drop_buckets(&mut self, from: usize) {
+impl<P, R> Storage for Slots<P, R> {
+    type Entry = Bucket<P, R>;
+
+    fn zeroed(capacity: usize) -> Self {
+        debug_assert!(capacity.is_power_of_two());
+        let layout = Self::layout(capacity);
+        // SAFETY: the size is not zero, because `capacity` is not and a
+        // slot holds a `u64`.
+        let Some(ptr) = NonNull::new(unsafe { alloc::alloc_zeroed(layout) }) else {
+            alloc::handle_alloc_error(layout)
+        };
+        Self {
+            ptr: ptr.cast(),
+            capacity,
+            _owns: PhantomData,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn take(&mut self, k: usize) -> Option<Bucket<P, R>> {
+        self.as_mut_slice()[k].take(TOMBSTONE)
+    }
+
+    fn place(&mut self, bucket: Bucket<P, R>) -> (usize, bool) {
+        let slot = self.free_slot(bucket.hash);
+        let reused = !self.is_empty_slot(slot);
+        self.put(slot, bucket);
+        (slot, reused)
+    }
+
+    fn drop_entries(&mut self, from: usize) {
         if !mem::needs_drop::<Few<(P, R)>>() {
             return;
         }
@@ -257,7 +306,7 @@ impl<P, R> Slots<P, R> {
 impl<P, R> Drop for Slots<P, R> {
     fn drop(&mut self) {
         if self.capacity != 0 {
-            // SAFETY: allocated by `zeroed` with this layout.
+            // SAFETY: allocated by `Storage::zeroed` with this layout.
             unsafe { alloc::dealloc(self.ptr.as_ptr().cast(), Self::layout(self.capacity)) }
         }
     }

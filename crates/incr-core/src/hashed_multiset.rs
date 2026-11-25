@@ -1,7 +1,7 @@
 //! Open-addressing multiset keyed by caller-supplied hashes.
 //!
 //! The table stores each element's hash next to it, so `reserve` and the
-//! rehash it may trigger move entries by their stored hashes and never run
+//! migration it steps move entries by their stored hashes and never run
 //! user code. Lookup is the only operation that calls user `Eq`; every
 //! mutation takes an index that a lookup returned (for an absent value,
 //! the first free slot on its probe run), so a caller can run all user
@@ -10,10 +10,12 @@
 //! hashes" a compile-time fact.
 //!
 //! Removal leaves a tombstone (or an empty slot when no probe run can pass
-//! through it) and never moves another entry, and only `reserve` rehashes,
-//! so indices stay valid until the next `reserve`.
+//! through it) and never moves another entry, and only `reserve` moves
+//! entries, a few per call while the table grows (see [`crate::grow`]), so
+//! indices stay valid until the next `reserve`.
 
 use std::alloc::{self, Layout};
+use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
@@ -21,7 +23,7 @@ use std::slice;
 use std::time::{Duration, Instant};
 
 use crate::capture::{self, Capture, CaptureStep};
-
+use crate::grow::{Growing, Moves, Storage};
 use crate::yield_hook::{NoTicks, Ticks};
 
 const EMPTY: u8 = 0;
@@ -34,10 +36,6 @@ fn tag(hash: u64) -> u8 {
     FULL | (hash >> 57) as u8
 }
 
-fn load_limit(capacity: usize) -> usize {
-    capacity / 4 * 3
-}
-
 struct Entry<T> {
     hash: u64,
     count: usize,
@@ -46,7 +44,8 @@ struct Entry<T> {
 
 /// `capacity` entries followed by `capacity` control bytes in a single
 /// allocation, since every table needs both. Dropping a table frees the
-/// memory but drops no entry; [`HashedMultiset`] drops the live ones.
+/// memory but drops no entry; [`Storage::drop_entries`] drops the live
+/// ones.
 struct Table<T> {
     entries: NonNull<MaybeUninit<Entry<T>>>,
     ctrl: NonNull<u8>,
@@ -75,26 +74,10 @@ impl<T> Table<T> {
             .expect("incr-core: collection capacity overflow")
     }
 
-    /// A table of `capacity` EMPTY slots. `capacity` must not be zero.
-    fn new(capacity: usize) -> Self {
-        debug_assert!(capacity != 0);
-        let (layout, ctrl_offset) = Self::layout(capacity);
-        // SAFETY: the size is not zero, because `capacity` is not and an
-        // entry holds a `u64`.
-        let base = unsafe { alloc::alloc_zeroed(layout) };
-        let Some(base) = NonNull::new(base) else {
-            alloc::handle_alloc_error(layout)
-        };
-        // SAFETY: the `capacity` control bytes at `ctrl_offset` lie inside
-        // the allocation, and the entries at its start are aligned by the
-        // layout. The zeroed allocation initialised every control byte to
-        // EMPTY.
-        let ctrl = unsafe { base.add(ctrl_offset) };
-        Self {
-            entries: base.cast(),
-            ctrl,
-            capacity,
-            _owns: PhantomData,
+    fn heap_bytes(capacity: usize) -> usize {
+        match capacity {
+            0 => 0,
+            capacity => Self::layout(capacity).0.size(),
         }
     }
 
@@ -119,12 +102,159 @@ impl<T> Table<T> {
             )
         }
     }
+
+    /// The entry in slot `k`, or `None` for a free slot.
+    fn full(&self, k: usize) -> Option<&Entry<T>> {
+        // SAFETY: a full slot's entry is initialised.
+        (self.ctrl()[k] & FULL != 0).then(|| unsafe { self.entries()[k].assume_init_ref() })
+    }
+
+    /// Calls `visit` on the entry of each full slot from `from` on, with
+    /// the slot numbered from `base`, until it returns an error.
+    #[inline(always)]
+    fn try_each<E>(
+        &self,
+        from: usize,
+        base: usize,
+        visit: &mut impl FnMut(usize, &T, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let slots = self.ctrl()[from..].iter().zip(&self.entries()[from..]);
+        for (k, (c, e)) in slots.enumerate() {
+            if *c & FULL != 0 {
+                // SAFETY: the slot is full, so its entry is initialised.
+                let e = unsafe { e.assume_init_ref() };
+                visit(base + from + k, &e.value, e.count)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `Ok` with the slot of the entry equal to `value`, or `Err` with the
+    /// first free slot on its probe run, the slot an insert of it takes.
+    /// Requires a non-empty table.
+    #[inline(always)]
+    fn probe(&self, hash: u64, value: &T) -> Result<usize, usize>
+    where
+        T: PartialEq,
+    {
+        let (ctrl, entries) = (self.ctrl(), self.entries());
+        let mask = ctrl.len() - 1;
+        let tag = tag(hash);
+        let mut i = hash as usize & mask;
+        let mut free = usize::MAX;
+        loop {
+            let c = ctrl[i];
+            if c == tag {
+                // SAFETY: a tag byte has FULL set, so the entry is initialised.
+                let e = unsafe { entries[i].assume_init_ref() };
+                if e.hash == hash && e.value == *value {
+                    return Ok(i);
+                }
+            } else if c & FULL == 0 {
+                if c == EMPTY {
+                    return Err(if free == usize::MAX { i } else { free });
+                }
+                if free == usize::MAX {
+                    free = i;
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// The slot of the entry equal to `value` in the old storage of a
+    /// migration whose cursor is `cursor`. The probe skips the slots below
+    /// the cursor, which hold no entry: the run from an entry's home to
+    /// its slot has no empty slot, so none of the slots skipped could have
+    /// ended the probe before it reached an entry at or past the cursor.
+    fn probe_from(&self, cursor: usize, hash: u64, value: &T) -> Option<usize>
+    where
+        T: PartialEq,
+    {
+        let (ctrl, entries) = (self.ctrl(), self.entries());
+        let tag = tag(hash);
+        let home = hash as usize & (ctrl.len() - 1);
+        let wrapped = cursor..home.max(cursor);
+        (home.max(cursor)..ctrl.len())
+            .chain(wrapped)
+            .take_while(|&k| ctrl[k] != EMPTY)
+            .find(|&k| {
+                // SAFETY: a tag byte has FULL set, so the entry is initialised.
+                ctrl[k] == tag && {
+                    let e = unsafe { entries[k].assume_init_ref() };
+                    e.hash == hash && e.value == *value
+                }
+            })
+    }
+}
+
+impl<T> Storage for Table<T> {
+    type Entry = Entry<T>;
+
+    fn zeroed(capacity: usize) -> Self {
+        debug_assert!(capacity.is_power_of_two());
+        let (layout, ctrl_offset) = Self::layout(capacity);
+        // SAFETY: the size is not zero, because `capacity` is not and an
+        // entry holds a `u64`.
+        let base = unsafe { alloc::alloc_zeroed(layout) };
+        let Some(base) = NonNull::new(base) else {
+            alloc::handle_alloc_error(layout)
+        };
+        // SAFETY: the `capacity` control bytes at `ctrl_offset` lie inside
+        // the allocation, and the entries at its start are aligned by the
+        // layout. The zeroed allocation initialised every control byte to
+        // EMPTY.
+        let ctrl = unsafe { base.add(ctrl_offset) };
+        Self {
+            entries: base.cast(),
+            ctrl,
+            capacity,
+            _owns: PhantomData,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn take(&mut self, k: usize) -> Option<Entry<T>> {
+        let (ctrl, entries) = self.parts_mut();
+        if ctrl[k] & FULL == 0 {
+            return None;
+        }
+        ctrl[k] = TOMBSTONE;
+        // SAFETY: the slot was full and is now marked free, so this read
+        // takes the only ownership of the entry.
+        Some(unsafe { entries[k].assume_init_read() })
+    }
+
+    fn place(&mut self, entry: Entry<T>) -> (usize, bool) {
+        let (ctrl, entries) = self.parts_mut();
+        let mask = ctrl.len() - 1;
+        let mut j = entry.hash as usize & mask;
+        while ctrl[j] & FULL != 0 {
+            j = (j + 1) & mask;
+        }
+        let reused = ctrl[j] == TOMBSTONE;
+        ctrl[j] = tag(entry.hash);
+        entries[j].write(entry);
+        (j, reused)
+    }
+
+    fn drop_entries(&mut self, from: usize) {
+        if !mem::needs_drop::<T>() {
+            return;
+        }
+        for k in from..self.capacity {
+            drop(self.take(k));
+        }
+    }
 }
 
 impl<T> Drop for Table<T> {
     fn drop(&mut self) {
         if self.capacity != 0 {
-            // SAFETY: allocated by `new` with this layout.
+            // SAFETY: allocated by `zeroed` with this layout.
             unsafe { alloc::dealloc(self.entries.as_ptr().cast(), Self::layout(self.capacity).0) }
         }
     }
@@ -135,15 +265,13 @@ pub(crate) struct HashedMultiset<T> {
     // initialised. The table's capacity is a power of two (or zero), and
     // at least one slot is EMPTY whenever it is not zero, so every probe
     // loop terminates.
-    table: Table<T>,
+    store: Growing<Table<T>>,
     len: usize,
-    growth_left: usize,
-    /// How many times entries moved, which a write whose user `Eq` panics
-    /// after reserving can do without changing any element.
+    /// How many times `reserve` moved an entry or started or ended a
+    /// migration, which a write whose user `Eq` panics after reserving
+    /// can do without changing any element.
     rehashes: u64,
     capture: Option<Box<Capture<(T, usize)>>>,
-    #[cfg(test)]
-    scanned: usize,
 }
 
 /// Where one change lands, as found by [`HashedMultiset::locate`]. Valid
@@ -176,13 +304,10 @@ impl Located {
 impl<T> HashedMultiset<T> {
     pub(crate) fn new() -> Self {
         Self {
-            table: Table::empty(),
+            store: Growing::new(Table::empty()),
             len: 0,
-            growth_left: 0,
             rehashes: 0,
             capture: None,
-            #[cfg(test)]
-            scanned: 0,
         }
     }
 
@@ -190,7 +315,7 @@ impl<T> HashedMultiset<T> {
     /// multiset's life.
     #[cfg(test)]
     pub(crate) fn scanned(&self) -> usize {
-        self.scanned
+        self.store.scanned()
     }
 
     /// Number of distinct elements.
@@ -198,94 +323,100 @@ impl<T> HashedMultiset<T> {
         self.len
     }
 
-    /// The bytes of the table's allocation.
+    /// The bytes of the table's allocation, and of the one it is growing
+    /// out of.
     pub(crate) fn heap_bytes(&self) -> usize {
-        match self.table.capacity {
-            0 => 0,
-            capacity => Table::<T>::layout(capacity).0.size(),
-        }
+        Table::<T>::heap_bytes(self.store.table.capacity)
+            + Table::<T>::heap_bytes(self.store.old_capacity())
     }
 
-    /// Distinct elements with their multiplicities, in table order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&T, usize)> {
-        self.slots().map(|(_, value, count)| (value, count))
+    /// Calls `visit` on each distinct element with its multiplicity, in
+    /// table order.
+    #[inline]
+    pub(crate) fn for_each(&self, mut visit: impl FnMut(&T, usize)) {
+        let Ok(()) = self.try_for_each_slot(|_, value, count| {
+            visit(value, count);
+            Ok::<(), Infallible>(())
+        });
     }
 
-    /// How many times entries moved; slots from [`Self::slots`] name the
-    /// same entries while this and the elements stay unchanged.
+    /// How many times the slots of entries changed; slots from
+    /// [`Self::try_for_each_slot`] name the same entries while this and
+    /// the elements stay unchanged.
     pub(crate) fn rehashes(&self) -> u64 {
         self.rehashes
     }
 
-    /// [`Self::iter`] with each element's slot, which [`Self::stored`] and
-    /// [`Self::count`] take until the multiset next changes or rehashes.
-    pub(crate) fn slots(&self) -> impl Iterator<Item = (usize, &T, usize)> {
-        self.table
-            .ctrl()
-            .iter()
-            .zip(self.table.entries())
-            .enumerate()
-            .filter(|(_, (c, _))| **c & FULL != 0)
-            // SAFETY: the slot is full, so its entry is initialised.
-            .map(|(i, (_, e))| (i, unsafe { e.assume_init_ref() }))
-            .map(|(i, e)| (i, &e.value, e.count))
+    /// [`Self::try_for_each_slot`] for a `visit` that cannot fail.
+    #[cfg(test)]
+    fn for_each_slot(&self, mut visit: impl FnMut(usize, &T, usize)) {
+        let Ok(()) = self.try_for_each_slot(|slot, value, count| {
+            visit(slot, value, count);
+            Ok::<(), Infallible>(())
+        });
     }
 
-    /// Ensure `additional` more distinct elements can be inserted without
-    /// a rehash. Runs no user code. Returns whether it rehashed, which
-    /// moves entries and so invalidates every located index.
-    pub(crate) fn reserve(&mut self, additional: usize) -> bool {
-        self.reserve_ticking(additional, &NoTicks)
-    }
-
-    /// [`Self::reserve`], ticking `yielder` per entry a rehash moves.
-    pub(crate) fn reserve_ticking(&mut self, additional: usize, yielder: &impl Ticks) -> bool {
-        let rehash = additional > self.growth_left;
-        if rehash {
-            self.rehash(additional, yielder);
+    /// Calls `visit` on each distinct element with its slot, which
+    /// [`Self::stored`] and [`Self::count`] take until the multiset next
+    /// changes or reserves, and its multiplicity, until it returns an
+    /// error.
+    #[inline]
+    pub(crate) fn try_for_each_slot<E>(
+        &self,
+        mut visit: impl FnMut(usize, &T, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.store.table.try_each(0, 0, &mut visit)?;
+        if self.store.migrating() {
+            self.try_each_old(&mut visit)?;
         }
-        rehash
+        Ok(())
     }
 
     #[cold]
-    fn rehash(&mut self, additional: usize, yielder: &impl Ticks) {
-        let need = self
-            .len
-            .checked_add(additional)
-            .expect("incr-core: collection capacity overflow");
-        let limit = load_limit(self.table.capacity);
-        // Purging tombstones at the same size is enough when it frees at
-        // least half the limit, which keeps rehashes amortised O(1).
-        let capacity = if need <= limit / 2 {
-            self.table.capacity
-        } else {
-            let need = need.max(limit + 1);
-            let mut capacity = 8_usize;
-            while load_limit(capacity) < need {
-                capacity = capacity
-                    .checked_mul(2)
-                    .expect("incr-core: collection capacity overflow");
-            }
-            capacity
-        };
-        let mut table = Table::new(capacity);
-        #[cfg(test)]
-        {
-            self.scanned += self.table.capacity;
+    #[inline(never)]
+    fn try_each_old<E>(
+        &self,
+        visit: &mut impl FnMut(usize, &T, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self.store.old() {
+            Some(old) => old.storage.try_each(old.cursor, old.base, visit),
+            None => Ok(()),
         }
-        match self.capture.as_deref_mut() {
-            None => move_entries(&mut self.table, &mut table, yielder, |_, _| {}),
-            Some(capture) => {
-                let mut moved = vec![usize::MAX; self.table.capacity];
-                move_entries(&mut self.table, &mut table, yielder, |old, new| {
-                    moved[old] = new
-                });
-                capture.rehashed(capacity, &moved);
-            }
+    }
+
+    /// Ensure `additional` more distinct elements can be inserted, and
+    /// take a step of a running migration. Runs no user code, and
+    /// invalidates every located index.
+    #[inline]
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        if self.store.must_grow(additional) {
+            self.grow(additional, None, &NoTicks);
         }
-        self.table = table;
-        self.rehashes += 1;
-        self.growth_left = load_limit(capacity) - self.len;
+    }
+
+    /// [`Self::reserve`] that reports where the entries it moved went, or
+    /// `None` when no slot changed, ticking `yielder` per entry moved.
+    pub(crate) fn reserve_moving(
+        &mut self,
+        additional: usize,
+        yielder: &impl Ticks,
+    ) -> Option<Moves> {
+        if !self.store.must_grow(additional) {
+            return None;
+        }
+        let mut moves = Moves::default();
+        self.grow(additional, Some(&mut moves), yielder)
+            .then_some(moves)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, additional: usize, moves: Option<&mut Moves>, yielder: &impl Ticks) -> bool {
+        let changed = self
+            .store
+            .grow(self.len, additional, &mut self.capture, moves, yielder);
+        self.rehashes += u64::from(changed);
+        changed
     }
 
     /// Installs a capture of every element with its count as of now.
@@ -295,7 +426,10 @@ impl<T> HashedMultiset<T> {
             self.capture.is_none(),
             "incr-core: a capture is already installed"
         );
-        self.capture = Some(Capture::new(self.table.capacity));
+        self.capture = Some(Capture::new(
+            self.store.table.capacity,
+            self.store.old_capacity(),
+        ));
     }
 
     /// Clones the unsettled entries from the capture's cursor on, at least
@@ -312,13 +446,15 @@ impl<T> HashedMultiset<T> {
         T: Clone,
     {
         let capture = self.capture.as_deref()?;
-        let (ctrl, entries) = (self.table.ctrl(), self.table.entries());
+        let emptied = self.store.old().map_or(0, |old| old.cursor);
+        let from = capture.cursor().max(emptied);
         let mut run = Vec::new();
-        let end = capture::scan(capture.cursor(), ctrl.len(), unit, start, budget, |i| {
-            if ctrl[i] & FULL != 0 && !capture.settled(i) {
-                // SAFETY: the slot is full, so its entry is initialised.
-                let e = unsafe { entries[i].assume_init_ref() };
-                run.push((e.value.clone(), e.count));
+        let end = capture::scan(from, capture.len(), unit, start, budget, |position| {
+            let i = capture.slot(position);
+            if let Some(e) = self.full(i) {
+                if !capture.settled(i) {
+                    run.push((e.value.clone(), e.count));
+                }
             }
         });
         Some((end, run))
@@ -343,7 +479,7 @@ impl<T> HashedMultiset<T> {
     /// once it is done; an empty finished step without one.
     pub(crate) fn capture_drain(&mut self) -> CaptureStep<(T, usize)> {
         let step = match self.capture.as_deref_mut() {
-            Some(capture) => capture.drain(self.table.capacity),
+            Some(capture) => capture.drain(),
             None => CaptureStep {
                 rows: Vec::new(),
                 done: true,
@@ -372,7 +508,7 @@ impl<T> HashedMultiset<T> {
     where
         T: PartialEq,
     {
-        if self.table.capacity == 0 {
+        if self.store.table.capacity == 0 {
             return None;
         }
         self.probe(hash, value).ok()
@@ -386,32 +522,26 @@ impl<T> HashedMultiset<T> {
     where
         T: PartialEq,
     {
-        let (ctrl, entries) = (self.table.ctrl(), self.table.entries());
-        let mask = ctrl.len() - 1;
-        let tag = tag(hash);
-        let mut i = hash as usize & mask;
-        let mut free = usize::MAX;
-        loop {
-            let c = ctrl[i];
-            if c == tag {
-                // SAFETY: a tag byte has FULL set, so the entry is initialised.
-                let e = unsafe { entries[i].assume_init_ref() };
-                if e.hash == hash && e.value == *value {
-                    return Ok(i);
-                }
-            } else if c & FULL == 0 {
-                if c == EMPTY {
-                    return Err(if free == usize::MAX { i } else { free });
-                }
-                if free == usize::MAX {
-                    free = i;
-                }
-            }
-            i = (i + 1) & mask;
+        match self.store.table.probe(hash, value) {
+            Err(free) if self.store.migrating() => self.probe_old(hash, value, free),
+            found => found,
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn probe_old(&self, hash: u64, value: &T, free: usize) -> Result<usize, usize>
+    where
+        T: PartialEq,
+    {
+        self.store
+            .old()
+            .and_then(|old| Some(old.base + old.storage.probe_from(old.cursor, hash, value)?))
+            .ok_or(free)
+    }
+
     /// Requires a prior `reserve(1)`, so the table is not empty.
+    #[inline(always)]
     fn locate_one(&self, hash: u64, value: &T) -> AddAt
     where
         T: PartialEq,
@@ -422,8 +552,20 @@ impl<T> HashedMultiset<T> {
         }
     }
 
+    /// The entry in slot `i` of either storage, or `None` for a free slot.
+    fn full(&self, i: usize) -> Option<&Entry<T>> {
+        if i < self.store.table.capacity {
+            return self.store.table.full(i);
+        }
+        let old = self.store.old()?;
+        old.storage.full(i - old.base)
+    }
+
     fn entry_mut(&mut self, i: usize) -> &mut Entry<T> {
-        let (ctrl, entries) = self.table.parts_mut();
+        if i >= self.store.table.capacity {
+            return self.old_entry_mut(i);
+        }
+        let (ctrl, entries) = self.store.table.parts_mut();
         assert!(
             ctrl[i] & FULL != 0,
             "incr-core: multiset index {i} is not a live entry"
@@ -432,13 +574,38 @@ impl<T> HashedMultiset<T> {
         unsafe { entries[i].assume_init_mut() }
     }
 
-    fn entry(&self, i: usize) -> &Entry<T> {
+    #[cold]
+    #[inline(never)]
+    fn old_entry_mut(&mut self, i: usize) -> &mut Entry<T> {
+        let (old, k) = self.store.old_slot_mut(i);
+        let (ctrl, entries) = old.parts_mut();
         assert!(
-            self.table.ctrl()[i] & FULL != 0,
+            ctrl[k] & FULL != 0,
             "incr-core: multiset index {i} is not a live entry"
         );
         // SAFETY: checked full just above.
-        unsafe { self.table.entries()[i].assume_init_ref() }
+        unsafe { entries[k].assume_init_mut() }
+    }
+
+    fn entry(&self, i: usize) -> &Entry<T> {
+        let Some(&c) = self.store.table.ctrl().get(i) else {
+            return self.old_entry(i);
+        };
+        assert!(
+            c & FULL != 0,
+            "incr-core: multiset index {i} is not a live entry"
+        );
+        // SAFETY: checked full just above.
+        unsafe { self.store.table.entries()[i].assume_init_ref() }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn old_entry(&self, i: usize) -> &Entry<T> {
+        match self.full(i) {
+            Some(entry) => entry,
+            None => panic!("incr-core: multiset index {i} is not a live entry"),
+        }
     }
 
     /// The multiplicity of the live entry at `i`.
@@ -507,28 +674,24 @@ impl<T> HashedMultiset<T> {
     where
         T: Clone,
     {
-        let Some(capture) = self.capture.as_deref_mut() else {
-            return;
-        };
-        if capture.settled(i) {
+        if self.capture.as_deref().is_none_or(|c| c.settled(i)) {
             return;
         }
-        assert!(
-            self.table.ctrl()[i] & FULL != 0,
-            "incr-core: multiset index {i} is not a live entry"
-        );
-        // SAFETY: checked full just above.
-        let e = unsafe { self.table.entries()[i].assume_init_ref() };
+        let e = self.entry(i);
         let content = (e.value.clone(), e.count);
-        capture.take(i, [content]);
+        if let Some(capture) = self.capture.as_deref_mut() {
+            capture.take(i, [content]);
+        }
     }
 
     /// [`Self::find`] that settles the entry it finds, for a write that
-    /// changes it next.
+    /// changes it next. It first takes a step of a running migration, so
+    /// that writes which only remove still finish one.
     pub(crate) fn find_settling(&mut self, hash: u64, value: &T) -> Option<usize>
     where
         T: PartialEq + Clone,
     {
+        self.reserve(0);
         let found = self.find(hash, value);
         if let Some(i) = found {
             self.settle(i);
@@ -547,13 +710,16 @@ impl<T> HashedMultiset<T> {
             entry.count -= 1;
             return None;
         }
-        let (ctrl, entries) = self.table.parts_mut();
+        if i >= self.store.table.capacity {
+            return self.remove_old(i);
+        }
+        let (ctrl, entries) = self.store.table.parts_mut();
         let next = (i + 1) & (ctrl.len() - 1);
         // An entry's probe run covers every slot from its home to its own
         // position, so a run can only pass through `i` if it continues to
         // `i + 1`. With `i + 1` empty, `i` can be emptied too.
         ctrl[i] = if ctrl[next] == EMPTY {
-            self.growth_left += 1;
+            self.store.growth_left += 1;
             EMPTY
         } else {
             TOMBSTONE
@@ -564,21 +730,35 @@ impl<T> HashedMultiset<T> {
         Some(unsafe { entries[i].assume_init_read() }.value)
     }
 
+    /// Removes the entry in old slot `i`, whose room in the table the
+    /// migration no longer needs. The slot always becomes a tombstone: the
+    /// old storage takes no insert, and a lookup in it may rely on no slot
+    /// at or past the migration's cursor turning empty.
+    #[cold]
+    #[inline(never)]
+    fn remove_old(&mut self, i: usize) -> Option<T> {
+        let (old, k) = self.store.old_slot_mut(i);
+        let entry = old.take(k);
+        self.store.growth_left += 1;
+        self.len -= 1;
+        entry.map(|entry| entry.value)
+    }
+
     /// Insert `value`, which no entry equals, with count 1 at `i`, the
     /// free slot its lookup returned. Requires a prior `reserve(1)`.
     #[inline]
     fn insert_absent(&mut self, hash: u64, i: usize, value: T) {
         assert!(
-            self.growth_left > 0,
+            self.store.growth_left > 0,
             "incr-core: multiset insert without a reserve"
         );
-        let (ctrl, entries) = self.table.parts_mut();
+        let (ctrl, entries) = self.store.table.parts_mut();
         assert!(
             ctrl[i] & FULL == 0,
             "incr-core: multiset slot {i} is not free"
         );
         if ctrl[i] == EMPTY {
-            self.growth_left -= 1;
+            self.store.growth_left -= 1;
         }
         entries[i].write(Entry {
             hash,
@@ -596,10 +776,10 @@ impl<T> HashedMultiset<T> {
     /// Returns its index.
     pub(crate) fn insert_absent_probe(&mut self, hash: u64, value: T) -> usize {
         assert!(
-            self.growth_left > 0,
+            self.store.growth_left > 0,
             "incr-core: multiset insert without a reserve"
         );
-        let ctrl = self.table.ctrl();
+        let ctrl = self.store.table.ctrl();
         let mask = ctrl.len() - 1;
         let mut i = hash as usize & mask;
         while ctrl[i] & FULL != 0 {
@@ -618,9 +798,7 @@ impl<T> HashedMultiset<T> {
     where
         T: PartialEq + Clone,
     {
-        if add.is_some() {
-            self.reserve(1);
-        }
+        self.reserve(usize::from(add.is_some()));
         let remove = remove.and_then(|(hash, value)| self.find(hash, value));
         let add = add.map(|(hash, value)| self.locate_one(hash, value));
         if let Some(i) = remove {
@@ -700,62 +878,16 @@ impl<T> HashedMultiset<T> {
     }
 }
 
-/// Moves every entry of `old` into `new`, an empty table, by its stored
-/// hash, leaving `old` with no full slot, and reports each move as (old
-/// slot, new slot), ticking `yielder` per move. Runs no user code.
-#[inline(always)]
-fn move_entries<T>(
-    old: &mut Table<T>,
-    new: &mut Table<T>,
-    yielder: &impl Ticks,
-    mut moved: impl FnMut(usize, usize),
-) {
-    let (ctrl, entries) = new.parts_mut();
-    let mask = ctrl.len() - 1;
-    let (old_ctrl, old_entries) = old.parts_mut();
-    for (at, (old_c, old_e)) in old_ctrl.iter_mut().zip(old_entries.iter()).enumerate() {
-        if *old_c & FULL == 0 {
-            continue;
-        }
-        yielder.tick();
-        // SAFETY: the slot is full. Marking it empty right away hands
-        // ownership to the new table, so the old one never drops it.
-        let entry = unsafe { old_e.assume_init_read() };
-        let c = mem::replace(old_c, EMPTY);
-        let mut j = entry.hash as usize & mask;
-        while ctrl[j] != EMPTY {
-            j = (j + 1) & mask;
-        }
-        ctrl[j] = c;
-        entries[j].write(entry);
-        moved(at, j);
-    }
-}
-
 impl<T> Default for HashedMultiset<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> Drop for HashedMultiset<T> {
-    fn drop(&mut self) {
-        if !mem::needs_drop::<T>() {
-            return;
-        }
-        let (ctrl, entries) = self.table.parts_mut();
-        for (c, e) in ctrl.iter().zip(entries.iter_mut()) {
-            if *c & FULL != 0 {
-                // SAFETY: the slot is full, and the table is never used again.
-                unsafe { e.assume_init_drop() };
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grow::{load_limit, with_step_slots};
     use proptest::prelude::*;
     use std::collections::HashMap;
 
@@ -803,8 +935,10 @@ mod tests {
         Reserve(usize),
     }
 
+    const KEYS: u8 = 40;
+
     fn op() -> impl Strategy<Value = Op> {
-        let key = 0_u8..24;
+        let key = 0_u8..KEYS;
         prop_oneof![
             3 => (key.clone(), any::<u32>()).prop_map(|(k, id)| Op::Insert(k, id)),
             2 => key.clone().prop_map(Op::Remove),
@@ -900,22 +1034,33 @@ mod tests {
 
     fn assert_matches(set: &HashedMultiset<V>, hashing: Hashing, model: &Model) {
         assert_eq!(set.len(), model.len());
-        let mut seen: Vec<(u8, usize, u32)> = set.iter().map(|(v, c)| (v.key, c, *v.id)).collect();
+        let mut seen: Vec<(u8, usize, u32)> = Vec::new();
+        set.for_each(|v, c| seen.push((v.key, c, *v.id)));
         seen.sort_unstable();
         let mut expected: Vec<(u8, usize, u32)> =
             model.iter().map(|(&k, &(c, id))| (k, c, id)).collect();
         expected.sort_unstable();
         assert_eq!(seen, expected);
-        for key in 0..24 {
+        for key in 0..KEYS {
             let found = set.find(hash(hashing, key), &v(key, 0));
             assert_eq!(found.is_some(), model.contains_key(&key), "find({key})");
         }
-        let full = set.table.ctrl().iter().filter(|c| **c & FULL != 0).count();
-        let tombstones = set.table.ctrl().iter().filter(|c| **c == TOMBSTONE).count();
-        assert_eq!(full, set.len);
+        assert_accounting(set);
+    }
+
+    /// The length and the room left agree with the slots of both storages.
+    fn assert_accounting(set: &HashedMultiset<V>) {
+        let ctrl = set.store.table.ctrl();
+        let full = ctrl.iter().filter(|c| **c & FULL != 0).count();
+        let tombstones = ctrl.iter().filter(|c| **c == TOMBSTONE).count();
+        let unmoved = set.store.old().map_or(0, |old| {
+            let ctrl = &old.storage.ctrl()[old.cursor..];
+            ctrl.iter().filter(|c| **c & FULL != 0).count()
+        });
+        assert_eq!(full + unmoved, set.len);
         assert_eq!(
-            full + tombstones + set.growth_left,
-            load_limit(set.table.capacity)
+            full + tombstones + unmoved + set.store.growth_left,
+            load_limit(set.store.table.capacity)
         );
     }
 
@@ -937,10 +1082,19 @@ mod tests {
                     assert_eq!(got, model_change(&mut model, old, Some((k, id))), "{op:?}");
                 }
                 Op::Reserve(n) => {
-                    let before = set.table.capacity;
-                    set.reserve(n);
-                    assert!(set.growth_left >= n);
-                    assert!(set.table.capacity >= before, "reserve shrank the table");
+                    let before = set.store.table.capacity;
+                    let mut held = Vec::new();
+                    set.for_each_slot(|slot, value, _| held.push((slot, value.key)));
+                    let moves = set.reserve_moving(n, &NoTicks);
+                    assert!(set.store.growth_left >= n);
+                    assert!(
+                        set.store.table.capacity >= before,
+                        "reserve shrank the table"
+                    );
+                    for (slot, key) in held {
+                        let slot = moves.as_ref().map_or(slot, |moves| moves.remap(slot));
+                        assert_eq!(set.stored(slot).key, key, "{op:?} moved key {key}");
+                    }
                 }
             }
             assert_matches(&set, hashing, &model);
@@ -957,10 +1111,11 @@ mod tests {
         #[test]
         fn matches_a_hashmap_model(
             clustered in any::<bool>(),
+            step in prop_oneof![Just(1_usize), Just(3), Just(256)],
             ops in proptest::collection::vec(op(), 0..if cfg!(miri) { 40 } else { 200 }),
         ) {
             let hashing = if clustered { Hashing::Clustered } else { Hashing::Spread };
-            run(hashing, &ops);
+            with_step_slots(step, || run(hashing, &ops));
         }
     }
 
@@ -1016,12 +1171,12 @@ mod tests {
         for (k, id) in [(0, 0), (3, 1)] {
             change(&mut set, hashing, None, Some((k, id)));
         }
-        let home = hash(hashing, 0) as usize & (set.table.capacity - 1);
+        let home = hash(hashing, 0) as usize & (set.store.table.capacity - 1);
         assert_eq!(set.find(hash(hashing, 0), &v(0, 0)), Some(home));
         let (removed, displaced) = change(&mut set, hashing, Some(0), Some((6, 2)));
         assert!(removed);
         assert_eq!(displaced, vec![0]);
-        assert_eq!(set.table.ctrl()[home], TOMBSTONE);
+        assert_eq!(set.store.table.ctrl()[home], TOMBSTONE);
         assert!(set.find(hash(hashing, 6), &v(6, 0)).is_some());
         assert!(set.find(hash(hashing, 3), &v(3, 0)).is_some());
     }
@@ -1050,6 +1205,124 @@ mod tests {
         assert_eq!(set.count(i), 2);
     }
 
+    /// Adds an occurrence of key `k` under the hash `h`.
+    fn add_at(set: &mut HashedMultiset<V>, h: u64, k: u8) {
+        let value = v(k, u32::from(k));
+        let at = set.locate_add(h, &value);
+        drop(set.add(at, value));
+    }
+
+    /// Removes an occurrence of key `k`, held under the hash `h`.
+    fn remove_at(set: &mut HashedMultiset<V>, h: u64, k: u8) {
+        let i = set.find_settling(h, &v(k, 0)).expect("the key is held");
+        drop(set.decrement_or_remove(i));
+    }
+
+    /// Twelve keys that fill a 16-slot table to its limit, key `k` in slot
+    /// `k`, so that the next insert starts a migration into 32 slots.
+    fn full_sixteen() -> HashedMultiset<V> {
+        let mut set = HashedMultiset::new();
+        for k in 0..12 {
+            add_at(&mut set, u64::from(k), k);
+        }
+        assert_eq!(set.store.table.capacity, 16);
+        assert_eq!(set.store.growth_left, 0);
+        set
+    }
+
+    #[test]
+    fn a_migration_spans_writes_and_keeps_every_entry_reachable() {
+        with_step_slots(1, || {
+            let mut set = full_sixteen();
+            let one_table = set.heap_bytes();
+            add_at(&mut set, 12, 12);
+            let old = set.store.old().expect("the insert starts a migration");
+            assert_eq!(
+                (old.cursor, old.base),
+                (5, 32),
+                "the start scans 4 * 1 + 1 slots"
+            );
+            assert!(set.heap_bytes() > 2 * one_table);
+            for k in 0..13 {
+                let i = set.find(u64::from(k), &v(k, 0)).expect("held");
+                assert_eq!(i >= 32, (5..12).contains(&k), "key {k} at slot {i}");
+                assert_eq!((set.stored(i).key, set.count(i)), (k, 1));
+            }
+            assert_eq!(set.find(13, &v(13, 0)), None);
+            assert_eq!(set.find(3, &v(35, 0)), None);
+
+            remove_at(&mut set, 10, 10);
+            assert_eq!(set.store.old().map(|old| old.cursor), Some(6));
+            assert_eq!(
+                set.find(10, &v(10, 0)),
+                None,
+                "removed from the old storage"
+            );
+            assert_eq!(set.len(), 12);
+            assert_accounting(&set);
+            add_at(&mut set, 11, 11);
+            assert_eq!(set.store.old().map(|old| old.cursor), Some(11));
+            let i = set.find(11, &v(11, 0)).expect("held");
+            assert_eq!(
+                (i, set.count(i)),
+                (32 + 11, 2),
+                "counted in the old storage"
+            );
+            assert_accounting(&set);
+
+            let mut steps = 0;
+            while set.store.migrating() {
+                set.reserve(0);
+                steps += 1;
+                assert_accounting(&set);
+            }
+            assert_eq!(steps, 5, "a reserve of nothing scans one slot");
+            for k in (0..10).chain([11, 12]) {
+                let i = set.find(u64::from(k), &v(k, 0)).expect("held");
+                assert!(i < 32, "key {k} moved into the table");
+                assert_eq!(set.count(i), if k == 11 { 2 } else { 1 });
+            }
+            assert_eq!(set.heap_bytes(), 2 * one_table);
+        });
+    }
+
+    #[test]
+    fn a_moved_entry_does_not_take_a_stale_settled_bit_from_its_new_slot() {
+        with_step_slots(1, || {
+            let mut set = full_sixteen();
+            set.begin_capture();
+            add_at(&mut set, 12, 12);
+            add_at(&mut set, 11, 50);
+            assert_eq!(
+                set.find(11, &v(50, 0)),
+                Some(11),
+                "in the table, while key 11 is still in the old storage"
+            );
+            remove_at(&mut set, 11, 50);
+            assert_eq!(set.find(11, &v(11, 0)), Some(32 + 11));
+            set.reserve(0);
+            assert_eq!(
+                set.find(11, &v(11, 0)),
+                Some(11),
+                "moved into the slot a settled entry left"
+            );
+            let mut keys = Vec::new();
+            loop {
+                let (end, run) = set
+                    .capture_scan(4, Instant::now(), Duration::ZERO)
+                    .expect("a capture is installed");
+                let step = set.capture_advance(end, run);
+                keys.extend(step.rows.iter().map(|(value, count)| (value.key, *count)));
+                if step.done {
+                    break;
+                }
+            }
+            keys.sort_unstable();
+            let begun: Vec<(u8, usize)> = (0..12).map(|k| (k, 1)).collect();
+            assert_eq!(keys, begun);
+        });
+    }
+
     #[test]
     fn growth_rehash_keeps_every_entry() {
         let mut model = Model::new();
@@ -1059,6 +1332,6 @@ mod tests {
             assert_eq!(got, model_change(&mut model, None, Some((k, u32::from(k)))));
         }
         assert_matches(&set, Hashing::Clustered, &model);
-        assert!(set.table.capacity >= 32);
+        assert!(set.store.table.capacity >= 32);
     }
 }

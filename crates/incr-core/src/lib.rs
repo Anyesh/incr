@@ -37,6 +37,7 @@ mod few;
 pub mod fx;
 pub mod generic_arena;
 pub mod grid_table;
+mod grow;
 pub mod handle;
 mod hashed_multiset;
 mod hold;

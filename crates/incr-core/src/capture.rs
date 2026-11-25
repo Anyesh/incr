@@ -2,13 +2,17 @@
 //! instant is installed: see [`crate::KeyedCollection::begin_capture`] and
 //! [`crate::IncrCollection::begin_capture`].
 //!
-//! A slot is settled when it is below the cursor or its bit is set. The
-//! capture holds the content, as of the instant it was installed, of every
-//! settled slot that was occupied then. Every write that changes an
-//! occupied slot first settles it, cloning its content into the capture;
-//! filling a free slot settles it with no copy; a rehash carries each
-//! entry's settled state to its new slot and resets the cursor; the scan
+//! A slot is settled when its scan position is below the cursor or its bit
+//! is set. The capture holds the content, as of the instant it was
+//! installed, of every settled slot that was occupied then. Every write
+//! that changes an occupied slot first settles it, cloning its content into
+//! the capture; filling a free slot settles it with no copy; the scan
 //! copies the unsettled occupied slots from the cursor on.
+//!
+//! The scan visits the old storage of a migration (see [`crate::grow`])
+//! before the table's, so an entry that a migration step moves is never
+//! behind the cursor unless it was settled: the step gives its new slot the
+//! settled state of its old one.
 
 use std::time::{Duration, Instant};
 
@@ -31,23 +35,65 @@ pub struct CaptureStep<T> {
 }
 
 pub(crate) struct Capture<O> {
+    /// One bit per slot; every bit from `table + old` on is zero.
     bits: Vec<u64>,
+    /// A scan position: see [`Self::position`].
     cursor: usize,
+    /// The capacity of the table's storage, slots `0..table`.
+    table: usize,
+    /// The capacity of a migration's old storage, slots `table..table +
+    /// old`; zero with no migration.
+    old: usize,
     out: Vec<O>,
 }
 
 impl<O> Capture<O> {
-    pub(crate) fn new(capacity: usize) -> Box<Self> {
+    /// A capture of a table whose storage has `table` slots and whose
+    /// migration, if one runs, has `old` slots left to empty.
+    pub(crate) fn new(table: usize, old: usize) -> Box<Self> {
         Box::new(Self {
-            bits: vec![0; capacity.div_ceil(64)],
+            bits: vec![0; (table + old).div_ceil(64)],
             cursor: 0,
+            table,
+            old,
             out: Vec::new(),
         })
     }
 
+    /// Where the scan visits slot `i`: the old storage's slots first, then
+    /// the table's.
+    #[inline]
+    fn position(&self, i: usize) -> usize {
+        if i >= self.table {
+            i - self.table
+        } else {
+            i + self.old
+        }
+    }
+
+    /// The slot the scan visits at `position`.
+    #[inline]
+    pub(crate) fn slot(&self, position: usize) -> usize {
+        if position < self.old {
+            position + self.table
+        } else {
+            position - self.old
+        }
+    }
+
+    /// The number of scan positions.
+    pub(crate) fn len(&self) -> usize {
+        self.table + self.old
+    }
+
+    #[inline]
+    fn bit(&self, i: usize) -> bool {
+        self.bits[i / 64] >> (i % 64) & 1 != 0
+    }
+
     #[inline]
     pub(crate) fn settled(&self, i: usize) -> bool {
-        i < self.cursor || self.bits[i / 64] >> (i % 64) & 1 != 0
+        self.position(i) < self.cursor || self.bit(i)
     }
 
     #[inline]
@@ -66,18 +112,50 @@ impl<O> Capture<O> {
         None
     }
 
-    /// After a rehash into `capacity` slots that moved old slot `i` to
-    /// `moved[i]` (`usize::MAX` for a free one): carries each moved entry's
-    /// settled state and restarts the scan.
-    pub(crate) fn rehashed(&mut self, capacity: usize, moved: &[usize]) {
-        let mut bits = vec![0u64; capacity.div_ceil(64)];
-        for (old, &new) in moved.iter().enumerate() {
-            if new != usize::MAX && self.settled(old) {
-                bits[new / 64] |= 1 << (new % 64);
+    /// A migration into a storage of `capacity` slots started, which
+    /// renumbers slot `i` to `capacity + i`. The cursor stays: the scan
+    /// position of every slot it has passed is unchanged.
+    pub(crate) fn migration_started(&mut self, capacity: usize) {
+        debug_assert_eq!(self.old, 0);
+        let old = self.table;
+        let mut bits = vec![0u64; (capacity + old).div_ceil(64)];
+        if capacity.is_multiple_of(64) {
+            bits[capacity / 64..][..self.bits.len()].copy_from_slice(&self.bits);
+        } else {
+            for i in (0..old).filter(|&i| self.bit(i)) {
+                bits[(capacity + i) / 64] |= 1 << ((capacity + i) % 64);
             }
         }
         self.bits = bits;
-        self.cursor = 0;
+        self.table = capacity;
+        self.old = old;
+    }
+
+    /// A migration step moved the entry in old slot `from` to table slot
+    /// `to`, which takes its settled state. The bit is cleared for an
+    /// unsettled entry because `to` may keep one from an entry inserted
+    /// there and removed since; the scan has yet to reach `to`, so it
+    /// still copies the entry.
+    pub(crate) fn moved(&mut self, from: usize, to: usize) {
+        if self.settled(from) {
+            self.settle(to);
+        } else {
+            self.bits[to / 64] &= !(1 << (to % 64));
+        }
+    }
+
+    /// The migration ended and its old slots are gone. A scan that had not
+    /// left them restarts at the table's first slot, where every entry
+    /// carries its settled state in its bit.
+    pub(crate) fn migration_finished(&mut self) {
+        self.bits.truncate(self.table.div_ceil(64));
+        if !self.table.is_multiple_of(64) {
+            if let Some(last) = self.bits.last_mut() {
+                *last &= (1 << (self.table % 64)) - 1;
+            }
+        }
+        self.cursor = self.cursor.saturating_sub(self.old);
+        self.old = 0;
     }
 
     pub(crate) fn cursor(&self) -> usize {
@@ -97,11 +175,11 @@ impl<O> Capture<O> {
     }
 
     /// Hands over what was taken since the last call; the capture is
-    /// finished once the cursor reaches `capacity`.
-    pub(crate) fn drain(&mut self, capacity: usize) -> CaptureStep<O> {
+    /// finished once the cursor has passed every scan position.
+    pub(crate) fn drain(&mut self) -> CaptureStep<O> {
         CaptureStep {
             rows: std::mem::take(&mut self.out),
-            done: self.cursor >= capacity,
+            done: self.cursor >= self.len(),
             discarded: Vec::new(),
         }
     }
@@ -150,9 +228,9 @@ fn settle_free_slow<O>(capture: &mut Option<Box<Capture<O>>>, i: usize) {
     }
 }
 
-/// Scans `capacity` slots from `from`, calling `visit` on each until the
-/// end or until `budget` since `start` has passed at a unit boundary, and
-/// returns where it stopped. At least one unit is scanned.
+/// Scans the positions from `from` to `capacity`, calling `visit` on each
+/// until the end or until `budget` since `start` has passed at a unit
+/// boundary, and returns where it stopped. At least one unit is scanned.
 pub(crate) fn scan(
     from: usize,
     capacity: usize,

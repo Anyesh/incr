@@ -925,8 +925,9 @@ fn model_matches<C: Cells>() {
         failure_persistence: None,
         ..ProptestConfig::default()
     };
-    proptest!(config, |(steps in prop::collection::vec(step(), 1..12))| {
-        run_steps::<C>(steps);
+    let step_slots = prop_oneof![Just(1_usize), Just(256)];
+    proptest!(config, |(steps in prop::collection::vec(step(), 1..12), slots in step_slots)| {
+        crate::grow::with_step_slots(slots, || run_steps::<C>(steps));
     });
 }
 
@@ -1923,10 +1924,10 @@ fn registering_partitions_finishes_when_a_commit_lands_after_every_optimistic_bu
 #[test]
 fn a_key_table_write_that_skips_the_stage_clone_panics_under_a_capture() {
     let mut table = KeyTable::<(u8, u8), u8>::new();
-    table.reserve(1);
+    table.reserve(1, &NoTicks);
     table.insert(BucketHash::new(7), few_of(vec![((1, 2), 0)]));
     let slot = table.buckets().next().expect("a bucket").0;
-    table.capture = Some(Capture::new(table.slots.capacity()));
+    table.capture = Some(Capture::new(table.store.table.capacity(), 0));
     let replace = catch_unwind(AssertUnwindSafe(|| {
         table.replace(slot, few_of(vec![((1, 3), 0)]));
     }));
@@ -1958,14 +1959,14 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
     kc.begin_capture();
     let begin = rows(&kc);
     let mut got = kc.capture_step_by(Duration::ZERO, 5).rows;
-    let capacity = kc.index.table.read().slots.capacity();
+    let capacity = kc.index.table.read().store.table.capacity();
     let ops: Vec<PairOp<(V, u8), ()>> = (0..5)
         .map(|k| PairOp::Remove((v(k, 0), k), ()))
         .chain((5..10).map(|k| PairOp::Insert((v(k, 0), k + 1), ())))
         .chain((241..246).map(|k| PairOp::Insert((v(k, 0), 0), ())))
         .collect();
     kc.apply_pairs_with(&rt, ops, &mut (), None);
-    let regrown = kc.index.table.read().slots.capacity();
+    let regrown = kc.index.table.read().store.table.capacity();
     assert!(
         regrown > capacity,
         "the write that changes keys grows the table"
@@ -1978,10 +1979,10 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
             kc.remove(&rt, &v(k, 0));
         },
     );
-    let grown = kc.index.table.read().slots.capacity();
+    let grown = kc.index.table.read().store.table.capacity();
     assert!(grown > regrown, "the clump grows the table");
     got.extend(kc.capture_step_by(Duration::ZERO, 7).rows);
-    let growth_left = kc.index.table.read().growth_left;
+    let growth_left = kc.index.table.read().store.growth_left;
     let ops: Vec<PairOp<(V, u8), ()>> = (10..15)
         .map(|k| PairOp::Remove((v(k, 0), k), ()))
         .chain((15..20).map(|k| PairOp::Insert((v(k, 0), k + 2), ())))
@@ -1989,8 +1990,8 @@ fn keyed_capture_survives_both_rehashes_mid_scan() {
         .collect();
     kc.apply_pairs_with(&rt, ops, &mut (), None);
     let table = kc.index.table.read();
-    assert!(table.growth_left > growth_left, "the write rehashes");
-    assert_eq!(table.slots.capacity(), grown, "at the same size");
+    assert!(table.store.growth_left > growth_left, "the write rehashes");
+    assert_eq!(table.store.table.capacity(), grown, "at the same size");
     drop(table);
     loop {
         let step = kc.capture_step_by(Duration::ZERO, 4);
