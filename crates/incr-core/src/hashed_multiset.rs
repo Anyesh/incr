@@ -14,7 +14,7 @@
 //! entries, a few per call while the table grows (see [`crate::grow`]), so
 //! indices stay valid until the next `reserve`.
 
-use std::alloc::{self, Layout};
+use std::alloc::Layout;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{self, Capture, CaptureStep};
 use crate::grow::{Growing, Moves, Storage};
+use crate::pages;
 use crate::yield_hook::{NoTicks, Ticks};
 
 const EMPTY: u8 = 0;
@@ -194,12 +195,7 @@ impl<T> Storage for Table<T> {
     fn zeroed(capacity: usize) -> Self {
         debug_assert!(capacity.is_power_of_two());
         let (layout, ctrl_offset) = Self::layout(capacity);
-        // SAFETY: the size is not zero, because `capacity` is not and an
-        // entry holds a `u64`.
-        let base = unsafe { alloc::alloc_zeroed(layout) };
-        let Some(base) = NonNull::new(base) else {
-            alloc::handle_alloc_error(layout)
-        };
+        let base = pages::alloc_zeroed(layout);
         // SAFETY: the `capacity` control bytes at `ctrl_offset` lie inside
         // the allocation, and the entries at its start are aligned by the
         // layout. The zeroed allocation initialised every control byte to
@@ -249,13 +245,28 @@ impl<T> Storage for Table<T> {
             drop(self.take(k));
         }
     }
+
+    fn release(&mut self, from: usize, to: usize) {
+        let size = mem::size_of::<Entry<T>>();
+        // SAFETY: the entries of slots `from..to` start the allocation,
+        // ahead of the control bytes, and the caller no longer reads
+        // them.
+        unsafe {
+            pages::release(
+                self.entries.cast(),
+                Self::layout(self.capacity).0,
+                from * size,
+                to * size,
+            )
+        }
+    }
 }
 
 impl<T> Drop for Table<T> {
     fn drop(&mut self) {
         if self.capacity != 0 {
             // SAFETY: allocated by `zeroed` with this layout.
-            unsafe { alloc::dealloc(self.entries.as_ptr().cast(), Self::layout(self.capacity).0) }
+            unsafe { pages::dealloc(self.entries.cast(), Self::layout(self.capacity).0) }
         }
     }
 }
@@ -316,6 +327,11 @@ impl<T> HashedMultiset<T> {
     #[cfg(test)]
     pub(crate) fn scanned(&self) -> usize {
         self.store.scanned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn migrating(&self) -> bool {
+        self.store.migrating()
     }
 
     /// Number of distinct elements.

@@ -2076,3 +2076,46 @@ fn single_writes_after_a_batch_that_fills_a_doubled_table_stay_bounded() {
     assert_eq!(kc.len(), 1_200);
     assert!((0..1_200).all(|k| kc.row(&k) == Some(k)));
 }
+
+/// Storage of this size is mapped and released page by page on Linux, and
+/// its migrations take hundreds of writes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn every_row_reads_back_through_the_migrations_of_a_large_table() {
+    let rt = Runtime::<crate::Local>::new();
+    let kc = Grown::new(&rt);
+    let mut model: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut checked_migrating = 0;
+    let check = |kc: &Grown, model: &BTreeMap<u64, u64>, upto: u64| {
+        for k in 0..=upto {
+            assert_eq!(kc.row(&k), model.get(&k).copied(), "row of {k} at {upto}");
+        }
+        let mut items = kc.items();
+        items.sort_unstable();
+        assert!(items
+            .iter()
+            .copied()
+            .eq(model.iter().map(|(k, v)| (*k, *v))));
+        let mut pairs = kc.pairs().values(&rt);
+        pairs.sort_unstable();
+        assert_eq!(pairs, items);
+    };
+    for k in 0..200_000_u64 {
+        kc.upsert(&rt, k, k);
+        model.insert(k, k);
+        if k % 3 == 0 {
+            kc.remove(&rt, &(k / 2));
+            model.remove(&(k / 2));
+        }
+        if k % 5 == 0 && model.contains_key(&(k / 3)) {
+            kc.upsert(&rt, k / 3, k);
+            model.insert(k / 3, k);
+        }
+        if k % 64 == 0 && kc.index.table.read().store.migrating() {
+            check(&kc, &model, k);
+            checked_migrating += 1;
+        }
+    }
+    check(&kc, &model, 200_000);
+    assert!(checked_migrating >= 4, "checked {checked_migrating} times");
+}

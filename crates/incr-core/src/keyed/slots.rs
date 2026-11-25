@@ -4,7 +4,7 @@
 //! A slot's hash doubles as its state, so a zeroed allocation is an array
 //! of empty slots and comes from the allocator without a write per slot.
 
-use std::alloc::{self, Layout};
+use std::alloc::Layout;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
@@ -12,6 +12,7 @@ use std::slice;
 
 use crate::few::Few;
 use crate::grow::Storage;
+use crate::pages;
 
 const EMPTY: u64 = 0;
 const TOMBSTONE: u64 = 1;
@@ -265,14 +266,8 @@ impl<P, R> Storage for Slots<P, R> {
 
     fn zeroed(capacity: usize) -> Self {
         debug_assert!(capacity.is_power_of_two());
-        let layout = Self::layout(capacity);
-        // SAFETY: the size is not zero, because `capacity` is not and a
-        // slot holds a `u64`.
-        let Some(ptr) = NonNull::new(unsafe { alloc::alloc_zeroed(layout) }) else {
-            alloc::handle_alloc_error(layout)
-        };
         Self {
-            ptr: ptr.cast(),
+            ptr: pages::alloc_zeroed(Self::layout(capacity)).cast(),
             capacity,
             _owns: PhantomData,
         }
@@ -301,13 +296,27 @@ impl<P, R> Storage for Slots<P, R> {
             drop(slot.take(TOMBSTONE));
         }
     }
+
+    fn release(&mut self, from: usize, to: usize) {
+        let size = mem::size_of::<Slot<P, R>>();
+        // SAFETY: the bytes are those of slots `from..to`, which the
+        // caller no longer reads; given back, they read as empty slots.
+        unsafe {
+            pages::release(
+                self.ptr.cast(),
+                Self::layout(self.capacity),
+                from * size,
+                to * size,
+            )
+        }
+    }
 }
 
 impl<P, R> Drop for Slots<P, R> {
     fn drop(&mut self) {
         if self.capacity != 0 {
             // SAFETY: allocated by `Storage::zeroed` with this layout.
-            unsafe { alloc::dealloc(self.ptr.as_ptr().cast(), Self::layout(self.capacity)) }
+            unsafe { pages::dealloc(self.ptr.cast(), Self::layout(self.capacity)) }
         }
     }
 }

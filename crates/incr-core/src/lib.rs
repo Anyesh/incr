@@ -55,6 +55,7 @@ mod loom_seed_models;
 pub mod memory;
 pub mod node;
 mod notes;
+mod pages;
 #[doc(hidden)]
 pub mod persist_hooks;
 mod reclaim_probe;

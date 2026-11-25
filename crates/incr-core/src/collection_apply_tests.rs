@@ -617,3 +617,31 @@ fn single_inserts_after_a_batch_that_fills_a_doubled_table_stay_bounded() {
     held.sort_unstable();
     assert_eq!(held, (0..1_200).collect::<Vec<u64>>());
 }
+
+/// Storage of this size is mapped and released page by page on Linux, and
+/// its migrations take hundreds of writes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn every_element_reads_back_through_the_migrations_of_a_large_table() {
+    let rt = Runtime::<Local>::new();
+    let c = rt.create_collection::<u64>();
+    let mut model: std::collections::BTreeSet<u64> = Default::default();
+    let mut checked_migrating = 0;
+    let check = |model: &std::collections::BTreeSet<u64>| {
+        assert!(sorted_values(&rt, &c).iter().eq(model.iter()));
+        assert_eq!(c.distinct_len(), model.len());
+    };
+    for v in 0..200_000_u64 {
+        c.insert(&rt, v);
+        model.insert(v);
+        if v % 3 == 0 {
+            assert_eq!(c.delete(&rt, &(v / 2)), model.remove(&(v / 2)));
+        }
+        if v % 64 == 0 && c.log.read().elements.migrating() {
+            check(&model);
+            checked_migrating += 1;
+        }
+    }
+    check(&model);
+    assert!(checked_migrating >= 4, "checked {checked_migrating} times");
+}

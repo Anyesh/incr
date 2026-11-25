@@ -9,6 +9,9 @@
 //! most `8 * a + 256` old slots: `4 * a + 256` by pace, and under `4 * a`
 //! more when it has to finish one migration before starting the next.
 //!
+//! The old storage's memory goes back as the migration passes it, where
+//! [`crate::pages`] can release it, so ending a migration frees little.
+//!
 //! Slots `0..table.capacity()` name `table` and the slots from there on
 //! name `old`, so an index into `table` costs what it does with no
 //! migration, and a start renumbers every held slot. [`Moves`] reports what
@@ -81,6 +84,11 @@ pub(crate) trait Storage {
 
     /// Drops every entry from slot `from` on.
     fn drop_entries(&mut self, from: usize);
+
+    /// Gives back what it can of the memory of slots `from..to`. No slot
+    /// below `to` holds an entry or is read again, and the calls on one
+    /// storage cover consecutive ranges from slot 0.
+    fn release(&mut self, from: usize, to: usize);
 }
 
 /// What one `reserve` did to the slots of the entries held before it: the
@@ -151,6 +159,7 @@ impl<S: Storage> Migration<S> {
             stepped.reused += usize::from(reused);
         }
         self.cursor = end;
+        self.old.release(from, end);
         stepped
     }
 
