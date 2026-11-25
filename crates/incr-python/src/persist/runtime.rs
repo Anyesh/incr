@@ -14,6 +14,7 @@ use crate::lookups::Lookups;
 use crate::overlay::Born;
 use crate::state::{LocalState, RtState};
 use crate::{PyCollection, PyKeyedCollection, PyNodeId, PyRuntime};
+use crate::{PyCollectionFields, PyNodeIdFields};
 
 impl StoreRuntime<LocalBinding> for PyRuntime {
     type Node = PyNodeId;
@@ -32,7 +33,7 @@ impl StoreRuntime<LocalBinding> for PyRuntime {
     }
 
     fn node(inner: Incr<PyValue>) -> PyNodeId {
-        PyNodeId { inner }
+        PyNodeId::from(PyNodeIdFields { inner })
     }
 
     fn node_inner(node: &PyNodeId) -> Incr<PyValue> {
@@ -78,12 +79,12 @@ impl FullStoreRuntime<LocalBinding> for PyRuntime {
     }
 
     fn collection(slf: &Bound<'_, Self>, handle: IncrCollection<PyValue>) -> PyCollection {
-        PyCollection {
+        PyCollection::from(PyCollectionFields {
             inner: handle,
             rt: slf.clone().unbind(),
             born: Born::default(),
             writer: crate::Writer::Store,
-        }
+        })
     }
 
     fn version_slot(collection: &PyCollection) -> u32 {

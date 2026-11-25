@@ -23,6 +23,7 @@ use incr_core::{
 };
 
 pub mod by_id;
+pub mod confined;
 pub mod gil;
 pub mod gil_yield;
 pub mod inspect;

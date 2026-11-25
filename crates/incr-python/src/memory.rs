@@ -11,6 +11,7 @@ use incr_compute::{
     KeptTraceMemory, Labels, MemoryVisitor, MemoryWalker, NodeKind, NodeMemory, StateMemory,
     ValueType, WalkEnd,
 };
+use incr_python_protocol::confined::Confined;
 use incr_python_protocol::inspect::label_group;
 use incr_python_protocol::{PyPair, PyValue};
 use pyo3::prelude::*;
@@ -173,8 +174,12 @@ impl MemoryVisitor for Tally {
 /// began, each measured as it is when the walk reaches it, so on a
 /// runtime that changes between steps the figures can mix moments; on
 /// one that does not, `result()` equals `memory_stats()`.
-#[pyclass(name = "MemoryWalker", unsendable)]
-pub(crate) struct PyMemoryWalker {
+#[pyclass(name = "MemoryWalker")]
+pub(crate) struct PyMemoryWalker(Confined<PyMemoryWalkerFields>);
+
+incr_python_protocol::confined_newtype!(PyMemoryWalker => PyMemoryWalkerFields);
+
+pub(crate) struct PyMemoryWalkerFields {
     rt: Py<crate::PyRuntime>,
     walker: MemoryWalker,
     tally: Tally,
@@ -183,12 +188,12 @@ pub(crate) struct PyMemoryWalker {
 
 impl PyMemoryWalker {
     pub(crate) fn new(rt: Py<crate::PyRuntime>, walker: MemoryWalker, tally: Tally) -> Self {
-        Self {
+        Self::from(PyMemoryWalkerFields {
             rt,
             walker,
             tally,
             callables: 0,
-        }
+        })
     }
 }
 
@@ -210,7 +215,8 @@ impl PyMemoryWalker {
             .and_then(|budget| Instant::now().checked_add(budget));
         let this = self.rt.bind(py).borrow();
         let rt = this.rt()?;
-        let (walker, tally) = (&mut self.walker, &mut self.tally);
+        let fields: &mut PyMemoryWalkerFields = self;
+        let (walker, tally) = (&mut fields.walker, &mut fields.tally);
         let done = crate::engine_read(rt, || {
             walker
                 .belongs_to(rt)
