@@ -623,8 +623,13 @@ where
                 (done, mismatches)
             })
         })?;
-        let on_worker = worker.and_then(|worker| core.registry().take_failure_of(worker));
         let on_caller = core.registry().take_failure();
+        // The worker may raise before a poll that does not end the flight;
+        // its exception stays for the call that does.
+        let ended = done.as_ref().map_or(true, saved);
+        let on_worker = worker
+            .filter(|_| ended)
+            .and_then(|worker| core.registry().take_failure_of(worker));
         let (done, on_worker) = match (done, on_worker) {
             (Err(_), Some(raised)) => return Err(raised),
             (done, on_worker) => (

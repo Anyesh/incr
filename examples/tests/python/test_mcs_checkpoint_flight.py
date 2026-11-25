@@ -420,3 +420,42 @@ def test_a_mismatch_names_the_codecs_exception_as_its_cause(flight):
         else:
             memo.checkpoint()
     assert isinstance(raised.value.__cause__, LookupError)
+
+
+class GatedMemo:
+    concurrent_compaction = True
+
+    def __init__(self):
+        self.inner = persist.MemoryMemo()
+        self.entered = threading.Event()
+        self.go = threading.Event()
+
+    def write_generation_streamed(self, *args):
+        self.entered.set()
+        assert self.go.wait(DEADLINE)
+        return self.inner.write_generation_streamed(*args)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def test_a_poll_before_the_write_ends_keeps_the_codecs_exception_for_the_cause():
+    store = persist.Store.open(persist.MemoryBackend(), build_id="b1")
+    base = store.input("base", 7, JsonCodec())
+    table = store.memo_table(
+        "sq", 1, JsonCodec(), DecodeRefusing(), lambda ctx, k: k * k + ctx.get(base)
+    )
+    gate = GatedMemo()
+    memo = store.open_memo(gate)
+    for k in range(20):
+        store.runtime.get(memo.get_or_insert(table, k))
+    pending = memo.begin_checkpoint()
+    deadline = time.monotonic() + DEADLINE
+    while not gate.entered.is_set():
+        assert not pending.poll(0.001)
+        assert time.monotonic() < deadline, "the worker did not reach the write"
+    assert not pending.poll(0.001)
+    gate.go.set()
+    with pytest.raises(ValueError, match="round-trip") as raised:
+        poll_to_end(pending)
+    assert isinstance(raised.value.__cause__, LookupError)
