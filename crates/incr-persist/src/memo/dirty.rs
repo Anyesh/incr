@@ -40,11 +40,59 @@ struct Marked {
 
 #[derive(Default)]
 struct Shard {
-    /// Per entry, its table, key and the mark of its latest compute.
-    marks: HashMap<ErasedIncr, Marked>,
-    /// Entries [`Dirty::carry`] counted again, until they compute again or
-    /// the attempt fails.
+    /// Per entry, its table, key and the mark of its latest compute, in
+    /// the order [`Dirty::take`] walks them.
+    marks: Vec<(ErasedIncr, Marked)>,
+    /// Each entry's index in `marks`.
+    at: HashMap<ErasedIncr, usize>,
+    /// How far the current attempt's [`Dirty::take`] has walked `marks`.
+    /// A removal keeps the walked entries before it, so no entry the walk
+    /// has yet to reach moves behind it.
+    walked: usize,
+    /// Entries [`Dirty::carry`] counted again, until they compute again,
+    /// save or die, or the attempt fails; a subset of `marks`.
     carried: HashSet<ErasedIncr>,
+}
+
+impl Shard {
+    fn get(&self, handle: &ErasedIncr) -> Option<&Marked> {
+        self.at.get(handle).map(|&i| &self.marks[i].1)
+    }
+
+    fn get_mut(&mut self, handle: &ErasedIncr) -> Option<&mut Marked> {
+        self.at.get(handle).map(|&i| &mut self.marks[i].1)
+    }
+
+    fn insert(&mut self, handle: ErasedIncr, marked: Marked) {
+        self.at.insert(handle, self.marks.len());
+        self.marks.push((handle, marked));
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.marks.swap(a, b);
+        self.at.insert(self.marks[a].0, a);
+        self.at.insert(self.marks[b].0, b);
+    }
+
+    fn remove(&mut self, handle: &ErasedIncr) -> Option<Marked> {
+        let i = *self.at.get(handle)?;
+        let last = self.marks.len() - 1;
+        if i < self.walked {
+            let edge = self.walked - 1;
+            self.swap(i, edge);
+            self.swap(edge, last);
+            self.walked = edge;
+        } else {
+            self.swap(i, last);
+        }
+        self.at.remove(handle);
+        self.carried.remove(handle);
+        self.marks.pop().map(|(_, marked)| marked)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Marked> {
+        self.marks.iter().map(|(_, marked)| marked)
+    }
 }
 
 /// The live entries computed since a checkpoint last saved them, each
@@ -102,11 +150,11 @@ impl Dirty {
         let mut shard = self.shard(handle);
         let mark = self.marks.fetch_add(1, Relaxed) + 1;
         shard.carried.remove(&handle);
-        let previous = match shard.marks.get_mut(&handle) {
+        let previous = match shard.get_mut(&handle) {
             Some(marked) => Some(std::mem::replace(&mut marked.mark, mark)),
             None => {
                 let key = Arc::clone(key);
-                shard.marks.insert(handle, Marked { table, mark, key });
+                shard.insert(handle, Marked { table, mark, key });
                 None
             }
         };
@@ -127,14 +175,18 @@ impl Dirty {
     /// Keeps `handle` dirty without counting it as unsaved: an entry a
     /// checkpoint evicted, which may be evicted again at every checkpoint.
     pub(crate) fn evicted(&self, table: u32, handle: ErasedIncr, key: Vec<u8>) {
-        self.shard(handle)
-            .marks
-            .entry(handle)
-            .or_insert_with(|| Marked {
-                table,
-                mark: 0,
-                key: Arc::new(Encoded(key)),
-            });
+        let mut shard = self.shard(handle);
+        if shard.get(&handle).is_none() {
+            let key = Arc::new(Encoded(key));
+            shard.insert(
+                handle,
+                Marked {
+                    table,
+                    mark: 0,
+                    key,
+                },
+            );
+        }
     }
 
     /// Starts a checkpoint attempt: removes entries `alive` refuses and
@@ -148,33 +200,36 @@ impl Dirty {
         dead: &mut Vec<KeyPart>,
     ) -> Vec<Record> {
         let mut shards = self.all();
-        self.start();
+        self.start(&mut shards);
         let attempt = self.attempt.load(Relaxed);
         let mut out = Vec::new();
         for shard in shards.iter_mut() {
-            copy_marks(shard, attempt, &alive, dead, &mut out);
+            walk(shard, attempt, usize::MAX, &alive, dead, &mut out);
         }
         out.sort_unstable_by_key(|record| (record.table, record.mark));
         out
     }
 
     /// Starts a checkpoint attempt without copying it: the entries whose
-    /// mark is at or below the attempt's are its, and
-    /// [`Self::take_shard`] copies them a shard at a time.
+    /// mark is at or below the attempt's are its, and [`Self::take`]
+    /// copies them a piece of a shard at a time.
     pub(crate) fn begin(&self) {
-        let _shards = self.all();
-        self.start();
+        let mut shards = self.all();
+        self.start(&mut shards);
     }
 
-    /// [`Self::attempt`] for the attempt's entries of shard `shard`, below
-    /// [`SHARDS`]. Entries computed since the attempt began are left for
-    /// the next one.
-    pub(crate) fn take_shard(
+    /// [`Self::attempt`] for the next piece of shard `shard`, below
+    /// [`SHARDS`]: walks on over at most `most` of its entries from where
+    /// the attempt's last take of it stopped. Returns the piece by table
+    /// and then mark, and whether the walk reached the shard's end. Entries
+    /// computed since the attempt began are left for the next one.
+    pub(crate) fn take(
         &self,
         shard: usize,
+        most: usize,
         alive: impl Fn(ErasedIncr) -> bool,
         dead: &mut Vec<KeyPart>,
-    ) -> Vec<Record> {
+    ) -> (Vec<Record>, bool) {
         let mut guard = Ordered::take(LockKind::MemoDirty, || {
             self.shards[shard]
                 .lock()
@@ -182,14 +237,17 @@ impl Dirty {
         });
         let attempt = self.attempt.load(Relaxed);
         let mut out = Vec::new();
-        copy_marks(&mut guard, attempt, &alive, dead, &mut out);
+        let done = walk(&mut guard, attempt, most, &alive, dead, &mut out);
         out.sort_unstable_by_key(|record| (record.table, record.mark));
-        out
+        (out, done)
     }
 
-    /// Moves the counters to a new attempt; the caller holds every shard
-    /// lock.
-    fn start(&self) {
+    /// Moves the counters to a new attempt and restarts every shard's walk;
+    /// the caller holds every shard lock.
+    fn start(&self, shards: &mut [MutexGuard<'_, Shard>]) {
+        for shard in shards.iter_mut() {
+            shard.walked = 0;
+        }
         let (previous, attempt) = (self.previous.load(Relaxed), self.attempt.load(Relaxed));
         self.undo.0.store(previous, Relaxed);
         self.undo.1.store(attempt, Relaxed);
@@ -211,7 +269,7 @@ impl Dirty {
         self.attempt.store(attempt, Relaxed);
         let unsaved = shards
             .iter()
-            .flat_map(|shard| shard.marks.values())
+            .flat_map(|shard| shard.values())
             .filter(|marked| marked.mark > attempt)
             .count();
         self.unsaved.store(unsaved as u64, Relaxed);
@@ -223,20 +281,20 @@ impl Dirty {
     /// is not counted at every attempt.
     pub(crate) fn carry(&self, record: &Record) -> Carried {
         let mut shard = self.shard(record.handle);
-        let Shard { marks, carried } = &mut *shard;
-        let Some(current) = marks
-            .get_mut(&record.handle)
-            .filter(|marked| marked.mark == record.mark)
-        else {
+        if shard
+            .get(&record.handle)
+            .is_none_or(|marked| marked.mark != record.mark)
+        {
             return Carried::No;
-        };
-        if carried.contains(&record.handle) {
+        }
+        if shard.carried.contains(&record.handle) {
             return Carried::Before;
         }
         if record.mark <= self.previous.load(Relaxed) {
             return Carried::No;
         }
-        carried.insert(record.handle);
+        shard.carried.insert(record.handle);
+        let current = shard.get_mut(&record.handle).expect("checked present");
         current.mark = self.marks.fetch_add(1, Relaxed) + 1;
         self.unsaved.fetch_add(1, Relaxed);
         Carried::Counted
@@ -250,7 +308,6 @@ impl Dirty {
         let mut shard = self.shard(handle);
         let attempt = self.attempt.load(Relaxed);
         if let Some(current) = shard
-            .marks
             .get_mut(&handle)
             .filter(|marked| marked.mark <= attempt)
         {
@@ -265,12 +322,8 @@ impl Dirty {
     #[must_use]
     pub(crate) fn saved(&self, handle: ErasedIncr, mark: u64) -> Option<KeyPart> {
         let mut shard = self.shard(handle);
-        if shard
-            .marks
-            .get(&handle)
-            .is_some_and(|marked| marked.mark == mark)
-        {
-            shard.marks.remove(&handle).map(|marked| marked.key)
+        if shard.get(&handle).is_some_and(|marked| marked.mark == mark) {
+            shard.remove(&handle).map(|marked| marked.key)
         } else {
             None
         }
@@ -287,40 +340,44 @@ impl Dirty {
         let attempt = self.attempt.load(Relaxed);
         self.all()
             .iter()
-            .flat_map(|shard| shard.marks.values())
+            .flat_map(|shard| shard.values())
             .filter(|marked| marked.mark > attempt)
             .count() as u64
     }
 }
 
-/// Removes from `shard` the entries at or below `attempt` that `alive`
-/// refuses, their keys to `dead`, and copies the rest of them to `out`.
-fn copy_marks(
+/// Walks `shard` on from where its walk stopped, over at most `most`
+/// entries: removes those at or below `attempt` that `alive` refuses,
+/// their keys to `dead`, and copies the rest of them to `out`. Returns
+/// whether the walk reached the end.
+fn walk(
     shard: &mut Shard,
     attempt: u64,
+    most: usize,
     alive: &impl Fn(ErasedIncr) -> bool,
     dead: &mut Vec<KeyPart>,
     out: &mut Vec<Record>,
-) {
-    shard.marks.retain(|&handle, marked| {
-        marked.mark > attempt || alive(handle) || {
-            dead.push(Arc::clone(&marked.key));
-            false
+) -> bool {
+    for _ in 0..most {
+        let Some((handle, marked)) = shard.marks.get(shard.walked) else {
+            return true;
+        };
+        let handle = *handle;
+        if marked.mark <= attempt && !alive(handle) {
+            dead.extend(shard.remove(&handle).map(|marked| marked.key));
+            continue;
         }
-    });
-    shard.carried.retain(|&handle| alive(handle));
-    out.extend(
-        shard
-            .marks
-            .iter()
-            .filter(|(_, marked)| marked.mark <= attempt)
-            .map(|(&handle, marked)| Record {
+        if marked.mark <= attempt {
+            out.push(Record {
                 table: marked.table,
                 handle,
                 mark: marked.mark,
                 key: Arc::clone(&marked.key),
-            }),
-    );
+            });
+        }
+        shard.walked += 1;
+    }
+    shard.walked == shard.marks.len()
 }
 
 #[cfg(test)]
@@ -455,5 +512,51 @@ mod tests {
         let marks = dirty.attempt(|_| true, &mut Vec::new());
         assert_eq!(dirty.carry(&mark(&marks, h[0])), Carried::Counted);
         assert_eq!(dirty.unsaved(), 1);
+    }
+    #[test]
+    fn a_take_walks_a_shard_in_pieces_and_loses_no_entry_to_removals() {
+        let rt = Runtime::<Local>::new();
+        let h: Vec<ErasedIncr> = (0..4_000_u64)
+            .map(|i| rt.create_input(i).erase())
+            .filter(|h| h.slot() as usize % SHARDS == 3)
+            .take(120)
+            .collect();
+        let dirty = Dirty::new();
+        for &handle in &h[..100] {
+            dirty.computed(0, handle, &key());
+        }
+        dirty.begin();
+        let mut taken: Vec<Record> = Vec::new();
+        let mut gone = Vec::new();
+        let mut pieces = 0;
+        loop {
+            let (piece, done) = dirty.take(3, 10, |_| true, &mut Vec::new());
+            assert!(piece.len() <= 10);
+            taken.extend(piece);
+            pieces += 1;
+            let behind = &taken[pieces - 1];
+            assert!(dirty.saved(behind.handle, behind.mark).is_some());
+            let ahead = h[100 - pieces];
+            if !taken.iter().any(|r| r.handle == ahead) {
+                assert!(dirty.saved(ahead, (101 - pieces) as u64).is_some());
+                gone.push(ahead);
+            }
+            dirty.computed(0, h[100 + pieces % 20], &key());
+            if done {
+                break;
+            }
+        }
+        assert!(pieces >= 6, "{pieces} pieces");
+        let mut handles: Vec<ErasedIncr> = taken.iter().map(|r| r.handle).collect();
+        handles.sort_unstable_by_key(|h| h.slot());
+        handles.dedup();
+        assert_eq!(handles.len(), taken.len(), "an entry was taken twice");
+        let mut want: Vec<ErasedIncr> = h[..100]
+            .iter()
+            .copied()
+            .filter(|h| !gone.contains(h))
+            .collect();
+        want.sort_unstable_by_key(|h| h.slot());
+        assert_eq!(handles, want);
     }
 }

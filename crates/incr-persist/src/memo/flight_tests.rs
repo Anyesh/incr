@@ -373,7 +373,8 @@ fn a_cancelled_flight_leaves_every_dirty_entry_unsaved() {
 
 /// Stores `top(0..100)` and 10,000 leaves, then reopens with every leaf
 /// restored and so seeded and the last 5,000 removed, so the seed maps
-/// hold 5,000 dead entries and the next checkpoint prunes in three steps.
+/// hold 5,000 dead entries and the next checkpoint prunes over several
+/// steps.
 fn seeded(log: &MemoryBackend, backend: &MemoryMemo) -> Fx {
     {
         let fx = Fx::open(log, backend.clone());
@@ -407,25 +408,26 @@ fn live_seeds(fx: &Fx) -> usize {
     (0..5_000)
         .filter(|k| {
             let handle = fx.memo.get(fx.leaf, k).unwrap().erase();
-            state.seed_info.contains_key(&handle) && state.seed_keys.contains_key(&handle)
+            state.seed_info.get(&handle).is_some() && state.seed_keys.get(&handle).is_some()
         })
         .count()
 }
 
 #[test]
-fn a_lookup_in_the_middle_of_the_prune_falls_back_and_the_prune_keeps_live_seeds() {
+fn a_lookup_in_the_middle_of_the_prune_sees_every_live_seed() {
     let (log, backend) = (MemoryBackend::new(), MemoryMemo::new());
     let fx = seeded(&log, &backend);
     let flight = fx.memo.begin_checkpoint().unwrap();
     assert!(!flight.poll(&fx.memo, Duration::ZERO).unwrap());
     assert_eq!(fx.stage(), Some("prune"));
-    let moved = seeds(&fx).0;
-    assert!(0 < moved && moved < 5_000, "{moved} seeds moved");
+    let left = seeds(&fx).0;
+    assert!(5_000 < left && left < 10_000, "{left} seeds left");
+    assert_eq!(live_seeds(&fx), 5_000);
     let runs = fx.runs.load(SeqCst);
     for k in 0..100 {
         assert_eq!(fx.top(k), 10 * (u64::from(k) + 1));
     }
-    assert!(fx.runs.load(SeqCst) - runs < 100, "every restore ran");
+    assert_eq!(fx.runs.load(SeqCst), runs, "a restore ran");
     fx.finish(&flight);
     assert_eq!(live_seeds(&fx), 5_000);
     assert_eq!(seeds(&fx), (5_000 + 100, 5_000 + 100));
@@ -438,7 +440,6 @@ fn a_flight_abandoned_in_the_middle_of_the_prune_loses_no_seed() {
     let flight = fx.memo.begin_checkpoint().unwrap();
     assert!(!flight.poll(&fx.memo, Duration::ZERO).unwrap());
     assert_eq!(fx.stage(), Some("prune"));
-    assert!(live_seeds(&fx) < 5_000);
     drop(flight);
     fx.wait_worker();
     assert!(fx.memo.checkpoint_if_due().unwrap().is_none());

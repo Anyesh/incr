@@ -6,8 +6,7 @@
 //! query dep recorded in its batch.
 
 use std::any::Any;
-use std::collections::hash_map::IntoIter;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use super::dirty::{Record, SHARDS};
 use super::memo_core::{CoreRef, ErasedBackend, IndexGen, Landing, MemoCells, MemoState};
 use super::open::Memo;
 use super::snapshot::{copy_seeds, fresh, stored_bytes, Origin, Seed, Seeds};
+use super::split_map::SplitMap;
 use super::table_core::{KeyPart, Snap};
 use super::{CheckpointInput, CheckpointStats, Checkpointed, GenId, TableDesc};
 use crate::backend::Backend;
@@ -28,8 +28,8 @@ use crate::flight::{Control, Flight, FlightToken, Inbox, Parcel, Verdict};
 use crate::value_context::{wait_released, EncodeMismatch, ValueScope};
 use crate::{Error, Result};
 
-/// Slots a prune moves, or written entries a finish applies, between two
-/// looks at the clock.
+/// Seeds a prune looks at, dirty entries a take walks, or written entries
+/// a finish applies, between two looks at the clock.
 const UNIT: usize = 4096;
 /// What one inspect batch aims to take.
 const BATCH_TARGET: Duration = Duration::from_millis(5);
@@ -149,22 +149,10 @@ enum Stage {
     Finish(Finishing),
 }
 
-/// The seed maps' entries a prune has yet to move into the fresh maps.
+/// The next bucket of each seed map a prune retains the live entries of.
 struct Prune {
-    info: IntoIter<ErasedIncr, (u128, u64)>,
-    keys: IntoIter<ErasedIncr, (u32, Vec<u8>)>,
-}
-
-impl Prune {
-    /// Moves the rest back, alive or not, under entries written since.
-    fn put_back(self, state: &mut MemoState) {
-        for (handle, info) in self.info {
-            state.seed_info.entry(handle).or_insert(info);
-        }
-        for (handle, key) in self.keys {
-            state.seed_keys.entry(handle).or_insert(key);
-        }
-    }
+    info: usize,
+    keys: usize,
 }
 
 struct Finishing {
@@ -179,7 +167,7 @@ pub(crate) struct MemoFlight {
     stage: Stage,
     started: Instant,
     batch: usize,
-    copied: HashSet<ErasedIncr>,
+    copied: SplitMap<ErasedIncr, ()>,
     /// What the inspect batches carried, handed over as one checkpoint's
     /// landing at the seal: a later handover replaces an earlier one.
     landing: Landing,
@@ -224,20 +212,19 @@ impl<C: MemoCells> CoreRef<C> {
         !self.settle_idle(&mut self.lock_checkpoint())
     }
 
-    /// Ends `flight` without its finish: puts back the seeds its prune
-    /// had not moved, swaps in the index of a generation the worker
-    /// committed and removes the generations it superseded, and takes the
-    /// attempt back so its entries stay dirty. `verdict` is the worker's,
-    /// if already taken. Returns what the handle is to read.
-    fn settle(&self, mut flight: MemoFlight, verdict: Option<Verdict<Written>>) -> Ended {
+    /// Ends `flight` without its finish: swaps in the index of a
+    /// generation the worker committed and removes the generations it
+    /// superseded, and takes the attempt back so its entries stay dirty.
+    /// `verdict` is the worker's, if already taken. Returns what the handle
+    /// is to read.
+    fn settle(&self, flight: MemoFlight, verdict: Option<Verdict<Written>>) -> Ended {
         let verdict = verdict.or_else(|| flight.flight.take_verdict());
         let mut state = self.lock_memo();
-        if let Stage::Prune(prune) = std::mem::replace(&mut flight.stage, Stage::Sealed) {
-            prune.put_back(&mut state);
-        }
+        let mut written = None;
         let outcome = match verdict {
             Some(Verdict::Committed(Written::Generation(mut generation))) => {
                 self.publish(&mut state, &mut generation);
+                written = Some(generation);
                 Outcome::Failed(Error::Cancelled)
             }
             Some(Verdict::Committed(Written::Nothing { mismatches, .. })) => {
@@ -252,10 +239,22 @@ impl<C: MemoCells> CoreRef<C> {
             Some(Verdict::Cancelled) | None => Outcome::Failed(Error::Cancelled),
         };
         drop(state);
+        if let Some(generation) = written {
+            drop_in_background(generation, self.scope.clone());
+        }
         self.dirty.failed();
         let token = Arc::clone(flight.flight.control());
-        drop(flight);
+        self.retire(flight);
         Ended { token, outcome }
+    }
+
+    /// Drops an ended flight, its written generation on a thread of its
+    /// own: freeing every written entry's origin is in proportion to the
+    /// generation, which no poll may be.
+    fn retire(&self, flight: MemoFlight) {
+        if let Stage::Finish(finishing) = flight.stage {
+            drop_in_background(finishing.generation, self.scope.clone());
+        }
     }
 
     /// Swaps in a committed generation's index, counts the write and
@@ -302,6 +301,7 @@ impl<C: MemoCells> CoreRef<C> {
                     token: Arc::clone(flight.flight.control()),
                     outcome: Outcome::Done(stats),
                 });
+                self.retire(flight);
                 return Ok(true);
             }
             Ok(Step::Ended(verdict)) => {
@@ -431,27 +431,29 @@ impl<C: MemoCells> CoreRef<C> {
         }
     }
 
+    /// Retains the live entries of the seed maps' next buckets, until
+    /// [`UNIT`] entries are looked at or both maps are pruned.
     fn prune_slice(&self, rt: &Runtime<C>, flight: &mut MemoFlight) -> bool {
         let Stage::Prune(prune) = &mut flight.stage else {
             return false;
         };
         let mut state = self.lock_memo();
-        let mut moved = 0;
-        for (handle, info) in prune.info.by_ref() {
-            if rt.is_alive(handle) {
-                state.seed_info.entry(handle).or_insert(info);
-            }
-            moved += 1;
-            if moved == UNIT {
+        let mut looked = 0;
+        while prune.info < state.seed_info.buckets() {
+            looked += state
+                .seed_info
+                .retain_bucket(prune.info, |&handle, _| rt.is_alive(handle));
+            prune.info += 1;
+            if looked >= UNIT {
                 return true;
             }
         }
-        for (handle, key) in prune.keys.by_ref() {
-            if rt.is_alive(handle) {
-                state.seed_keys.entry(handle).or_insert(key);
-            }
-            moved += 1;
-            if moved == UNIT {
+        while prune.keys < state.seed_keys.buckets() {
+            looked += state
+                .seed_keys
+                .retain_bucket(prune.keys, |&handle, _| rt.is_alive(handle));
+            prune.keys += 1;
+            if looked >= UNIT {
                 return true;
             }
         }
@@ -464,7 +466,7 @@ impl<C: MemoCells> CoreRef<C> {
     }
 
     /// Inspects one batch of one table's dirty entries, or copies the next
-    /// shard's, or seals once every shard is inspected.
+    /// piece of a shard's, or seals once every shard is inspected.
     fn inspect_slice(&self, rt: &Runtime<C>, flight: &mut MemoFlight) -> bool {
         let Stage::Inspect { shard, pending } = &mut flight.stage else {
             return false;
@@ -477,11 +479,13 @@ impl<C: MemoCells> CoreRef<C> {
                 return true;
             }
             let mut dead = Vec::new();
-            *pending = self
-                .dirty
-                .take_shard(*shard, |handle| rt.is_alive(handle), &mut dead)
-                .into();
-            *shard += 1;
+            let (piece, done) =
+                self.dirty
+                    .take(*shard, UNIT, |handle| rt.is_alive(handle), &mut dead);
+            *pending = piece.into();
+            if done {
+                *shard += 1;
+            }
             drop(dead);
             return true;
         }
@@ -667,12 +671,9 @@ impl CoreRef<Local> {
             }
         };
         let stage = {
-            let mut state = self.lock_memo();
+            let state = self.lock_memo();
             if state.prune_due() {
-                Stage::Prune(Prune {
-                    info: std::mem::take(&mut state.seed_info).into_iter(),
-                    keys: std::mem::take(&mut state.seed_keys).into_iter(),
-                })
+                Stage::Prune(Prune { info: 0, keys: 0 })
             } else {
                 Stage::Inspect {
                     shard: 0,
@@ -685,7 +686,7 @@ impl CoreRef<Local> {
             stage,
             started: Instant::now(),
             batch: FIRST_BATCH,
-            copied: HashSet::new(),
+            copied: SplitMap::new(),
             landing: Landing::default(),
         });
         slot.ended = None;
@@ -759,6 +760,16 @@ fn work(inbox: Inbox<ToWorker>, job: Job) -> Verdict<Written> {
             })))
         }
     }
+}
+
+/// Drops `garbage` on a thread of its own, or here when none starts.
+fn drop_in_background<T: Send + 'static>(garbage: T, scope: Option<ValueScope>) {
+    let dropped = move |_: Inbox<()>| {
+        drop(garbage);
+        Verdict::Committed(())
+    };
+    // A failed start drops the closure, and `garbage` with it, here.
+    let _ = Flight::<(), ()>::start(scope, dropped);
 }
 
 /// Removes `superseded` on a worker of its own, counting what it fails to
