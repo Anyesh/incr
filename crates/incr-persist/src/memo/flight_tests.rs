@@ -970,3 +970,27 @@ fn settle_of_an_abandoned_flight_at_531k_marks() {
     assert_eq!(unsaved_is_exact(&fx), 531_000);
     eprintln!("settled an abandoned flight over 531,000 marks in {took:?}");
 }
+/// 80,000 dirty leaves put about 5,000 in each dirty shard: no poll may
+/// copy more than a unit of one.
+#[test]
+fn a_poll_copies_at_most_a_unit_of_a_dirty_shard() {
+    let (log, backend) = (MemoryBackend::new(), MemoryMemo::new());
+    let fx = Fx::open(&log, backend);
+    for k in 0..80_000 {
+        fx.leaf(k);
+    }
+    let flight = fx.memo.begin_checkpoint().unwrap();
+    let started = Instant::now();
+    let mut most = 0;
+    while !flight.poll(&fx.memo, Duration::ZERO).unwrap() {
+        assert!(started.elapsed() < WAIT, "the flight never finished");
+        if let Some((_, pending)) = fx.inspect_at() {
+            most = most.max(pending);
+        }
+    }
+    assert!(
+        most > super::UNIT / 2,
+        "the shards held only {most} entries"
+    );
+    assert!(most <= super::UNIT, "a poll copied {most} dirty entries");
+}

@@ -49,6 +49,10 @@ struct Shard {
     /// A removal keeps the walked entries before it, so no entry the walk
     /// has yet to reach moves behind it.
     walked: usize,
+    /// `marks`' length when the attempt began: entries added since belong
+    /// to the next one, and a removal moves an unwalked entry only to a
+    /// lower index, so the walk ends here or at the end, if sooner.
+    end: usize,
     /// Entries [`Dirty::carry`] counted again, until they compute again,
     /// save or die, or the attempt fails; a subset of `marks`.
     carried: HashSet<ErasedIncr>,
@@ -247,6 +251,7 @@ impl Dirty {
     fn start(&self, shards: &mut [MutexGuard<'_, Shard>]) {
         for shard in shards.iter_mut() {
             shard.walked = 0;
+            shard.end = shard.marks.len();
         }
         let (previous, attempt) = (self.previous.load(Relaxed), self.attempt.load(Relaxed));
         self.undo.0.store(previous, Relaxed);
@@ -359,6 +364,9 @@ fn walk(
     out: &mut Vec<Record>,
 ) -> bool {
     for _ in 0..most {
+        if shard.walked >= shard.end {
+            return true;
+        }
         let Some((handle, marked)) = shard.marks.get(shard.walked) else {
             return true;
         };
@@ -377,7 +385,7 @@ fn walk(
         }
         shard.walked += 1;
     }
-    shard.walked == shard.marks.len()
+    shard.walked >= shard.end.min(shard.marks.len())
 }
 
 #[cfg(test)]
@@ -558,5 +566,35 @@ mod tests {
             .collect();
         want.sort_unstable_by_key(|h| h.slot());
         assert_eq!(handles, want);
+    }
+
+    #[test]
+    fn a_take_finishes_the_shard_however_many_entries_land_behind_it() {
+        let rt = Runtime::<Local>::new();
+        let h: Vec<ErasedIncr> = (0..20_000_u64)
+            .map(|i| rt.create_input(i).erase())
+            .filter(|h| h.slot() as usize % SHARDS == 5)
+            .take(1_000)
+            .collect();
+        let dirty = Dirty::new();
+        for &handle in &h[..100] {
+            dirty.computed(0, handle, &key());
+        }
+        dirty.begin();
+        let mut taken = 0;
+        let mut next = 100;
+        for _ in 0..20 {
+            let (piece, done) = dirty.take(5, 10, |_| true, &mut Vec::new());
+            taken += piece.len();
+            if done {
+                assert_eq!(taken, 100);
+                return;
+            }
+            for &handle in &h[next..next + 20] {
+                dirty.computed(0, handle, &key());
+            }
+            next += 20;
+        }
+        panic!("the walk took {taken} of 100 and never reached the attempt's end");
     }
 }

@@ -156,7 +156,7 @@ impl<K: Hash + Eq, V> SplitMap<K, V> {
     /// [`Self::retain`] for bucket `at` alone; returns how many entries it
     /// looked at. A split moves keys only to a new bucket after every
     /// existing one, so retaining buckets `0..buckets()` in order, across
-    /// inserts, looks at every key present when it began.
+    /// inserts, looks at every key present when it began at least once.
     pub(crate) fn retain_bucket(
         &mut self,
         at: usize,
