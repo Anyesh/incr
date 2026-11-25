@@ -269,9 +269,9 @@ impl<T> Storage for Table<T> {
             }
             k += GROUP;
         }
-        for k in k..to {
-            if old_ctrl[k] & FULL != 0 {
-                move_slot(k, &mut old_ctrl[k]);
+        for (k, old_c) in (k..to).zip(&mut old_ctrl[k..to]) {
+            if *old_c & FULL != 0 {
+                move_slot(k, old_c);
             }
         }
         (count, reused)

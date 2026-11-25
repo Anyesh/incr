@@ -140,13 +140,13 @@ impl<S: Storage> Migration<S> {
         table: &mut S,
         budget: usize,
         capture: &mut Option<Box<Capture<O>>>,
-        mut moves: Option<&mut Vec<(usize, usize)>>,
+        moves: Option<&mut Vec<(usize, usize)>>,
         yielder: &impl Ticks,
     ) -> Stepped {
         let base = table.capacity();
         let from = self.cursor;
         let end = from + budget.min(self.old.capacity() - from);
-        let (moved, reused) = match (capture.as_deref_mut(), moves.as_deref_mut()) {
+        let (moved, reused) = match (capture.as_deref_mut(), moves) {
             (None, None) => self.old.move_range(from, end, table, |_, _| yielder.tick()),
             (mut capture, mut moves) => self.old.move_range(from, end, table, |k, to| {
                 yielder.tick();

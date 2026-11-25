@@ -246,7 +246,7 @@ type KeyedScan<O> = (u64, usize, Vec<O>);
 /// hash, holding that key's pairs with their ranks. Open addressing with
 /// stored hashes, as `HashedMultiset`: only a lookup runs user code, only
 /// `reserve` moves buckets, a few per call while the table grows (see
-/// [`crate::grow`]), and removal leaves a tombstone unless no probe run
+/// `crate::grow`), and removal leaves a tombstone unless no probe run
 /// passes through the slot.
 pub struct KeyTable<P, R> {
     // Invariant: the table's capacity is zero or a power of two with at
