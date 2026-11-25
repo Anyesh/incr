@@ -107,9 +107,8 @@ def probe(scenario, start, on_poll=None, expect=None, bars=True):
     """Runs the flight `start()` opens under the probe, polling with a 1 ms
     sleep between calls until it settles, its handle is freed (which starts
     a memo flight's removal of superseded generations) and no worker is
-    left. Returns the
-    flight's result, or the exception it raised when `expect` names its
-    type."""
+    left. Returns the flight's result, or the exception it raised when
+    `expect` names its type."""
     gc.collect()
     gc.freeze()
     passes = Passes()

@@ -354,7 +354,8 @@ pub fn join_checkpoint_workers() {
 }
 
 /// Checkpoint worker threads started and not yet ended, abandoned flights'
-/// included. A thread counts from its spawn, before it runs any code.
+/// included. A thread counts once the call that spawned it has returned,
+/// until its thread ends.
 pub fn checkpoint_workers_running() -> usize {
     WORKERS
         .lock()
