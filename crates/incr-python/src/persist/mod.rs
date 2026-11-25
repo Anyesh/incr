@@ -170,6 +170,10 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             incr_python_persist::flight::_set_memo_frame_limit,
             &checks
         )?)?;
+        checks.add_function(wrap_pyfunction!(
+            incr_python_persist::flight::_checkpoint_workers_running,
+            &checks
+        )?)?;
         module.add_submodule(&checks)?;
     }
     #[cfg(feature = "conformance")]

@@ -40,6 +40,10 @@ def without_comments(text):
     return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
 
 
+def without_test_modules(code):
+    return re.split(r"#\[cfg\([^\]]*\btest\b[^\]]*\)\]\s*mod tests\b", code)[0]
+
+
 def line_of(text, pos):
     return text.count("\n", 0, pos) + 1
 
@@ -97,7 +101,7 @@ def declared_sites():
     sites = {}
     duplicates = []
     for path in [GATE, *scanned_files()]:
-        for m in SITE.finditer(without_comments(path.read_text())):
+        for m in SITE.finditer(without_test_modules(without_comments(path.read_text()))):
             kind, name, bound = m.group(1), m.group(2), m.group(3)
             if name in sites:
                 duplicates.append(name)
@@ -125,6 +129,11 @@ def test_the_gate_declares_unique_sites_and_workers_reach_some():
     kinds = {kind for kind, _ in sites.values()}
     assert {"caller", "one", "bounded", "unbounded"} <= kinds
     assert all(bound for kind, bound in sites.values() if kind == "bounded")
+
+
+def test_sites_declared_in_a_test_module_are_not_declared_sites():
+    body = 'static A: Site = Site::one("a");\n#[cfg(all(test, feature = "x"))]\nmod tests {\n    static B: Site = Site::one("b");\n}'
+    assert SITE.findall(without_test_modules(body)) == [("one", "a", "")]
 
 
 def test_the_gate_is_the_only_other_file_that_releases():

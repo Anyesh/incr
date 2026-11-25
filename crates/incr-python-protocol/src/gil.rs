@@ -23,8 +23,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyFrozenSet, PyList, PyTuple};
 
 /// The shortest stretch off the GIL that lets a waiting thread take it.
-/// A bare release and reacquire hands nothing over.
-pub const GAP: Duration = Duration::from_micros(50);
+/// A bare release and reacquire hands nothing over, and a waiter woken by
+/// the release often needs more than 50 us to run.
+pub const GAP: Duration = Duration::from_micros(200);
 /// How long a worker holds the GIL, between ticks, before its next tick or
 /// entry first spends a [`GAP`] off it.
 pub const STRETCH: Duration = Duration::from_millis(2);
@@ -34,7 +35,8 @@ pub const STRETCH: Duration = Duration::from_millis(2);
 pub const MAX_RELEASED_DROPS: u64 = 64;
 /// Elements a sequence function converts between frees of a list slice.
 const SLICE: usize = 64;
-/// Stretches at least this long are kept for the probe's report.
+/// With `gil-checks`, stretches at least this long are kept for the probe's
+/// report; without it none are, since nothing would ever clear them.
 const LOGGED_HOLD: Duration = Duration::from_millis(1);
 
 /// What one entry through a site carries, declared where the site is.
@@ -139,7 +141,7 @@ impl Site {
     fn note_hold(&'static self, held: Duration, ended: Instant) {
         let nanos = nanos(held);
         self.longest.fetch_max(nanos, Ordering::Relaxed);
-        if held >= LOGGED_HOLD {
+        if cfg!(feature = "gil-checks") && held >= LOGGED_HOLD {
             let end = since_base(ended);
             HOLDS.lock().unwrap_or_else(PoisonError::into_inner).push((
                 end.saturating_sub(nanos),
@@ -193,11 +195,22 @@ pub fn on_worker() -> bool {
 ///
 /// As for [`idle`]: `body` reaches Python only through the gate.
 pub unsafe fn run_worker(body: &mut dyn FnMut()) {
+    let mut ending = None;
     Python::attach(|py| {
         let _worker = WorkerMark::start();
         detach(py, body);
+        ending = Some(Instant::now());
     });
+    if let Some(began) = ending {
+        WORKER_END.note_entry();
+        let now = Instant::now();
+        WORKER_END.note_hold(now.saturating_duration_since(began), now);
+    }
 }
+
+/// The worker's last hold, from its body's end until its thread state is
+/// released, which frees whatever the thread's `threading.local` kept.
+static WORKER_END: Site = Site::one("worker.end");
 
 struct WorkerMark;
 
@@ -484,8 +497,10 @@ pub fn build<'py, T, X>(
 /// `list` incr holds the only reference to is converted from its tail and
 /// freed a slice at a time; another `list` or a `tuple` is first copied
 /// into a new list, so a tick never lets another thread change what is
-/// being walked; any other iterable is walked through [`pull`].
-pub fn drain<'py, T, X>(
+/// being walked, and released before the walk, so elements only it held
+/// are freed with the copy's slices; any other iterable is walked through
+/// [`pull`].
+pub fn drain<'py, T: Send, X>(
     site: &'static Site,
     sequence: Bound<'py, PyAny>,
     error: impl Fn(PyErr) -> X,
@@ -496,11 +511,13 @@ pub fn drain<'py, T, X>(
             .downcast_into::<PyList>()
             .map_err(|e| error(e.into()))?
     } else if sequence.is_instance_of::<PyList>() || sequence.is_instance_of::<PyTuple>() {
-        sequence
+        let copy = sequence
             .downcast::<pyo3::types::PySequence>()
             .map_err(|e| error(e.into()))?
             .to_list()
-            .map_err(&error)?
+            .map_err(&error)?;
+        drop(sequence);
+        copy
     } else {
         return pull(site, &sequence, error, convert);
     };
@@ -508,23 +525,31 @@ pub fn drain<'py, T, X>(
     let len = list.len();
     site.note_elements(len);
     let mut out = Vec::with_capacity(len);
-    let mut end = len;
-    while end > 0 {
-        let start = end.saturating_sub(SLICE);
-        for at in (start..end).rev() {
-            tick(py);
-            let item = list.get_item(at).map_err(&error)?;
-            out.push(convert(&item)?);
+    let mut walk = || {
+        let mut end = len;
+        while end > 0 {
+            let start = end.saturating_sub(SLICE);
+            for at in (start..end).rev() {
+                tick(py);
+                let item = list.get_item(at).map_err(&error)?;
+                out.push(convert(&item)?);
+            }
+            list.del_slice(start, end).map_err(&error)?;
+            end = start;
         }
-        list.del_slice(start, end).map_err(&error)?;
-        end = start;
+        Ok(())
+    };
+    match walk() {
+        Ok(()) => Ok(leave(py, move || {
+            out.reverse();
+            out
+        })),
+        Err(failed) => Err(discarded(py, out, failed)),
     }
-    out.reverse();
-    Ok(out)
 }
 
 /// Walks a Python iterable from Rust, ticking per element.
-pub fn pull<'py, T, X>(
+pub fn pull<'py, T: Send, X>(
     site: &'static Site,
     iterable: &Bound<'py, PyAny>,
     error: impl Fn(PyErr) -> X,
@@ -532,12 +557,39 @@ pub fn pull<'py, T, X>(
 ) -> Result<Vec<T>, X> {
     let py = iterable.py();
     let mut out = Vec::new();
-    for item in iterable.try_iter().map_err(&error)? {
-        tick(py);
-        out.push(convert(&item.map_err(&error)?)?);
+    let mut walk = || {
+        for item in iterable.try_iter().map_err(&error)? {
+            tick(py);
+            if out.len() == out.capacity() {
+                out = grown(py, std::mem::take(&mut out));
+            }
+            out.push(convert(&item.map_err(&error)?)?);
+        }
+        Ok(())
+    };
+    match walk() {
+        Ok(()) => {
+            site.note_elements(out.len());
+            Ok(out)
+        }
+        Err(failed) => Err(discarded(py, out, failed)),
     }
-    site.note_elements(out.len());
-    Ok(out)
+}
+
+/// `failed`, after the elements converted before it are freed, off the GIL
+/// on a worker: a walk that fails late holds most of the sequence.
+fn discarded<T: Send, X>(py: Python<'_>, out: Vec<T>, failed: X) -> X {
+    leave(py, move || drop(out));
+    failed
+}
+
+/// `out` with room for as many elements again. A reallocation copies the
+/// whole vector, so on a worker it runs off the GIL.
+fn grown<T: Send>(py: Python<'_>, mut out: Vec<T>) -> Vec<T> {
+    leave(py, move || {
+        out.reserve(out.len().max(SLICE));
+        out
+    })
 }
 
 /// A `frozenset` of the elements of `list`, a list [`build`] made.
@@ -656,14 +708,15 @@ pub mod checks {
 
     struct Probe {
         stop: Arc<AtomicBool>,
-        waits: Arc<Mutex<Vec<(u64, u64)>>>,
+        waits: Arc<Mutex<Vec<(u64, u64, u64)>>>,
         thread: JoinHandle<()>,
     }
 
     static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 
     /// Starts a thread that asks for the GIL, lets go at once and sleeps
-    /// `interval_us`, recording each request's start and wait.
+    /// `interval_us`, recording each request's start, its wait and the time
+    /// the process's threads spent runnable but not scheduled during it.
     #[pyfunction]
     #[pyo3(signature = (interval_us=200))]
     fn _gil_probe_start(interval_us: u64) -> PyResult<()> {
@@ -682,13 +735,16 @@ pub mod checks {
                     Python::attach(|py| {
                         super::detach(py, || {
                             while !stop.load(Ordering::Acquire) {
+                                let queued = run_delay();
                                 let asked = Instant::now();
                                 Python::attach(|_| {});
                                 let waited = asked.elapsed();
-                                waits
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .push((since_base(asked), super::nanos(waited)));
+                                let unscheduled = run_delay().saturating_sub(queued);
+                                waits.lock().unwrap_or_else(PoisonError::into_inner).push((
+                                    since_base(asked),
+                                    super::nanos(waited),
+                                    unscheduled,
+                                ));
                                 thread::sleep(Duration::from_micros(interval_us));
                             }
                         })
@@ -703,9 +759,23 @@ pub mod checks {
         Ok(())
     }
 
-    /// Stops the probe and returns its `(asked_ns, waited_ns)` records.
+    /// Nanoseconds the process's threads have spent runnable but not
+    /// scheduled, from Linux's schedstat; 0 where it cannot be read.
+    fn run_delay() -> u64 {
+        let Ok(threads) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        threads
+            .flatten()
+            .filter_map(|thread| std::fs::read_to_string(thread.path().join("schedstat")).ok())
+            .filter_map(|stat| stat.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .sum()
+    }
+
+    /// Stops the probe and returns its `(asked_ns, waited_ns,
+    /// unscheduled_ns)` records.
     #[pyfunction]
-    fn _gil_probe_stop(py: Python<'_>) -> PyResult<Vec<(u64, u64)>> {
+    fn _gil_probe_stop(py: Python<'_>) -> PyResult<Vec<(u64, u64, u64)>> {
         let probe = PROBE.lock().unwrap_or_else(PoisonError::into_inner).take();
         let Some(probe) = probe else {
             return Err(PyRuntimeError::new_err("the GIL probe is not running"));
@@ -779,5 +849,58 @@ mod tests {
             .expect_err("the worker's exit reports the drops");
         assert_eq!(caught.lock().unwrap().as_deref(), Some("the first panic"));
         assert!(message(&*exit).contains("dropped"), "{}", message(&*exit));
+    }
+
+    #[test]
+    fn a_drained_tuple_frees_its_elements_a_slice_at_a_time() {
+        static SITE: Site = Site::unbounded("test.drained_tuple");
+        Python::initialize();
+        Python::attach(|py| {
+            let scope = pyo3::types::PyDict::new(py);
+            py.run(
+                c"freed = []\nclass Counted:\n    def __del__(self):\n        freed.append(1)\nitems = tuple(Counted() for _ in range(1000))",
+                Some(&scope),
+                None,
+            )
+            .unwrap();
+            let items = scope.get_item("items").unwrap().unwrap();
+            scope.del_item("items").unwrap();
+            let freed = scope.get_item("freed").unwrap().unwrap();
+            let mut freed_before_the_first = None;
+            drain(
+                &SITE,
+                items,
+                |e| e,
+                |_| {
+                    freed_before_the_first = Some(freed.len().unwrap());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(
+                freed_before_the_first.unwrap() >= 1000 - 2 * SLICE,
+                "{freed_before_the_first:?} of 1000 elements were freed before the walk reached \
+                 the first"
+            );
+        });
+    }
+}
+
+#[cfg(all(test, not(feature = "gil-checks")))]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn a_build_without_gil_checks_keeps_no_record_of_worker_holds() {
+        static SITE: Site = Site::one("test.long_hold");
+        Python::initialize();
+        let mut body = || enter(&SITE, |_| thread::sleep(LOGGED_HOLD * 3));
+        thread::spawn(move || unsafe { run_worker(&mut body) })
+            .join()
+            .unwrap();
+        assert_eq!(
+            HOLDS.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            0
+        );
     }
 }

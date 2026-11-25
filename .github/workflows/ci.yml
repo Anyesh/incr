@@ -352,9 +352,16 @@ jobs:
           python -m venv .ci-venv
           source .ci-venv/bin/activate
           pip install maturin pytest
-          maturin develop --release --features conformance --manifest-path crates/incr-python/Cargo.toml
-          maturin develop --release --features conformance --manifest-path crates/incr-concurrent-python/Cargo.toml
+          maturin develop --release --features conformance,gil-checks --manifest-path crates/incr-python/Cargo.toml
+          maturin develop --release --features conformance,gil-checks --manifest-path crates/incr-concurrent-python/Cargo.toml
           python -m pytest examples/tests/python/ -q -rs
+      # gil::tests embeds the interpreter, so the test binary links libpython.
+      - run: |
+          source .ci-venv/bin/activate
+          export PYO3_PYTHON="$(command -v python)"
+          export LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          cargo test -p incr-python-protocol --features gil-checks --lib gil::tests
+          cargo test -p incr-python-protocol --lib gil::release_tests
 
   wheel-linux-aarch64:
     name: Linux aarch64 wheels

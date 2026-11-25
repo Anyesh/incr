@@ -503,11 +503,11 @@ impl<E: PersistExceptions> MemoBackend for PyMemoBackend<E> {
                 &LOAD_CHAIN,
                 result,
                 sequence_error::<E>("load_chain"),
-                |layer| Ok(layer.clone()),
+                |layer| Ok(layer.clone().unbind()),
             )?;
             layers
                 .into_iter()
-                .map(|layer| self.layer(layer, &LOAD_CHAIN_ITEMS, "load_chain"))
+                .map(|layer| self.layer(layer.into_bound(py), &LOAD_CHAIN_ITEMS, "load_chain"))
                 .collect::<Result<Vec<_>>>()
                 .map(Some)
         })?;
