@@ -485,7 +485,9 @@ pub fn build<'py, T, X>(
 /// `list` incr holds the only reference to is converted from its tail and
 /// freed a slice at a time; another `list` or a `tuple` is first copied
 /// into a new list, so a tick never lets another thread change what is
-/// being walked; any other iterable is walked through [`pull`].
+/// being walked, and released before the walk, so elements only it held
+/// are freed with the copy's slices; any other iterable is walked through
+/// [`pull`].
 pub fn drain<'py, T: Send, X>(
     site: &'static Site,
     sequence: Bound<'py, PyAny>,
@@ -497,11 +499,13 @@ pub fn drain<'py, T: Send, X>(
             .downcast_into::<PyList>()
             .map_err(|e| error(e.into()))?
     } else if sequence.is_instance_of::<PyList>() || sequence.is_instance_of::<PyTuple>() {
-        sequence
+        let copy = sequence
             .downcast::<pyo3::types::PySequence>()
             .map_err(|e| error(e.into()))?
             .to_list()
-            .map_err(&error)?
+            .map_err(&error)?;
+        drop(sequence);
+        copy
     } else {
         return pull(site, &sequence, error, convert);
     };
@@ -829,5 +833,39 @@ mod tests {
             .expect_err("the worker's exit reports the drops");
         assert_eq!(caught.lock().unwrap().as_deref(), Some("the first panic"));
         assert!(message(&*exit).contains("dropped"), "{}", message(&*exit));
+    }
+
+    #[test]
+    fn a_drained_tuple_frees_its_elements_a_slice_at_a_time() {
+        static SITE: Site = Site::unbounded("test.drained_tuple");
+        Python::initialize();
+        Python::attach(|py| {
+            let scope = pyo3::types::PyDict::new(py);
+            py.run(
+                c"freed = []\nclass Counted:\n    def __del__(self):\n        freed.append(1)\nitems = tuple(Counted() for _ in range(1000))",
+                Some(&scope),
+                None,
+            )
+            .unwrap();
+            let items = scope.get_item("items").unwrap().unwrap();
+            scope.del_item("items").unwrap();
+            let freed = scope.get_item("freed").unwrap().unwrap();
+            let mut freed_before_the_first = None;
+            drain(
+                &SITE,
+                items,
+                |e| e,
+                |_| {
+                    freed_before_the_first = Some(freed.len().unwrap());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(
+                freed_before_the_first.unwrap() >= 1000 - 2 * SLICE,
+                "{freed_before_the_first:?} of 1000 elements were freed before the walk reached \
+                 the first"
+            );
+        });
     }
 }
