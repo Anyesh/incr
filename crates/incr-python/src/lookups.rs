@@ -28,7 +28,7 @@ pub(crate) struct Lookups {
 
 // SAFETY: the state registry needs `Send + Sync`, but it lives in a
 // `Runtime<Local>`, which is neither, and the lookups otherwise only in the
-// binding state of that runtime's `unsendable` classes and closures, so they
+// binding state of that runtime's confined (`Confined`) classes and closures, so they
 // are only ever reached from the one thread that runtime lives on.
 unsafe impl Send for Lookups {}
 // SAFETY: see `Send`.

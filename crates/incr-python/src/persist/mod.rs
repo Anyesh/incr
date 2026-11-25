@@ -88,7 +88,8 @@ mod classes {
         binding = LocalBinding,
         runtime = PyRuntime,
         module = "incr.persist",
-        flags = [unsendable],
+        flags = [],
+        wrap = incr_python_protocol::confined::Confined,
         store_methods = {
             /// Starts a checkpoint that runs as a flight and returns its
             /// `PendingCheckpoint`: each `poll` copies the store's tables for

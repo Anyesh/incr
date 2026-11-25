@@ -43,7 +43,7 @@ impl PyCallable {
 }
 
 // SAFETY: the engine's closures must be `Send + Sync`, but these live only
-// in a `Runtime<Local>`, which is neither, and in the `unsendable` classes
+// in a `Runtime<Local>`, which is neither, and in the confined (`Confined`) classes
 // of this crate, so they are created, used and dropped on the one thread
 // that runtime lives on, and the state's journal of `Local` handles is
 // never touched from another. `&PyCallable` reaches the `Py`, which is

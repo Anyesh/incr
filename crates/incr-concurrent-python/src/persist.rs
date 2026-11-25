@@ -196,7 +196,8 @@ mod classes {
         binding = SharedBinding,
         runtime = PyRuntime,
         module = "incr_concurrent.persist",
-        flags = [frozen]
+        flags = [frozen],
+        wrap = incr_python_persist::incr_python_protocol::confined::Unconfined
     );
 }
 

@@ -9,8 +9,8 @@
 //! and `Sync` in PyO3 (you need the GIL to actually dereference).
 //!
 //! Runtime is `!Send + !Sync` under the Local strategy, so every class
-//! here is `unsendable`: Python may not move them across threads, which
-//! matches the engine's confinement exactly. The GIL-deadlock concern
+//! here is confined (`Confined`): only the thread that made one may use
+//! it, which matches the engine's confinement exactly. The GIL-deadlock concern
 //! that applies to the concurrent binding (a compute waiting on another
 //! thread's node while holding the GIL) cannot arise single-threaded.
 //!
@@ -55,6 +55,7 @@ use state::{LocalState, PyCallable, RtState};
 
 use incr_python_persist::ready;
 use incr_python_protocol::by_id::{keep_traced, resolve, snapshot_values, TypedNode};
+use incr_python_protocol::confined::Confined;
 use incr_python_protocol::gil_yield::{gil_yield_hook, DEFAULT_GIL_YIELD_MS};
 use incr_python_protocol::inspect::{kept_value, trace_dict};
 use incr_python_protocol::notready::{
@@ -109,6 +110,7 @@ impl Exceptions for Exc {
 /// read routes them. A Local runtime is touched by one thread, so its
 /// waits never block on another thread and the GIL stays held.
 fn engine_write<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
+    incr_python_protocol::confined::drain_pending();
     let _suppressed = rt.hold_routing_suppressed();
     pyerr_boundary::<Exc, _>(|| in_runtime(rt, f))
 }
@@ -118,6 +120,7 @@ fn engine_write<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
 /// raised before `f` runs, so a consuming read never loses what it took.
 /// A failure from routing inside `f` is stored for the next read.
 fn engine_read<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
+    incr_python_protocol::confined::drain_pending();
     pyerr_boundary::<Exc, _>(|| {
         in_runtime(rt, || {
             if let Some(failure) = rt.take_routing_failure().or_else(|| rt.route_pending()) {
@@ -226,11 +229,11 @@ fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync +
             let missing = Cell::new(0);
             let rt_ref = Py::new(
                 py,
-                PyRuntimeRef {
+                PyRuntimeRef::from(PyRuntimeRefFields {
                     ptr: Cell::new(rt as *const _),
                     state: py_func.state(),
                     missing: &missing,
-                },
+                }),
             )
             .unwrap();
             // Invalidates the ref when the callback returns or unwinds, so
@@ -250,9 +253,14 @@ fn query_fn(py_func: PyCallable) -> impl Fn(&Runtime) -> PyValue + Send + Sync +
 }
 
 /// Typed node handle exposed to Python. Wraps `Incr<PyValue>`.
-#[pyclass(name = "NodeId", unsendable)]
+#[pyclass(name = "NodeId")]
 #[derive(Clone)]
-struct PyNodeId {
+struct PyNodeId(Confined<PyNodeIdFields>);
+
+incr_python_protocol::confined_newtype!(PyNodeId => PyNodeIdFields);
+
+#[derive(Clone)]
+struct PyNodeIdFields {
     inner: Incr<PyValue>,
 }
 
@@ -279,17 +287,26 @@ impl PyNodeId {
 }
 
 /// Token for an observer registration; pass to `Runtime.unobserve`.
-#[pyclass(name = "ObserverId", unsendable)]
+#[pyclass(name = "ObserverId")]
 #[derive(Clone)]
-struct PyObserverId {
+struct PyObserverId(Confined<PyObserverIdFields>);
+
+incr_python_protocol::confined_newtype!(PyObserverId => PyObserverIdFields);
+
+#[derive(Clone)]
+struct PyObserverIdFields {
     inner: incr_compute::ObserverId,
 }
 
 /// Read-only runtime handle passed to query closures. The pointer is
 /// nulled out after the callback returns to make stale captures fail
 /// loudly rather than silently corrupt memory.
-#[pyclass(name = "RuntimeRef", unsendable)]
-struct PyRuntimeRef {
+#[pyclass(name = "RuntimeRef")]
+struct PyRuntimeRef(Confined<PyRuntimeRefFields>);
+
+incr_python_protocol::confined_newtype!(PyRuntimeRef => PyRuntimeRefFields);
+
+struct PyRuntimeRefFields {
     ptr: Cell<*const Runtime>,
     /// The runtime's binding state, valid while `ptr` is non-null: the
     /// running query's closure holds it.
@@ -475,7 +492,7 @@ impl PyRuntimeRef {
         let rt = self.rt()?;
         let (key, init) = (PyValue(key), init_fn(init));
         let node = engine_in_query(rt, || rt.child_input(key, init))?;
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     /// The query child named `key`, created with `f` the first time, like
@@ -494,14 +511,18 @@ impl PyRuntimeRef {
         let opts = query_opts(py, fallback, fixpoint, replay, |f| callables.callable(f))?;
         let (key, f) = (PyValue(key), query_fn(callables.callable(f)));
         let node = engine_in_query(rt, || rt.child_query_with(key, f, opts))?;
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 }
 
 /// A map from keys to nodes of one runtime. Key `__eq__` and `__hash__`
 /// run as value code: one that calls into incr raises the contract error.
-#[pyclass(name = "NodeTable", unsendable)]
-struct PyNodeTable {
+#[pyclass(name = "NodeTable")]
+struct PyNodeTable(Confined<PyNodeTableFields>);
+
+incr_python_protocol::confined_newtype!(PyNodeTable => PyNodeTableFields);
+
+struct PyNodeTableFields {
     inner: NodeTable<PyValue, PyValue>,
     rt: Py<PyRuntime>,
 }
@@ -527,7 +548,7 @@ impl PyNodeTable {
             .forbid_in_overlay("NodeTable.get_or_insert_input")?;
         let (key, init) = (PyValue(key), init_fn(init));
         let node = self.engine_read(py, |rt| self.inner.get_or_insert_input(rt, key, init))?;
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     /// The query node for `key`, created with `f` and the options on a miss.
@@ -551,14 +572,14 @@ impl PyNodeTable {
         let node = self.engine_read(py, |rt| {
             self.inner.get_or_insert_query_with(rt, key, f, opts)
         })?;
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     /// The live node for `key`, or `None`. Not allowed inside a query.
     fn get(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<PyNodeId>> {
         let key = PyValue(key);
         let node = self.engine_read(py, |rt| self.inner.get(rt, &key))?;
-        Ok(node.map(|inner| PyNodeId { inner }))
+        Ok(node.map(|inner| PyNodeId::from(PyNodeIdFields { inner })))
     }
 
     /// Deletes `key`'s node and removes the entry. Raises `KeyError` if
@@ -586,13 +607,17 @@ impl PyNodeTable {
         })?;
         Ok(entries
             .into_iter()
-            .map(|(key, inner)| (key.into_inner(), PyNodeId { inner }))
+            .map(|(key, inner)| (key.into_inner(), PyNodeId::from(PyNodeIdFields { inner })))
             .collect())
     }
 }
 
-#[pyclass(name = "Collection", unsendable)]
-struct PyCollection {
+#[pyclass(name = "Collection")]
+struct PyCollection(Confined<PyCollectionFields>);
+
+incr_python_protocol::confined_newtype!(PyCollection => PyCollectionFields);
+
+struct PyCollectionFields {
     inner: IncrCollection<PyValue>,
     rt: Py<PyRuntime>,
     born: Born,
@@ -646,12 +671,12 @@ impl PyCollection {
     /// overlay ends, and its node deleted then.
     fn made(parent: &impl OnRuntime, py: Python<'_>, inner: IncrCollection<PyValue>) -> Self {
         parent.created(py, inner.version_node().erase());
-        PyCollection {
+        PyCollection::from(PyCollectionFields {
             inner,
             rt: parent.runtime().clone_ref(py),
             born: parent.state(py).born(),
             writer: Writer::Caller,
-        }
+        })
     }
 
     /// Applies `changes` as one atomic step, and in an overlay journals
@@ -777,7 +802,7 @@ impl PyCollection {
         })?;
         self.created(py, parts.erase());
         self.created(py, node.erase());
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     /// `fold_fn` of the list of rows, with not-ready elements left out
@@ -799,7 +824,7 @@ impl PyCollection {
             })
         })?;
         self.created(py, node.erase());
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     /// Incrementally maintained monoid fold: `lift` maps an element into
@@ -839,7 +864,7 @@ impl PyCollection {
             )
         })?;
         self.created(py, node.erase());
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     fn sort_by_key(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PySortedCollection> {
@@ -856,11 +881,11 @@ impl PyCollection {
             })
         })?;
         self.created(py, sorted.version_node().erase());
-        Ok(PySortedCollection {
+        Ok(PySortedCollection::from(PySortedCollectionFields {
             inner: sorted,
             rt: self.rt.clone_ref(py),
             born: self.state(py).born(),
-        })
+        }))
     }
 
     fn group_by(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PyGroupedCollection> {
@@ -877,11 +902,11 @@ impl PyCollection {
             })
         })?;
         self.created(py, grouped.version_node().erase());
-        Ok(PyGroupedCollection {
+        Ok(PyGroupedCollection::from(PyGroupedCollectionFields {
             inner: grouped,
             rt: self.rt.clone_ref(py),
             born: self.state(py).born(),
-        })
+        }))
     }
 
     fn join(
@@ -960,8 +985,12 @@ impl PyCollection {
 /// `label` names the collection's group in `Runtime.graph_summary`: it
 /// labels the pair and row collections' version nodes, and the group
 /// reports the key count as `"keys"`.
-#[pyclass(name = "KeyedCollection", unsendable)]
-struct PyKeyedCollection {
+#[pyclass(name = "KeyedCollection")]
+struct PyKeyedCollection(Confined<PyKeyedCollectionFields>);
+
+incr_python_protocol::confined_newtype!(PyKeyedCollection => PyKeyedCollectionFields);
+
+struct PyKeyedCollectionFields {
     kind: KeyedKind,
     rows: IncrCollection<PyValue>,
     rt: Py<PyRuntime>,
@@ -971,8 +1000,12 @@ struct PyKeyedCollection {
 
 /// The result of `KeyedCollection.key_partitions`: read one partition with
 /// `ctx.keys(parts, p)`.
-#[pyclass(name = "KeyPartitions", unsendable)]
-struct PyKeyPartitions {
+#[pyclass(name = "KeyPartitions")]
+struct PyKeyPartitions(Confined<PyKeyPartitionsFields>);
+
+incr_python_protocol::confined_newtype!(PyKeyPartitions => PyKeyPartitionsFields);
+
+struct PyKeyPartitionsFields {
     parts: incr_core::KeyPartitions<PyKey>,
     owner: Py<PyKeyedCollection>,
 }
@@ -1082,13 +1115,13 @@ impl PyKeyedCollection {
                 .borrow_mut()
                 .push((stats, label.clone(), pairs.version_node().erase()));
         }
-        Ok(PyKeyedCollection {
+        Ok(PyKeyedCollection::from(PyKeyedCollectionFields {
             kind,
             rows,
             rt: runtime.unbind(),
             born: state.born(),
             label,
-        })
+        }))
     }
 
     /// A keyed collection over one a store persists.
@@ -1276,10 +1309,10 @@ impl PyKeyedCollection {
             let (source, _) = this.key_source(py, rt)?;
             Ok::<_, PyErr>(source.key_partitions(rt, f))
         })??;
-        Ok(PyKeyPartitions {
+        Ok(PyKeyPartitions::from(PyKeyPartitionsFields {
             parts,
             owner: slf.clone().unbind(),
-        })
+        }))
     }
 
     /// How many version inputs this collection holds: one per key a query
@@ -1368,17 +1401,21 @@ impl PyKeyedCollection {
                 "store.upsert, store.remove, store.reconcile or a store.batch"
             }
         };
-        Ok(PyCollection {
+        Ok(PyCollection::from(PyCollectionFields {
             inner: self.rows.clone(),
             rt: self.rt.clone_ref(py),
             born: self.born.clone(),
             writer: Writer::Keyed(keyed_rows_refusal(self.label.as_deref(), how)),
-        })
+        }))
     }
 }
 
-#[pyclass(name = "SortedCollection", unsendable)]
-struct PySortedCollection {
+#[pyclass(name = "SortedCollection")]
+struct PySortedCollection(Confined<PySortedCollectionFields>);
+
+incr_python_protocol::confined_newtype!(PySortedCollection => PySortedCollectionFields);
+
+struct PySortedCollectionFields {
     inner: SortedCollection<PyValue, PyValue>,
     rt: Py<PyRuntime>,
     born: Born,
@@ -1462,8 +1499,12 @@ impl PySortedCollection {
     }
 }
 
-#[pyclass(name = "GroupedCollection", unsendable)]
-struct PyGroupedCollection {
+#[pyclass(name = "GroupedCollection")]
+struct PyGroupedCollection(Confined<PyGroupedCollectionFields>);
+
+incr_python_protocol::confined_newtype!(PyGroupedCollection => PyGroupedCollectionFields);
+
+struct PyGroupedCollectionFields {
     inner: incr_compute::GroupedCollection<PyValue, PyValue>,
     rt: Py<PyRuntime>,
     born: Born,
@@ -1493,11 +1534,13 @@ impl PyGroupedCollection {
     fn get_group(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<PyCollection>> {
         let py_key = PyValue(key);
         let group = self.engine_read(py, |_| self.inner.get_group(&py_key))?;
-        Ok(group.map(|collection| PyCollection {
-            inner: collection,
-            rt: self.rt.clone_ref(py),
-            born: self.born.clone(),
-            writer: Writer::Caller,
+        Ok(group.map(|collection| {
+            PyCollection::from(PyCollectionFields {
+                inner: collection,
+                rt: self.rt.clone_ref(py),
+                born: self.born.clone(),
+                writer: Writer::Caller,
+            })
         }))
     }
 
@@ -1514,8 +1557,12 @@ impl PyGroupedCollection {
     }
 }
 
-#[pyclass(name = "Runtime", unsendable)]
-struct PyRuntime {
+#[pyclass(name = "Runtime")]
+struct PyRuntime(Confined<PyRuntimeFields>);
+
+incr_python_protocol::confined_newtype!(PyRuntime => PyRuntimeFields);
+
+struct PyRuntimeFields {
     holder: Holder,
     /// The query each collection's `version_node` getter hands out,
     /// keyed by the collection's internal version node, so repeated
@@ -1556,12 +1603,12 @@ const _: () = {
 
 impl PyRuntime {
     fn persisted(core: Arc<persist::StoreCore>) -> Self {
-        PyRuntime {
+        PyRuntime::from(PyRuntimeFields {
             holder: Holder::Persisted(core),
             version_bridges: RefCell::new(HashMap::new()),
             keyed_labels: RefCell::new(Vec::new()),
             state: RtState::default(),
-        }
+        })
     }
 
     /// Closes a store's runtime, for `store.close()`.
@@ -1702,7 +1749,7 @@ impl PyRuntime {
         let mut bridges = self.version_bridges.borrow_mut();
         if let Some(&bridge) = bridges.get(&version) {
             if rt.is_alive(bridge) {
-                return PyNodeId { inner: bridge };
+                return PyNodeId::from(PyNodeIdFields { inner: bridge });
             }
         }
         let bridge = rt.create_query(move |rt| -> PyValue {
@@ -1712,7 +1759,7 @@ impl PyRuntime {
         bridges.insert(version, bridge);
         self.state
             .journal(|overlay| overlay.created(bridge.erase()));
-        PyNodeId { inner: bridge }
+        PyNodeId::from(PyNodeIdFields { inner: bridge })
     }
 }
 
@@ -1730,12 +1777,12 @@ impl PyRuntime {
     fn new(gil_yield_ms: Option<u64>) -> PyResult<Self> {
         let mut runtime = Box::new(Runtime::new());
         runtime.set_yield_hook(gil_yield_hook(gil_yield_ms)?);
-        Ok(PyRuntime {
+        Ok(PyRuntime::from(PyRuntimeFields {
             holder: Holder::Owned(runtime),
             version_bridges: RefCell::new(HashMap::new()),
             keyed_labels: RefCell::new(Vec::new()),
             state: RtState::default(),
-        })
+        }))
     }
 
     /// Drop the engine and everything it holds: values, closures and the
@@ -1766,7 +1813,7 @@ impl PyRuntime {
     fn create_input(&self, value: Py<PyAny>) -> PyResult<PyNodeId> {
         let node = self.engine_read(|rt| rt.create_input(PyValue(value)))?;
         self.state.journal(|overlay| overlay.created(node.erase()));
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     /// The node's value: a `NotReady` value as stored, and an `Incomplete`
@@ -1893,7 +1940,7 @@ impl PyRuntime {
             rt.drain_dirtied_watched()
                 .into_iter()
                 .filter_map(|h| rt.typed_handle::<PyValue>(h))
-                .map(|inner| PyNodeId { inner })
+                .map(|inner| PyNodeId::from(PyNodeIdFields { inner }))
                 .collect()
         })
     }
@@ -1910,7 +1957,7 @@ impl PyRuntime {
                 });
             })
         })?;
-        Ok(PyObserverId { inner: id })
+        Ok(PyObserverId::from(PyObserverIdFields { inner: id }))
     }
 
     fn unobserve(&self, id: PyObserverId) -> PyResult<()> {
@@ -1945,14 +1992,14 @@ impl PyRuntime {
         if let Some(label) = label {
             self.relabel(node.slot(), label)?;
         }
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     fn create_table(slf: PyRef<'_, Self>) -> PyResult<PyNodeTable> {
         slf.forbid_in_overlay("create_table")?;
         let table = slf.engine_read(|rt| rt.create_table::<PyValue, PyValue>())?;
         let rt: Py<PyRuntime> = slf.into();
-        Ok(PyNodeTable { inner: table, rt })
+        Ok(PyNodeTable::from(PyNodeTableFields { inner: table, rt }))
     }
 
     /// The value a replayed read returns in place of the node it wanted.
@@ -1977,12 +2024,12 @@ impl PyRuntime {
         state.journal(|overlay| overlay.created(col.version_node().erase()));
         let born = state.born();
         let rt: Py<PyRuntime> = slf.into();
-        Ok(PyCollection {
+        Ok(PyCollection::from(PyCollectionFields {
             inner: col,
             rt,
             born,
             writer: Writer::Caller,
-        })
+        }))
     }
 
     fn set_label(&self, node: PyNodeId, label: String) -> PyResult<()> {
@@ -2239,7 +2286,7 @@ impl PyRuntime {
     fn create_lookup(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<PyNodeId> {
         let lookups = self.state.lookups();
         let node = self.engine_read(|rt| lookups.node(rt, py, &key))?;
-        Ok(PyNodeId { inner: node })
+        Ok(PyNodeId::from(PyNodeIdFields { inner: node }))
     }
 
     /// The keys queued since the last drain whose lookup is still

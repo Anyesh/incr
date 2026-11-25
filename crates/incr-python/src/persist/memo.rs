@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use crate::state::PyCallable;
 use incr_python_persist::ready;
 
-use crate::{InvalidateRef, PyRuntimeRef};
+use crate::{InvalidateRef, PyRuntimeRef, PyRuntimeRefFields};
 
 /// The closure the engine runs for a memo table: `py_func` called with a
 /// `RuntimeRef` that is invalidated when it returns, and the entry's key.
@@ -25,11 +25,11 @@ pub(super) fn memo_fn(
             let missing = Cell::new(0);
             let rt_ref = Py::new(
                 py,
-                PyRuntimeRef {
+                PyRuntimeRef::from(PyRuntimeRefFields {
                     ptr: Cell::new(rt as *const _),
                     state: py_func.state(),
                     missing: &missing,
-                },
+                }),
             )
             .unwrap();
             let _guard = InvalidateRef(rt_ref.bind(py).clone());

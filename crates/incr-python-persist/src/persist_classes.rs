@@ -3,7 +3,9 @@
 
 /// Defines a package's persistence classes in the calling module, which
 /// must hold nothing else, under the Python module path `$module`, with
-/// the pyclass flags `$flag` (such as `unsendable` or `frozen`).
+/// the pyclass flags `$flag` (such as `frozen`). Each class is a newtype over
+/// `$wrap<Fields>`: `Confined` where one thread uses a class, `Unconfined`
+/// where any thread may.
 ///
 /// Defines `PyStore`, `PyBatch`, `PyMemo`, `PyMemoTable` and `PyOverlay`
 /// for a runtime that implements
@@ -15,7 +17,8 @@ macro_rules! persist_classes {
         binding = $b:ty,
         runtime = $rt:ty,
         module = $module:literal,
-        flags = [$($flag:ident),*]
+        flags = [$($flag:ident),*],
+        wrap = $($wrap:ident)::+
         $(, store_methods = { $($store_extra:tt)* })?
         $(, memo_methods = { $($memo_extra:tt)* })?
     ) => {
@@ -55,7 +58,11 @@ macro_rules! persist_classes {
         /// `store.insert`, ...); `runtime.set` and a persisted collection's own
         /// `insert`, `delete`, `extend` and `replace` raise `RuntimeError`.
         #[pyclass(name = "Store", module = $module, $($flag),*)]
-        pub(crate) struct PyStore {
+        pub(crate) struct PyStore($($wrap)::+<PyStoreFields>);
+
+        $crate::incr_python_protocol::confined_newtype!(PyStore => PyStoreFields);
+
+        pub(crate) struct PyStoreFields {
             core: Mutex<Option<Arc<$crate::store::StoreCore<$b>>>>,
             memo: Mutex<Option<Arc<MemoCore<$b>>>>,
             runtime: Py<$rt>,
@@ -87,19 +94,30 @@ macro_rules! persist_classes {
             }
         }
 
-        impl Drop for PyStore {
+        impl Drop for PyStoreFields {
             fn drop(&mut self) {
                 $crate::incr_python_protocol::gil::enter(&STORE_DROP, |py| self.release(py));
             }
         }
 
+        impl PyStoreFields {
+            /// Drops the memo, stopping its checkpoint thread, and the core,
+            /// through the binding's [`drop_detached`](PyBinding::drop_detached).
+            fn release(&self, py: Python<'_>) {
+                let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let core = self.core.lock().unwrap_or_else(PoisonError::into_inner).take();
+                drop(MemoRef(memo));
+                <$b as PyBinding>::drop_detached(py, core);
+            }
+        }
+
         impl PyStore {
             fn new(core: Arc<$crate::store::StoreCore<$b>>, runtime: Py<$rt>) -> Self {
-                PyStore {
+                PyStore::from(PyStoreFields {
                     core: Mutex::new(Some(core)),
                     memo: Mutex::new(Some(Arc::new(MemoCore::default()))),
                     runtime,
-                }
+                })
             }
 
             fn core(&self) -> PyResult<Arc<$crate::store::StoreCore<$b>>> {
@@ -108,15 +126,6 @@ macro_rules! persist_classes {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone()
                     .ok_or_else(|| PyRuntimeError::new_err("store is closed"))
-            }
-
-            /// Drops the memo, stopping its checkpoint thread, and the core,
-            /// through the binding's [`drop_detached`](PyBinding::drop_detached).
-            fn release(&self, py: Python<'_>) {
-                let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner).take();
-                let core = self.core.lock().unwrap_or_else(PoisonError::into_inner).take();
-                drop(MemoRef(memo));
-                <$b as PyBinding>::drop_detached(py, core);
             }
 
             fn memo(&self) -> PyResult<MemoRef> {
@@ -352,11 +361,11 @@ macro_rules! persist_classes {
                 let py = slf.py();
                 let apply = $crate::batch::Apply::parse(apply)?;
                 slf.borrow().core_outside_overlay(py)?;
-                Ok(PyBatch {
+                Ok(PyBatch::from(PyBatchFields {
                     store: slf.clone().unbind(),
                     batch: Mutex::new($crate::batch::Batch::new(apply)),
                     opener: std::thread::current().id(),
-                })
+                }))
             }
 
             /// Declares the memo table `name`, whose entries `func(ctx, key)`
@@ -398,11 +407,11 @@ macro_rules! persist_classes {
                     label.as_deref(),
                     store.maker(py),
                 )?;
-                Ok(PyMemoTable {
+                Ok(PyMemoTable::from(PyMemoTableFields {
                     store: slf.clone().unbind(),
                     name: name.to_owned(),
                     handle,
-                })
+                }))
             }
 
             /// Opens the memo over `backend`, an object that implements the memo
@@ -435,9 +444,9 @@ macro_rules! persist_classes {
                 let store = slf.borrow();
                 let core = store.core_outside_overlay(py)?;
                 store.memo()?.open(&core, py, backend, options, store.maker(py))?;
-                Ok(PyMemo {
+                Ok(PyMemo::from(PyMemoFields {
                     store: slf.clone().unbind(),
-                })
+                }))
             }
 
             /// Applies the records other writers appended since this store last
@@ -516,13 +525,17 @@ macro_rules! persist_classes {
         /// A batch is used only on the thread that called `store.batch()`: a
         /// call from another thread raises `RuntimeError`.
         #[pyclass(name = "Batch", module = $module, $($flag),*)]
-        pub(crate) struct PyBatch {
+        pub(crate) struct PyBatch($($wrap)::+<PyBatchFields>);
+
+        $crate::incr_python_protocol::confined_newtype!(PyBatch => PyBatchFields);
+
+        pub(crate) struct PyBatchFields {
             store: Py<PyStore>,
             batch: Mutex<$crate::batch::Batch<$b>>,
             opener: std::thread::ThreadId,
         }
 
-        impl Drop for PyBatch {
+        impl Drop for PyBatchFields {
             fn drop(&mut self) {
                 let batch = std::mem::replace(
                     self.batch.get_mut().unwrap_or_else(PoisonError::into_inner),
@@ -669,7 +682,11 @@ macro_rules! persist_classes {
         /// A memo table of a store: pass it to `memo.get_or_insert` and
         /// `ctx.memo`.
         #[pyclass(name = "MemoTable", module = $module, $($flag),*)]
-        pub(crate) struct PyMemoTable {
+        pub(crate) struct PyMemoTable($($wrap)::+<PyMemoTableFields>);
+
+        $crate::incr_python_protocol::confined_newtype!(PyMemoTable => PyMemoTableFields);
+
+        pub(crate) struct PyMemoTableFields {
             store: Py<PyStore>,
             name: String,
             handle: TableHandle,
@@ -707,7 +724,11 @@ macro_rules! persist_classes {
         /// An open memo: `memo.get_or_insert(table, key)` gives an entry's node, and
         /// `memo.checkpoint()` writes the live entries to the backend.
         #[pyclass(name = "Memo", module = $module, $($flag),*)]
-        pub(crate) struct PyMemo {
+        pub(crate) struct PyMemo($($wrap)::+<PyMemoFields>);
+
+        $crate::incr_python_protocol::confined_newtype!(PyMemo => PyMemoFields);
+
+        pub(crate) struct PyMemoFields {
             store: Py<PyStore>,
         }
 
@@ -815,13 +836,17 @@ macro_rules! persist_classes {
         /// for a key inside the block stays after exit, so a query that first
         /// read its key there still reruns when that key changes later.
         #[pyclass(name = "Overlay", $($flag),*)]
-        pub(crate) struct PyOverlay {
+        pub(crate) struct PyOverlay($($wrap)::+<PyOverlayFields>);
+
+        $crate::incr_python_protocol::confined_newtype!(PyOverlay => PyOverlayFields);
+
+        pub(crate) struct PyOverlayFields {
             rt: Py<$rt>,
         }
 
         impl PyOverlay {
             pub(crate) fn new(rt: Py<$rt>) -> Self {
-                PyOverlay { rt }
+                PyOverlay::from(PyOverlayFields { rt })
             }
         }
 
