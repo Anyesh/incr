@@ -14,6 +14,7 @@ use super::checkpoint::Fate;
 use super::dirty::{Carried, Record};
 use super::mapping::LiveDep;
 use super::memo_core::{CoreRef, ErasedBackend, IndexGen, Landing, MemoCells, MemoState};
+use super::split_map::SplitMap;
 use super::table_core::{KeyPart, Snap};
 use super::{fingerprint, CheckpointInput, CheckpointStats, Entry, GenId, StoredDep, VALUE_BATCH};
 use crate::flight::Parcel;
@@ -82,7 +83,7 @@ pub(crate) type Seeds = HashMap<ErasedIncr, Seed>;
 pub(crate) fn copy_seeds(
     state: &MemoState,
     snaps: &mut [Snap],
-    copied: &mut HashSet<ErasedIncr>,
+    copied: &mut SplitMap<ErasedIncr, ()>,
     yielder: &Yielder<'_>,
 ) -> Vec<(ErasedIncr, Seed)> {
     let mut seeds = Vec::new();
@@ -98,7 +99,7 @@ pub(crate) fn copy_seeds(
             let LiveDep::Query { handle, stamp } = *dep else {
                 continue;
             };
-            if !copied.insert(handle) {
+            if copied.insert(handle, ()).is_some() {
                 continue;
             }
             let Some(&(fp, seeded_at)) = state.seed_info.get(&handle) else {
@@ -181,7 +182,7 @@ impl<C: MemoCells> CoreRef<C> {
             let mut landing = Landing::default();
             self.carry_uninspected(&dirty, &snaps, &yielder, &mut landing);
             self.wake.await_landing(landing);
-            let seeds: Seeds = copy_seeds(&state, &mut snaps, &mut HashSet::new(), &yielder)
+            let seeds: Seeds = copy_seeds(&state, &mut snaps, &mut SplitMap::new(), &yielder)
                 .into_iter()
                 .collect();
             (snaps, seeds)
@@ -240,8 +241,6 @@ impl<C: MemoCells> CoreRef<C> {
         let mut saved = Vec::new();
         {
             let yielder = rt.yielder_under_lock();
-            state.seed_info.reserve(done.fates.len());
-            state.seed_keys.reserve(done.fates.len());
             for (fate, origin) in done.fates.iter().zip(&found.origin) {
                 yielder.tick();
                 unsaveable += u64::from(self.finish_entry(&mut state, *fate, origin, &mut saved));

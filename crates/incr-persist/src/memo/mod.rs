@@ -28,6 +28,7 @@ mod open;
 mod options;
 mod restore;
 mod snapshot;
+mod split_map;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod summary;

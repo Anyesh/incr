@@ -11,6 +11,7 @@ use incr_core::persist_hooks::changed_at;
 use incr_core::{Cells, ErasedIncr, Incr, Local, NodeTable, Runtime, Shared};
 
 use super::dirty::Dirty;
+use super::split_map::SplitMap;
 
 use super::checkpoint::{write_known, Pulls};
 use super::flight::Slot;
@@ -202,9 +203,9 @@ pub(crate) struct MemoState {
     /// Per node a restore seeded: the fingerprint of the value it seeded
     /// and the stamp it seeded at. A removed or recycled node never matches
     /// a live handle; checkpoints prune them.
-    pub(crate) seed_info: HashMap<ErasedIncr, (u128, u64)>,
+    pub(crate) seed_info: SplitMap<ErasedIncr, (u128, u64)>,
     /// Per node in `seed_info`, its live table and stored key bytes.
-    pub(crate) seed_keys: HashMap<ErasedIncr, (u32, Vec<u8>)>,
+    pub(crate) seed_keys: SplitMap<ErasedIncr, (u32, Vec<u8>)>,
     /// `seed_info`'s length after checkpoints last pruned it.
     pub(crate) pruned_at: usize,
     pub(crate) stats: MemoStats,
