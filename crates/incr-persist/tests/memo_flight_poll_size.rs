@@ -7,13 +7,16 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use incr_persist::memo::{
-    BuildId, Memo, MemoBackend, MemoBuilder, MemoCheckpoint, MemoOptions, MemoTable, MemoryMemo,
+    BuildId, Chain, DeltaHeader, EncodedEntry, GenHeader, GenId, Generation, IndexItem, Memo,
+    MemoBackend, MemoBuilder, MemoCheckpoint, MemoOptions, MemoTable, MemoryMemo, Tombstone,
 };
-use incr_persist::{Error, Input, Local, MemoryBackend, Options, Store};
+use incr_persist::{Error, Input, Local, MemoryBackend, Options, Result, Store};
 
 struct Metered;
 
@@ -106,12 +109,91 @@ impl Most {
     }
 }
 
+/// The reference memory backend, noting when the worker starts a write:
+/// the caller has sealed by then and has nothing left to poll for.
+#[derive(Clone)]
+struct Writing {
+    inner: MemoryMemo,
+    started: Arc<AtomicBool>,
+}
+
+impl MemoBackend for Writing {
+    type Guard = <MemoryMemo as MemoBackend>::Guard;
+
+    fn lock_checkpoint(&self) -> Result<Self::Guard> {
+        self.inner.lock_checkpoint()
+    }
+
+    fn load(&self) -> Result<Option<Generation>> {
+        self.inner.load()
+    }
+
+    fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>> {
+        self.inner.read_entry(generation, item)
+    }
+
+    fn write_generation(
+        &self,
+        base: Option<GenId>,
+        id: GenId,
+        header: &GenHeader,
+        entries: &[EncodedEntry],
+    ) -> Result<Generation> {
+        self.started.store(true, SeqCst);
+        self.inner.write_generation(base, id, header, entries)
+    }
+
+    fn write_generation_streamed(
+        &self,
+        base: Option<GenId>,
+        id: GenId,
+        header: &GenHeader,
+        entries: &mut dyn Iterator<Item = Result<EncodedEntry>>,
+    ) -> Result<Generation> {
+        self.started.store(true, SeqCst);
+        self.inner
+            .write_generation_streamed(base, id, header, entries)
+    }
+
+    fn read_entries(&self, generation: GenId, items: &[IndexItem]) -> Result<Vec<Option<Vec<u8>>>> {
+        self.inner.read_entries(generation, items)
+    }
+
+    fn supports_delta(&self) -> bool {
+        self.inner.supports_delta()
+    }
+
+    fn concurrent_compaction(&self) -> bool {
+        self.inner.concurrent_compaction()
+    }
+
+    fn load_chain(&self, known: &[Arc<Generation>]) -> Result<Option<Chain>> {
+        self.inner.load_chain(known)
+    }
+
+    fn write_delta(
+        &self,
+        tip: GenId,
+        id: GenId,
+        header: &DeltaHeader,
+        entries: &[EncodedEntry],
+        tombstones: &[Tombstone],
+    ) -> Result<Generation> {
+        self.started.store(true, SeqCst);
+        self.inner.write_delta(tip, id, header, entries, tombstones)
+    }
+
+    fn remove_generation(&self, generation: GenId) -> Result<()> {
+        self.inner.remove_generation(generation)
+    }
+}
+
 /// `node(0) = y` and `node(k) = node(k / 2) + k`: every entry but the
 /// first has a query dep, so inspection copies seeds and records deps.
 struct Fx {
     _store: Arc<Store<Local, MemoryBackend>>,
     memo: Memo<Local, MemoryBackend>,
-    backend: MemoryMemo,
+    backend: Writing,
     _y: Input<u64>,
     node: MemoTable<u32, u64>,
 }
@@ -133,7 +215,10 @@ impl Fx {
                 ctx.get(node, k / 2) + u64::from(k)
             }
         });
-        let backend = MemoryMemo::new();
+        let backend = Writing {
+            inner: MemoryMemo::new(),
+            started: Arc::new(AtomicBool::new(false)),
+        };
         let memo = builder.open(&store, backend.clone()).unwrap();
         Fx {
             _store: store,
@@ -151,8 +236,9 @@ impl Fx {
         }
     }
 
-    fn tip(&self) -> Option<incr_persist::memo::GenId> {
+    fn tip(&self) -> Option<GenId> {
         self.backend
+            .inner
             .load_chain(&[])
             .unwrap()
             .map(|chain| chain.tip().id())
@@ -166,10 +252,12 @@ impl Fx {
         }
     }
 
-    fn cancel_when(&self, most: &mut Most, ready: impl Fn() -> bool) {
+    /// Polls until `polled`, then waits without polling until `ready`,
+    /// cancels, and polls until the cancel settles.
+    fn cancel_when(&self, most: &mut Most, polled: impl Fn() -> bool, ready: impl Fn() -> bool) {
         let flight = self.memo.begin_checkpoint().unwrap();
         let deadline = Instant::now() + WAIT;
-        while !ready() {
+        while !polled() {
             assert!(
                 !most.poll(&flight, &self.memo).unwrap(),
                 "finished before the cancel"
@@ -178,6 +266,10 @@ impl Fx {
                 Instant::now() < deadline,
                 "the flight never got ready to cancel"
             );
+        }
+        while !ready() {
+            assert!(Instant::now() < deadline, "the worker never committed");
+            thread::sleep(Duration::from_millis(1));
         }
         flight.cancel();
         loop {
@@ -208,13 +300,22 @@ fn every_memo_flight_poll_does_at_most_one_unit() {
 
     let mut pruning = Most::default();
     let polls = Cell::new(0);
-    fx.cancel_when(&mut pruning, || polls.replace(polls.get() + 1) == 1);
+    fx.cancel_when(
+        &mut pruning,
+        || polls.replace(polls.get() + 1) == 1,
+        || true,
+    );
     over.extend(pruning.within("cancelled while pruning"));
 
     fx.compute(2 * N..3 * N);
     let before = fx.tip();
+    fx.backend.started.store(false, SeqCst);
     let mut committed = Most::default();
-    fx.cancel_when(&mut committed, || fx.tip() != before);
+    fx.cancel_when(
+        &mut committed,
+        || fx.backend.started.load(SeqCst),
+        || fx.tip() != before,
+    );
     over.extend(committed.within("cancelled once committed"));
 
     assert!(over.is_empty(), "{over:#?}");
