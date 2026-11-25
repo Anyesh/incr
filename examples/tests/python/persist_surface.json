@@ -893,8 +893,8 @@
     "signature": "(self, /, upto, records)"
    },
    "concurrent_compaction": {
-    "doc": "Returns True when the argument is true, False otherwise.\nThe builtins True and False are the only two instances of the class bool.\nThe class bool is a subclass of the class int, and cannot be subclassed.",
-    "kind": "bool"
+    "kind": "bool",
+    "value": "True"
    },
    "load_snapshot": {
     "doc": null,
@@ -941,8 +941,8 @@
     "signature": "(*args, **kwargs)"
    },
    "concurrent_compaction": {
-    "doc": "Returns True when the argument is true, False otherwise.\nThe builtins True and False are the only two instances of the class bool.\nThe class bool is a subclass of the class int, and cannot be subclassed.",
-    "kind": "bool"
+    "kind": "bool",
+    "value": "True"
    },
    "load": {
     "doc": null,

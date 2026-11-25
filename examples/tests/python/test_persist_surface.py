@@ -50,8 +50,14 @@ def _doc(raw, kind):
     return getattr(raw, "__doc__", None)
 
 
+def _is_value(raw):
+    return not callable(raw) and not hasattr(type(raw), "__get__")
+
+
 def _member(raw, bound):
     kind = type(raw).__name__
+    if _is_value(raw):
+        return {"kind": kind, "value": repr(raw)}
     entry = {"kind": kind, "doc": _doc(raw, kind)}
     if callable(bound) and not isinstance(raw, (property,)):
         entry["signature"] = _signature(bound)

@@ -45,7 +45,7 @@ pub struct MemoCheckpoint {
 
 impl MemoCheckpoint {
     /// Runs the caller's part of the checkpoint for about `budget`, plus
-    /// one inspect batch or [`UNIT`] entries: the seed prune, inspecting
+    /// one inspect batch or `UNIT` entries: the seed prune, inspecting
     /// the dirty set, and once the worker has written, the finish. `Ok(true)`
     /// once the checkpoint is finished; the worker's error, or
     /// [`Error::Cancelled`], once it is not going to be. Inspection waits
