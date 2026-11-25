@@ -117,9 +117,9 @@ The engine itself lives in [`incr-core`](crates/incr-core/) under a `Cells` stra
 
 ```toml
 [dependencies]
-incr-compute = "0.2.0-beta.12"      # single-threaded
+incr-compute = "0.2.0-beta.14"      # single-threaded
 # or
-incr-concurrent = "0.2.0-beta.12"   # multi-threaded (Send + Sync)
+incr-concurrent = "0.2.0-beta.14"   # multi-threaded (Send + Sync)
 ```
 
 The yield hook that lets long native work call back into its host (`Runtime::set_yield_hook`, `incr_persist::Options::yield_hook`) is behind the `yield-hook` feature of `incr-compute`, `incr-concurrent`, `incr-core` and `incr-persist`; without it no loop checks for a hook.
