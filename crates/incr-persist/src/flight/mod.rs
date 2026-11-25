@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 pub(crate) use chunked::Chunked;
 pub(crate) use parcel::Parcel;
 
-use crate::value_context::{enter_value_scope, start_worker};
+use crate::value_context::{drop_then_hold, enter_value_scope, start_worker};
 use crate::{Error, Result, ValueScope};
 
 /// What a flight's worker posts once it is done.
@@ -134,7 +134,10 @@ impl<M: Send + 'static, T: Send + 'static> Flight<M, T> {
             thread::Builder::new()
                 .name("incr-checkpoint".to_owned())
                 .stack_size(WORKER_STACK)
-                .spawn(move || posted.post(run_worker(scope, inbox, body)))?
+                .spawn(move || {
+                    posted.post(run_worker(scope.clone(), inbox, body));
+                    drop_then_hold(scope, posted);
+                })?
         };
         let _ = control.worker.set(worker.thread().clone());
         register(Arc::clone(&control), worker);
