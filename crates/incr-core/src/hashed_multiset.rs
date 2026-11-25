@@ -81,18 +81,15 @@ impl<T> Table<T> {
         let (layout, ctrl_offset) = Self::layout(capacity);
         // SAFETY: the size is not zero, because `capacity` is not and an
         // entry holds a `u64`.
-        let base = unsafe { alloc::alloc(layout) };
+        let base = unsafe { alloc::alloc_zeroed(layout) };
         let Some(base) = NonNull::new(base) else {
             alloc::handle_alloc_error(layout)
         };
         // SAFETY: the `capacity` control bytes at `ctrl_offset` lie inside
         // the allocation, and the entries at its start are aligned by the
-        // layout. Writing EMPTY initialises every control byte.
-        let ctrl = unsafe {
-            let ctrl = base.add(ctrl_offset);
-            ctrl.write_bytes(EMPTY, capacity);
-            ctrl
-        };
+        // layout. The zeroed allocation initialised every control byte to
+        // EMPTY.
+        let ctrl = unsafe { base.add(ctrl_offset) };
         Self {
             entries: base.cast(),
             ctrl,
