@@ -38,14 +38,14 @@ pub(crate) fn alloc_zeroed_from(layout: Layout, from: usize) -> NonNull<u8> {
 }
 
 /// # Safety
-/// `ptr` must come from [`alloc_zeroed`] with this `layout` and not have
-/// been passed here before.
+/// `ptr` must come from [`alloc_zeroed`] or [`alloc_zeroed_from`] with
+/// this `layout` and not have been passed here before.
 pub(crate) unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     if sys::maps(layout) {
-        // SAFETY: mapped by `alloc_zeroed` with this size.
+        // SAFETY: mapped with this size.
         unsafe { sys::unmap(ptr, layout) }
     } else {
-        // SAFETY: allocated by `alloc_zeroed` with this layout.
+        // SAFETY: allocated by the global allocator with this layout.
         unsafe { alloc::dealloc(ptr.as_ptr(), layout) }
     }
 }
@@ -56,9 +56,9 @@ pub(crate) unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
 /// `to`. The bytes given back read as zero afterwards.
 ///
 /// # Safety
-/// `ptr` must come from [`alloc_zeroed`] with this `layout`, `from <= to <=
-/// layout.size()`, and nothing may rely on the contents of the bytes below
-/// `to`.
+/// `ptr` must come from [`alloc_zeroed`] or [`alloc_zeroed_from`] with
+/// this `layout`, `from <= to <= layout.size()`, and nothing may rely on
+/// the contents of the bytes below `to`.
 pub(crate) unsafe fn release(ptr: NonNull<u8>, layout: Layout, from: usize, to: usize) {
     if sys::maps(layout) {
         // SAFETY: the range lies in the mapping.
