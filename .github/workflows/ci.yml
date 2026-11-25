@@ -361,6 +361,7 @@ jobs:
           export PYO3_PYTHON="$(command -v python)"
           export LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
           cargo test -p incr-python-protocol --features gil-checks --lib gil::tests
+          cargo test -p incr-python-protocol --lib gil::release_tests
 
   wheel-linux-aarch64:
     name: Linux aarch64 wheels
