@@ -194,11 +194,22 @@ pub fn on_worker() -> bool {
 ///
 /// As for [`idle`]: `body` reaches Python only through the gate.
 pub unsafe fn run_worker(body: &mut dyn FnMut()) {
+    let mut ending = None;
     Python::attach(|py| {
         let _worker = WorkerMark::start();
         detach(py, body);
+        ending = Some(Instant::now());
     });
+    if let Some(began) = ending {
+        WORKER_END.note_entry();
+        let now = Instant::now();
+        WORKER_END.note_hold(now.saturating_duration_since(began), now);
+    }
 }
+
+/// The worker's last hold, from its body's end until its thread state is
+/// released, which frees whatever the thread's `threading.local` kept.
+static WORKER_END: Site = Site::one("worker.end");
 
 struct WorkerMark;
 

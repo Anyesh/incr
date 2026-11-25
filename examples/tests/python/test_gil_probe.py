@@ -185,6 +185,7 @@ def note(scenario, began, ended, calls, passes, waits, bars):
             "probe_wait_ms": wait / 1e6,
             "probe_wait_raw_ms": raw / 1e6,
             "probe_unscheduled_ms": unscheduled / 1e6,
+            "probe_wait_at_ms": (asked - began) / 1e6,
             "most_unscheduled_ms": max((u for _, _, u in waits), default=0) / 1e6,
             "holds_during_wait": during,
             "gate_hold_ms": hold / 1e6,
